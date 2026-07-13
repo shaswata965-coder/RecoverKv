@@ -190,6 +190,7 @@ class LongBenchRunner:
             from utils.cache_factory import assert_transformers_version_supported
 
             assert_transformers_version_supported()
+            self._warn_on_cache_window_disagreement()
 
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
@@ -451,11 +452,6 @@ class LongBenchRunner:
         """Create windowed cache and install hooks."""
         cfg = self.config
         model = self.model
-
-        # LongBench reads window params from cfg.cache.*; parity runners read
-        # from cfg.window.*. Warn loudly if the two configs disagree so a user
-        # who copied a parity template doesn't silently get cache defaults.
-        self._warn_on_cache_window_disagreement()
 
         budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.20
         cache_config = self.WindowedCacheConfig(

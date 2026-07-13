@@ -1,0 +1,53 @@
+# ============================================================================
+# StickyKV — Batched Performance Benchmarks
+# ============================================================================
+# Two scenarios:
+#   1) Standard batch  : prefill=2048,  decode=256, batch_size=64
+#   2) Long context    : prefill=16384, decode=512, batch_size=4
+#
+# Metrics reported: TPOT (ms/token), TTFT (s), throughput (token/s)
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 64
+
+perf:
+  data_source: "2wikimqa"
+  configs:
+    - name: windowed_flash_20pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+    - name: windowed_eager_20pct
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.20
+
+  grid:
+    - { prefill_len: 512, gen_len: 32,   batch_size: 1 }
+    - { prefill_len: 512, gen_len: 512,  batch_size: 1 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 1 }
+
+  num_warmup_runs: 5
+  num_measurement_runs: 5
+  allow_shared_gpu: true
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: false
+  enable_clock_locking: false
+
+telemetry:
+  output_dir: outputs/perf_batched

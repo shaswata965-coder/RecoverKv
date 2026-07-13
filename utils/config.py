@@ -269,6 +269,7 @@ class PerfConfig:
     skip_if_oom: bool = True
     skip_if_flash_attn_unavailable: bool = True
     enable_clock_locking: bool = False
+    data_source: Optional[str] = None  # LongBench dataset name (e.g. "2wikimqa"); None = synthetic
 
 
 # ---------------------------------------------------------------------------

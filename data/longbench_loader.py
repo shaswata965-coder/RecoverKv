@@ -82,31 +82,53 @@ TASK_CATEGORIES = {
 }
 
 
+LONGBENCH_LOCAL_DIR: str = (
+    "/home/ee/visitor/man_misn.visitor/kv_cache/LongBenchDataset"
+)
+
+
 def load_longbench_dataset(
     dataset_name: str,
     use_e_variant: bool = False,
     streaming: bool = False,
+    data_dir: Optional[str] = None,
 ):
-    """Load a single LongBench dataset from HuggingFace.
+    """Load a single LongBench dataset, preferring local JSONL files.
 
     Parameters
     ----------
     dataset_name : str
         One of the 16+5 LongBench dataset config names.
     use_e_variant : bool
-        If True, load the ``_e`` length-stratified variant.
+        If True, load the ``_e`` length-stratified variant (HuggingFace only).
     streaming : bool
-        If True, return an iterable dataset (useful for very large splits).
+        If True, return an iterable dataset (HuggingFace path only).
+    data_dir : str, optional
+        Directory containing ``<dataset_name>.jsonl`` files.  Defaults to
+        ``LONGBENCH_LOCAL_DIR``.  Pass ``None`` to force HuggingFace.
 
     Returns
     -------
     datasets.Dataset or datasets.IterableDataset
     """
+    import os
+
     from datasets import load_dataset
 
-    config_name = f"{dataset_name}_e" if use_e_variant else dataset_name
-    log.info("Loading LongBench dataset: %s (config=%s)", dataset_name, config_name)
+    local_dir = data_dir if data_dir is not None else LONGBENCH_LOCAL_DIR
+    local_path = os.path.join(local_dir, f"{dataset_name}.jsonl")
 
+    if not use_e_variant and os.path.isfile(local_path):
+        log.info("Loading LongBench dataset from local file: %s", local_path)
+        ds = load_dataset("json", data_files=local_path, split="train")
+        return ds
+
+    config_name = f"{dataset_name}_e" if use_e_variant else dataset_name
+    log.info(
+        "Local file not found; loading LongBench dataset from HuggingFace: %s (config=%s)",
+        dataset_name,
+        config_name,
+    )
     ds = load_dataset(
         "THUDM/LongBench",
         config_name,

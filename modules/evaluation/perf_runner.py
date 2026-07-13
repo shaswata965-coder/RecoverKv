@@ -43,26 +43,32 @@ class PerfRunner:
         # Build (prefill_len, gen_len) grid. Explicit `grid:` wins; otherwise
         # fall back to legacy `prefill_lengths` x scalar `gen_len`.
         if pc.grid:
-            cells = [(int(g["prefill_len"]), int(g["gen_len"])) for g in pc.grid]
+            cells = [
+                (int(g["prefill_len"]), int(g["gen_len"]),
+                 int(g.get("batch_size", pc.batch_size)))
+                for g in pc.grid
+            ]
         else:
-            cells = [(p, pc.gen_len) for p in pc.prefill_lengths]
+            cells = [(p, pc.gen_len, pc.batch_size) for p in pc.prefill_lengths]
         output_paths = []
-        for prefill_len, gen_len in cells:
-            log.info("--- Cell: prefill=%d gen=%d ---", prefill_len, gen_len)
-            result = self._run_prefill(prefill_len, gen_len, pc, cfg, flash_ok, env)
+        for prefill_len, gen_len, batch_size in cells:
+            log.info("--- Cell: prefill=%d gen=%d batch=%d ---", prefill_len, gen_len, batch_size)
+            result = self._run_prefill(prefill_len, gen_len, batch_size, pc, cfg, flash_ok, env)
             result["clocks_locked"] = clocks_locked
             result["gen_len"] = gen_len
-            path = self._save(result, prefill_len, gen_len, cfg, env, clocks_locked)
+            result["batch_size"] = batch_size
+            path = self._save(result, prefill_len, gen_len, batch_size, cfg, env, clocks_locked)
             output_paths.append(path)
         return output_paths
 
-    def _run_prefill(self, prefill_len: int, gen_len: int, pc, cfg, flash_ok: bool, env: dict) -> dict:
+    def _run_prefill(self, prefill_len: int, gen_len: int, batch_size: int, pc, cfg, flash_ok: bool, env: dict) -> dict:
         configs = pc.configs
         n_configs = len(configs)
         n_runs = pc.num_measurement_runs
         ttft = np.full((n_configs, n_runs), np.nan)
         throughput = np.full((n_configs, n_runs), np.nan)
         tpot = np.full((n_configs, n_runs), np.nan)
+        e2e_latency = np.full((n_configs, n_runs), np.nan)
         peak_mem = np.full((n_configs, n_runs), np.nan)
         skipped = np.zeros(n_configs, dtype=bool)
         names = []
@@ -79,11 +85,12 @@ class PerfRunner:
                     continue
             log.info("Running config: %s", name)
             try:
-                measurements = self._measure_config(c, prefill_len, gen_len, pc, cfg)
+                measurements = self._measure_config(c, prefill_len, gen_len, batch_size, pc, cfg)
                 for ri, m in enumerate(measurements):
                     ttft[ci, ri] = m["ttft_ms"]
                     throughput[ci, ri] = m["throughput_tokps"]
                     tpot[ci, ri] = m["tpot_ms"]
+                    e2e_latency[ci, ri] = m["e2e_latency_ms"]
                     peak_mem[ci, ri] = m["peak_memory_mb"]
             except torch.cuda.OutOfMemoryError:
                 if pc.skip_if_oom:
@@ -98,10 +105,10 @@ class PerfRunner:
                 log.warning("Error on %s: %s — skipping", name, e)
                 skipped[ci] = True
         return {"names": names, "attn_impls": attn_impls, "ttft": ttft,
-                "throughput": throughput, "tpot": tpot, "peak_mem": peak_mem,
-                "skipped": skipped}
+                "throughput": throughput, "tpot": tpot, "e2e_latency": e2e_latency,
+                "peak_mem": peak_mem, "skipped": skipped}
 
-    def _measure_config(self, c: dict, prefill_len: int, gen_len: int, pc, cfg) -> List[dict]:
+    def _measure_config(self, c: dict, prefill_len: int, gen_len: int, batch_size: int, pc, cfg) -> List[dict]:
         from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
         dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         torch_dtype = dtypes.get(cfg.model.dtype, torch.float16)
@@ -115,12 +122,17 @@ class PerfRunner:
             device_map="auto")
         model.eval()
         # Create input. batch_size>1 measures batched throughput; the windowed
-        # cache evicts each row independently (synthetic inputs are equal-length,
-        # so no padding is involved).
-        batch_size = max(1, int(getattr(pc, "batch_size", 1)))
-        input_ids = torch.randint(
-            100, 30000, (batch_size, prefill_len), device=model.device
-        )
+        # cache evicts each row independently (equal-length inputs, no padding).
+        batch_size = max(1, int(batch_size))
+        data_source = c.get("data_source") or getattr(pc, "data_source", None)
+        if data_source:
+            input_ids = self._build_input_ids(
+                data_source, tokenizer, prefill_len, batch_size, cfg.run.seed
+            ).to(model.device)
+        else:
+            input_ids = torch.randint(
+                100, 30000, (batch_size, prefill_len), device=model.device
+            )
         # Setup cache
         cache_backend = c.get("cache_backend", "dynamic")
         cache_pkg = c.get("cache_package")
@@ -228,6 +240,7 @@ class PerfRunner:
                 t3 = time.perf_counter()
                 gen_time = t3 - t2
                 tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
+                e2e_latency_ms = (t3 - t0) * 1000
                 # End-to-end throughput includes prefill (TTFT) + decode time; this
                 # mirrors the legacy field name but is NOT decode-only. Counts all
                 # batch_size rows (B=1 ⇒ identical to the legacy value).
@@ -236,7 +249,8 @@ class PerfRunner:
                 if torch.cuda.is_available():
                     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
                 measurements.append({"ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
-                                     "tpot_ms": tpot_ms, "peak_memory_mb": peak_mb})
+                                     "tpot_ms": tpot_ms, "e2e_latency_ms": e2e_latency_ms,
+                                     "peak_memory_mb": peak_mb})
             finally:
                 if hooks is not None:
                     hooks.remove()
@@ -248,12 +262,13 @@ class PerfRunner:
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         return measurements
 
-    def _save(self, result: dict, prefill_len: int, gen_len: int, cfg, env: dict, clocks_locked: bool) -> Path:
+    def _save(self, result: dict, prefill_len: int, gen_len: int, batch_size: int, cfg, env: dict, clocks_locked: bool) -> Path:
         od = Path(cfg.telemetry.output_dir); od.mkdir(parents=True, exist_ok=True)
-        npz_path = od / f"perf_prefill{prefill_len}_gen{gen_len}.npz"
+        npz_path = od / f"perf_prefill{prefill_len}_gen{gen_len}_bs{batch_size}.npz"
         meta = {
             "prefill_len": prefill_len,
             "gen_len": gen_len,
+            "batch_size": batch_size,
             **env,
             "clocks_locked": clocks_locked,
         }
@@ -264,12 +279,36 @@ class PerfRunner:
             ttft_ms=result["ttft"],
             throughput_tokps=result["throughput"],
             tpot_ms=result["tpot"],
+            e2e_latency_ms=result["e2e_latency"],
             peak_memory_mb=result["peak_mem"],
             skipped_mask=result["skipped"],
             metadata_json=np.array([json.dumps(meta)], dtype=object),
         )
         log.info("Saved perf: %s", npz_path)
         return npz_path
+
+    def _build_input_ids(self, data_source: str, tokenizer, prefill_len: int,
+                         batch_size: int, seed: int) -> torch.Tensor:
+        import random
+        from data.longbench_loader import load_longbench_dataset
+        log.info("Loading dataset '%s' for perf inputs (prefill_len=%d, batch_size=%d)",
+                 data_source, prefill_len, batch_size)
+        ds = load_longbench_dataset(data_source)
+        parts = [s["context"] + "\n\n" + s["input"] for s in ds]
+        full_text = "\n\n".join(parts)
+        all_ids = tokenizer.encode(full_text, return_tensors="pt", add_special_tokens=False)
+        total = all_ids.shape[1]
+        chunks = [all_ids[:, i:i + prefill_len]
+                  for i in range(0, total - prefill_len + 1, prefill_len)]
+        if len(chunks) < batch_size:
+            raise ValueError(
+                f"Dataset '{data_source}' yields only {len(chunks)} chunks of "
+                f"{prefill_len} tokens but batch_size={batch_size}. "
+                f"Reduce batch_size or prefill_len."
+            )
+        rng = random.Random(seed)
+        selected = rng.sample(chunks, batch_size)
+        return torch.cat(selected, dim=0)  # [batch_size, prefill_len]
 
     def _try_lock_clocks(self) -> bool:
         import subprocess
