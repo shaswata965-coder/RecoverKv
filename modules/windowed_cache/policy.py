@@ -31,6 +31,13 @@ class EvictionPolicy:
         self.local_tokens: int = resolved.local_tokens
         self.local_windows: int = resolved.local_tokens // resolved.window_size
         self.top_k_windows: int = resolved.top_k_windows
+        # Two-tier split (design.md §5, §7). Unused when quant_ratio == 0.
+        self.quant_ratio: float = resolved.quant_ratio
+        self.top_k_fp: int = resolved.top_k_fp
+        self.N_q: int = resolved.N_q
+        # total_tokens tracks the MERGED length (T_fp + T_q) so window/region
+        # counts stay aligned with the merged axis and get_seq_length (design §5).
+        # At q=0, T_q == 0, so this is exactly the fp-only token count.
         self.total_tokens: int = 0
 
     # -----------------------------------------------------------------
@@ -144,6 +151,72 @@ class EvictionPolicy:
 
         retained = torch.cat([topk_sorted, local_idx], dim=-1)  # [B, k + local_w]
         return retained
+
+    # -----------------------------------------------------------------
+    # Two-tier retain + tier assignment (design.md §5) — q > 0 only, B = 1
+    # -----------------------------------------------------------------
+
+    def compute_two_tier_retain(
+        self, window_scores: Tensor
+    ) -> "tuple[Tensor, Tensor]":
+        """Rank the evictable band and assign each survivor a tier.
+
+        Sink + local are force-fp (never eligible for Q). The evictable band is
+        partitioned by rank: top ``top_k_fp`` → fp, next ``N_q`` → Q, rest
+        dropped (design §5 steps 1–2). Returns the retained windows in
+        **chronological** (ascending merged-index) order plus their assigned
+        tier, so the caller can drive demote/promote/keep against the store.
+
+        B = 1 in v1 (guarded by the cache before this is called).
+
+        Parameters
+        ----------
+        window_scores : Tensor
+            Shape ``[1, H_q, W]`` — merged-axis cumulative scores.
+
+        Returns
+        -------
+        retained_idx : Tensor
+            Shape ``[1, W_retained]`` — merged-axis indices, ascending.
+        new_tier : Tensor
+            Shape ``[1, W_retained]`` — 0 = fp, 1 = Q, aligned with
+            ``retained_idx``.
+        """
+        W = window_scores.shape[2]
+        device = window_scores.device
+
+        local_w = min(self.local_windows, W)
+        evictable_w = W - local_w
+        local_idx = torch.arange(W - local_w, W, device=device, dtype=torch.long)
+        local_tier = torch.zeros(local_w, device=device, dtype=torch.long)
+
+        if evictable_w <= 0:
+            return local_idx.unsqueeze(0), local_tier.unsqueeze(0)
+
+        mean = window_scores.mean(dim=1)[0]        # [W]
+        ev_scores = mean[:evictable_w]
+
+        k_fp = min(self.top_k_fp, evictable_w)
+        n_q = min(self.N_q, evictable_w - k_fp)
+
+        # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
+        order = torch.argsort(ev_scores, descending=True)
+        fp_sel = order[:k_fp]
+        q_sel = order[k_fp:k_fp + n_q]
+
+        ev_idx = torch.cat([fp_sel, q_sel])
+        ev_tier = torch.cat([
+            torch.zeros(fp_sel.numel(), device=device, dtype=torch.long),
+            torch.ones(q_sel.numel(), device=device, dtype=torch.long),
+        ])
+        # Sort the retained evictable windows chronologically (by merged index).
+        perm = torch.argsort(ev_idx)
+        ev_idx = ev_idx[perm]
+        ev_tier = ev_tier[perm]
+
+        retained = torch.cat([ev_idx, local_idx])
+        tier = torch.cat([ev_tier, local_tier])
+        return retained.unsqueeze(0), tier.unsqueeze(0)
 
     # -----------------------------------------------------------------
     # Retain indices — token granularity

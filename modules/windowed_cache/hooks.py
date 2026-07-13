@@ -205,8 +205,16 @@ def install_score_hooks(
                     return
 
                 # Keys: already RoPE-applied and appended by cache.update()
-                # earlier in this same forward pass.
-                k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
+                # earlier in this same forward pass. At q > 0 the raw fp store
+                # misses the Q tier, so source the effective K (fp + dequantized,
+                # RoPE'd Q windows, interleaved chronologically) instead — the
+                # same tensor attention saw (design §8, §9).
+                if getattr(cache, "_q", 0.0) > 0.0:
+                    if cache._states[lidx].key_states is None:
+                        return
+                    k_current = cache._materialize(lidx)[0]  # [1, H_kv, S, D]
+                else:
+                    k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
                 if k_current is None:
                     return
 

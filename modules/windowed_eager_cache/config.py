@@ -35,6 +35,20 @@ class ResolvedConfig:
     total_budget_bytes: int
     total_budget_tokens: int
     rerotate_on_evict: bool = False
+    # --- two-tier quantization (design.md §7) ---
+    # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
+    # and the int4 (Q) tier by memory. q=0 disables the Q tier entirely and every
+    # field below reduces to today's single-tier config (top_k_fp == top_k_windows,
+    # N_q == 0), so the pure-fp16 path stays byte-identical.
+    quant_ratio: float = 0.0
+    top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
+    N_q: int = 0               # evictable int4 windows (0 when q=0)
+
+    def __post_init__(self) -> None:
+        # top_k_fp defaults to top_k_windows so direct constructions (and every
+        # q=0 path) mirror the single-tier count without extra plumbing.
+        if self.top_k_fp < 0:
+            object.__setattr__(self, "top_k_fp", self.top_k_windows)
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +87,13 @@ class WindowedCacheConfig:
         position corrupts RoPE phase after the first eviction.  Leaving this off
         keeps original key positions (KVPress / H2O behaviour), correct on any
         version.
+    quant_ratio : float
+        Two-tier split ``q`` in ``[0, 1]`` (design.md §7).  **Default 0.0** —
+        the Q (int4) tier is disabled and the cache is byte-identical to the
+        single-tier fp16 path.  When ``q > 0``, the evictable window budget is
+        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int4 tier
+        (which holds ~4× the windows per byte).  Requires an even ``window_size``
+        (int4 nibble packing) and — in v1 — batch size 1 (design.md §10).
 
     Notes
     -----
@@ -86,6 +107,7 @@ class WindowedCacheConfig:
     cache_budget: float
     track_scores: bool = False
     rerotate_on_evict: bool = False
+    quant_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -151,6 +173,28 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
+            )
+
+        # -- quant_ratio (two-tier split, design.md §7) --
+        if isinstance(self.quant_ratio, bool):
+            raise ValueError("quant_ratio must be a float in [0, 1], got bool")
+        if isinstance(self.quant_ratio, int) and not isinstance(self.quant_ratio, bool):
+            # allow the literal 0 / 1 as a convenience; promote to float
+            self.quant_ratio = float(self.quant_ratio)
+        if not isinstance(self.quant_ratio, float):
+            raise ValueError(
+                f"quant_ratio must be a float in [0, 1], "
+                f"got {type(self.quant_ratio).__name__}"
+            )
+        if not (0.0 <= self.quant_ratio <= 1.0):
+            raise ValueError(
+                f"quant_ratio must be in [0, 1], got {self.quant_ratio}"
+            )
+        if self.quant_ratio > 0.0 and self.window_size % 2 != 0:
+            # int4 nibble packing needs an even window (2 codes/byte, design §2).
+            raise ValueError(
+                f"quant_ratio > 0 requires an even window_size (int4 packing), "
+                f"got window_size={self.window_size}"
             )
 
     # -----------------------------------------------------------------
@@ -238,6 +282,26 @@ class WindowedCacheConfig:
             )
         top_k_windows = remaining // self.window_size
 
+        # --- Two-tier split (design.md §7) --------------------------------
+        # Only the EVICTABLE window budget is divided between tiers; sink and
+        # local stay fp and are already carved as tokens above. At q=0 this
+        # yields top_k_fp == top_k_windows and N_q == 0 by construction, so the
+        # ResolvedConfig is field-for-field identical to the single-tier path.
+        q = self.quant_ratio
+        # one fp window vs one int4 window, in bytes:
+        b_fp = bytes_per_token * self.window_size                       # K+V fp16
+        b_q = (
+            num_kv_heads * head_dim * self.window_size                  # int4 codes, K+V
+            + 4 * num_kv_heads * head_dim                               # key scale+zero fp16
+            + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
+        )
+        m_evict = remaining * bytes_per_token                           # evictable bytes
+        top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
+        N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+        # q=0 must reproduce today's count exactly (guard float floor drift).
+        if q == 0.0:
+            top_k_fp = top_k_windows
+
         return ResolvedConfig(
             window_size=self.window_size,
             num_sink_tokens=self.num_sink_tokens,
@@ -247,4 +311,7 @@ class WindowedCacheConfig:
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
             rerotate_on_evict=self.rerotate_on_evict,
+            quant_ratio=q,
+            top_k_fp=top_k_fp,
+            N_q=N_q,
         )

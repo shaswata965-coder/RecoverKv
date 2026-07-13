@@ -460,6 +460,7 @@ class LongBenchRunner:
             local_window_size=cfg.cache.local_window_size,
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
+            quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
         )
 
         # Get RoPE module

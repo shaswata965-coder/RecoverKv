@@ -48,6 +48,7 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
+    quant_ratio: float = 0.0  # two-tier int4 split q in [0,1] (design.md §7); 0 disables the Q tier
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -93,6 +94,18 @@ class CacheConfig:
                     f"local_window_size as float must be in (0, 1], "
                     f"got {self.local_window_size}"
                 )
+
+        # quant_ratio: two-tier int4 split (design.md §7). Full validation
+        # (even window_size when q>0, range) lives in WindowedCacheConfig; here
+        # we only guard the obvious type/range so eval configs fail fast.
+        if isinstance(self.quant_ratio, bool):
+            raise ConfigValidationError("quant_ratio must be a float in [0, 1], got bool")
+        if isinstance(self.quant_ratio, int):
+            self.quant_ratio = float(self.quant_ratio)
+        if not isinstance(self.quant_ratio, float) or not (0.0 <= self.quant_ratio <= 1.0):
+            raise ConfigValidationError(
+                f"quant_ratio must be a float in [0, 1], got {self.quant_ratio!r}"
+            )
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.
