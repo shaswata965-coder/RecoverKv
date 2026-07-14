@@ -154,9 +154,14 @@ class PerfRunner:
             assert_transformers_version_supported()
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
             w = cfg.window
+            # quant_ratio is per-config (like cache_budget), falling back to the
+            # shared cache.quant_ratio; 0.0 keeps the pure-fp16 path (design.md §7).
+            quant_ratio = c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0))
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
-                      cache_budget=budget if budget is not None else 0.5)
+                      cache_budget=budget if budget is not None else 0.5,
+                      rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
+                      quant_ratio=quant_ratio)
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():

@@ -284,7 +284,9 @@ class OursParityRunner:
             # Fresh cache + hooks per chunk (cache state must reset).
             cache_config = WCC(
                 window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
-                local_window_size=w.local_window_size, cache_budget=budget)
+                local_window_size=w.local_window_size, cache_budget=budget,
+                rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
+                quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0))
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
