@@ -192,6 +192,37 @@ def dequantize_key_window(
     return _affine_dequantize(codes, scale16, zero16, out_dtype)
 
 
+def dequantize_key_windows(
+    packed: Tensor,
+    scale: Tensor,
+    zero: Tensor,
+    window: int,
+    out_dtype: torch.dtype = torch.float16,
+) -> Tensor:
+    """Batched :func:`dequantize_key_window` over a leading window axis.
+
+    Same numerics as the singular form applied per slice — every op here is
+    elementwise on the last axis or a broadcast, so the ``N`` windows are
+    dequantized in a handful of tensor ops instead of ``N`` Python-loop calls
+    (read-path launch-count fix; the per-window loop was launch-bound on GPU).
+
+    Parameters
+    ----------
+    packed : uint8 ``[N, H_kv, D, window // 2]`` — channel-major, 2 tokens/byte.
+    scale, zero : fp16 ``[N, H_kv, D]`` — one grid per ``(window, head, channel)``.
+    window : int — original (unpacked) token count.
+
+    Returns
+    -------
+    ``[N, H_kv, window, D]`` token-major, in ``out_dtype``.
+    """
+    codes_cm = unpack_nibbles_last(packed, window)          # [N, H_kv, D, window]
+    codes = codes_cm.transpose(2, 3).contiguous()           # [N, H_kv, window, D]
+    scale16 = scale.unsqueeze(2)                            # [N, H_kv, 1, D]
+    zero16 = zero.unsqueeze(2)                              # [N, H_kv, 1, D]
+    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+
+
 # ---------------------------------------------------------------------------
 # Value quantization — per (head, token), token-major store, pack over channels
 # ---------------------------------------------------------------------------
@@ -242,4 +273,29 @@ def dequantize_value_window(
     codes = unpack_nibbles_last(packed, head_dim)  # [H_kv, window, D]
     scale16 = scale.unsqueeze(2)                   # [H_kv, window, 1]
     zero16 = zero.unsqueeze(2)                     # [H_kv, window, 1]
+    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+
+
+def dequantize_value_windows(
+    packed: Tensor,
+    scale: Tensor,
+    zero: Tensor,
+    head_dim: int,
+    out_dtype: torch.dtype = torch.float16,
+) -> Tensor:
+    """Batched :func:`dequantize_value_window` over a leading window axis.
+
+    Parameters
+    ----------
+    packed : uint8 ``[N, H_kv, window, D // 2]`` — token-major, 2 channels/byte.
+    scale, zero : fp16 ``[N, H_kv, window]`` — one grid per ``(window, head, token)``.
+    head_dim : int — original (unpacked) channel count.
+
+    Returns
+    -------
+    ``[N, H_kv, window, D]`` token-major, in ``out_dtype``.
+    """
+    codes = unpack_nibbles_last(packed, head_dim)  # [N, H_kv, window, D]
+    scale16 = scale.unsqueeze(3)                   # [N, H_kv, window, 1]
+    zero16 = zero.unsqueeze(3)                     # [N, H_kv, window, 1]
     return _affine_dequantize(codes, scale16, zero16, out_dtype)

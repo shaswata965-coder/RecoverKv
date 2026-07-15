@@ -24,7 +24,9 @@ from __future__ import annotations
 
 from .quantizer import (
     dequantize_key_window,
+    dequantize_key_windows,
     dequantize_value_window,
+    dequantize_value_windows,
     pack_nibbles_last,
     quantize_key_window,
     quantize_value_window,
@@ -34,8 +36,10 @@ from .quantizer import (
 __all__ = [
     "quantize_key_window",
     "dequantize_key_window",
+    "dequantize_key_windows",
     "quantize_value_window",
     "dequantize_value_window",
+    "dequantize_value_windows",
     "pack_nibbles_last",
     "unpack_nibbles_last",
 ]

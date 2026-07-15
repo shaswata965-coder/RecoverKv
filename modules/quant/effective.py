@@ -168,11 +168,22 @@ def materialize_effective_kv(
     # Window ids come from each window's first position; derive them all in one
     # host sync rather than a per-window ``.item()``.
     _, q_keys_pre, q_values, q_positions = store.gather_active(out_dtype=out_dtype)
+    n_q, h_kv, s, d = q_keys_pre.shape
     q_wids = ((q_positions[:, 0].to(torch.long) - num_sink) // window_size).tolist()
-    for idx in range(q_keys_pre.shape[0]):
-        pos = q_positions[idx]
-        k_rot = rotate_key_window(q_keys_pre[idx], pos, rope_module)
-        chunks.append((int(q_wids[idx]), k_rot.to(out_dtype), q_values[idx].to(out_dtype)))
+
+    # RoPE is per-token pointwise (each key rotated by cos/sin at its own
+    # position), so rotating all N_q windows in ONE call — flattened window-major
+    # to [H_kv, N_q*window, D] with their original positions [N_q*window] — is
+    # bit-identical to N_q separate per-window calls, but pays a single kernel
+    # launch instead of ~40/window. The chunk split below is pure views (no
+    # launches); the interleave stays the chronological sort + one cat.
+    k_flat = q_keys_pre.permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)  # [H, N*S, D]
+    pos_flat = q_positions.reshape(n_q * s)                           # [N*S]
+    k_rot_flat = rotate_key_window(k_flat, pos_flat, rope_module).to(out_dtype)
+    k_rot = k_rot_flat.reshape(h_kv, n_q, s, d).permute(1, 0, 2, 3)   # [N, H, S, D]
+    q_values = q_values.to(out_dtype)
+    for idx in range(n_q):
+        chunks.append((int(q_wids[idx]), k_rot[idx], q_values[idx]))
 
     # Interleave by chronological window id.
     chunks.sort(key=lambda c: c[0])

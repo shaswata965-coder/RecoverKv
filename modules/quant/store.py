@@ -26,7 +26,9 @@ from torch import Tensor
 from .ledger import LedgerEntry, QuantLedger
 from .quantizer import (
     dequantize_key_window,
+    dequantize_key_windows,
     dequantize_value_window,
+    dequantize_value_windows,
     quantize_key_window,
     quantize_value_window,
 )
@@ -167,32 +169,31 @@ class QuantizedStore:
         if not entries:
             return None
 
-        keys: List[Tensor] = []
-        values: List[Tensor] = []
-        positions: List[Tensor] = []
-        ids: List[int] = []
-        for e in entries:
-            keys.append(
-                dequantize_key_window(
-                    e.key_codes, e.key_scale, e.key_zero,
-                    self.window_size, out_dtype=out_dtype,
-                )
-            )
-            values.append(
-                dequantize_value_window(
-                    e.val_codes, e.val_scale, e.val_zero,
-                    self.head_dim, out_dtype=out_dtype,
-                )
-            )
-            positions.append(e.position_range.to(torch.long))
-            ids.append(e.original_window_id)
+        # Stack each frozen field into one dense tensor (a handful of constant
+        # launches, regardless of window count), then dequantize the whole tier
+        # in ONE batched call per tier — no per-window Python loop. On GPU the
+        # old singular-per-window loop was launch-bound (~70 dispatches/window);
+        # this path is flat at ~a dozen for any N_q. Numerics are unchanged:
+        # the batched dequant is the singular op applied slice-wise.
+        ids = [e.original_window_id for e in entries]
+        k_codes = torch.stack([e.key_codes for e in entries], dim=0)   # [N,H,D,S/2]
+        k_scale = torch.stack([e.key_scale for e in entries], dim=0)   # [N,H,D]
+        k_zero = torch.stack([e.key_zero for e in entries], dim=0)     # [N,H,D]
+        v_codes = torch.stack([e.val_codes for e in entries], dim=0)   # [N,H,S,D/2]
+        v_scale = torch.stack([e.val_scale for e in entries], dim=0)   # [N,H,S]
+        v_zero = torch.stack([e.val_zero for e in entries], dim=0)     # [N,H,S]
+        positions = torch.stack(
+            [e.position_range for e in entries], dim=0
+        ).to(torch.long)                                              # [N,window]
 
-        return (
-            ids,
-            torch.stack(keys, dim=0),       # [N_q, H_kv, window, D]
-            torch.stack(values, dim=0),     # [N_q, H_kv, window, D]
-            torch.stack(positions, dim=0),  # [N_q, window]
-        )
+        keys = dequantize_key_windows(
+            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
+        )                                                             # [N,H,window,D]
+        values = dequantize_value_windows(
+            v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
+        )                                                             # [N,H,window,D]
+
+        return ids, keys, values, positions
 
     # -- eviction bookkeeping ------------------------------------------------
 
