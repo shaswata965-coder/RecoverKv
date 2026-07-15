@@ -55,6 +55,27 @@ def _prefill_score_chunk() -> int:
     except (TypeError, ValueError):
         return 1024
 
+
+def _score_softmax_dtype() -> torch.dtype:
+    """Dtype for the auxiliary-score softmax intermediate.
+
+    The softmax runs over the full ``[.., blk, S]`` logit block — the single
+    largest transient in the prefill score pass. ``bfloat16`` halves that tensor
+    versus ``float32`` while keeping fp32's exponent range (unlike ``float16``,
+    whose 5-bit exponent can overflow on large logits), so it is the memory-lean
+    default. Set ``STICKYKV_SCORE_SOFTMAX_DTYPE=float32`` to restore the exact
+    fp32 reduction (byte-identical scores) for parity checks.
+    """
+    name = os.environ.get("STICKYKV_SCORE_SOFTMAX_DTYPE", "bfloat16").lower()
+    return {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }.get(name, torch.bfloat16)
+
 try:
     from transformers.models.llama.modeling_llama import (
         LlamaAttention,
@@ -245,40 +266,46 @@ def install_score_hooks(
                 T = q.shape[2]
                 S = k_current.shape[2]
 
-                # 2. GQA broadcast so keys match the query head count.
+                # 2. Score at KV-head granularity WITHOUT expanding K.
+                #    repeat_kv materializes a num_groups×-larger [B, H_q, S, D]
+                #    key copy (its expand+reshape forces a real copy) that is
+                #    only averaged back to a per-window mean downstream. Instead,
+                #    view the query heads as (H_kv, n_rep) and let the S-dim
+                #    matmul broadcast over n_rep against the un-expanded keys —
+                #    identical per-head scores, no num_groups× key copy.
+                B = q.shape[0]
+                H_q = q.shape[1]
                 num_groups = getattr(module, "num_key_value_groups", 1)
-                if num_groups > 1:
-                    k_expanded = repeat_kv(k_current, num_groups)
-                else:
-                    k_expanded = k_current  # [B, H_q, S, D]
+                H_kv = H_q // num_groups
+                q5 = q.reshape(B, H_kv, num_groups, T, head_dim)  # [B,H_kv,rep,T,D]
+                k_t = k_current.transpose(-2, -1).unsqueeze(2)    # [B,H_kv,1,D,S]
 
                 # 3. Auxiliary attention scoring, CHUNKED over the query rows.
                 #    The score we need is softmax(q·kᵀ).sum(over query rows) — a
                 #    sum, so we accumulate it in query-row blocks and never
                 #    materialize the full [B, H_q, T, S] matrix. Peak memory is
-                #    O(chunk · S) instead of O(T · S); at full LongBench context
-                #    the full fp32 matrix is tens of GiB per layer (the prior
-                #    cause of CUDA OOM once truncation was removed).
+                #    O(chunk · S) instead of O(T · S).
                 #
-                #    Numerics: per block we softmax in fp32 then cast to q.dtype
-                #    and sum — identical to the previous one-shot path when
-                #    T <= chunk (every prefill <= chunk and every generation
-                #    step, where T == 1). Only T > chunk diverges, and that case
-                #    previously OOM'd, so no baseline depends on it.
+                #    Numerics: the softmax intermediate runs in
+                #    _score_softmax_dtype() (bf16 by default — half the fp32
+                #    transient, same exponent range). Set
+                #    STICKYKV_SCORE_SOFTMAX_DTYPE=float32 for the exact fp32
+                #    reduction earlier baselines used.
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
-                k_t = k_expanded.transpose(-2, -1)  # [B, H_q, D, S]
+                sm_dtype = _score_softmax_dtype()
                 token_scores = torch.zeros(
-                    q.shape[0], q.shape[1], S, device=q.device, dtype=q.dtype
+                    B, H_kv, num_groups, S, device=q.device, dtype=q.dtype
                 )
                 chunk = _prefill_score_chunk()
                 for start in range(0, T, chunk):
                     end = min(start + chunk, T)
-                    q_blk = q[:, :, start:end, :]                    # [B,H,blk,D]
-                    aw = torch.matmul(q_blk, k_t) * scaling          # [B,H,blk,S]
+                    q_blk = q5[:, :, :, start:end, :]                # [B,H_kv,rep,blk,D]
+                    aw = torch.matmul(q_blk, k_t) * scaling          # [B,H_kv,rep,blk,S]
 
                     # Causal mask for this block: the global query row (start+r)
                     # sits at absolute position S-T+start+r and may attend to
                     # keys 0..S-T+start+r. Generation (T==1) needs no mask.
+                    # The [blk, S] mask broadcasts over the leading head dims.
                     if T > 1:
                         blk = end - start
                         causal = torch.triu(
@@ -289,9 +316,12 @@ def install_score_hooks(
                         )
                         aw = aw.masked_fill(causal, float("-inf"))
 
-                    aw = F.softmax(aw, dim=-1, dtype=torch.float32).to(q.dtype)
-                    token_scores += aw.sum(dim=-2)                   # [B,H,S]
+                    aw = F.softmax(aw, dim=-1, dtype=sm_dtype).to(q.dtype)
+                    token_scores += aw.sum(dim=-2)                   # [B,H_kv,rep,S]
                     del aw
+
+                # Merge (H_kv, n_rep) back to H_q in the original head order.
+                token_scores = token_scores.reshape(B, H_q, S)
 
                 # 4. Reduce to per-window scores and hand off to the cache.
                 scores = reduce_token_scores_to_windows(
