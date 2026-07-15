@@ -120,6 +120,13 @@ class WindowedCache(_HFCacheBase):
             i: {} for i in range(num_layers)
         }
 
+        # Fix #2: the flash score hook needs the SAME effective K that update()
+        # built for this layer this pass. Stash it here so the hook reuses it
+        # instead of calling _materialize a second time (which would
+        # re-dequantize the entire Q tier again, per layer, per decode step).
+        # Stays None at q == 0 (the hook reads state.key_states directly there).
+        self._last_effective_k: List[Optional[Tensor]] = [None] * num_layers
+
     # -----------------------------------------------------------------
     # HF Cache interface
     # -----------------------------------------------------------------
@@ -347,7 +354,11 @@ class WindowedCache(_HFCacheBase):
         #    attention (and the eager scorer) see both tiers; at q == 0 this is
         #    the live fp store, byte-identical to the single-tier cache.
         if self._q > 0.0:
-            return self._materialize(layer_idx)
+            eff_k, eff_v = self._materialize(layer_idx)
+            # Hand the effective K to the score hook (fix #2) so it need not
+            # rebuild it. Overwritten each step; the hook consumes (clears) it.
+            self._last_effective_k[layer_idx] = eff_k
+            return eff_k, eff_v
         return state.key_states, state.value_states
 
     # -----------------------------------------------------------------

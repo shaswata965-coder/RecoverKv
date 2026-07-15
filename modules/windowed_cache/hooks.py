@@ -212,7 +212,18 @@ def install_score_hooks(
                 if getattr(cache, "_q", 0.0) > 0.0:
                     if cache._states[lidx].key_states is None:
                         return
-                    k_current = cache._materialize(lidx)[0]  # [1, H_kv, S, D]
+                    # Reuse the effective K that cache.update() already built
+                    # for this layer this pass (fix #2) instead of rebuilding it
+                    # (a second full Q-tier dequant + RoPE, per layer, per step).
+                    # Consume it so a later stray hook call can't read a stale
+                    # tensor; fall back to a fresh materialize if update() didn't
+                    # run for this layer.
+                    stash = getattr(cache, "_last_effective_k", None)
+                    if stash is not None and stash[lidx] is not None:
+                        k_current = stash[lidx]  # [1, H_kv, S, D]
+                        stash[lidx] = None
+                    else:
+                        k_current = cache._materialize(lidx)[0]  # [1, H_kv, S, D]
                 else:
                     k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
                 if k_current is None:
