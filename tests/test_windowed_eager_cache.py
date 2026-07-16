@@ -329,6 +329,43 @@ class TestHooksInherited:
                     if isinstance(target, ast.Name) and target.id.lower() in forbidden:
                         pytest.fail(f"Found forbidden loop variable '{target.id}' in {mod.__name__}")
 
+    def test_two_tier_eviction_is_wholly_loop_free(self):
+        """Zero Python iteration inside the eager twin's two-tier hot path.
+
+        Mirrors the flash guard. The name-based check above matches on the
+        iterator *variable name*, so ``for wid in new_fp`` passed it while being
+        exactly a per-window loop — and per-window loops cannot carry a batch
+        axis. Comprehensions count: they are the same loop in different syntax.
+        """
+        from modules.windowed_eager_cache import cache as cache_mod
+
+        guarded = {"_evict_two_tier", "_materialize", "_window_spans"}
+        required = {"_evict_two_tier", "_materialize"}
+        loopy = (ast.For, ast.AsyncFor, ast.While,
+                 ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+        tree = ast.parse(inspect.getsource(cache_mod))
+        seen = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if fn.name not in guarded:
+                continue
+            seen.add(fn.name)
+            for node in ast.walk(fn):
+                if isinstance(node, loopy):
+                    pytest.fail(
+                        f"{cache_mod.__name__}.{fn.name} contains "
+                        f"{type(node).__name__} at line {node.lineno} — the "
+                        f"two-tier hot path must be loop-free to carry a batch "
+                        f"axis (BATCHING_PLAN.md §1)"
+                    )
+        missing = required - seen
+        assert not missing, (
+            f"{cache_mod.__name__} is missing {sorted(missing)} — the loop guard "
+            f"must not be silently skipped by renaming the hot path"
+        )
+
 
 # ===========================================================================
 # Eager-specific Replacement Tests (replace 19, 21, 25)

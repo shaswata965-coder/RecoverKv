@@ -596,6 +596,61 @@ class TestHooks:
                             f"{mod.__name__}"
                         )
 
+    # -------------------------------------------------------------------
+    # 24b. test_two_tier_eviction_is_wholly_loop_free
+    # -------------------------------------------------------------------
+
+    def test_two_tier_eviction_is_wholly_loop_free(self):
+        """No Python iteration AT ALL inside the two-tier eviction / read path.
+
+        The name-based guard above is necessary but not sufficient: it matches on
+        the iterator *variable name*, so ``for wid in new_fp`` — a per-window loop
+        by any honest reading — sailed through it while being exactly the kind of
+        host-side iteration that cannot carry a batch axis. Every such loop is a
+        B > 1 blocker and a GPU launch storm, so these functions are held to a
+        stricter rule: **zero** ``for``/``while`` statements and zero
+        comprehensions, whatever the target is named.
+
+        Comprehensions count. ``[w for w in new_fp]`` is the same per-window loop
+        wearing a different syntax, and leaving it legal would let the batching
+        work regress silently through a one-line rewrite — the exact hole this
+        test exists to close.
+        """
+        from modules.windowed_cache import cache as cache_mod
+        from modules.windowed_eager_cache import cache as eager_cache_mod
+
+        # Functions that must be vectorized over the batch axis. Names that are
+        # absent (e.g. a helper refactored away) are simply not checked — a
+        # function that no longer exists cannot loop. The two load-bearing ones
+        # are asserted present below so the guard cannot be defeated by a rename.
+        guarded = {"_evict_two_tier", "_materialize", "_window_spans"}
+        required = {"_evict_two_tier", "_materialize"}
+        loopy = (ast.For, ast.AsyncFor, ast.While,
+                 ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+        for mod in [cache_mod, eager_cache_mod]:
+            tree = ast.parse(inspect.getsource(mod))
+            seen = set()
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if fn.name not in guarded:
+                    continue
+                seen.add(fn.name)
+                for node in ast.walk(fn):
+                    if isinstance(node, loopy):
+                        pytest.fail(
+                            f"{mod.__name__}.{fn.name} contains "
+                            f"{type(node).__name__} at line {node.lineno} — the "
+                            f"two-tier hot path must be loop-free to carry a "
+                            f"batch axis (BATCHING_PLAN.md §1)"
+                        )
+            missing = required - seen
+            assert not missing, (
+                f"{mod.__name__} is missing {sorted(missing)} — the loop guard "
+                f"must not be silently skipped by renaming the hot path"
+            )
+
     # 25. test_q_buffer_preallocation removed:
     # _QRingBuffer was deleted along with the obs_window scoring path.
     # H2O-style cumulative scoring needs no per-layer query buffer.
