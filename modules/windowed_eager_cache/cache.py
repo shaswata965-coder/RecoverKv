@@ -388,6 +388,30 @@ class WindowedCache(_HFCacheBase):
         )
         return eff_k.unsqueeze(0), eff_v.unsqueeze(0)
 
+    @staticmethod
+    def _window_spans(tok_wid: Tensor) -> Dict[int, Tuple[int, int]]:
+        """Map each window id to its ``[start, end)`` run in the fp store.
+
+        Relies on ``tok_wid`` being non-decreasing, which the fp store
+        guarantees: prefill appends in position order, generation appends at the
+        end, and ``_evict_two_tier`` re-emits ``[sink ‖ fp windows by ascending
+        id]``. So every window owns exactly one contiguous run and the whole map
+        falls out of the run boundaries.
+
+        Costs two host syncs regardless of window count — the point of the
+        exercise. Sink tokens share the single ``wid < 0`` run and are never
+        looked up (callers only ask for real window ids).
+        """
+        n = tok_wid.numel()
+        if n == 0:
+            return {}
+        is_start = torch.ones(n, dtype=torch.bool, device=tok_wid.device)
+        is_start[1:] = tok_wid[1:] != tok_wid[:-1]
+        starts = torch.nonzero(is_start, as_tuple=True)[0]      # [n_groups]
+        bounds = starts.tolist() + [n]                          # sync 1
+        wids = tok_wid[starts].tolist()                         # sync 2
+        return {w: (bounds[g], bounds[g + 1]) for g, w in enumerate(wids)}
+
     def _evict_two_tier(self, layer_idx: int, step: int) -> None:
         """One two-tier eviction (design §5), operating on row 0 (B = 1).
 
@@ -409,25 +433,36 @@ class WindowedCache(_HFCacheBase):
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
         retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
         ri = retained_idx[0]                    # [W_ret] merged indices, ascending
-        nt = new_tier[0].tolist()               # 0 = fp, 1 = Q
-        owids = state.original_window_ids[0]     # window id per merged index
 
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
         # retained indices are merged-WINDOW indices (not token indices — the fp
         # and Q survivors live in different stores).
         self.telemetry.record_scores(layer_idx, step, state.window_scores, retained_idx)
 
-        retained = [(int(owids[m]), nt[k]) for k, m in enumerate(ri.tolist())]
-        retained_wids = set(w for w, _ in retained)
+        # Gather the retained window ids ON DEVICE, then pay one host sync for
+        # the whole list. Subscripting the id tensor per retained window
+        # (``int(owids[m])``) instead costs a GPU→CPU sync EACH — ~140 per layer
+        # per eviction, ~130k per sample once multiplied by layers and steps.
+        # Each drains the CUDA pipeline, so the GPU sits idle and the run goes
+        # host-latency-bound: no GPU is fast enough to hide it.
+        owids_ret = state.original_window_ids[0][ri].tolist()   # 1 sync
+        nt = new_tier[0].tolist()                               # 1 sync
+        retained = list(zip(owids_ret, nt))
+        retained_wids = set(owids_ret)
         new_fp = sorted(w for w, t in retained if t == 0)
         new_q = set(w for w, t in retained if t == 1)
 
         def cur_is_q(wid: int) -> bool:
             return store.ledger.is_active(wid)
 
-        # fp-store token → window id (sink tokens map to < 0 and are excluded).
+        # fp-store token → window id (sink tokens map to < 0 and are excluded),
+        # then window id → its [start, end) run in the fp store. Resolving each
+        # window with ``(tok_wid == wid).nonzero()`` instead costs a sync per
+        # window AND turns every lookup into a gather+copy; the span map costs
+        # two syncs total and makes each lookup a view.
         pos_row = state.position_ids[0]                       # [T_fp]
         tok_wid = (pos_row - num_sink) // ws                  # [T_fp]
+        wid_span = self._window_spans(tok_wid)
 
         # --- 3a. Build the new fp windows (fp→fp keep + Q→fp promote) -------
         new_fp_windows = []  # (wid, k[H,ntok,D] post-RoPE, v, pos[ntok])
@@ -438,10 +473,13 @@ class WindowedCache(_HFCacheBase):
                 k_rot = rotate_key_window(k_pre, prange, rope).to(dtype)
                 new_fp_windows.append((wid, k_rot, v.to(dtype), prange.to(pos_row.dtype)))
             else:
-                sel = (tok_wid == wid).nonzero(as_tuple=True)[0]
-                k_tok = state.key_states[0][:, sel, :]
-                v_tok = state.value_states[0][:, sel, :]
-                new_fp_windows.append((wid, k_tok, v_tok, pos_row[sel]))
+                s, e = wid_span.get(wid, (0, 0))
+                new_fp_windows.append((
+                    wid,
+                    state.key_states[0][:, s:e, :],
+                    state.value_states[0][:, s:e, :],
+                    pos_row[s:e],
+                ))
 
         # --- 3b. Demote (fp→Q): first-time un-rotate+quantize or reactivate --
         for wid in new_q:
@@ -450,10 +488,10 @@ class WindowedCache(_HFCacheBase):
             if store.has_entry(wid):
                 store.reactivate(wid)  # dormant → active; codes/grid frozen (§10)
             else:
-                sel = (tok_wid == wid).nonzero(as_tuple=True)[0]
-                k_post = state.key_states[0][:, sel, :]
-                v_tok = state.value_states[0][:, sel, :]
-                prange = pos_row[sel]
+                s, e = wid_span.get(wid, (0, 0))
+                k_post = state.key_states[0][:, s:e, :]
+                v_tok = state.value_states[0][:, s:e, :]
+                prange = pos_row[s:e]
                 k_pre = unrotate_key_window(k_post, prange, rope)
                 store.demote(wid, k_pre, v_tok, prange)
 
