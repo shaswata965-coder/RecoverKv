@@ -83,11 +83,12 @@ def _seed_prefill_state(cache, n_win=4, ws=2, num_sink=0, H=2, D=4):
 # ---------------------------------------------------------------------------
 
 
-def test_b_gt_1_with_quant_raises():
+def test_b_gt_1_with_quant_is_supported():
+    """B>1 at q>0 runs. Was NotImplementedError until the tier decision batched."""
     cache = _make_cache(quant_ratio=0.5)
     k = torch.randn(2, 2, 3, 4)  # B=2
-    with pytest.raises(NotImplementedError):
-        cache.update(k, k.clone(), 0, cache_kwargs={"cache_position": torch.arange(3)})
+    ek, ev = cache.update(k, k.clone(), 0, cache_kwargs={"cache_position": torch.arange(3)})
+    assert ek.shape[0] == 2 and ev.shape[0] == 2
 
 
 def test_first_eviction_demotes_and_materializes():
@@ -439,6 +440,253 @@ def test_end_to_end_generation_with_quant():
     assert used_q, "Q tier was never populated — demotion path not exercised"
 
 
+# ===========================================================================
+# B > 1 at q > 0 (BATCHING_PLAN.md §3, §4 Phase 2)
+# ===========================================================================
+
+
+def _batched_cache(B, ws=2, num_sink=0, prefill=8, q=0.5, memo=None):
+    cfg = WindowedCacheConfig(
+        window_size=ws, num_sink_tokens=num_sink, local_window_size=ws,
+        cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
+    )
+    c = WindowedCache(
+        config=cfg, prefill_len=prefill, model_config=_FakeModelConfig(),
+        kv_dtype=torch.float32, rope_module=_RealRoPE(4),
+        num_layers=1, max_tokens=16,
+    )
+    c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 2, 2, 1
+    return c
+
+
+def _drive(cache, kp, vp, kd, vd, scores, ws=2, num_sink=0):
+    """Prefill + decode a cache with pre-generated tensors. Returns per-step outs."""
+    B, H, prefill, D = kp.shape
+    outs = []
+    W = _merged_W(cache, ws, num_sink, prefill)
+    ek, ev = cache.update(kp, vp, 0, cache_kwargs={
+        "cache_position": torch.arange(prefill),
+        "window_scores": scores[0][:, :, :W].clone(),
+    })
+    outs.append((ek.clone(), ev.clone()))
+    for i in range(kd.shape[0]):
+        t = prefill + i
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        ek, ev = cache.update(kd[i], vd[i], 0, cache_kwargs={
+            "cache_position": torch.arange(t, t + 1),
+            "window_scores": scores[i + 1][:, :, :W].clone(),
+        })
+        outs.append((ek.clone(), ev.clone()))
+    return outs
+
+
+def _rows_diverge_scores(B, H, steps, prefill_W=4, maxW=32):
+    """Scores that force each row to rank the evictable band DIFFERENTLY.
+
+    Row r pins its own windows to the top, so rows retain different sets — the
+    case a host-side dict keyed by window id cannot express at all. Drawn from a
+    fixed-size pool so the number of random values never depends on W.
+    """
+    g = torch.Generator().manual_seed(31)
+    s = torch.rand(steps + 1, B, H, maxW, generator=g)
+    for r in range(B):
+        s[:, r, :, r % prefill_W] += 100.0
+        s[:, r, :, (r + 2) % prefill_W] += 50.0
+    return s
+
+
+def test_b_gt_1_rows_evict_divergently():
+    """Rows retain DIFFERENT window sets in the Q tier, simultaneously."""
+    B, H, D, ws, prefill = 4, 2, 4, 2, 8
+    cache = _batched_cache(B, ws=ws, prefill=prefill)
+    g = torch.Generator().manual_seed(3)
+    kp = torch.randn(B, H, prefill, D, generator=g)
+    kd = torch.randn(12, B, H, 1, D, generator=g)
+    sc = _rows_diverge_scores(B, H, 12)
+    _drive(cache, kp, kp.clone(), kd, kd.clone(), sc, ws=ws)
+
+    store = cache._stores[0]
+    store.validate()
+    ids = store.active_ids()
+    assert ids.shape[0] == B
+    per_row = [tuple(ids[r].tolist()) for r in range(B)]
+    assert len(set(per_row)) > 1, (
+        f"rows did not diverge ({per_row}) — the test is not exercising the "
+        f"case a host-side dict ledger could not express"
+    )
+    # Rectangular: same COUNT per row, different WINDOWS (BATCHING_PLAN.md §3).
+    assert len({len(p) for p in per_row}) == 1
+
+
+def test_b_gt_1_row_equivalence_vs_solo_runs():
+    """Row i of a batched run == a solo run of that same sequence.
+
+    The property that makes batching trustworthy: rows must not interact. Any
+    cross-row leak — a shared slot, a mask reduced over the wrong axis, a count
+    taken from row 0 — breaks this and almost nothing else.
+    """
+    B, H, D, ws, prefill, steps = 4, 2, 4, 2, 8, 12
+    g = torch.Generator().manual_seed(17)
+    kp = torch.randn(B, H, prefill, D, generator=g)
+    vp = torch.randn(B, H, prefill, D, generator=g)
+    kd = torch.randn(steps, B, H, 1, D, generator=g)
+    vd = torch.randn(steps, B, H, 1, D, generator=g)
+    sc = _rows_diverge_scores(B, H, steps)
+
+    batched = _drive(_batched_cache(B, ws=ws, prefill=prefill),
+                     kp, vp, kd, vd, sc, ws=ws)
+
+    for r in range(B):
+        solo = _drive(
+            _batched_cache(1, ws=ws, prefill=prefill),
+            kp[r:r + 1], vp[r:r + 1], kd[:, r:r + 1], vd[:, r:r + 1],
+            sc[:, r:r + 1], ws=ws,
+        )
+        assert len(solo) == len(batched)
+        for i, ((bk, bv), (sk, sv)) in enumerate(zip(batched, solo)):
+            assert torch.equal(bk[r:r + 1], sk), (
+                f"row {r} step {i}: batched effective K != solo run"
+            )
+            assert torch.equal(bv[r:r + 1], sv), (
+                f"row {r} step {i}: batched effective V != solo run"
+            )
+
+
+def _seed_rows(cache, B, H=2, D=4, seed=23):
+    """Seed layer-0 with B rows of 4 full windows at positions 0..7."""
+    torch.manual_seed(seed)
+    st = cache._states[0]
+    pos = torch.arange(8, dtype=torch.long)
+    k_pre = torch.randn(B, H, 8, D)
+    k_post = rotate_key_window(k_pre, pos.unsqueeze(0).expand(B, -1), cache.rope_module)
+    st.replace(k_post, torch.randn(B, H, 8, D),
+               pos.unsqueeze(0).expand(B, -1).contiguous())
+    st.original_window_ids = torch.arange(4).unsqueeze(0).expand(B, -1).contiguous()
+    return st
+
+
+def test_b_gt_1_ragged_demote_counts_allocate_correctly():
+    """Rows demote DIFFERENT numbers of windows in ONE eviction.
+
+    §3's rectangularity covers the RETAINED counts; the transition counts are
+    ragged, because `demote = is_q_new & ~is_q_cur` depends on where each row's Q
+    tier already sits. Slots are therefore allocated by rank into a worst-case
+    tensor rather than by count, and this asserts the ragged case is real and
+    that no row's allocation clobbers another's.
+    """
+    B, H, D, ws = 3, 2, 4, 2
+    cache = _batched_cache(B, ws=ws, prefill=8)
+    st = _seed_rows(cache, B)
+    store = cache._stores[0]
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
+
+    # Eviction 1: each row sends a DIFFERENT window to the Q tier.
+    st.window_scores = torch.zeros(B, H, 4)
+    st.window_scores[0, :, [0, 1]] = torch.tensor([100.0, 50.0])   # row 0: Q <- w1
+    st.window_scores[1, :, [1, 0]] = torch.tensor([100.0, 50.0])   # row 1: Q <- w0
+    st.window_scores[2, :, [0, 2]] = torch.tensor([100.0, 50.0])   # row 2: Q <- w2
+    cache._evict_two_tier(0, step=2)
+    store.validate()
+    first = [store.active_ids()[r].tolist() for r in range(B)]
+    assert first == [[1], [0], [2]], f"rows did not diverge: {first}"
+    assert int(store.table.n_live.max()) == 1
+
+    # Eviction 2 on the merged axis. Row 0 keeps its existing Q window (0 fresh
+    # demotions); the other rows send one they have never quantized (1 fresh
+    # each) -> ragged fresh-demote counts within a single pass.
+    owids = st.original_window_ids
+    st.window_scores = torch.zeros(B, H, owids.shape[1])
+    st.window_scores[:, :, 0] = 100.0
+    cache._evict_two_tier(0, step=4)
+    store.validate()
+    assert int(store.table.n_live.max()) <= pol.top_k_fp + pol.N_q, \
+        "live entries exceeded the slot bound"
+    assert int(store.table.n_live.min()) >= 1, \
+        "a row lost its entry to another row's allocation"
+
+
+def test_b_gt_1_dormant_survives_promote_then_redemote():
+    """Codes written exactly once per (row, window_id), across B>1 churn.
+
+    design.md §10: a re-demotion REACTIVATES; it never re-quantizes (re-quantizing
+    would pick up fp16 rounding from the promote-side dequant and could flip
+    boundary codes). Asserted on the codes tensor itself, per row.
+    """
+    B, H, D, ws = 3, 2, 4, 2
+    cache = _batched_cache(B, ws=ws, prefill=8)
+    st = _seed_rows(cache, B, seed=29)
+    store = cache._stores[0]
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
+
+    # Demote w1 into the Q tier on every row.
+    st.window_scores = torch.zeros(B, H, 4)
+    st.window_scores[:, :, 0] = 100.0
+    st.window_scores[:, :, 1] = 50.0
+    st.window_scores[:, :, 2] = 10.0
+    cache._evict_two_tier(0, step=2)
+    assert [store.active_ids()[r].tolist() for r in range(B)] == [[1]] * B
+
+    def codes_for(wid):
+        has, _, slot, _ = store.lookup(torch.full((B, 1), wid, dtype=torch.long))
+        assert bool(has.all())
+        return torch.stack([store.table.key_codes[r, slot[r, 0]] for r in range(B)])
+
+    codes0 = codes_for(1).clone()
+
+    # Promote w1 back to fp on every row -> entries go dormant, not freed.
+    st.window_scores = torch.zeros(B, H, 3)
+    st.window_scores[:, :, 0] = 10.0
+    st.window_scores[:, :, 1] = 100.0
+    st.original_window_ids = torch.tensor([[0, 1, 3]] * B)
+    pol.top_k_fp, pol.N_q = 2, 0
+    cache._evict_two_tier(0, step=4)
+    assert [store.active_ids()[r].tolist() for r in range(B)] == [[]] * B
+    assert int(store.table.n_live.min()) == 1, "dormant entry was freed"
+    assert torch.equal(codes_for(1), codes0), "promotion mutated the codes"
+
+    # Re-demote w1 -> must REACTIVATE the dormant slot, bit-for-bit.
+    st.window_scores = torch.zeros(B, H, 3)
+    st.window_scores[:, :, 0] = 10.0
+    st.window_scores[:, :, 1] = 100.0
+    st.original_window_ids = torch.tensor([[0, 1, 3]] * B)
+    pol.top_k_fp, pol.N_q = 0, 1
+    cache._evict_two_tier(0, step=6)
+    assert [store.active_ids()[r].tolist() for r in range(B)] == [[1]] * B
+    assert torch.equal(codes_for(1), codes0), (
+        "re-demotion re-quantized instead of reactivating (design.md §10)"
+    )
+    store.validate()
+
+
+@pytest.mark.parametrize("B", [2, 3, 4, 8])
+def test_b_gt_1_end_to_end_invariants(B):
+    """The two-tier machine stays self-consistent per row at every batch size."""
+    H, D, ws, prefill, steps = 2, 4, 2, 8, 14
+    cache = _batched_cache(B, ws=ws, prefill=prefill)
+    store = cache._stores[0]
+    g = torch.Generator().manual_seed(41 + B)
+    kp = torch.randn(B, H, prefill, D, generator=g)
+    kd = torch.randn(steps, B, H, 1, D, generator=g)
+    sc = _rows_diverge_scores(B, H, steps)
+    outs = _drive(cache, kp, kp.clone(), kd, kd.clone(), sc, ws=ws)
+
+    for ek, ev in outs:
+        assert ek.shape[0] == B and ev.shape[0] == B
+        assert ek.shape == ev.shape
+    # get_seq_length reports the CURRENT length, so only the last output can be
+    # checked against it — it is what HF sizes the causal mask from.
+    assert outs[-1][0].shape[2] == cache.get_seq_length(0)
+    st = cache._states[0]
+    assert st.key_states.shape[0] == B
+    for r in range(B):
+        p = st.position_ids[r]
+        assert torch.all(p[1:] > p[:-1]), f"row {r} positions not strictly increasing"
+    store.validate()
+    assert store.num_active_windows <= cache._policies[0].N_q
+
+
 # ---------------------------------------------------------------------------
 # Flash / eager backend parity (shared cache.py ⇒ identical two-tier results)
 # ---------------------------------------------------------------------------
@@ -447,7 +695,10 @@ from modules.windowed_eager_cache.cache import WindowedCache as EagerWindowedCac
 from modules.windowed_eager_cache.config import WindowedCacheConfig as EagerCfg
 
 
-def test_flash_eager_two_tier_parity():
+@pytest.mark.parametrize("B", [1, 4])
+def test_flash_eager_two_tier_parity(B):
+    """The twins share cache.py, so their two-tier results must be identical —
+    at B>1 as well as B=1, since batching is a cache.py-level change."""
     ws, num_sink, H, D, prefill = 2, 0, 2, 4, 8
 
     def build(EWC, ECfg):
@@ -462,22 +713,24 @@ def test_flash_eager_two_tier_parity():
     eager = build(EagerWindowedCache, EagerCfg)
 
     torch.manual_seed(3)
-    kp = torch.randn(1, H, prefill, D); vp = torch.randn(1, H, prefill, D)
-    sc0 = torch.rand(1, H, _merged_W(flash, ws, num_sink, prefill))
+    kp = torch.randn(B, H, prefill, D); vp = torch.randn(B, H, prefill, D)
+    sc0 = _rows_diverge_scores(B, H, 12)[0][:, :, :_merged_W(flash, ws, num_sink, prefill)]
     fk, _ = flash.update(kp.clone(), vp.clone(), 0,
                          cache_kwargs={"cache_position": torch.arange(prefill), "window_scores": sc0.clone()})
     ek, _ = eager.update(kp.clone(), vp.clone(), 0,
                          cache_kwargs={"cache_position": torch.arange(prefill), "window_scores": sc0.clone()})
     assert torch.equal(fk, ek)
 
-    for t in range(prefill, prefill + 12):
-        k1 = torch.randn(1, H, 1, D); v1 = torch.randn(1, H, 1, D)
+    pool = _rows_diverge_scores(B, H, 12)
+    for i, t in enumerate(range(prefill, prefill + 12)):
+        k1 = torch.randn(B, H, 1, D); v1 = torch.randn(B, H, 1, D)
         Wf = _merged_W(flash, ws, num_sink, flash._states[0].seq_length + 1)
-        sc = torch.rand(1, H, Wf)
+        sc = pool[i + 1][:, :, :Wf]
         fk, fv = flash.update(k1.clone(), v1.clone(), 0,
                               cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
         ek, ev = eager.update(k1.clone(), v1.clone(), 0,
                               cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
         assert torch.equal(fk, ek) and torch.equal(fv, ev)
-        assert _active(flash._stores[0]) == _active(eager._stores[0])
+        fa, ea = flash._stores[0].active_ids(), eager._stores[0].active_ids()
+        assert (fa is None and ea is None) or torch.equal(fa, ea)
         assert flash.get_seq_length(0) == eager.get_seq_length(0)

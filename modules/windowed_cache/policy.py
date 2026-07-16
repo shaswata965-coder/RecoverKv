@@ -190,53 +190,59 @@ class EvictionPolicy:
         **chronological** (ascending merged-index) order plus their assigned
         tier, so the caller can drive demote/promote/keep against the store.
 
-        B = 1 in v1 (guarded by the cache before this is called).
+        **Per row.** Rows rank independently and therefore retain *different*
+        windows — but always the same *number* of them, since ``k_fp`` / ``n_q``
+        come from :meth:`tier_counts` (config + ``W``, both shared across the
+        batch). That is what keeps the result rectangular (BATCHING_PLAN.md §3).
 
         Parameters
         ----------
         window_scores : Tensor
-            Shape ``[1, H_q, W]`` — merged-axis cumulative scores.
+            Shape ``[B, H_q, W]`` — merged-axis cumulative scores.
 
         Returns
         -------
         retained_idx : Tensor
-            Shape ``[1, W_retained]`` — merged-axis indices, ascending.
+            Shape ``[B, W_retained]`` — merged-axis indices, ascending per row.
         new_tier : Tensor
-            Shape ``[1, W_retained]`` — 0 = fp, 1 = Q, aligned with
+            Shape ``[B, W_retained]`` — 0 = fp, 1 = Q, aligned with
             ``retained_idx``.
         """
-        W = window_scores.shape[2]
+        B, _, W = window_scores.shape
         device = window_scores.device
 
         k_fp, n_q, local_w = self.tier_counts(W)
         evictable_w = W - local_w
-        local_idx = torch.arange(W - local_w, W, device=device, dtype=torch.long)
-        local_tier = torch.zeros(local_w, device=device, dtype=torch.long)
+        local_idx = (
+            torch.arange(W - local_w, W, device=device, dtype=torch.long)
+            .unsqueeze(0).expand(B, -1)
+        )
+        local_tier = torch.zeros(B, local_w, device=device, dtype=torch.long)
 
         if evictable_w <= 0:
-            return local_idx.unsqueeze(0), local_tier.unsqueeze(0)
+            return local_idx.contiguous(), local_tier
 
-        mean = window_scores.mean(dim=1)[0]        # [W]
-        ev_scores = mean[:evictable_w]
+        mean = window_scores.mean(dim=1)            # [B, W]
+        ev_scores = mean[:, :evictable_w]
 
         # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
-        order = torch.argsort(ev_scores, descending=True)
-        fp_sel = order[:k_fp]
-        q_sel = order[k_fp:k_fp + n_q]
+        order = torch.argsort(ev_scores, dim=-1, descending=True)
+        fp_sel = order[:, :k_fp]
+        q_sel = order[:, k_fp:k_fp + n_q]
 
-        ev_idx = torch.cat([fp_sel, q_sel])
+        ev_idx = torch.cat([fp_sel, q_sel], dim=-1)
         ev_tier = torch.cat([
-            torch.zeros(fp_sel.numel(), device=device, dtype=torch.long),
-            torch.ones(q_sel.numel(), device=device, dtype=torch.long),
-        ])
+            torch.zeros(B, k_fp, device=device, dtype=torch.long),
+            torch.ones(B, n_q, device=device, dtype=torch.long),
+        ], dim=-1)
         # Sort the retained evictable windows chronologically (by merged index).
-        perm = torch.argsort(ev_idx)
-        ev_idx = ev_idx[perm]
-        ev_tier = ev_tier[perm]
+        perm = torch.argsort(ev_idx, dim=-1)
+        ev_idx = torch.gather(ev_idx, 1, perm)
+        ev_tier = torch.gather(ev_tier, 1, perm)
 
-        retained = torch.cat([ev_idx, local_idx])
-        tier = torch.cat([ev_tier, local_tier])
-        return retained.unsqueeze(0), tier.unsqueeze(0)
+        retained = torch.cat([ev_idx, local_idx], dim=-1)
+        tier = torch.cat([ev_tier, local_tier], dim=-1)
+        return retained, tier
 
     # -----------------------------------------------------------------
     # Retain indices — token granularity

@@ -38,6 +38,12 @@ from modules.quant.slots import n_slots_for
 class WindowedCache(_HFCacheBase):
     """Windowed KV cache with H2O-style cumulative eviction.
 
+    Supports ``B > 1`` at any ``quant_ratio``, for **equal-length** prompts.
+    Rows evict divergently — each ranks its own windows — but the tier split
+    keeps the same *count* per row, so both tiers stay dense and rectangular
+    (BATCHING_PLAN.md §3). Ragged / left-padded batches are not implemented, at
+    either tier (BATCHING_PLAN.md §4 Phase 3).
+
     Parameters
     ----------
     config : WindowedCacheConfig
@@ -227,17 +233,6 @@ class WindowedCache(_HFCacheBase):
         policy = self._policies[layer_idx]
 
         self._resolve_memoization(key_states.shape[0])
-
-        # The Q tier's storage and eviction carry a batch axis, but the tier
-        # DECISION still collapses to row 0 (policy.compute_two_tier_retain), so
-        # q > 0 stays gated to B == 1 until that is vectorized (Phase 2). B > 1
-        # is fully supported at q == 0 (byte-identical); only the Q tier is gated.
-        if self._q > 0.0 and key_states.shape[0] != 1:
-            raise NotImplementedError(
-                "Two-tier quantization (quant_ratio > 0) is batch-size 1 only "
-                f"until the tier decision is vectorized; got batch size "
-                f"{key_states.shape[0]}. Use quant_ratio=0 for B > 1."
-            )
 
         # Extract position_ids from cache_kwargs if provided
         pos = None
