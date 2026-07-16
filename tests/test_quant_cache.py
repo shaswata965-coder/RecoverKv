@@ -174,6 +174,95 @@ def test_q0_store_is_none():
 # ---------------------------------------------------------------------------
 
 
+class TestReadMemoization:
+    """The Q-tier read memo is configurable and OFF by default above B=1.
+
+    It caches the dequantized + RoPE'd Q tier between evictions — correct and
+    free at B=1, where decode is weight-bound (BATCHING_PLAN.md §5) and the memo
+    saves 7 of every 8 steps' dequant at window_size=8. Above B=1 it is charged
+    per row: measured at the qasper steady state it holds ~149 MB/row against
+    ~131 MB/row of actual two-tier KV, so it more than doubles per-row memory and
+    halves the batch that fits — and batch capacity is the entire thesis.
+    """
+
+    def _cache(self, memo, q=0.5):
+        cfg = WindowedCacheConfig(
+            window_size=2, num_sink_tokens=0, local_window_size=2,
+            cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
+        )
+        return WindowedCache(
+            config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
+            kv_dtype=torch.float32, rope_module=_RealRoPE(4),
+            num_layers=1, max_tokens=8,
+        )
+
+    def test_auto_default_is_on_at_b1_off_above(self):
+        c = self._cache(None)
+        c._resolve_memoization(1)
+        assert c._stores[0].memoize_read is True
+        c = self._cache(None)
+        c._resolve_memoization(4)
+        assert c._stores[0].memoize_read is False, (
+            "the memo must default OFF at B>1 — it costs ~149 MB/row and halves "
+            "max batch, which is what the method exists to raise"
+        )
+
+    def test_explicit_setting_overrides_the_batch_heuristic(self):
+        c = self._cache(True)
+        c._resolve_memoization(8)
+        assert c._stores[0].memoize_read is True
+        c = self._cache(False)
+        c._resolve_memoization(1)
+        assert c._stores[0].memoize_read is False
+
+    def test_memo_is_a_pure_optimization(self):
+        """Memo on vs off must be byte-identical — it caches, it never decides.
+
+        Codes and grids are written once at first demotion and position_range is
+        never rebased (§10), so the dequant + RoPE cannot move between evictions.
+        If these ever diverged, the memo would be serving stale reads.
+        """
+        ws, H, D, prefill = 2, 2, 4, 8
+        outs = []
+        for memo in (True, False):
+            c = self._cache(memo)
+            c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 2, 2, 1
+            torch.manual_seed(5)
+            kp = torch.randn(1, H, prefill, D)
+            got = []
+            ek, ev = c.update(kp, kp.clone(), 0, cache_kwargs={
+                "cache_position": torch.arange(prefill),
+                "window_scores": torch.rand(1, H, _merged_W(c, ws, 0, prefill)),
+            })
+            got.append((ek.clone(), ev.clone()))
+            for t in range(prefill, prefill + 14):
+                k1 = torch.randn(1, H, 1, D)
+                W = _merged_W(c, ws, 0, c._states[0].seq_length + 1)
+                ek, ev = c.update(k1, k1.clone(), 0, cache_kwargs={
+                    "cache_position": torch.arange(t, t + 1),
+                    "window_scores": torch.rand(1, H, W),
+                })
+                got.append((ek.clone(), ev.clone()))
+            outs.append(got)
+
+        assert len(outs[0]) == len(outs[1])
+        for i, ((ka, va), (kb, vb)) in enumerate(zip(*outs)):
+            assert torch.equal(ka, kb), f"memo changed effective K at step {i}"
+            assert torch.equal(va, vb), f"memo changed effective V at step {i}"
+
+    def test_memo_off_holds_nothing_between_reads(self):
+        c = self._cache(False)
+        c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 1, 1, 1
+        _seed_prefill_state(c, n_win=4, ws=2)
+        st = c._states[0]
+        st.window_scores = torch.zeros(1, 2, 4)
+        st.window_scores[0, :, [0, 1, 2]] = torch.tensor([100.0, 50.0, 10.0])
+        st.original_window_ids = torch.tensor([[0, 1, 2, 3]])
+        c._evict_two_tier(0, step=2)
+        c._materialize(0)
+        assert c._stores[0]._read_cache is None, "memo=False still retained a tier"
+
+
 def _windows_of(positions, num_sink, ws):
     """Group absolute positions into {window_id: sorted positions}."""
     out = {}
