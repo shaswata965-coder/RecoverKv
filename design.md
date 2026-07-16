@@ -315,10 +315,23 @@ everything below is dropped. Every later eviction is the steady-state cycle abov
 
 ---
 
-## 6. Per-window ledger
+## 6. Per-window ledger (a dense slot table)
 
 A small record keyed by `original_window_id` tracks each surviving Q window across
 evictions. The fp tier needs no ledger — it is a plain dense tensor.
+
+**Physically this is a tensor slot table, not a dict** *(amended with B>1 — §10)*:
+`[B, N_slots, …]` codes/grids/positions plus `slot_wid` (`-1` = free) and
+`slot_active`. A dict keyed by window id cannot carry the batch axis, and window ids
+are unbounded so they cannot index a fixed table either — a lookup resolves
+id → slot through a `[B, W, N_slots]` equality match, unambiguous because at most one
+slot per row carries a given id. `N_slots` is **bounded by config**: `retain_only`
+frees every non-retained window, so live entries are (active ≤ `N_q`) + (dormant
+≤ `top_k_fp`, since a dormant window has been demoted at least once and is therefore
+evictable-fp, never sink/local). Hence `top_k_fp + N_q` suffices and no growth policy
+is needed — provided `retain_only` runs **before** allocation, which is what makes the
+bound exact rather than merely likely. Allocation takes the lowest free slots; the
+"physical `offset`" below is that slot index.
 
 | field | mutable? | purpose |
 |---|---|---|
@@ -496,11 +509,23 @@ instead; callers must not assume the returned tensor aliases the stored fp cache
   `4 + 32/window_size` (expectation-setting, not a rule).
 - **Precision: fp16 K tier, int4 Q tier.** Full-precision windows are fp16; the
   quantized tier is int4 (§2, §7).
-- **v1 is batch-size 1 only.** The single-tier cache it builds on is already B=1 (it
-  relies on HF's monotonic absolute query position and evicts per row), and
-  `materialize_effective_kv` runs per row; B>1 is **out of scope for v1** and gated
-  behind the ragged left-padded batching design. Keep the per-row primitives in §5 so
-  B>1 is a later extension, not a rewrite.
+- **B>1 for equal-length prompts; ragged is still out of scope.** *(Amended — v1
+  shipped B=1 only.)* Rows evict divergently, so the per-window record cannot be a
+  host-side dict keyed by `original_window_id`: it is a dense `[B, N_slots, …]` **slot
+  table** (§6). What makes the rest fall out is that divergent eviction stays
+  **rectangular** — `compute_two_tier_retain` keeps exactly `k_fp = min(top_k_fp,
+  evictable_w)` fp and `n_q = min(N_q, evictable_w − k_fp)` Q windows, and both derive
+  from config + `W_total`, which are shared across rows. So rows retain *different*
+  windows but always the *same count*: `T_fp` and `T_q` are equal across rows, the
+  effective K/V stays a dense `[B, H_kv, T_total, D]`, and no padding or keep-mask is
+  needed. **Ragged / left-padded batches remain unimplemented at either tier** — that
+  is not a quant problem (it is already blocked at `q = 0`) and is gated behind the
+  shared left-pad + keep-mask design. See [BATCHING_PLAN.md](BATCHING_PLAN.md).
+  - The *retained* counts are rectangular; the **transition** counts are not.
+    `demote = is_q_new & ~is_q_cur` depends on where each row's Q tier already sits, so
+    it is ragged per row. Slots are therefore allocated **by rank** into a
+    worst-case-width tensor (bounded by `N_q`), never by count — allocating by count
+    would need a host sync per layer per eviction to learn the max.
 
 ---
 

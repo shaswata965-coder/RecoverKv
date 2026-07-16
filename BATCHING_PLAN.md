@@ -6,6 +6,14 @@ where KV compression actually pays.
 Status of every claim below: **verified against the tree at `3fb5a45`**, not
 inherited from notes.
 
+> **Phases 1 and 2 are DONE** (branch `quant_batched`). `q > 0` runs at B>1 for
+> equal-length prompts; the loop guard is widened; the Q store is a dense slot
+> table; the fp store is preallocated; the read memo is configurable and defaults
+> off above B=1. **Phase 3 (ragged / left-pad) is not started** — it needs the live
+> 4.47.1 env. Two claims below were **wrong against the tree and are corrected in
+> place**, marked *CORRECTION*: the §5 preallocation target, and §4's demote-slot
+> sketch. Everything else held.
+
 ---
 
 ## 1. Where we actually are
@@ -16,11 +24,11 @@ inherited from notes.
 | `original_window_ids` | `[B, W]`, per-row gather at eviction — batch-ready |
 | `state.slice_and_keep` | per-row gather — batch-ready |
 | `q = 0`, equal-length B>1 | **works** (verified byte-identical B∈{2,3,4,8}) |
-| `q > 0`, any B>1 | **raises** `NotImplementedError` (`cache.py:179`) |
+| `q > 0`, equal-length B>1 | **works** — *was* `NotImplementedError` (`cache.py:179`) |
 | ragged / left-pad + keep-mask | **not implemented** — blocks LongBench at *any* q |
 
 So batching is half-built: the fp tier is per-row already; the Q tier has no
-batch axis at all.
+batch axis at all. *(Fixed in Phases 1–2: the Q tier now carries a batch axis.)*
 
 ### The loop guard has a hole
 
@@ -36,9 +44,19 @@ slips through. Every such loop in `_evict_two_tier` is a B>1 blocker. Widen the
 guard to flag any `ast.For` in `_evict_two_tier` / `_materialize` regardless of
 target name, or the batching work will regress silently.
 
+*Done (`b921aa0`): `test_two_tier_eviction_is_wholly_loop_free`, both backends.
+It also rejects **comprehensions** — `[w for w in new_fp]` is the same per-window
+loop in different syntax, and leaving it legal would reopen the hole with a
+one-line rewrite. `_window_spans` is gone entirely (`searchsorted` over the
+non-decreasing `tok_wid` resolves a window to its run in one shot), so the guard
+asserts `_evict_two_tier` / `_materialize` are still present and cannot be
+defeated by renaming.*
+
 ---
 
 ## 2. What actually blocks `q > 0` at B>1
+
+*(All five cleared in Phases 1–2. Kept as the record of what the work was.)*
 
 1. **`cache.py:179`** — the explicit guard.
 2. **`policy.compute_two_tier_retain`** — `window_scores.mean(dim=1)[0]`, row 0
@@ -94,12 +112,40 @@ slot_pos    [B, N_slots, ws] int64
 ```
 
 `N_slots` is **bounded**: `retain_only` drops every non-retained window, so live
-entries ≤ `top_k_fp + N_q + local_windows`. Size it from `ResolvedConfig`; no
-growth policy needed.
+entries ≤ `top_k_fp + N_q`. Size it from `ResolvedConfig`; no growth policy needed.
+(A local window can never hold a dormant entry — a window's trajectory is one-way,
+born local → ages into evictable → never returns — so `local_windows` is not in
+the bound. The bound is exact only if `retain_only` runs **before** allocation.)
 
 This is the shape the `quantization` branch already proved out (`active_view()`
 returns tensors, `gather_keys(slots)` is one `index_select`). Do it at B=1 first
 and hold byte-identity — it is a pure refactor.
+
+**Allocating slots for demotions.** The *retained* counts are rectangular (§3);
+the **transition** counts are not — `demote = is_q_new & ~is_q_cur` depends on
+where each row's Q tier already sits, so row 0 may demote 4 windows while row 1
+demotes none. Allocate by **rank**, not count, into a worst-case-width tensor:
+
+```python
+fresh_mask = is_q_new & ~has_entry              # [B, W]  -- see CORRECTION
+fresh_rank = fresh_mask.cumsum(1) - 1
+free_order = argsort(~(slot_wid == -1), dim=1, stable=True)
+target     = free_order[:, :n_q]               # width = the BOUND, masked
+```
+
+> **CORRECTION (implemented).** An earlier sketch ranked over
+> `demote = is_q_new & ~is_q_cur`. That set also contains **re-demotions of
+> dormant windows**, which already own a slot; handing them a fresh slot means
+> re-quantizing, which design.md §10 forbids outright (it picks up fp16 rounding
+> from the promote-side dequant and can flip boundary codes). Split three ways
+> instead — Q→Q (nothing), dormant→active (one bit), **fresh** (allocate +
+> quantize) — and rank only the fresh set.
+
+Invalid lanes ride through the quantizer carrying garbage and are dropped by
+mask. That is bit-identical for the valid ones, because every quantizer op
+reduces only over a window's own quant group, so lane `j` cannot influence lane
+`k`. It costs work proportional to the bound rather than the count; the
+alternative is a host sync per layer per eviction to learn the true max.
 
 **It pays for itself immediately, before any batching:**
 - kills the residual eviction host syncs (§2 of the perf work; 5/layer/eviction → ~0);
@@ -201,9 +247,33 @@ becomes the single largest term. It also doubles peak VRAM at the moment of copy
 which directly caps B.
 
 HF's `DynamicCache` cats identically, so the full-cache baseline pays it too —
-this is not a StickyKV regression. `StaticCache`-style preallocation to
-`prefill + max_new_tokens` is the standard fix, and it is a **prerequisite for
-max-B**, not a micro-optimization. Do it with Phase 1.
+this is not a StickyKV regression. Preallocation is the standard fix, and it is a
+**prerequisite for max-B**, not a micro-optimization. Do it with Phase 1.
+
+> **CORRECTION (implemented).** An earlier draft said to preallocate
+> `StaticCache`-style to **`prefill + max_new_tokens`**. **That is wrong here.**
+> `StaticCache` uses that target because it never evicts, so it *is* its steady
+> state. This cache compacts back to the budget every `window_size` steps, so
+> prefill-sizing would pin the fp store at its **un-evicted** size for the whole
+> decode:
+>
+> | fp store sizing | resident/row | total/row | B in 56 GB |
+> |---|---|---|---|
+> | `prefill + max_new` (5400 tok) | 707.8 MB | 764.8 MB | **73** |
+> | eviction budget (565 tok) | 74.1 MB | 131.1 MB | **427** |
+>
+> i.e. it would cap B ~6× below the ~458 this section's own thesis rests on —
+> *worse than the `cat` it replaces*. Preallocate to the **eviction budget**
+> (+ a window of growth). The prompt still needs a full-size buffer for exactly
+> one pass — the whole prompt's KV must exist before the first eviction can score
+> it — so allocate that separately and **release it at the first eviction**.
+> Steady state then runs allocation-free at budget size, which is what this
+> section actually wants.
+>
+> (Independent of the sizing choice: that unavoidable prefill peak is itself ~612
+> MB/row, so a *cold* max-B prefill does not fit either. The 458 figure is a
+> steady-state number; reaching it needs chunked prefill or continuous batching.
+> Out of scope here, but the perf suite should not be surprised by it.)
 
 The Q slot table (§4) is the same idea for the other tier: bounded size, allocate
 once, no per-eviction churn.
@@ -258,17 +328,49 @@ is preallocation + the dense slot store.
 
 ---
 
+### The read memo: a batch-capacity tax, and an open question
+
+`store.effective_q_tier` memoizes the dequantized + RoPE'd Q tier between
+evictions, per layer (commit `50fac8e`). **Measured** at the qasper steady state
+(built on the real slot table at Llama-3.1-8B geometry, not derived):
+
+| | per row, 32 layers | B in 56 GB |
+|---|---|---|
+| actual two-tier KV | 131.4 MB | **426** |
+| \+ read memo | +149.2 MB ⇒ 280.6 MB | **199** |
+
+It more than doubles per-row memory and costs 53% of the batch. At B=1 it is
+free (decode is weight-bound at the 10.3 ms/token floor above, so the footprint
+buys nothing and costs nothing) and it saves 7 of every 8 steps' dequant. So:
+**default it off above B=1, keep it at B=1, make it a knob**
+(`quant_memoize_read`). Done in Phase 1b.
+
+**Open.** With the memo off, the Phase-1 materialize path rematerializes the
+whole Q tier *every decode step* rather than once per eviction — ~8× the
+dequant+RoPE traffic at `ws=8`, and at max-B that is the dominant term (design.md
+§8 calls the fp16 write-back "the real v1 cost"; §11's fused Triton kernel is what
+actually removes it, not this). So the trade is **~2.1× the batch against ~8× the
+Q-tier read traffic**, and which wins on tokens/s is a measurement, not a
+derivation. The default follows the memory bound because that is the side we can
+compute; the knob exists so the perf suite can overturn it.
+
+---
+
 ## 6. Sequencing
 
-1. Widen the AST loop guard (cheap; stops regression).
-2. **Phase 1** dense slot store + fp-cache preallocation at B=1, byte-identical.
-   *Also finishes the perf work and lifts the VRAM cap on B.*
-3. **Phase 2** vectorize over B ⇒ equal-length B>1 at `q>0`.
-4. Re-point the perf suite at tokens/s @ max-B (B=1 latency cannot show this
-   method working — see above).
+1. ~~Widen the AST loop guard~~ **done** (`b921aa0`).
+2. ~~**Phase 1** dense slot store + fp-cache preallocation at B=1,
+   byte-identical~~ **done** (`200b09c`, memo knob `f839a4a`).
+3. ~~**Phase 2** vectorize over B ⇒ equal-length B>1 at `q>0`~~ **done**
+   (`2916909`).
+4. **NEXT, and unblocked:** re-point the perf suite at tokens/s @ max-B (B=1
+   latency cannot show this method working — see above). This is also what
+   settles the memo default and the eviction-width trade above.
 5. **Phase 3** ragged, on 4.47.1, shared with the q=0 gap.
 
-Steps 2 and 3 are CPU-verifiable against the existing byte-identity harness.
-Step 5 is the only one that needs the live model.
+Steps 2 and 3 were CPU-verified against the byte-identity harness (1796 tensors,
+`torch.equal`, both backends) plus a row-equivalence property test: row `i` of a
+batched run equals a solo run of that sequence. Step 5 is the only one that needs
+the live model.
 
 The grid work is **not** in this list, by the measurement above.
