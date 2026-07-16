@@ -182,47 +182,93 @@ thesis. It is invisible at B=1 and only measurable batched — so the perf suite
 should report **tokens/s at max-B-that-fits**, not B=1 latency, or it will keep
 showing our method winning by ~0%.
 
-### A finding worth acting on: the key grid costs as much as the codes
+### Preallocation: negligible at B=1, ~1.9× at max-B
 
-Per token per layer:
+`state.append` does `torch.cat([key_states, key], dim=2)` every decode step, per
+layer — reallocating and copying the **whole fp store** each time (`state.py:92`).
+The fp tier is 57% of per-row KV bytes, so the copy is not small.
 
-| | K | V |
-|---|---|---|
-| fp16 | 2048 B | 2048 B |
-| int4 codes | 512 B | 512 B |
-| int4 **grid** | **512 B** | 32 B |
-| ⇒ compression | **2.0×** | 3.8× |
+| B | weights | KV read | cat copy | total/step | prealloc speedup |
+|---|---|---|---|---|---|
+| 1 | 16.1 G | 0.1 G | 0.1 G | 16.3 G | 1.01× |
+| 32 | 16.1 G | 4.2 G | 4.7 G | 25.0 G | 1.23× |
+| 128 | 16.1 G | 16.8 G | 19.0 G | 51.8 G | 1.58× |
+| 458 | 16.1 G | 60.0 G | **67.8 G** | 143.9 G | **1.89×** |
 
-Keys use a per-`(window, head, channel)` grid reducing over the **token** axis —
-but `window_size = 8`, so each grid covers only 8 tokens: two fp16 values per 8
-tokens per channel = 4 bits/token of overhead on top of a 4-bit code. **The key
-tier is effectively int8, not int4.**
+At B=1 it is 19 GB/sample ≈ 12 ms ≈ **0.2%** of runtime (plus 12,288 dispatches,
+2.4%) — real but invisible. At max-B the cat is **4× the weight traffic** and
+becomes the single largest term. It also doubles peak VRAM at the moment of copy,
+which directly caps B.
 
-Values escape this (their grid is per-`(head, token)`, reducing over the 128-wide
-channel axis — 32 B/token).
+HF's `DynamicCache` cats identically, so the full-cache baseline pays it too —
+this is not a StickyKV regression. `StaticCache`-style preallocation to
+`prefill + max_new_tokens` is the standard fix, and it is a **prerequisite for
+max-B**, not a micro-optimization. Do it with Phase 1.
 
-Since batch capacity is the whole payoff, this directly costs ~30% of the
-achievable B. Options, cheapest first:
-1. **Raise `window_size`** (16/32) — grid cost halves/quarters. Changes eviction
-   granularity, so it is an accuracy↔memory trade to measure, not a free win.
-2. **Grid per `(head, channel)` across the whole Q tier** rather than per window —
-   needs care: §10 freezes the grid at first demotion, and a tier-wide grid would
-   have to be frozen at the same point or re-fit (which §10 forbids).
-3. Quantize the grids themselves (fp8) — smallest change, ~25% of key overhead back.
+The Q slot table (§4) is the same idea for the other tier: bounded size, allocate
+once, no per-eviction churn.
 
-Worth measuring before Phase 1: it changes the headline number more than the
-batching refactor does.
+### The grid overhead is NOT the lever (correcting an earlier claim)
+
+An earlier draft claimed the int4 key grid "costs ~30% of achievable B". **That
+was wrong.** `config.py:293` computes
+
+```python
+b_q = (num_kv_heads*head_dim*ws          # codes
+       + 4*num_kv_heads*head_dim         # key scale+zero fp16
+       + 4*num_kv_heads*ws)              # value scale+zero fp16
+```
+
+— the budget **already includes the grid**, and it is enforced in **bytes**. So
+per-row memory is pinned by `cache_budget` alone. The grid does not cost batch
+capacity; it costs **retained tokens**, i.e. accuracy.
+
+The observation itself holds — at `ws=8` the key grid is 512 B/token against
+512 B of codes, so the key tier is effectively int8 (2.0× compression, not 4×;
+values get 3.8×). It is 1:1 because the quant group is only 8 tokens. But every
+way of fixing it is roughly a wash, measured on outlier-channel key-like data:
+
+| option | b_q/win | retained tokens | int4 rel-err |
+|---|---|---|---|
+| now (ws=8, fp16 grids) | 12544 | 1701 | 1.00× |
+| fp8 **scale** only | 11456 | 1805 (+6%) | 1.10× |
+| ws=16 | 20992 | 1925 (+13%) | 1.30× |
+| ws=32 | 37888 | 2053 (+21%) | 1.57× |
+| ws=64 | 71680 | 2053 (+21%) | 1.79× |
+
+Token gain **saturates at +21%** (once the grid is amortized the codes dominate)
+while error grows without bound. Raising `window_size` also coarsens eviction
+granularity — a second accuracy cost not in that column.
+
+Also ruled out concretely:
+- **Full fp8 grid → NaN.** `e4m3fn` maxes at 448; the zero point is a raw value
+  magnitude and overflows once channel spread ≥ ~100. `e5m2` survives but doubles
+  the error (2 mantissa bits). Only the *scale* is safe in fp8 (it is a small
+  ratio) — and scale-only buys just +6% tokens for +10% error.
+- **Tier-wide key grid.** This is the `ws → ∞` limit of the table above: the group
+  would span ~1136 tokens instead of 8, on exactly the same error curve, and key
+  channels have persistent outliers that would dominate the range for every other
+  token. It also breaks §10 — the grid is frozen at first demotion, but windows
+  demote at different times, so a tier-wide grid must either re-fit (forbidden;
+  flips boundary codes) or clip late arrivals. **Do not pursue.**
+
+**Conclusion: leave the grid alone.** The lever for batch capacity is
+`cache_budget` (which *is* per-row memory, 1:1); the lever for decode throughput
+is preallocation + the dense slot store.
 
 ---
 
 ## 6. Sequencing
 
 1. Widen the AST loop guard (cheap; stops regression).
-2. **Phase 1** dense slot store at B=1, byte-identical. *Also finishes the perf work.*
-3. Measure the `window_size` / grid-overhead trade (§5) — may reset the design.
-4. **Phase 2** vectorize over B ⇒ equal-length B>1 at `q>0`.
-5. Re-point the perf suite at tokens/s @ max-B.
-6. **Phase 3** ragged, on 4.47.1, shared with the q=0 gap.
+2. **Phase 1** dense slot store + fp-cache preallocation at B=1, byte-identical.
+   *Also finishes the perf work and lifts the VRAM cap on B.*
+3. **Phase 2** vectorize over B ⇒ equal-length B>1 at `q>0`.
+4. Re-point the perf suite at tokens/s @ max-B (B=1 latency cannot show this
+   method working — see above).
+5. **Phase 3** ragged, on 4.47.1, shared with the q=0 gap.
 
-Steps 2 and 4 are CPU-verifiable against the existing byte-identity harness.
-Step 6 is the only one that needs the live model.
+Steps 2 and 3 are CPU-verifiable against the existing byte-identity harness.
+Step 5 is the only one that needs the live model.
+
+The grid work is **not** in this list, by the measurement above.
