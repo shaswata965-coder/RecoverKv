@@ -465,13 +465,30 @@ class WindowedCache(_HFCacheBase):
         wid_span = self._window_spans(tok_wid)
 
         # --- 3a. Build the new fp windows (fp→fp keep + Q→fp promote) -------
+        # Promotions are collected and run as ONE batched dequant + ONE RoPE.
+        # Per-window promote() + rotate_key_window() instead cost ~18 ATen
+        # dispatches EACH — a launch storm on GPU, and eviction touches most of
+        # the retained tier. RoPE is per-token pointwise and the batched dequant
+        # is the singular op applied slice-wise, so this is bit-identical.
+        promote_wids = [w for w in new_fp if cur_is_q(w)]
+        promoted: Dict[int, Tuple[Tensor, Tensor, Tensor]] = {}
+        if promote_wids:
+            k_pre, v_all, pos_all = store.promote_many(promote_wids, out_dtype=dtype)
+            n, h, sw, dd = k_pre.shape
+            k_rot = rotate_key_window(
+                k_pre.permute(1, 0, 2, 3).reshape(h, n * sw, dd),
+                pos_all.reshape(n * sw),
+                rope,
+            ).to(dtype).reshape(h, n, sw, dd).permute(1, 0, 2, 3)   # [N,H,S,D]
+            v_all = v_all.to(dtype)
+            for i, wid in enumerate(promote_wids):
+                promoted[wid] = (k_rot[i], v_all[i], pos_all[i].to(pos_row.dtype))
+
         new_fp_windows = []  # (wid, k[H,ntok,D] post-RoPE, v, pos[ntok])
         for wid in new_fp:
-            if cur_is_q(wid):
-                # Promote: dequant → RoPE at original positions → splice.
-                k_pre, v, prange = store.promote(wid, out_dtype=dtype)
-                k_rot = rotate_key_window(k_pre, prange, rope).to(dtype)
-                new_fp_windows.append((wid, k_rot, v.to(dtype), prange.to(pos_row.dtype)))
+            if wid in promoted:
+                k_rot_w, v_w, pos_w = promoted[wid]
+                new_fp_windows.append((wid, k_rot_w, v_w, pos_w))
             else:
                 s, e = wid_span.get(wid, (0, 0))
                 new_fp_windows.append((
@@ -482,18 +499,32 @@ class WindowedCache(_HFCacheBase):
                 ))
 
         # --- 3b. Demote (fp→Q): first-time un-rotate+quantize or reactivate --
+        # Reactivations are free (codes/grid frozen — §10). First-time demotions
+        # are collected and run as ONE un-rotate + ONE batched quantize, same
+        # reasoning as the promote batch above.
+        fresh: List[int] = []
         for wid in new_q:
             if cur_is_q(wid):
                 continue  # Q→Q: stays active, codes untouched
             if store.has_entry(wid):
                 store.reactivate(wid)  # dormant → active; codes/grid frozen (§10)
             else:
-                s, e = wid_span.get(wid, (0, 0))
-                k_post = state.key_states[0][:, s:e, :]
-                v_tok = state.value_states[0][:, s:e, :]
-                prange = pos_row[s:e]
-                k_pre = unrotate_key_window(k_post, prange, rope)
-                store.demote(wid, k_pre, v_tok, prange)
+                fresh.append(wid)
+
+        if fresh:
+            spans = [wid_span.get(w, (0, 0)) for w in fresh]
+            k_post = torch.stack(
+                [state.key_states[0][:, s:e, :] for s, e in spans], dim=0)
+            v_tok = torch.stack(
+                [state.value_states[0][:, s:e, :] for s, e in spans], dim=0)
+            prange = torch.stack([pos_row[s:e] for s, e in spans], dim=0)
+            n, h, sw, dd = k_post.shape
+            k_pre = unrotate_key_window(
+                k_post.permute(1, 0, 2, 3).reshape(h, n * sw, dd),
+                prange.reshape(n * sw),
+                rope,
+            ).reshape(h, n, sw, dd).permute(1, 0, 2, 3)             # [N,H,S,D]
+            store.demote_many(fresh, k_pre, v_tok, prange)
 
         # --- 3c. Drop entries for windows dropped outright (§6) -------------
         store.retain_only(retained_wids)

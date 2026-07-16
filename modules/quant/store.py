@@ -30,7 +30,9 @@ from .quantizer import (
     dequantize_value_window,
     dequantize_value_windows,
     quantize_key_window,
+    quantize_key_windows,
     quantize_value_window,
+    quantize_value_windows,
 )
 
 
@@ -146,7 +148,84 @@ class QuantizedStore:
         )
         self.ledger.demote_new(entry)
 
+    def demote_many(
+        self,
+        window_ids: List[int],
+        keys_pre_rope: Tensor,
+        values: Tensor,
+        position_ranges: Tensor,
+    ) -> None:
+        """First-time demotion of N windows in one batched quantize (§5).
+
+        Equivalent to :meth:`demote` per window — the batched quantizers are the
+        singular ones applied slice-wise — but pays one launch per tier instead
+        of one per window. Every id must be **new** (no ledger entry); callers
+        route reactivations through :meth:`reactivate`, which needs no quantize.
+
+        Parameters
+        ----------
+        window_ids : list of int
+            ``original_window_id`` per leading slice, in order.
+        keys_pre_rope, values : Tensor
+            ``[N, H_kv, window, D]``.
+        position_ranges : Tensor
+            ``[N, window]`` int64 original absolute positions.
+        """
+        if not window_ids:
+            return
+        self._invalidate()
+        k_codes, k_scale, k_zero = quantize_key_windows(keys_pre_rope)
+        v_codes, v_scale, v_zero = quantize_value_windows(values)
+        pos = position_ranges.to(torch.long)
+        for i, wid in enumerate(window_ids):
+            self.ledger.demote_new(LedgerEntry(
+                original_window_id=wid,
+                key_codes=k_codes[i].contiguous(),
+                key_scale=k_scale[i].contiguous(),
+                key_zero=k_zero[i].contiguous(),
+                val_codes=v_codes[i].contiguous(),
+                val_scale=v_scale[i].contiguous(),
+                val_zero=v_zero[i].contiguous(),
+                position_range=pos[i].clone(),
+                active=True,
+            ))
+
     # -- promotion -----------------------------------------------------------
+
+    def promote_many(
+        self, window_ids: List[int], out_dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Promote N windows out of the Q tier in one batched dequantize (§5).
+
+        Equivalent to :meth:`promote` per window, at one launch per tier instead
+        of one per window. Marks every entry dormant and returns the tier
+        stacked on a leading window axis, aligned with ``window_ids``.
+
+        Returns
+        -------
+        keys_pre_rope : ``[N, H_kv, window, D]``
+        values : ``[N, H_kv, window, D]``
+        position_ranges : ``[N, window]`` int64
+        """
+        self._invalidate()
+        entries = [self.ledger.get(w) for w in window_ids]
+        k_codes = torch.stack([e.key_codes for e in entries], dim=0)
+        k_scale = torch.stack([e.key_scale for e in entries], dim=0)
+        k_zero = torch.stack([e.key_zero for e in entries], dim=0)
+        v_codes = torch.stack([e.val_codes for e in entries], dim=0)
+        v_scale = torch.stack([e.val_scale for e in entries], dim=0)
+        v_zero = torch.stack([e.val_zero for e in entries], dim=0)
+        positions = torch.stack([e.position_range for e in entries], dim=0).to(torch.long)
+
+        keys = dequantize_key_windows(
+            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
+        )
+        values = dequantize_value_windows(
+            v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
+        )
+        for w in window_ids:
+            self.ledger.deactivate(w)
+        return keys, values, positions
 
     def promote(self, window_id: int, out_dtype: torch.dtype) -> Tuple[Tensor, Tensor, Tensor]:
         """Promote one window out of the Q tier.

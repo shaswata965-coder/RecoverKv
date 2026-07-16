@@ -173,6 +173,76 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     return packed, scale, zero
 
 
+def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Batched :func:`quantize_key_window` over a leading window axis.
+
+    Bit-identical to calling the singular form per window: the quant group is
+    still the token axis, and every op below is either elementwise or a
+    reduction over a non-batch axis, so a leading ``N`` rides through untouched.
+    Batching matters at eviction, where demoting N windows one at a time is a
+    launch storm on GPU.
+
+    Parameters
+    ----------
+    k_wins : Tensor
+        ``[N, H_kv, window, D]`` token-major pre-RoPE keys. ``window`` even.
+
+    Returns
+    -------
+    packed : uint8 ``[N, H_kv, D, window // 2]`` — channel-major.
+    scale, zero : fp16 ``[N, H_kv, D]``.
+    """
+    if k_wins.dim() != 4:
+        raise ValueError(
+            f"k_wins must be [N, H_kv, window, D], got {tuple(k_wins.shape)}"
+        )
+    window = k_wins.shape[2]
+    if window % 2 != 0:
+        raise ValueError(f"key window must be even, got {window}")
+
+    # Quant group = token axis (dim 2 with the batch axis) ⇒ grid per (N, head, channel).
+    codes, scale16, zero16 = _affine_quantize(k_wins, group_dim=2)
+    scale = scale16.squeeze(2)  # [N, H_kv, D]
+    zero = zero16.squeeze(2)    # [N, H_kv, D]
+
+    codes_cm = codes.transpose(2, 3).contiguous()  # [N, H_kv, D, window]
+    packed = pack_nibbles_last(codes_cm)           # [N, H_kv, D, window // 2]
+    return packed, scale, zero
+
+
+def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    """Batched :func:`quantize_value_window` over a leading window axis.
+
+    Bit-identical to the singular form applied per window — see
+    :func:`quantize_key_windows`.
+
+    Parameters
+    ----------
+    v_wins : Tensor
+        ``[N, H_kv, window, D]`` token-major values. ``D`` even.
+
+    Returns
+    -------
+    packed : uint8 ``[N, H_kv, window, D // 2]`` — token-major.
+    scale, zero : fp16 ``[N, H_kv, window]``.
+    """
+    if v_wins.dim() != 4:
+        raise ValueError(
+            f"v_wins must be [N, H_kv, window, D], got {tuple(v_wins.shape)}"
+        )
+    D = v_wins.shape[3]
+    if D % 2 != 0:
+        raise ValueError(f"value head_dim must be even, got {D}")
+
+    # Quant group = channel axis ⇒ grid per (N, head, token).
+    codes, scale16, zero16 = _affine_quantize(v_wins, group_dim=3)
+    scale = scale16.squeeze(3)  # [N, H_kv, window]
+    zero = zero16.squeeze(3)    # [N, H_kv, window]
+
+    packed = pack_nibbles_last(codes.contiguous())  # [N, H_kv, window, D // 2]
+    return packed, scale, zero
+
+
 def dequantize_key_window(
     packed: Tensor,
     scale: Tensor,
