@@ -1,0 +1,40 @@
+# ============================================================================
+# StickyKV — Perf smoke test: ONE (config, prefill, gen, batch) combination.
+# ============================================================================
+# Not a measurement — a pipeline check. Run this before committing GPU-hours to
+# eval_perf_batched.yaml's full 84-run grid, to catch load/dtype/version errors
+# in seconds instead of hours.
+#
+# WHY THIS ONE CELL, not batch_size=1. The CPU test suite + the byte-identity
+# parity harness (torch.equal vs 7afdac1 across 1796 tensors) already prove the
+# two-tier batching logic correct on CPU. What has NEVER run is quant_ratio>0 at
+# B>1 against a real model on real transformers 4.47.1 — the exact thing this
+# GPU box is for. So this smoke test deliberately exercises quant_ratio=0.5 at
+# batch_size=4, not the safer B=1 fp16 path. If this cell fails, it's telling
+# you something the CPU suite structurally cannot.
+#
+# Everything else (model, window, telemetry, data_source, warmup/measurement
+# counts) is inherited from eval_perf_batched.yaml — only `perf.configs` and
+# `perf.grid` are overridden (lists replace wholesale, not merge — see
+# utils/config.py::_merge_dicts).
+# ============================================================================
+_base_: eval_perf_batched.yaml
+
+perf:
+  configs:
+    - name: smoke_ours_b20_q50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.5
+      requires_flash_attn: true
+
+  grid:
+    - { prefill_len: 512, gen_len: 32, batch_size: 4 }
+
+  num_warmup_runs: 1
+  num_measurement_runs: 1
+
+telemetry:
+  output_dir: outputs/perf_smoke
