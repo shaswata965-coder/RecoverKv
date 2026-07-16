@@ -19,7 +19,7 @@ Everything here is per row (B = 1 in v1) and shape-agnostic to head count.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Tuple
 
 import torch
 from torch import Tensor
@@ -145,51 +145,42 @@ def materialize_effective_kv(
     body_pos = fp_positions[num_sink:]
     n_body = body_k.shape[1]
 
-    chunks: List[Tuple[int, Tensor, Tensor]] = []
-
-    # fp windows: group contiguous body tokens by window id (ascending along the
-    # body — fp windows are stored in ascending-id order, with gaps where Q
-    # windows were removed). Vectorized: derive every token's window id in one
-    # device op and locate group boundaries on-device, so the host pays a
-    # SINGLE ``.tolist()`` sync instead of one ``.item()`` GPU→CPU sync per body
-    # token (the latter serialized the CUDA pipeline O(T_fp) times per read).
-    if n_body > 0:
-        body_wids = (body_pos.to(torch.long) - num_sink) // window_size  # [n_body]
-        is_start = torch.ones(n_body, dtype=torch.bool, device=body_wids.device)
-        is_start[1:] = body_wids[1:] != body_wids[:-1]
-        starts = torch.nonzero(is_start, as_tuple=True)[0]               # [n_groups]
-        start_list = starts.tolist() + [n_body]
-        group_wids = body_wids[starts].tolist()
-        for g, w in enumerate(group_wids):
-            s, e = start_list[g], start_list[g + 1]
-            chunks.append((int(w), body_k[:, s:e], body_v[:, s:e]))
-
-    # Q windows: dequantize, RoPE at their original positions, tag by window id.
-    # Window ids come from each window's first position; derive them all in one
-    # host sync rather than a per-window ``.item()``.
-    _, q_keys_pre, q_values, q_positions = store.gather_active(out_dtype=out_dtype)
-    n_q, h_kv, s, d = q_keys_pre.shape
-    q_wids = ((q_positions[:, 0].to(torch.long) - num_sink) // window_size).tolist()
-
+    # Q windows: dequantize, then RoPE at their original positions.
+    #
     # RoPE is per-token pointwise (each key rotated by cos/sin at its own
     # position), so rotating all N_q windows in ONE call — flattened window-major
     # to [H_kv, N_q*window, D] with their original positions [N_q*window] — is
-    # bit-identical to N_q separate per-window calls, but pays a single kernel
-    # launch instead of ~40/window. The chunk split below is pure views (no
-    # launches); the interleave stays the chronological sort + one cat.
+    # bit-identical to N_q separate per-window calls but pays a single kernel
+    # launch instead of ~40/window.
+    _, q_keys_pre, q_values, q_positions = store.gather_active(out_dtype=out_dtype)
+    n_q, h_kv, s, d = q_keys_pre.shape
     k_flat = q_keys_pre.permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)  # [H, N*S, D]
-    pos_flat = q_positions.reshape(n_q * s)                           # [N*S]
-    k_rot_flat = rotate_key_window(k_flat, pos_flat, rope_module).to(out_dtype)
-    k_rot = k_rot_flat.reshape(h_kv, n_q, s, d).permute(1, 0, 2, 3)   # [N, H, S, D]
-    q_values = q_values.to(out_dtype)
-    for idx in range(n_q):
-        chunks.append((int(q_wids[idx]), k_rot[idx], q_values[idx]))
+    q_pos_flat = q_positions.reshape(n_q * s)                         # [N*S]
+    k_q = rotate_key_window(k_flat, q_pos_flat, rope_module).to(out_dtype)
+    v_q = q_values.to(out_dtype).permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
 
-    # Interleave by chronological window id.
-    chunks.sort(key=lambda c: c[0])
-    body_k2 = torch.cat([c[1] for c in chunks], dim=1)
-    body_v2 = torch.cat([c[2] for c in chunks], dim=1)
-
-    eff_k = torch.cat([sink_k, body_k2], dim=1)
-    eff_v = torch.cat([sink_v, body_v2], dim=1)
+    # Interleave chronologically, entirely ON DEVICE: concatenate the fp body
+    # with the Q tokens and sort the merged token axis by window id.
+    #
+    # The rerotation design could scatter by absolute position (positions were
+    # renumbered to tile arange(T_total)); keeping original positions leaves gaps
+    # where windows were evicted, so they don't tile. But chronological order
+    # only needs the window-id ORDERING, not the positions themselves — so an
+    # argsort gets us there without the host ever seeing the ids. A stable sort
+    # keeps each window's tokens in position order, and a window is always
+    # wholly fp or wholly Q (eviction assigns tiers per window), so no window is
+    # ever split across the two sources.
+    #
+    # Doing this on the host instead — grouping the body, .tolist()ing the ids,
+    # sorting chunks in Python — costs ~4 GPU→CPU syncs per layer PER DECODE
+    # STEP (~16k per sample), which is pure pipeline stall.
+    merged_k = torch.cat([body_k, k_q], dim=1)
+    merged_v = torch.cat([body_v, v_q], dim=1)
+    merged_wids = torch.cat([
+        (body_pos.to(torch.long) - num_sink) // window_size,      # [n_body]
+        (q_pos_flat.to(torch.long) - num_sink) // window_size,     # [N*S]
+    ])
+    order = torch.argsort(merged_wids, stable=True)
+    eff_k = torch.cat([sink_k, merged_k.index_select(1, order)], dim=1)
+    eff_v = torch.cat([sink_v, merged_v.index_select(1, order)], dim=1)
     return eff_k, eff_v
