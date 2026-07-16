@@ -157,11 +157,20 @@ class PerfRunner:
             # quant_ratio is per-config (like cache_budget), falling back to the
             # shared cache.quant_ratio; 0.0 keeps the pure-fp16 path (design.md §7).
             quant_ratio = c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0))
+            # None (default) = auto: memoize the dequantized Q tier at B=1, not
+            # above. The default is set by the memory bound (the memo costs
+            # ~149 MB/row against ~131 MB/row of actual KV, halving max-B); what
+            # it trades that for — ~8x fewer Q-tier dequants per step — is a
+            # wall-clock question only this suite can answer. Set it explicitly
+            # to measure both sides. See BATCHING_PLAN.md §5.
+            memoize = c.get("quant_memoize_read",
+                            getattr(cfg.cache, "quant_memoize_read", None))
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
                       cache_budget=budget if budget is not None else 0.5,
                       rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
-                      quant_ratio=quant_ratio)
+                      quant_ratio=quant_ratio,
+                      quant_memoize_read=memoize)
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():
@@ -178,13 +187,19 @@ class PerfRunner:
                 )
 
         def _make_windowed_cache():
-            # Prefill-only perf measurement (single forward pass, no generation),
-            # so no generation budget is needed.
+            # max_tokens sizes the budget against the FULL expected sequence
+            # (prefill + generation) per design.md §7, which is what
+            # ours_parity_runner and longbench_runner both pass. This used to
+            # pass 0 on the premise that perf was "prefill-only, no generation" —
+            # but the measurement loop below generates gen_len tokens, so the
+            # budget came out sized on the prompt alone. At gen_len >> prefill
+            # that is a different (much smaller) cache than the quality suites
+            # measure, so their numbers would not correspond.
             return WC(config=cc, prefill_len=prefill_len,
                       model_config=model.config, kv_dtype=torch_dtype,
                       rope_module=rope,
                       num_layers=model.config.num_hidden_layers,
-                      max_tokens=0)
+                      max_tokens=gen_len)
 
         gen_kwargs = {}
         if attn_impl == "eager" and c.get("install_hooks_for_measurement"):

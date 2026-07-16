@@ -49,6 +49,10 @@ class CacheConfig:
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int4 split q in [0,1] (design.md §7); 0 disables the Q tier
+    # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
+    # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
+    # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
+    quant_memoize_read: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:

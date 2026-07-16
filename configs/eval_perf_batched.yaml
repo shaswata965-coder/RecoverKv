@@ -1,11 +1,67 @@
 # ============================================================================
-# StickyKV — Batched Performance Benchmarks
+# StickyKV — Batched Performance Benchmarks (Suite C): tokens/s @ max-B
 # ============================================================================
-# Two scenarios:
-#   1) Standard batch  : prefill=2048,  decode=256, batch_size=64
-#   2) Long context    : prefill=16384, decode=512, batch_size=4
+# WHY BATCHED. At B=1 KV compression CANNOT show a speedup, and that is not a
+# bug: decode reads every weight once per step (16.06 GB for Llama-3.1-8B fp16 =
+# a 10.3 ms/token floor on an A100) and that floor is independent of cache size.
+# Batching is the only lever that amortizes the weight read — and B is capped by
+# KV memory, which is exactly what this method compresses. So the number that
+# shows the method working is tokens/s at the LARGEST BATCH THAT FITS, not B=1
+# latency. BATCHING_PLAN.md §5.
 #
-# Metrics reported: TPOT (ms/token), TTFT (s), throughput (token/s)
+# WHY THIS GRID — read before changing it. The cache does NOT evict during
+# prefill (should_evict is gated on `not is_prefill`), so the whole prompt is
+# resident before the first decode eviction and
+#
+#     peak_ours = max(prefill_len, budget_steady_state)
+#
+# Compression only buys batch capacity where the STEADY STATE is the binding
+# constraint — i.e. where generation is long enough to outgrow the prompt.
+# Computed at budget=0.20, 56 GB for KV:
+#
+#   (prefill, gen)   full peak  ours peak   B_full  B_ours   gain
+#   (4096,  128)         4224       4096       101     104   1.03x   <- LongBench shape
+#   (4096, 1024)         5120       4096        83     104   1.25x
+#   (4096, 4096)         8192       4096        52     104   2.00x
+#   ( 512, 1024)         1536        512       278     834   3.00x
+#   ( 512, 4096)         4608        917        92     465   5.03x   <- ~§5's 4.9x
+#
+# So a long-prompt/short-gen grid measures ~1.03x and would reproduce the exact
+# "our method wins by 0%" result this suite exists to escape. §5 quotes its 4.9x
+# from the qasper STEADY STATE (4900 ctx) — but at that shape the prefill peak
+# binds and the real end-to-end gain is ~1.03x. §5's number is reachable, in a
+# long-generation regime; getting it at LongBench's shape needs chunked prefill
+# or continuous batching (not implemented). Scenario C below measures that limit
+# honestly rather than hiding it.
+#
+# HOW TO READ THE OUTPUT
+#   Every config runs at every grid cell and `skip_if_oom: true` makes the ladder
+#   a max-B search: a config's max-B is the largest batch_size it did NOT skip.
+#   Headline = (max-B that fits) x (decode tok/s per row).
+#   CAVEAT: reported `throughput_tokps` includes prefill (perf_runner.py:252
+#   says so). For the decode claim use  batch_size / (tpot_ms / 1000).
+#
+# SWEEP
+#   cache_budget  0.20 / 0.10  — per-row memory; the 1:1 lever on max-B.
+#   quant_ratio   0.0  / 0.5   — how the evictable budget splits fp16 vs int4.
+#     The budget is enforced in BYTES and b_q already includes the int4 grid
+#     (config.py:293), so at a fixed budget q does NOT change per-row memory —
+#     verified: b20_q00 = 106.6 MB/row, b20_q50 = 106.3 MB/row. What q buys is
+#     RETAINED TOKENS at equal bytes: 813 (q=0) -> 1413 (q=0.5), i.e. 1.74x the
+#     context for free. So expect q to move QUALITY (LongBench), not max-B. If
+#     q>0 costs throughput at equal budget, that is the Phase-1 materialize read
+#     path (design.md §8) — §11's fused kernel is what fixes it, not this.
+#
+# COST. 14 cells x 6 configs x 3 passes. Scenario B is the expensive one (4096
+# decode steps/run); drop it first if you need to trim. Expect several hours on
+# one A100 — high-B cells OOM and skip fast.
+#
+# DATA. `_build_input_ids` RAISES (does not skip) if the dataset cannot yield
+# `batch_size` chunks of `prefill_len` tokens. 2wikimqa is ~1.3M tokens; the
+# ceilings here (512x512 = 262k, 4096x64 = 262k) are safe. Raise the ladder and
+# check that first.
+#
+# REQUIRES transformers 4.47.x — cache_factory refuses newer and fails fast.
 # ============================================================================
 _base_: base.yaml
 
@@ -19,35 +75,108 @@ model:
   dtype: float16
 
 window:
-  window_size: 8
+  window_size: 8            # must be EVEN for quant_ratio > 0 (int4 nibble packing)
   num_sink_tokens: 5
-  local_window_size: 64
+  local_window_size: 64     # int -> must be a multiple of window_size
 
 perf:
+  # Real long-context text, chunked to exactly prefill_len and sampled per row,
+  # so every row in a batch is EQUAL-LENGTH by construction. That is both what
+  # the cache supports today (ragged/left-pad is Phase 3) and what the field
+  # does: KV-Compress and ShadowKV report LongBench accuracy at B=1 and measure
+  # throughput separately on fixed-length batches.
   data_source: "2wikimqa"
+
   configs:
-    - name: windowed_flash_20pct
+    # -- baseline: full KV cache. It should OOM first; that IS the result. -----
+    - name: full_cache
+      cache_backend: dynamic
+      cache_package: null
+      attn_implementation: flash_attention_2
+      cache_budget: null
+      requires_flash_attn: true
+
+    # -- budget 0.20 ---------------------------------------------------------
+    - name: ours_b20_q00
       cache_backend: windowed
       cache_package: flash_attn
       attn_implementation: flash_attention_2
       cache_budget: 0.20
-    - name: windowed_eager_20pct
+      quant_ratio: 0.0
+      requires_flash_attn: true
+    - name: ours_b20_q50
       cache_backend: windowed
-      cache_package: eager
-      attn_implementation: eager
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
       cache_budget: 0.20
+      quant_ratio: 0.5
+      requires_flash_attn: true
+
+    # -- budget 0.10: half the per-row memory => expect ~2x the batch ---------
+    - name: ours_b10_q00
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      quant_ratio: 0.0
+      requires_flash_attn: true
+    - name: ours_b10_q50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      quant_ratio: 0.5
+      requires_flash_attn: true
+
+    # -- the read-memo A/B, at one setting -----------------------------------
+    # Every config above leaves quant_memoize_read at auto (= off above B=1).
+    # This forces it ON to price the other side: it holds the whole Q tier
+    # dequantized to fp16 per layer (~149 MB/row against ~131 MB/row of actual
+    # KV, so expect max-B roughly halved) in exchange for ~8x fewer Q-tier
+    # dequants per step. Which wins on tokens/s is unmeasured — that is why this
+    # row exists. Compare directly against ours_b20_q50.
+    - name: ours_b20_q50_memo_on
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.5
+      quant_memoize_read: true
+      requires_flash_attn: true
 
   grid:
-    - { prefill_len: 512, gen_len: 32,   batch_size: 1 }
-    - { prefill_len: 512, gen_len: 512,  batch_size: 1 }
-    - { prefill_len: 512, gen_len: 1024, batch_size: 1 }
+    # -- A. Long generation: the regime where eviction actually pays (~3x). ---
+    #    Short prompt, so the steady state binds, not the prefill peak.
+    - { prefill_len: 512, gen_len: 1024, batch_size: 1 }    # reference; expect ~0% gain at B=1
+    - { prefill_len: 512, gen_len: 1024, batch_size: 8 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 32 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 128 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 256 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 512 }
 
-  num_warmup_runs: 5
-  num_measurement_runs: 5
+    # -- B. Generation-dominated: where §5's ~5x should appear. EXPENSIVE ------
+    #    (4096 decode steps per run). Trim this scenario first.
+    - { prefill_len: 512, gen_len: 4096, batch_size: 1 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 32 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 128 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 256 }
+
+    # -- C. LongBench shape: long prompt, short gen. THE LIMIT CASE. ----------
+    #    Predicted ~1.03x — the prefill peak binds, so compression buys almost
+    #    no batch here. Included deliberately: this is the honest bound on the
+    #    method as it stands, and it is what motivates chunked prefill.
+    - { prefill_len: 4096, gen_len: 128, batch_size: 1 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 16 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 32 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 64 }
+
+  num_warmup_runs: 1
+  num_measurement_runs: 2
   allow_shared_gpu: true
-  skip_if_oom: true
-  skip_if_flash_attn_unavailable: false
+  skip_if_oom: true                    # REQUIRED: this is what makes the ladder a max-B search
+  skip_if_flash_attn_unavailable: true
   enable_clock_locking: false
 
 telemetry:
+  track_scores: false                  # scoring telemetry would distort the timings
   output_dir: outputs/perf_batched
