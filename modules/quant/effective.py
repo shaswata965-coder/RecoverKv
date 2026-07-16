@@ -145,19 +145,13 @@ def materialize_effective_kv(
     body_pos = fp_positions[num_sink:]
     n_body = body_k.shape[1]
 
-    # Q windows: dequantize, then RoPE at their original positions.
-    #
-    # RoPE is per-token pointwise (each key rotated by cos/sin at its own
-    # position), so rotating all N_q windows in ONE call — flattened window-major
-    # to [H_kv, N_q*window, D] with their original positions [N_q*window] — is
-    # bit-identical to N_q separate per-window calls but pays a single kernel
-    # launch instead of ~40/window.
-    _, q_keys_pre, q_values, q_positions = store.gather_active(out_dtype=out_dtype)
-    n_q, h_kv, s, d = q_keys_pre.shape
-    k_flat = q_keys_pre.permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)  # [H, N*S, D]
-    q_pos_flat = q_positions.reshape(n_q * s)                         # [N*S]
-    k_q = rotate_key_window(k_flat, q_pos_flat, rope_module).to(out_dtype)
-    v_q = q_values.to(out_dtype).permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
+    # Q windows: dequantized + RoPE'd at their frozen original positions.
+    # The store memoizes this on its version — the tier cannot change between
+    # evictions (§10), so on a non-eviction decode step this is a cache hit and
+    # costs nothing. RoPE is per-token pointwise, so rotating all N_q windows in
+    # ONE call (flattened window-major) is bit-identical to N_q separate
+    # per-window calls at a single kernel launch.
+    k_q, v_q, q_pos_flat = store.effective_q_tier(rope_module, out_dtype)
 
     # Interleave chronologically, entirely ON DEVICE: concatenate the fp body
     # with the Q tokens and sort the merged token axis by window id.

@@ -18,7 +18,7 @@ frozen ``position_range``. Values carry no RoPE (asymmetric store).
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -42,6 +42,26 @@ class QuantizedStore:
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.ledger = QuantLedger()
+        # Bumped by every mutation; read paths memoize against it (see
+        # `version`). Entries are write-once (§10) and the active set only moves
+        # at eviction, so between evictions a read is bit-identical.
+        self._version = 0
+        self._read_cache: Optional[Tuple[Any, Any]] = None
+
+    @property
+    def version(self) -> int:
+        """Monotonic counter — changes iff the Q tier's contents changed.
+
+        Every mutator (:meth:`demote`, :meth:`reactivate`, :meth:`promote`,
+        :meth:`retain_only`) bumps it, and all four are only reachable from the
+        cache's eviction pass. A read path can therefore cache against this and
+        trust the result until the next eviction.
+        """
+        return self._version
+
+    def _invalidate(self) -> None:
+        self._version += 1
+        self._read_cache = None
 
     # -- counts --------------------------------------------------------------
 
@@ -86,6 +106,7 @@ class QuantizedStore:
             ``[window]`` int64 original absolute positions (unused on
             reactivation — the frozen entry already carries them).
         """
+        self._invalidate()
         if self.ledger.contains(window_id):
             # Dormant entry exists → pure reactivation, no recompute.
             self.ledger.reactivate(window_id)
@@ -100,6 +121,7 @@ class QuantizedStore:
         if the window has no entry (a first demotion must go through
         :meth:`demote`).
         """
+        self._invalidate()
         self.ledger.reactivate(window_id)
 
     def has_entry(self, window_id: int) -> bool:
@@ -148,6 +170,7 @@ class QuantizedStore:
             e.val_codes, e.val_scale, e.val_zero, self.head_dim, out_dtype=out_dtype
         )
         position_range = e.position_range.clone()
+        self._invalidate()
         self.ledger.deactivate(window_id)
         return key_pre_rope, value, position_range
 
@@ -195,8 +218,54 @@ class QuantizedStore:
 
         return ids, keys, values, positions
 
+    def effective_q_tier(
+        self, rope_module: torch.nn.Module, out_dtype: torch.dtype
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Read-ready Q tier: post-RoPE keys, values, and their positions.
+
+        Returns ``None`` for an empty tier, else a triple flattened
+        window-major over the active windows (ascending id):
+
+        - ``keys``     : ``[H_kv, N_q * window, D]`` — dequantized, RoPE'd at
+          each window's frozen ``position_range``.
+        - ``values``   : ``[H_kv, N_q * window, D]``.
+        - ``positions``: ``[N_q * window]`` int64 original absolute positions.
+
+        **Memoized on** :attr:`version`. Codes and grids are written once at
+        first demotion and ``position_range`` is never rebased (§10), so the
+        dequant + RoPE are bit-identical until the ledger next changes — and the
+        ledger only changes at eviction. Recomputing per decode step re-ran the
+        whole tier's dequant and RoPE for a result that could not have moved:
+        at ``window_size = 8`` that is wasted on 7 of every 8 steps, and the
+        tier is the large one (int4 holds the *majority* of retained windows).
+        """
+        key = (self._version, out_dtype)
+        if self._read_cache is not None and self._read_cache[0] == key:
+            return self._read_cache[1]
+
+        gathered = self.gather_active(out_dtype=out_dtype)
+        if gathered is None:
+            self._read_cache = (key, None)
+            return None
+
+        # Local import: `effective` owns the RoPE primitives and imports nothing
+        # from this module, so this cannot cycle.
+        from .effective import rotate_key_window
+
+        _, keys_pre, values, positions = gathered
+        n_q, h_kv, s, d = keys_pre.shape
+        k_flat = keys_pre.permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
+        pos_flat = positions.reshape(n_q * s)
+        keys = rotate_key_window(k_flat, pos_flat, rope_module).to(out_dtype)
+        vals = values.to(out_dtype).permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
+
+        result = (keys, vals, pos_flat)
+        self._read_cache = (key, result)
+        return result
+
     # -- eviction bookkeeping ------------------------------------------------
 
     def retain_only(self, keep_ids) -> None:
         """Free ledger entries whose window was dropped outright (§6)."""
+        self._invalidate()
         self.ledger.retain_only(keep_ids)
