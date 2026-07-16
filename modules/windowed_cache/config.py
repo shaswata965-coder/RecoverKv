@@ -43,6 +43,9 @@ class ResolvedConfig:
     quant_ratio: float = 0.0
     top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
     N_q: int = 0               # evictable int4 windows (0 when q=0)
+    # None → decide from the batch size at the first forward (on at B=1, off
+    # above). See WindowedCacheConfig.quant_memoize_read.
+    quant_memoize_read: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # top_k_fp defaults to top_k_windows so direct constructions (and every
@@ -93,7 +96,34 @@ class WindowedCacheConfig:
         single-tier fp16 path.  When ``q > 0``, the evictable window budget is
         split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int4 tier
         (which holds ~4× the windows per byte).  Requires an even ``window_size``
-        (int4 nibble packing) and — in v1 — batch size 1 (design.md §10).
+        (int4 nibble packing).
+    quant_memoize_read : bool, optional
+        Cache the dequantized + RoPE'd Q tier between evictions, per layer.
+        **Default ``None`` = auto: on at ``B == 1``, off above.**
+
+        The memo is free at ``B == 1`` and pure waste of batch capacity above it.
+        At ``B == 1`` decode is weight-bound — every weight is read once per step
+        (16.06 GB for Llama-3.1-8B fp16, a 10.3 ms/token floor on an A100) and
+        that floor is independent of KV size — so the memo's footprint costs
+        nothing and it saves 7 of every 8 steps' dequant at ``window_size = 8``.
+
+        At ``B > 1`` it is charged **per row**, and batch capacity is the whole
+        thesis: batching is the only thing that amortizes the weight read, and
+        ``B`` is capped by KV memory, which is exactly what this method
+        compresses. Measured at the qasper steady state (``T_fp=565``,
+        ``T_q=1136``, 32 layers, ``H_kv=8``, ``D=128``, fp16) the memo holds
+        ~4.65 MB/layer/row ⇒ **~149 MB/row**, against ~125 MB/row for the actual
+        two-tier KV — it more than doubles per-row memory and cuts max-``B`` from
+        ~458 to ~204.
+
+        Set ``True`` to force it on at ``B > 1``: it trades that batch capacity
+        for ~8x fewer Q-tier dequants per step (the Phase-1 read path
+        rematerializes the whole tier every step without it — design.md §8, which
+        Phase 2's fused kernel is what actually fixes). Which side wins at max-``B``
+        is a measurement the perf suite must make; the default is set by the
+        memory bound, which is the one we can compute.
+    quant_ratio : float
+        (see above)
 
     Notes
     -----
@@ -108,6 +138,7 @@ class WindowedCacheConfig:
     track_scores: bool = False
     rerotate_on_evict: bool = False
     quant_ratio: float = 0.0
+    quant_memoize_read: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -195,6 +226,15 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_ratio > 0 requires an even window_size (int4 packing), "
                 f"got window_size={self.window_size}"
+            )
+
+        # -- quant_memoize_read --
+        if self.quant_memoize_read is not None and not isinstance(
+            self.quant_memoize_read, bool
+        ):
+            raise ValueError(
+                f"quant_memoize_read must be None (auto) or bool, got "
+                f"{type(self.quant_memoize_read).__name__}"
             )
 
     # -----------------------------------------------------------------
@@ -314,4 +354,5 @@ class WindowedCacheConfig:
             quant_ratio=q,
             top_k_fp=top_k_fp,
             N_q=N_q,
+            quant_memoize_read=self.quant_memoize_read,
         )

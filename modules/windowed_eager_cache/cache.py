@@ -32,6 +32,7 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
+from modules.quant.slots import n_slots_for
 
 
 class WindowedCache(_HFCacheBase):
@@ -97,13 +98,45 @@ class WindowedCache(_HFCacheBase):
                 nh = getattr(model_config, "num_attention_heads", None)
                 hidden = getattr(model_config, "hidden_size", None)
                 head_dim = hidden // nh
+            # Slots are bounded by config — retain_only drops every non-retained
+            # window, so live entries never exceed top_k_fp + N_q and no growth
+            # policy is needed (design §6; see n_slots_for).
+            n_slots = n_slots_for(self.resolved.top_k_fp, self.resolved.N_q)
             self._stores = [
-                QuantizedStore(self.resolved.window_size, head_dim, num_kv_heads)
+                QuantizedStore(
+                    self.resolved.window_size, head_dim, num_kv_heads,
+                    n_slots=n_slots,
+                    # Provisional: `None` means auto, resolved from the real batch
+                    # size at the first update() (see _resolve_memoization).
+                    memoize_read=self.resolved.quant_memoize_read is not False,
+                )
                 for _ in range(num_layers)
             ]
+        self._memoization_resolved = False
 
-        # Per-layer state and policy
-        self._states: List[CacheState] = [CacheState() for _ in range(num_layers)]
+        # Per-layer state and policy. The fp store is preallocated so append()
+        # never re-cats the whole store (BATCHING_PLAN.md §5: at max batch that
+        # copy is ~4x the weight traffic and the largest single term in the step).
+        #
+        # Sized to the EVICTION BUDGET, not to prefill + max_tokens. The latter is
+        # StaticCache's rule and is right for a cache that only grows; this one
+        # compacts back to the budget every window_size steps, so prefill-sizing
+        # would pin the fp store at its un-evicted size for the whole decode —
+        # ~708 MB/row vs ~74 MB/row on Llama-3.1-8B at the qasper steady state,
+        # capping B at ~73 against the ~458 the method is supposed to reach. The
+        # prompt still needs a full-size buffer for exactly one pass, before the
+        # first eviction can score it; `replace` releases it at that eviction.
+        r = self.resolved
+        steady = (
+            r.num_sink_tokens
+            + r.top_k_fp * r.window_size     # == top_k_windows at q = 0
+            + r.local_tokens
+            + 2 * r.window_size              # a window of growth + slack
+        )
+        self._states: List[CacheState] = [
+            CacheState(capacity=steady, prefill_capacity=prefill_len + r.window_size)
+            for _ in range(num_layers)
+        ]
         self._policies: List[EvictionPolicy] = [
             EvictionPolicy(self.resolved) for _ in range(num_layers)
         ]
@@ -150,6 +183,26 @@ class WindowedCache(_HFCacheBase):
         """Return ``None`` — windowed cache doesn't have a static max."""
         return None
 
+    def _resolve_memoization(self, batch_size: int) -> None:
+        """Settle the Q-tier read memo once the real batch size is known.
+
+        ``quant_memoize_read=None`` (the default) means: **on at B=1, off above.**
+        The memo holds the whole Q tier dequantized to fp16 per layer for the
+        whole decode — ~149 MB/row at the qasper steady state against ~125 MB/row
+        of actual two-tier KV. At B=1 that is invisible (decode is weight-bound —
+        BATCHING_PLAN.md §5) and it saves 7 of every 8 steps' dequant. At B>1 it
+        is charged per row and halves the batch that fits, which is the one thing
+        the whole method exists to raise. An explicit True/False always wins.
+        """
+        if self._memoization_resolved:
+            return
+        self._memoization_resolved = True
+        pref = self.resolved.quant_memoize_read
+        memo = (batch_size == 1) if pref is None else pref
+        for store in self._stores:
+            if store is not None:
+                store.memoize_read = memo
+
     def update(
         self,
         key_states: Tensor,
@@ -173,14 +226,17 @@ class WindowedCache(_HFCacheBase):
         state = self._states[layer_idx]
         policy = self._policies[layer_idx]
 
-        # v1 quantization is batch-size 1 only (design §10): the ledger/store and
-        # materialize_effective_kv run per row. B > 1 stays fully supported at
-        # q == 0 (byte-identical); only the Q tier is gated.
+        self._resolve_memoization(key_states.shape[0])
+
+        # The Q tier's storage and eviction carry a batch axis, but the tier
+        # DECISION still collapses to row 0 (policy.compute_two_tier_retain), so
+        # q > 0 stays gated to B == 1 until that is vectorized (Phase 2). B > 1
+        # is fully supported at q == 0 (byte-identical); only the Q tier is gated.
         if self._q > 0.0 and key_states.shape[0] != 1:
             raise NotImplementedError(
-                "Two-tier quantization (quant_ratio > 0) is batch-size 1 only in "
-                f"v1 (design.md §10); got batch size {key_states.shape[0]}. Use "
-                "quant_ratio=0 for B > 1."
+                "Two-tier quantization (quant_ratio > 0) is batch-size 1 only "
+                f"until the tier decision is vectorized; got batch size "
+                f"{key_states.shape[0]}. Use quant_ratio=0 for B > 1."
             )
 
         # Extract position_ids from cache_kwargs if provided
@@ -366,7 +422,7 @@ class WindowedCache(_HFCacheBase):
     # -----------------------------------------------------------------
 
     def _materialize(self, layer_idx: int) -> Tuple[Tensor, Tensor]:
-        """Interleave fp + Q tiers into the effective K/V for one layer (row 0).
+        """Interleave fp + Q tiers into the effective K/V for one layer.
 
         Returns a freshly-built tensor; callers must not assume it aliases the
         stored fp cache (design §9). Empty Q tier ⇒ the fp store, byte-identical.
@@ -376,50 +432,63 @@ class WindowedCache(_HFCacheBase):
         if store is None or store.num_active_windows == 0:
             return state.key_states, state.value_states
 
-        eff_k, eff_v = materialize_effective_kv(
-            state.key_states[0],
-            state.value_states[0],
-            state.position_ids[0],
+        return materialize_effective_kv(
+            state.key_states,
+            state.value_states,
+            state.position_ids,
             store,
             num_sink=self.resolved.num_sink_tokens,
             window_size=self.resolved.window_size,
             rope_module=self.rope_module,
             out_dtype=state.key_states.dtype,
         )
-        return eff_k.unsqueeze(0), eff_v.unsqueeze(0)
 
     @staticmethod
-    def _window_spans(tok_wid: Tensor) -> Dict[int, Tuple[int, int]]:
-        """Map each window id to its ``[start, end)`` run in the fp store.
+    def _compact(src: Tensor, mask: Tensor, width: int) -> Tuple[Tensor, Tensor]:
+        """Gather ``src``'s masked lanes to the front of a ``[B, width]`` tensor.
 
-        Relies on ``tok_wid`` being non-decreasing, which the fp store
-        guarantees: prefill appends in position order, generation appends at the
-        end, and ``_evict_two_tier`` re-emits ``[sink ‖ fp windows by ascending
-        id]``. So every window owns exactly one contiguous run and the whole map
-        falls out of the run boundaries.
+        The counterpart to ``BATCHING_PLAN.md §3``'s rectangularity result. The
+        *retained* counts are equal across rows, but the **transition** counts
+        are not: ``demote = is_q_new & ~is_q_cur`` depends on where each row's Q
+        tier already is, so row 0 may demote 4 windows while row 1 demotes none.
+        Allocating by *count* would therefore need a host sync to learn the max;
+        allocating by **rank** into a worst-case-width tensor does not.
 
-        Costs two host syncs regardless of window count — the point of the
-        exercise. Sink tokens share the single ``wid < 0`` run and are never
-        looked up (callers only ask for real window ids).
+        ``width`` must be a proven upper bound on ``mask.sum(1)`` — the caller
+        takes it from the budget resolver. Lanes beyond a row's count are
+        ``valid=False`` and carry ``-1``; overflow lanes (if the bound were ever
+        wrong) are routed to a dump column rather than scattering out of bounds,
+        so a bad bound drops work loudly in tests instead of corrupting memory.
+
+        Returns ``(compacted [B, width], valid [B, width])``.
         """
-        n = tok_wid.numel()
-        if n == 0:
-            return {}
-        is_start = torch.ones(n, dtype=torch.bool, device=tok_wid.device)
-        is_start[1:] = tok_wid[1:] != tok_wid[:-1]
-        starts = torch.nonzero(is_start, as_tuple=True)[0]      # [n_groups]
-        bounds = starts.tolist() + [n]                          # sync 1
-        wids = tok_wid[starts].tolist()                         # sync 2
-        return {w: (bounds[g], bounds[g + 1]) for g, w in enumerate(wids)}
+        B = mask.shape[0]
+        rank = mask.cumsum(1) - 1                                   # [B, W]
+        dump = torch.full_like(rank, width)
+        idx = torch.where(mask & (rank < width), rank.clamp_min(0), dump)
+        out = torch.full((B, width + 1), -1, dtype=src.dtype, device=src.device)
+        out.scatter_(1, idx, src)
+        valid = torch.zeros((B, width + 1), dtype=torch.bool, device=src.device)
+        valid.scatter_(1, idx, mask)
+        return out[:, :width], valid[:, :width]
 
     def _evict_two_tier(self, layer_idx: int, step: int) -> None:
-        """One two-tier eviction (design §5), operating on row 0 (B = 1).
+        """One two-tier eviction (design §5), per row, entirely on device.
 
         Ranks the merged window axis, assigns tiers, moves boundary-crossers
         (demote K→Q / promote Q→K), rebuilds the fp store as
         ``[sink ‖ fp windows in chronological id order]`` keeping every survivor's
-        original absolute positions, and updates the Q store + ledger. Positions
-        are never renumbered.
+        original absolute positions, and updates the Q store. Positions are never
+        renumbered.
+
+        **No Python loops and no host syncs.** The tier bookkeeping used to be
+        host-side Python sets over ``.tolist()``ed window ids — which is both a
+        pipeline stall per layer per eviction and, more fundamentally, unable to
+        carry a batch axis at all: rows evict divergently, so "the set of Q
+        windows" is per row. Every decision below is ``[B, W]`` mask algebra
+        against the slot table instead, and every tensor width comes from
+        :meth:`EvictionPolicy.tier_counts` — host ints that are identical across
+        rows (BATCHING_PLAN.md §3), so nothing has to be measured off a tensor.
         """
         state = self._states[layer_idx]
         policy = self._policies[layer_idx]
@@ -429,128 +498,163 @@ class WindowedCache(_HFCacheBase):
         ws = self.resolved.window_size
         num_sink = self.resolved.num_sink_tokens
         dtype = state.key_states.dtype
+        device = state.key_states.device
+
+        B, H_kv, T_fp, D = state.key_states.shape
+        T_body = T_fp - num_sink
+        W = state.window_scores.shape[2]
+        n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
         retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
-        ri = retained_idx[0]                    # [W_ret] merged indices, ascending
+        k_fp, n_q, local_w = policy.tier_counts(W)
+        n_fp = k_fp + local_w
 
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
         # retained indices are merged-WINDOW indices (not token indices — the fp
         # and Q survivors live in different stores).
         self.telemetry.record_scores(layer_idx, step, state.window_scores, retained_idx)
 
-        # Gather the retained window ids ON DEVICE, then pay one host sync for
-        # the whole list. Subscripting the id tensor per retained window
-        # (``int(owids[m])``) instead costs a GPU→CPU sync EACH — ~140 per layer
-        # per eviction, ~130k per sample once multiplied by layers and steps.
-        # Each drains the CUDA pipeline, so the GPU sits idle and the run goes
-        # host-latency-bound: no GPU is fast enough to hide it.
-        owids_ret = state.original_window_ids[0][ri].tolist()   # 1 sync
-        nt = new_tier[0].tolist()                               # 1 sync
-        retained = list(zip(owids_ret, nt))
-        retained_wids = set(owids_ret)
-        new_fp = sorted(w for w, t in retained if t == 0)
-        new_q = set(w for w, t in retained if t == 1)
+        wids = torch.gather(state.original_window_ids, 1, retained_idx)   # [B, W_ret]
+        is_q_new = new_tier == 1
 
-        def cur_is_q(wid: int) -> bool:
-            return store.ledger.is_active(wid)
+        # --- Resolve window ids → slots ONCE, then decide with masks --------
+        store.ensure(B, device)
+        has_entry, is_q_cur, slot_of, match = store.lookup(wids)
 
-        # fp-store token → window id (sink tokens map to < 0 and are excluded),
-        # then window id → its [start, end) run in the fp store. Resolving each
-        # window with ``(tok_wid == wid).nonzero()`` instead costs a sync per
-        # window AND turns every lookup into a gather+copy; the span map costs
-        # two syncs total and makes each lookup a view.
-        pos_row = state.position_ids[0]                       # [T_fp]
-        tok_wid = (pos_row - num_sink) // ws                  # [T_fp]
-        wid_span = self._window_spans(tok_wid)
+        demote = is_q_new & ~is_q_cur      # currently fp, wants Q
+        fresh = demote & ~has_entry        # never quantized → quantize now
+        react = demote & has_entry         # dormant → reactivate, NO requant (§10)
+        promote = ~is_q_new & is_q_cur     # currently Q, wants fp
 
-        # --- 3a. Build the new fp windows (fp→fp keep + Q→fp promote) -------
-        # Promotions are collected and run as ONE batched dequant + ONE RoPE.
-        # Per-window promote() + rotate_key_window() instead cost ~18 ATen
-        # dispatches EACH — a launch storm on GPU, and eviction touches most of
-        # the retained tier. RoPE is per-token pointwise and the batched dequant
-        # is the singular op applied slice-wise, so this is bit-identical.
-        promote_wids = [w for w in new_fp if cur_is_q(w)]
-        promoted: Dict[int, Tuple[Tensor, Tensor, Tensor]] = {}
-        if promote_wids:
-            k_pre, v_all, pos_all = store.promote_many(promote_wids, out_dtype=dtype)
-            n, h, sw, dd = k_pre.shape
-            k_rot = rotate_key_window(
-                k_pre.permute(1, 0, 2, 3).reshape(h, n * sw, dd),
-                pos_all.reshape(n * sw),
+        # --- 3a. Free dropped entries FIRST (§6) ----------------------------
+        # Before allocating, not after: it is what makes n_slots_for's
+        # top_k_fp + N_q bound exact rather than merely likely. Safe in either
+        # order — retain_only only touches windows that are NOT retained, and
+        # every demote/promote/reactivate target is retained by construction.
+        store.retain_only(match)
+
+        # --- fp window order: retained-fp windows, ascending id -------------
+        # `wids` is already ascending (the merged axis is chronological), so
+        # pushing the Q-tier picks to a sentinel and sorting compacts the fp
+        # picks to the front, still ascending. Everything the fp rebuild needs
+        # is then gathered onto that same axis.
+        sentinel = torch.iinfo(torch.long).max
+        fp_key = torch.where(is_q_new, torch.full_like(wids, sentinel), wids)
+        take = torch.argsort(fp_key, dim=1)[:, :n_fp]                  # [B, n_fp]
+        fp_wids = torch.gather(wids, 1, take)
+        fp_prom = torch.gather(promote, 1, take)
+        fp_slot = torch.gather(slot_of, 1, take)
+        prom_rank = fp_prom.cumsum(1) - 1                              # [B, n_fp]
+
+        body_k = state.key_states[:, :, num_sink:, :]
+        body_v = state.value_states[:, :, num_sink:, :]
+        body_pos = state.position_ids[:, num_sink:]
+        # Token → window id. Non-decreasing per row (the fp store is
+        # [sink ‖ windows by ascending id] and generation appends the newest
+        # tokens at the end), which is what lets searchsorted below resolve a
+        # window to its run in one shot — no host span map, no sync.
+        body_wid = ((body_pos - num_sink) // ws).contiguous()          # [B, T_body]
+
+        # --- 3b. Promote (Q→fp): ONE batched dequant + ONE RoPE -------------
+        # Width is the BOUND, not the count: promotions are ragged per row. The
+        # invalid lanes dequantize garbage from free slots and are dropped by the
+        # mask below — bit-identical for the valid ones, since every op here is
+        # per-window or per-token pointwise.
+        p_max = min(self.resolved.N_q, n_fp)
+        prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
+        prom_k = prom_v = prom_pos = None
+        if p_max > 0:
+            k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
+            prom_k = rotate_key_window(
+                k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
+                pos_pre.reshape(B, p_max * ws),
                 rope,
-            ).to(dtype).reshape(h, n, sw, dd).permute(1, 0, 2, 3)   # [N,H,S,D]
-            v_all = v_all.to(dtype)
-            for i, wid in enumerate(promote_wids):
-                promoted[wid] = (k_rot[i], v_all[i], pos_all[i].to(pos_row.dtype))
+            ).to(dtype)                                                # [B,H,p*ws,D]
+            prom_v = v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
+                B, H_kv, p_max * ws, D)
+            prom_pos = pos_pre.reshape(B, p_max * ws).to(body_pos.dtype)
 
-        new_fp_windows = []  # (wid, k[H,ntok,D] post-RoPE, v, pos[ntok])
-        for wid in new_fp:
-            if wid in promoted:
-                k_rot_w, v_w, pos_w = promoted[wid]
-                new_fp_windows.append((wid, k_rot_w, v_w, pos_w))
-            else:
-                s, e = wid_span.get(wid, (0, 0))
-                new_fp_windows.append((
-                    wid,
-                    state.key_states[0][:, s:e, :],
-                    state.value_states[0][:, s:e, :],
-                    pos_row[s:e],
-                ))
+        # --- 3c. Demote (fp→Q): un-rotate + quantize the FRESH windows ------
+        # Must read the OLD fp store, so it runs before the rebuild below.
+        # Reactivations are free — codes/grid/positions are frozen (§10) — so
+        # they are a bit flip and never touch this path.
+        react_slot, react_valid = self._compact(slot_of, react, n_q)
+        store.reactivate_many(react_slot, react_valid)
 
-        # --- 3b. Demote (fp→Q): first-time un-rotate+quantize or reactivate --
-        # Reactivations are free (codes/grid frozen — §10). First-time demotions
-        # are collected and run as ONE un-rotate + ONE batched quantize, same
-        # reasoning as the promote batch above.
-        fresh: List[int] = []
-        for wid in new_q:
-            if cur_is_q(wid):
-                continue  # Q→Q: stays active, codes untouched
-            if store.has_entry(wid):
-                store.reactivate(wid)  # dormant → active; codes/grid frozen (§10)
-            else:
-                fresh.append(wid)
+        fresh_wid, fresh_valid = self._compact(wids, fresh, n_q)
+        if n_q > 0 and T_body > 0:
+            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_q]
+            tok_f = (
+                start_f.unsqueeze(-1) + torch.arange(ws, device=device)
+            ).reshape(B, n_q * ws).clamp_(0, T_body - 1)
+            idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_q * ws, D)
+            k_post = torch.gather(body_k, 2, idx_d)
+            v_tok = torch.gather(body_v, 2, idx_d)
+            prange = torch.gather(body_pos, 1, tok_f)
+            k_pre_d = unrotate_key_window(k_post, prange, rope)
+            store.demote_many(
+                store.table.free_slots(n_q), fresh_valid, fresh_wid,
+                k_pre_d.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
+                v_tok.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
+                prange.reshape(B, n_q, ws),
+            )
 
-        if fresh:
-            spans = [wid_span.get(w, (0, 0)) for w in fresh]
-            k_post = torch.stack(
-                [state.key_states[0][:, s:e, :] for s, e in spans], dim=0)
-            v_tok = torch.stack(
-                [state.value_states[0][:, s:e, :] for s, e in spans], dim=0)
-            prange = torch.stack([pos_row[s:e] for s, e in spans], dim=0)
-            n, h, sw, dd = k_post.shape
-            k_pre = unrotate_key_window(
-                k_post.permute(1, 0, 2, 3).reshape(h, n * sw, dd),
-                prange.reshape(n * sw),
-                rope,
-            ).reshape(h, n, sw, dd).permute(1, 0, 2, 3)             # [N,H,S,D]
-            store.demote_many(fresh, k_pre, v_tok, prange)
+        # --- 4. Rebuild the fp store: [sink ‖ fp windows by id] -------------
+        # Every retained fp window contributes ws tokens except the newest, which
+        # may be partial — and it is always last, because a window's id fixes its
+        # position range and only the newest can straddle the end of the
+        # sequence. So new-body token i belongs to fp window rank i // ws at
+        # offset i % ws, and the length is pure config arithmetic: the retained
+        # evictable windows are full, and the local tokens are whatever the body
+        # holds beyond the evictable-fp windows currently in it.
+        n_ev_fp_cur = W - local_w - n_q_prev            # evictable windows in fp now
+        new_body_len = k_fp * ws + (T_body - n_ev_fp_cur * ws)
+        i = torch.arange(new_body_len, device=device)
+        jj = (i // ws).unsqueeze(0).expand(B, -1)                      # [B, T_new]
+        off = (i % ws).unsqueeze(0)                                    # [1, T_new]
 
-        # --- 3c. Drop entries for windows dropped outright (§6) -------------
-        store.retain_only(retained_wids)
+        start_of_rank = torch.searchsorted(body_wid, fp_wids)          # [B, n_fp]
+        src_fp = (torch.gather(start_of_rank, 1, jj) + off).clamp_(0, max(T_body - 1, 0))
+        idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
+        new_k = torch.gather(body_k, 2, idx_fp)
+        new_v = torch.gather(body_v, 2, idx_fp)
+        new_pos = torch.gather(body_pos, 1, src_fp)
 
-        # --- 4. Reassemble the fp store: [sink ‖ fp windows by id] ----------
-        sink_k = state.key_states[0][:, :num_sink, :]
-        sink_v = state.value_states[0][:, :num_sink, :]
-        sink_pos = pos_row[:num_sink]
-        new_fp_windows.sort(key=lambda t: t[0])
-        parts_k = [sink_k] + [w[1] for w in new_fp_windows]
-        parts_v = [sink_v] + [w[2] for w in new_fp_windows]
-        parts_pos = [sink_pos] + [w[3] for w in new_fp_windows]
+        if p_max > 0:
+            # A promoted window has no tokens in the fp store — splice its
+            # freshly-rotated copy in at its chronological slot (design §5 step
+            # 3): same layout, different source.
+            tok_is_prom = torch.gather(fp_prom, 1, jj)                 # [B, T_new]
+            src_pr = (
+                torch.gather(prom_rank, 1, jj) * ws + off
+            ).clamp_(0, p_max * ws - 1)
+            idx_pr = src_pr.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
+            sel = tok_is_prom.unsqueeze(1).unsqueeze(-1)
+            new_k = torch.where(sel, torch.gather(prom_k, 2, idx_pr), new_k)
+            new_v = torch.where(sel, torch.gather(prom_v, 2, idx_pr), new_v)
+            new_pos = torch.where(
+                tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
+            )
 
-        state.key_states = torch.cat(parts_k, dim=1).unsqueeze(0).contiguous()
-        state.value_states = torch.cat(parts_v, dim=1).unsqueeze(0).contiguous()
-        state.position_ids = torch.cat(parts_pos, dim=0).unsqueeze(0).contiguous()
+        state.replace(
+            torch.cat([state.key_states[:, :, :num_sink, :], new_k], dim=2),
+            torch.cat([state.value_states[:, :, :num_sink, :], new_v], dim=2),
+            torch.cat([state.position_ids[:, :num_sink], new_pos], dim=1),
+        )
 
         # --- 5. Gather scores + ids to the retained merged axis -------------
         H_q = state.window_scores.shape[1]
-        idx_w = ri.view(1, 1, -1).expand(1, H_q, -1)
-        state.window_scores = torch.gather(state.window_scores, dim=-1, index=idx_w).contiguous()
+        idx_w = retained_idx.unsqueeze(1).expand(B, H_q, -1)
+        state.window_scores = torch.gather(
+            state.window_scores, dim=-1, index=idx_w
+        ).contiguous()
         state.original_window_ids = torch.gather(
-            state.original_window_ids, 1, ri.view(1, -1)
+            state.original_window_ids, 1, retained_idx
         ).contiguous()
 
-        # --- 6. Policy total tracks the MERGED length (T_fp + T_q) ----------
+        # --- 6. Commit counts; policy total tracks T_fp + T_q ---------------
+        store.commit_active_count(n_q)
         policy.set_total_after_compaction(
             state.seq_length + store.num_active_tokens
         )

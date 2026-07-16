@@ -1,64 +1,121 @@
-"""QuantizedStore — the Q-tier facade over the per-window ledger (design.md §4–§6).
+"""QuantizedStore — the Q-tier facade over the dense slot table (design.md §4–§6).
 
-One store per layer (B = 1 in v1). It is the object the cache talks to for all
-Q-tier operations:
+One store per layer. It is the object the cache talks to for all Q-tier
+operations, and every one of them carries a **row** axis: rows evict
+divergently, so the Q tier's identity bookkeeping cannot live on the host
+(BATCHING_PLAN.md §2, §4).
 
-- :meth:`demote` — first-time demotion (quantize once) **or** reactivation of a
-  dormant entry (re-demotion; no recompute — design §10).
-- :meth:`promote` — hand back a window's frozen record and mark it dormant.
-- :meth:`gather_active` — dequantize every **active** window (pre-RoPE keys +
-  values) in chronological order for the read path (design §5, §8). The dense
-  gap-free "Q store" of §4 is materialized here on demand from the active
-  ledger entries; the physical byte ``offset`` is a Phase-2 layout concern.
+- :meth:`demote_many` — first-time demotion (quantize once) into free slots.
+- :meth:`reactivate_many` — re-demotion of a dormant entry: one bit, no
+  recompute, exactly zero added error (design §10).
+- :meth:`promote_many` — hand back a window's frozen record, mark it dormant.
+- :meth:`effective_q_tier` — dequantize + RoPE every **active** window in
+  chronological order for the read path (design §5, §8).
 
-Keys are stored **pre-RoPE**; RoPE is applied at read by
-:func:`modules.quant.effective.materialize_effective_kv` using each window's
-frozen ``position_range``. Values carry no RoPE (asymmetric store).
+Every method takes and returns tensors indexed by *slot*, never by window id:
+the cache resolves ids to slots once per eviction through :meth:`lookup` and
+drives the rest with masks. Nothing here loops or syncs.
+
+Keys are stored **pre-RoPE**; RoPE is applied at read using each window's frozen
+``position_range``. Values carry no RoPE (asymmetric store).
+
+**Worst-case widths.** Callers size the promote / demote batches by the *bound*
+(``N_q``, ``min(N_q, n_fp)``) rather than the actual per-row count, because the
+counts are **ragged across rows** even though the retained counts are not
+(BATCHING_PLAN.md §3 covers retained only): row 0 may re-demote 4 windows while
+row 1 demotes none. Invalid lanes carry garbage through the quantizer and are
+discarded by mask. This is safe *and* bit-identical because every quantizer op
+is elementwise or reduces only over a window's own quant-group axis — lane ``j``
+cannot influence lane ``k``. It costs work proportional to the bound, which is
+the price of rectangularity; the alternative is a host sync per layer per
+eviction to learn the true max.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
-from .ledger import LedgerEntry, QuantLedger
 from .quantizer import (
-    dequantize_key_window,
     dequantize_key_windows,
-    dequantize_value_window,
     dequantize_value_windows,
-    quantize_key_window,
     quantize_key_windows,
-    quantize_value_window,
     quantize_value_windows,
 )
+from .slots import QuantSlotTable
 
 
 class QuantizedStore:
-    """Q-tier storage + operations for one layer (B = 1)."""
+    """Q-tier storage + operations for one layer, over ``B`` rows.
 
-    def __init__(self, window_size: int, head_dim: int, num_kv_heads: int) -> None:
+    Parameters
+    ----------
+    window_size, head_dim, num_kv_heads : int
+    n_slots : int
+        Slots per row. Bounded by config — see :func:`modules.quant.slots.n_slots_for`.
+    memoize_read : bool
+        Cache :meth:`effective_q_tier`'s dequantized + RoPE'd result between
+        evictions. See that method for the memory/bandwidth trade.
+    """
+
+    def __init__(
+        self,
+        window_size: int,
+        head_dim: int,
+        num_kv_heads: int,
+        n_slots: int,
+        memoize_read: bool = True,
+    ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
-        self.ledger = QuantLedger()
-        # Bumped by every mutation; read paths memoize against it (see
-        # `version`). Entries are write-once (§10) and the active set only moves
-        # at eviction, so between evictions a read is bit-identical.
+        self.n_slots = n_slots
+        self.memoize_read = memoize_read
+
+        # Allocated on first use: the row count and device are not known until
+        # the first forward pass reaches the cache.
+        self.table: Optional[QuantSlotTable] = None
+
+        # Active windows per row, as a HOST int. It is the same for every row —
+        # `compute_two_tier_retain` keeps exactly n_q = min(N_q, evictable_w -
+        # k_fp) windows and both terms derive from config + W, which are shared
+        # across rows (BATCHING_PLAN.md §3). Tracking it as an int (rather than
+        # slot_active.sum(1)) keeps get_seq_length() — which HF calls per layer
+        # per step and which must return an int — free of a device sync.
+        # `validate()` asserts it against the table.
+        self._n_active = 0
+
+        # Bumped by every mutation; read paths memoize against it. Entries are
+        # write-once (§10) and the active set only moves at eviction, so between
+        # evictions a read is bit-identical.
         self._version = 0
-        self._read_cache: Optional[Tuple[Any, Any]] = None
+        self._read_cache: Optional[Tuple] = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def ensure(self, batch_size: int, device: torch.device) -> QuantSlotTable:
+        """Allocate the slot table on first use; return it."""
+        if self.table is None:
+            self.table = QuantSlotTable(
+                batch_size=batch_size,
+                n_slots=self.n_slots,
+                window_size=self.window_size,
+                head_dim=self.head_dim,
+                num_kv_heads=self.num_kv_heads,
+                device=device,
+            )
+        elif self.table.batch_size != batch_size:
+            raise ValueError(
+                f"Q store was allocated for batch size {self.table.batch_size}, "
+                f"got {batch_size}; a cache instance serves one batch shape."
+            )
+        return self.table
 
     @property
     def version(self) -> int:
-        """Monotonic counter — changes iff the Q tier's contents changed.
-
-        Every mutator (:meth:`demote`, :meth:`reactivate`, :meth:`promote`,
-        :meth:`retain_only`) bumps it, and all four are only reachable from the
-        cache's eviction pass. A read path can therefore cache against this and
-        trust the result until the next eviction.
-        """
+        """Monotonic counter — changes iff the Q tier's contents changed."""
         return self._version
 
     def _invalidate(self) -> None:
@@ -69,282 +126,207 @@ class QuantizedStore:
 
     @property
     def num_active_windows(self) -> int:
-        return self.ledger.num_active
+        return self._n_active
 
     @property
     def num_active_tokens(self) -> int:
-        return self.ledger.num_active * self.window_size
+        return self._n_active * self.window_size
 
-    def active_ids(self) -> List[int]:
-        return self.ledger.active_ids()
+    def commit_active_count(self, n_active: int) -> None:
+        """Record the post-eviction active-window count (same for every row).
+
+        The cache knows this as a plain int before it touches a tensor — it is
+        ``n_q`` from the budget resolver — so the store never has to reduce
+        ``slot_active`` and sync to learn its own size.
+        """
+        self._n_active = n_active
+
+    def active_ids(self) -> Optional[Tensor]:
+        """``[B, n_active]`` active window ids, ascending per row. Diagnostics."""
+        if self.table is None:
+            return None
+        return self.table.active_wids(self._n_active)
+
+    # -- lookup / bookkeeping ------------------------------------------------
+
+    def lookup(self, wids: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Resolve ``[B, W]`` window ids to slots. See :meth:`QuantSlotTable.lookup`."""
+        return self.table.lookup(wids)
+
+    def retain_only(self, match: Tensor) -> None:
+        """Free slots for windows dropped outright (§6). ``match`` from :meth:`lookup`."""
+        self._invalidate()
+        self.table.retain_only(match)
+
+    def reactivate_many(self, slot_idx: Tensor, valid: Tensor) -> None:
+        """Re-demote dormant entries: dormant → active, no recompute (§10)."""
+        self._invalidate()
+        self.table.set_active(slot_idx, valid, True)
 
     # -- demotion ------------------------------------------------------------
 
-    def demote(
-        self,
-        window_id: int,
-        key_pre_rope: Tensor,
-        value: Tensor,
-        position_range: Tensor,
-    ) -> None:
-        """Demote one window into the Q tier.
-
-        First time for this ``window_id``: quantize keys (pre-RoPE) and values
-        once against a freshly-pinned grid and register an active ledger entry.
-        If a **dormant** entry already exists (a prior promotion), this is a
-        re-demotion — reactivate it and **ignore the passed tensors** (the codes
-        and grid are frozen; re-quantizing could flip boundary codes — §10).
-
-        Parameters
-        ----------
-        window_id : int
-            The window's ``original_window_id``.
-        key_pre_rope : Tensor
-            ``[H_kv, window, D]`` — pre-RoPE keys (already un-rotated by the
-            caller for a first demotion; unused on reactivation).
-        value : Tensor
-            ``[H_kv, window, D]`` values (unused on reactivation).
-        position_range : Tensor
-            ``[window]`` int64 original absolute positions (unused on
-            reactivation — the frozen entry already carries them).
-        """
-        self._invalidate()
-        if self.ledger.contains(window_id):
-            # Dormant entry exists → pure reactivation, no recompute.
-            self.ledger.reactivate(window_id)
-            return
-
-        self._quantize_and_register(window_id, key_pre_rope, value, position_range)
-
-    def reactivate(self, window_id: int) -> None:
-        """Re-demote a window that already has a (dormant) ledger entry (§10).
-
-        Pure reactivation — no dequant, no re-quantize, zero added error. Fails
-        if the window has no entry (a first demotion must go through
-        :meth:`demote`).
-        """
-        self._invalidate()
-        self.ledger.reactivate(window_id)
-
-    def has_entry(self, window_id: int) -> bool:
-        """True if the window has a ledger entry (active or dormant)."""
-        return self.ledger.contains(window_id)
-
-    def _quantize_and_register(
-        self, window_id: int, key_pre_rope: Tensor, value: Tensor, position_range: Tensor
-    ) -> None:
-        k_codes, k_scale, k_zero = quantize_key_window(key_pre_rope)
-        v_codes, v_scale, v_zero = quantize_value_window(value)
-        entry = LedgerEntry(
-            original_window_id=window_id,
-            key_codes=k_codes,
-            key_scale=k_scale,
-            key_zero=k_zero,
-            val_codes=v_codes,
-            val_scale=v_scale,
-            val_zero=v_zero,
-            position_range=position_range.to(torch.long).clone(),
-            active=True,
-        )
-        self.ledger.demote_new(entry)
-
     def demote_many(
         self,
-        window_ids: List[int],
+        slot_idx: Tensor,
+        valid: Tensor,
+        wid: Tensor,
         keys_pre_rope: Tensor,
         values: Tensor,
         position_ranges: Tensor,
     ) -> None:
-        """First-time demotion of N windows in one batched quantize (§5).
+        """First-time demotion of up to ``n`` windows per row, in one quantize.
 
-        Equivalent to :meth:`demote` per window — the batched quantizers are the
-        singular ones applied slice-wise — but pays one launch per tier instead
-        of one per window. Every id must be **new** (no ledger entry); callers
-        route reactivations through :meth:`reactivate`, which needs no quantize.
+        Every ``valid`` lane must be a window with **no** existing entry —
+        callers route re-demotions through :meth:`reactivate_many`, which never
+        re-quantizes (§10). Invalid lanes are quantized too (they ride the same
+        dense tensor) and then discarded by :meth:`QuantSlotTable.write`.
 
         Parameters
         ----------
-        window_ids : list of int
-            ``original_window_id`` per leading slice, in order.
-        keys_pre_rope, values : Tensor
-            ``[N, H_kv, window, D]``.
-        position_ranges : Tensor
-            ``[N, window]`` int64 original absolute positions.
+        slot_idx : ``[B, n]`` target slots, from :meth:`QuantSlotTable.free_slots`.
+        valid : ``[B, n]`` bool — real demotions.
+        wid : ``[B, n]`` int64 window ids (``-1`` on invalid lanes).
+        keys_pre_rope, values : ``[B, n, H_kv, window, D]``.
+        position_ranges : ``[B, n, window]`` int64 original absolute positions.
         """
-        if not window_ids:
-            return
         self._invalidate()
-        k_codes, k_scale, k_zero = quantize_key_windows(keys_pre_rope)
-        v_codes, v_scale, v_zero = quantize_value_windows(values)
-        pos = position_ranges.to(torch.long)
-        for i, wid in enumerate(window_ids):
-            self.ledger.demote_new(LedgerEntry(
-                original_window_id=wid,
-                key_codes=k_codes[i].contiguous(),
-                key_scale=k_scale[i].contiguous(),
-                key_zero=k_zero[i].contiguous(),
-                val_codes=v_codes[i].contiguous(),
-                val_scale=v_scale[i].contiguous(),
-                val_zero=v_zero[i].contiguous(),
-                position_range=pos[i].clone(),
-                active=True,
-            ))
+        B, n = slot_idx.shape
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
+
+        # Flatten (row, lane) into the quantizers' leading window axis. They
+        # treat it as opaque and reduce only over the quant group, so this is the
+        # singular op applied slice-wise — bit-identical, one launch per tier.
+        k_flat = keys_pre_rope.reshape(B * n, H, S, D)
+        v_flat = values.reshape(B * n, H, S, D)
+        k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
+        v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
+
+        self.table.write(
+            slot_idx, valid, wid,
+            k_codes, k_scale, k_zero,
+            v_codes, v_scale, v_zero,
+            position_ranges.to(torch.long),
+        )
 
     # -- promotion -----------------------------------------------------------
 
     def promote_many(
-        self, window_ids: List[int], out_dtype: torch.dtype
+        self, slot_idx: Tensor, valid: Tensor, out_dtype: torch.dtype
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """Promote N windows out of the Q tier in one batched dequantize (§5).
+        """Promote up to ``n`` windows per row out of the Q tier, in one dequantize.
 
-        Equivalent to :meth:`promote` per window, at one launch per tier instead
-        of one per window. Marks every entry dormant and returns the tier
-        stacked on a leading window axis, aligned with ``window_ids``.
+        Marks every ``valid`` entry dormant — **retained**, not freed, so a later
+        re-demotion is a pure reactivation (§10) — and returns the frozen record.
+        The caller applies RoPE at the returned positions and splices each window
+        into the fp store at its chronological slot (§5).
 
         Returns
         -------
-        keys_pre_rope : ``[N, H_kv, window, D]``
-        values : ``[N, H_kv, window, D]``
-        position_ranges : ``[N, window]`` int64
+        keys_pre_rope : ``[B, n, H_kv, window, D]``
+        values : ``[B, n, H_kv, window, D]``
+        position_ranges : ``[B, n, window]`` int64
         """
         self._invalidate()
-        entries = [self.ledger.get(w) for w in window_ids]
-        k_codes = torch.stack([e.key_codes for e in entries], dim=0)
-        k_scale = torch.stack([e.key_scale for e in entries], dim=0)
-        k_zero = torch.stack([e.key_zero for e in entries], dim=0)
-        v_codes = torch.stack([e.val_codes for e in entries], dim=0)
-        v_scale = torch.stack([e.val_scale for e in entries], dim=0)
-        v_zero = torch.stack([e.val_zero for e in entries], dim=0)
-        positions = torch.stack([e.position_range for e in entries], dim=0).to(torch.long)
+        B, n = slot_idx.shape
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
+        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(slot_idx)
         keys = dequantize_key_windows(
             k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
         )
         values = dequantize_value_windows(
             v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
         )
-        for w in window_ids:
-            self.ledger.deactivate(w)
-        return keys, values, positions
-
-    def promote(self, window_id: int, out_dtype: torch.dtype) -> Tuple[Tensor, Tensor, Tensor]:
-        """Promote one window out of the Q tier.
-
-        Marks the entry dormant (retained for a possible re-demotion) and
-        returns the dequantized **pre-RoPE** keys, values, and the frozen
-        ``position_range``. The caller applies RoPE at those positions and
-        splices the window into the fp store at its chronological slot (§5).
-
-        Returns
-        -------
-        key_pre_rope : ``[H_kv, window, D]``
-        value : ``[H_kv, window, D]``
-        position_range : ``[window]`` int64
-        """
-        e = self.ledger.get(window_id)
-        key_pre_rope = dequantize_key_window(
-            e.key_codes, e.key_scale, e.key_zero, self.window_size, out_dtype=out_dtype
+        self.table.set_active(slot_idx, valid, False)
+        return (
+            keys.reshape(B, n, H, S, D),
+            values.reshape(B, n, H, S, D),
+            pos.reshape(B, n, S),
         )
-        value = dequantize_value_window(
-            e.val_codes, e.val_scale, e.val_zero, self.head_dim, out_dtype=out_dtype
-        )
-        position_range = e.position_range.clone()
-        self._invalidate()
-        self.ledger.deactivate(window_id)
-        return key_pre_rope, value, position_range
 
     # -- read-path gather ----------------------------------------------------
-
-    def gather_active(
-        self, out_dtype: torch.dtype
-    ) -> Optional[Tuple[List[int], Tensor, Tensor, Tensor]]:
-        """Dequantize all **active** windows in chronological order.
-
-        Returns ``None`` when the Q tier is empty. Otherwise:
-
-        - ``window_ids`` : list of active ``original_window_id`` (ascending).
-        - ``keys_pre_rope`` : ``[N_q, H_kv, window, D]`` — pre-RoPE.
-        - ``values`` : ``[N_q, H_kv, window, D]``.
-        - ``position_ranges`` : ``[N_q, window]`` int64 original positions.
-        """
-        entries = self.ledger.active_entries()
-        if not entries:
-            return None
-
-        # Stack each frozen field into one dense tensor (a handful of constant
-        # launches, regardless of window count), then dequantize the whole tier
-        # in ONE batched call per tier — no per-window Python loop. On GPU the
-        # old singular-per-window loop was launch-bound (~70 dispatches/window);
-        # this path is flat at ~a dozen for any N_q. Numerics are unchanged:
-        # the batched dequant is the singular op applied slice-wise.
-        ids = [e.original_window_id for e in entries]
-        k_codes = torch.stack([e.key_codes for e in entries], dim=0)   # [N,H,D,S/2]
-        k_scale = torch.stack([e.key_scale for e in entries], dim=0)   # [N,H,D]
-        k_zero = torch.stack([e.key_zero for e in entries], dim=0)     # [N,H,D]
-        v_codes = torch.stack([e.val_codes for e in entries], dim=0)   # [N,H,S,D/2]
-        v_scale = torch.stack([e.val_scale for e in entries], dim=0)   # [N,H,S]
-        v_zero = torch.stack([e.val_zero for e in entries], dim=0)     # [N,H,S]
-        positions = torch.stack(
-            [e.position_range for e in entries], dim=0
-        ).to(torch.long)                                              # [N,window]
-
-        keys = dequantize_key_windows(
-            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
-        )                                                             # [N,H,window,D]
-        values = dequantize_value_windows(
-            v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
-        )                                                             # [N,H,window,D]
-
-        return ids, keys, values, positions
 
     def effective_q_tier(
         self, rope_module: torch.nn.Module, out_dtype: torch.dtype
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Read-ready Q tier: post-RoPE keys, values, and their positions.
 
-        Returns ``None`` for an empty tier, else a triple flattened
-        window-major over the active windows (ascending id):
+        Returns ``None`` for an empty tier, else a triple flattened window-major
+        over each row's active windows (ascending id):
 
-        - ``keys``     : ``[H_kv, N_q * window, D]`` — dequantized, RoPE'd at
+        - ``keys``     : ``[B, H_kv, N_q * window, D]`` — dequantized, RoPE'd at
           each window's frozen ``position_range``.
-        - ``values``   : ``[H_kv, N_q * window, D]``.
-        - ``positions``: ``[N_q * window]`` int64 original absolute positions.
+        - ``values``   : ``[B, H_kv, N_q * window, D]``.
+        - ``positions``: ``[B, N_q * window]`` int64 original absolute positions.
 
-        **Memoized on** :attr:`version`. Codes and grids are written once at
-        first demotion and ``position_range`` is never rebased (§10), so the
-        dequant + RoPE are bit-identical until the ledger next changes — and the
-        ledger only changes at eviction. Recomputing per decode step re-ran the
-        whole tier's dequant and RoPE for a result that could not have moved:
-        at ``window_size = 8`` that is wasted on 7 of every 8 steps, and the
-        tier is the large one (int4 holds the *majority* of retained windows).
+        **Memoized on** :attr:`version` when :attr:`memoize_read` is set. Codes
+        and grids are written once at first demotion and ``position_range`` is
+        never rebased (§10), so the dequant + RoPE are bit-identical until the
+        ledger next changes — and it only changes at eviction. At
+        ``window_size = 8`` that makes 7 of every 8 decode steps a cache hit on
+        the *large* tier (int4 holds the majority of retained windows).
+
+        The memo is not free: it holds the whole tier **dequantized to fp16**,
+        which is ~4x the int4 codes it was computed from, per layer, for the
+        whole decode. At B = 1 that is invisible against the weights and the
+        method is weight-bound anyway (BATCHING_PLAN.md §5), so it is pure win.
+        At B > 1 it is charged per row and competes directly with batch capacity
+        — which is the entire thesis — so the cache defaults it **off** there.
+        See ``WindowedCacheConfig.quant_memoize_read``.
         """
-        key = (self._version, out_dtype)
-        if self._read_cache is not None and self._read_cache[0] == key:
-            return self._read_cache[1]
-
-        gathered = self.gather_active(out_dtype=out_dtype)
-        if gathered is None:
-            self._read_cache = (key, None)
+        if self.table is None or self._n_active == 0:
             return None
+
+        key = (self._version, out_dtype)
+        if (
+            self.memoize_read
+            and self._read_cache is not None
+            and self._read_cache[0] == key
+        ):
+            return self._read_cache[1]
 
         # Local import: `effective` owns the RoPE primitives and imports nothing
         # from this module, so this cannot cycle.
         from .effective import rotate_key_window
 
-        _, keys_pre, values, positions = gathered
-        n_q, h_kv, s, d = keys_pre.shape
-        k_flat = keys_pre.permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
-        pos_flat = positions.reshape(n_q * s)
+        idx = self.table.active_order(self._n_active)          # [B, n_q] slots
+        B, n = idx.shape
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
+
+        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(idx)
+        keys_pre = dequantize_key_windows(
+            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
+        )                                                      # [B*n, H, S, D]
+        values = dequantize_value_windows(
+            v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
+        )
+
+        # Window-major -> token-major: [B, n, H, S, D] -> [B, H, n*S, D]. RoPE is
+        # per-token pointwise, so rotating all n_q windows in ONE call is
+        # bit-identical to n_q per-window calls at a single launch.
+        k_flat = keys_pre.reshape(B, n, H, S, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * S, D)
+        v_flat = values.reshape(B, n, H, S, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * S, D)
+        pos_flat = pos.reshape(B, n * S)
+
         keys = rotate_key_window(k_flat, pos_flat, rope_module).to(out_dtype)
-        vals = values.to(out_dtype).permute(1, 0, 2, 3).reshape(h_kv, n_q * s, d)
+        vals = v_flat.to(out_dtype)
 
         result = (keys, vals, pos_flat)
-        self._read_cache = (key, result)
+        if self.memoize_read:
+            self._read_cache = (key, result)
         return result
 
-    # -- eviction bookkeeping ------------------------------------------------
+    # -- invariants (tests) --------------------------------------------------
 
-    def retain_only(self, keep_ids) -> None:
-        """Free ledger entries whose window was dropped outright (§6)."""
-        self._invalidate()
-        self.ledger.retain_only(keep_ids)
+    def validate(self) -> None:
+        """Assert the store's invariants. Test-only — syncs."""
+        if self.table is None:
+            assert self._n_active == 0
+            return
+        self.table.validate()
+        counts = self.table.slot_active.sum(1)
+        assert bool((counts == self._n_active).all()), (
+            f"commit_active_count({self._n_active}) disagrees with the table "
+            f"({counts.tolist()}) — the retained Q count must be identical "
+            f"across rows (BATCHING_PLAN.md §3)"
+        )

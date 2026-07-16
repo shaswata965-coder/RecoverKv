@@ -156,6 +156,29 @@ class EvictionPolicy:
     # Two-tier retain + tier assignment (design.md §5) — q > 0 only, B = 1
     # -----------------------------------------------------------------
 
+    def tier_counts(self, W: int) -> "tuple[int, int, int]":
+        """``(k_fp, n_q, local_w)`` for a merged axis of ``W`` windows.
+
+        **Host ints, and identical for every row** — that is the load-bearing
+        fact behind batching (BATCHING_PLAN.md §3). Both counts derive only from
+        the resolved config and ``W`` (the scores tensor's width, shared across
+        the batch), never from the scores themselves. So rows evict *divergently*
+        — different windows — but always retain the **same number** of fp and Q
+        windows. ``T_fp`` and ``T_q`` are therefore equal across rows and the
+        effective K/V stays a dense ``[B, H_kv, T_total, D]``: no padding, no
+        keep-mask, no raggedness (as long as prompts are equal-length).
+
+        The cache also uses these as loop-free tensor widths and to size the fp
+        store, so it never has to sync to learn its own shapes.
+        """
+        local_w = min(self.local_windows, W)
+        evictable_w = W - local_w
+        if evictable_w <= 0:
+            return 0, 0, local_w
+        k_fp = min(self.top_k_fp, evictable_w)
+        n_q = min(self.N_q, evictable_w - k_fp)
+        return k_fp, n_q, local_w
+
     def compute_two_tier_retain(
         self, window_scores: Tensor
     ) -> "tuple[Tensor, Tensor]":
@@ -185,7 +208,7 @@ class EvictionPolicy:
         W = window_scores.shape[2]
         device = window_scores.device
 
-        local_w = min(self.local_windows, W)
+        k_fp, n_q, local_w = self.tier_counts(W)
         evictable_w = W - local_w
         local_idx = torch.arange(W - local_w, W, device=device, dtype=torch.long)
         local_tier = torch.zeros(local_w, device=device, dtype=torch.long)
@@ -195,9 +218,6 @@ class EvictionPolicy:
 
         mean = window_scores.mean(dim=1)[0]        # [W]
         ev_scores = mean[:evictable_w]
-
-        k_fp = min(self.top_k_fp, evictable_w)
-        n_q = min(self.N_q, evictable_w - k_fp)
 
         # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
         order = torch.argsort(ev_scores, descending=True)

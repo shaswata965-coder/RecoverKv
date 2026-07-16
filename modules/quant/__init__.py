@@ -14,10 +14,13 @@ Design realities baked in (design.md):
   rerotation, no position override (§5).
 - **Pinned grid by identity.** A window's int4 codes + fp16 scale/zero are
   written exactly once (first demotion) and never recomputed. A re-demotion
-  reactivates the dormant ledger entry; it never re-quantizes (§3, §10).
-- **v1 is batch-size 1.** ``materialize_effective_kv`` runs per row and the
-  ledger/store carry no batch axis; callers guard ``q > 0`` to ``B == 1``
-  (design.md §10).
+  reactivates the dormant slot; it never re-quantizes (§3, §10).
+- **The Q tier carries a batch axis.** Rows evict divergently — row 0 may hold
+  windows ``{1, 5}`` in int4 while row 1 holds ``{4, 11}`` — so the per-window
+  record lives in a dense ``[B, N_slots, ...]`` slot table
+  (:mod:`modules.quant.slots`), not a host-side dict keyed by window id. The
+  retained counts stay equal across rows, so the effective K/V is dense and
+  needs no padding (BATCHING_PLAN.md §3).
 """
 
 from __future__ import annotations
@@ -44,21 +47,23 @@ __all__ = [
     "unpack_nibbles_last",
 ]
 
-# Ledger / store / effective are re-exported once written (see build order).
+# Slots / store / effective are re-exported once written (see build order).
 try:  # pragma: no cover - populated incrementally during bring-up
-    from .ledger import LedgerEntry, QuantLedger  # noqa: F401
+    from .slots import QuantSlotTable, n_slots_for  # noqa: F401
     from .store import QuantizedStore  # noqa: F401
     from .effective import (  # noqa: F401
         materialize_effective_kv,
+        rotate_key_window,
         unrotate_key_window,
         window_id_of,
     )
 
     __all__ += [
-        "LedgerEntry",
-        "QuantLedger",
+        "QuantSlotTable",
+        "n_slots_for",
         "QuantizedStore",
         "materialize_effective_kv",
+        "rotate_key_window",
         "unrotate_key_window",
         "window_id_of",
     ]

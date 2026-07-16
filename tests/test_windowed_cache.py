@@ -657,6 +657,110 @@ class TestHooks:
 
 
 # ---------------------------------------------------------------------------
+# fp-store preallocation (BATCHING_PLAN.md §5)
+# ---------------------------------------------------------------------------
+
+
+class TestPreallocation:
+    """The fp store is sized once and appended into — never re-cat per step.
+
+    ``append`` used to ``torch.cat([key_states, key], dim=2)`` every decode step,
+    per layer, copying the whole store to add one token. At B=1 that is ~0.2% of
+    runtime (invisible, which is why it survived); at max batch the copy is ~4x
+    the weight traffic and the largest single term in the step, and it doubles
+    peak VRAM at the moment of copy — which caps the batch size directly.
+    """
+
+    def test_append_does_not_reallocate_within_capacity(self):
+        st = CacheState(capacity=64)
+        k = torch.randn(2, 4, 8, 16)
+        st.append(k, k.clone(), torch.arange(8))
+        ptr = st._key_buf.data_ptr()
+        for i in range(20):
+            k1 = torch.randn(2, 4, 1, 16)
+            st.append(k1, k1.clone(), torch.arange(8 + i, 9 + i))
+        assert st._key_buf.data_ptr() == ptr, "append reallocated the fp store"
+        assert st.buffer_capacity == 64
+        assert st.seq_length == 28
+
+    def test_appended_content_is_exact(self):
+        st = CacheState(capacity=32)
+        k0 = torch.randn(1, 2, 5, 4)
+        st.append(k0, k0.clone() * 2, torch.arange(5))
+        k1 = torch.randn(1, 2, 3, 4)
+        st.append(k1, k1.clone() * 2, torch.arange(5, 8))
+        assert torch.equal(st.key_states, torch.cat([k0, k1], dim=2))
+        assert torch.equal(st.value_states, torch.cat([k0 * 2, k1 * 2], dim=2))
+        assert st.position_ids[0].tolist() == list(range(8))
+
+    def test_grows_when_capacity_hint_is_undersized(self):
+        """An under-sized hint costs a realloc, never correctness."""
+        st = CacheState(capacity=4)
+        k = torch.randn(1, 2, 8, 4)
+        st.append(k, k.clone(), torch.arange(8))
+        assert st.buffer_capacity >= 8
+        assert torch.equal(st.key_states, k)
+        k1 = torch.randn(1, 2, 6, 4)
+        st.append(k1, k1.clone(), torch.arange(8, 14))
+        assert st.seq_length == 14
+        assert torch.equal(st.key_states, torch.cat([k, k1], dim=2))
+
+    def test_prefill_buffer_is_released_at_first_compaction(self):
+        """The store settles at the BUDGET, not at the prefill size.
+
+        This is the whole point of preallocating an evicting cache. StaticCache
+        sizes to prefill + max_new because it never evicts; doing that here would
+        hold the fp store at its un-evicted size forever (~708 MB/row vs ~74
+        MB/row on Llama-3.1-8B at the qasper steady state) and cap the batch ~6x
+        below what compression is supposed to buy — i.e. preallocation would cost
+        more than the per-step cat it removes.
+        """
+        budget = 16
+        st = CacheState(capacity=budget, prefill_capacity=256)
+        k = torch.randn(1, 2, 250, 4)
+        st.append(k, k.clone(), torch.arange(250))
+        assert st.buffer_capacity == 256, "prompt must be resident before eviction"
+
+        # First compaction: down to the budget, and the big buffer is gone.
+        st.slice_and_keep(torch.arange(8).unsqueeze(0))
+        assert st.buffer_capacity == budget
+        assert torch.equal(st.key_states, k[:, :, :8])
+
+        # Steady state: appends and further evictions never touch the allocator.
+        ptr = st._key_buf.data_ptr()
+        for i in range(6):
+            k1 = torch.randn(1, 2, 1, 4)
+            st.append(k1, k1.clone(), torch.arange(250 + i, 251 + i))
+        st.slice_and_keep(torch.arange(8).unsqueeze(0))
+        assert st._key_buf.data_ptr() == ptr, "steady state reallocated"
+        assert st.buffer_capacity == budget
+
+    def test_replace_rejects_aliasing_the_buffer(self):
+        """replace() from a view of its own buffer must not self-overlap."""
+        st = CacheState(capacity=16)
+        k = torch.randn(1, 2, 8, 4)
+        st.append(k, k.clone(), torch.arange(8))
+        # A view of the live store, reversed — a self-overlapping copy if naive.
+        rev = st.key_states.flip(2).contiguous()
+        st.replace(st.key_states[:, :, :4], st.value_states[:, :, :4],
+                   st.position_ids[:, :4])
+        assert st.seq_length == 4
+        assert torch.equal(st.key_states, k[:, :, :4])
+        assert rev.shape[2] == 8  # untouched
+
+    def test_slice_and_keep_reuses_the_buffer(self):
+        st = CacheState(capacity=64)
+        k = torch.randn(1, 2, 8, 4)
+        st.append(k, k.clone(), torch.arange(8))
+        ptr = st._key_buf.data_ptr()
+        st.slice_and_keep(torch.tensor([[1, 3, 5, 7]]))
+        assert st._key_buf.data_ptr() == ptr, "compaction reallocated the fp store"
+        assert st.seq_length == 4
+        assert torch.equal(st.key_states, k[:, :, [1, 3, 5, 7]])
+        assert st.position_ids[0].tolist() == [1, 3, 5, 7]
+
+
+# ---------------------------------------------------------------------------
 # Batching — per-row independence under divergent eviction
 # ---------------------------------------------------------------------------
 

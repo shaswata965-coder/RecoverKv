@@ -50,6 +50,19 @@ def _make_cache(quant_ratio=0.5, ws=2, num_sink=0, prefill_len=8):
     )
 
 
+def _active(store):
+    """Active Q window ids for row 0, as a plain sorted list."""
+    ids = store.active_ids()
+    return [] if ids is None else ids[0].tolist()
+
+
+def _codes_of(store, wid, row=0):
+    """The stored int4 key codes for a window id (active or dormant)."""
+    has, _, slot, _ = store.lookup(torch.tensor([[wid]], dtype=torch.long))
+    assert bool(has[0, 0]), f"window {wid} has no slot-table entry"
+    return store.table.key_codes[row, slot[0, 0]]
+
+
 def _seed_prefill_state(cache, n_win=4, ws=2, num_sink=0, H=2, D=4):
     """Populate layer-0 state as if prefill produced n_win full windows."""
     T = num_sink + n_win * ws
@@ -59,10 +72,11 @@ def _seed_prefill_state(cache, n_win=4, ws=2, num_sink=0, H=2, D=4):
     k_pre = torch.randn(H, T, D)
     v = torch.randn(H, T, D)
     k_post = rotate_key_window(k_pre, pos, rope)
-    st = cache._states[0]
-    st.key_states = k_post.unsqueeze(0).clone()
-    st.value_states = v.unsqueeze(0).clone()
-    st.position_ids = pos.unsqueeze(0).clone()
+    # replace(), not attribute assignment: the fp store is preallocated and the
+    # buffers are what append/evict actually read.
+    cache._states[0].replace(
+        k_post.unsqueeze(0).clone(), v.unsqueeze(0).clone(), pos.unsqueeze(0).clone()
+    )
     return k_pre, v, k_post, pos
 
 
@@ -95,7 +109,7 @@ def test_first_eviction_demotes_and_materializes():
     store = cache._stores[0]
 
     # w1 is the sole Q window; w2 dropped; fp store holds w0 + w3.
-    assert store.active_ids() == [1]
+    assert _active(store) == [1]
     assert st.position_ids[0].tolist() == [0, 1, 6, 7]         # w0 ‖ w3
     assert torch.equal(st.key_states[0][:, :2], k_post[:, 0:2])  # w0 untouched fp
     assert torch.equal(st.key_states[0][:, 2:], k_post[:, 6:8])  # w3 untouched fp
@@ -124,7 +138,7 @@ def test_redemotion_after_promotion_reactivates():
     pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
     cache._evict_two_tier(0, step=2)
     store = cache._stores[0]
-    codes_before = store.ledger.get(1).key_codes.clone()
+    codes_before = _codes_of(store, 1).clone()
 
     # Now promote w1 back: fp store = [w0(0,1), w1(2,3), w3(6,7)] merged [0,1,3],
     # rank so w1 stays top → both w0,w1 fp (top_k_fp=2), w3 local.
@@ -135,8 +149,8 @@ def test_redemotion_after_promotion_reactivates():
     cache._evict_two_tier(0, step=4)
 
     # w1 promoted → dormant, fp store now holds it again at positions 2,3.
-    assert store.active_ids() == []
-    assert store.ledger.num_dormant == 1
+    assert _active(store) == []
+    assert int(store.table.n_live[0]) == 1  # dormant, retained not freed
     assert st.position_ids[0].tolist() == [0, 1, 2, 3, 6, 7]
 
     # Re-demote w1 (drop w0, keep w1 in Q): codes must be bit-identical (no requant).
@@ -145,14 +159,124 @@ def test_redemotion_after_promotion_reactivates():
     st.original_window_ids = torch.tensor([[0, 1, 3]])
     pol.top_k_fp, pol.N_q, pol.local_windows = 0, 1, 1
     cache._evict_two_tier(0, step=6)
-    assert store.active_ids() == [1]
-    assert torch.equal(store.ledger.get(1).key_codes, codes_before)
+    assert _active(store) == [1]
+    assert torch.equal(_codes_of(store, 1), codes_before)
 
 
 def test_q0_store_is_none():
     cache = _make_cache(quant_ratio=0.0)
     assert cache._stores[0] is None
     assert cache._q == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Slot table + fp-rebuild invariants (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _windows_of(positions, num_sink, ws):
+    """Group absolute positions into {window_id: sorted positions}."""
+    out = {}
+    for p in positions:
+        if p < num_sink:
+            continue
+        out.setdefault((p - num_sink) // ws, []).append(p)
+    return out
+
+
+def test_eviction_preserves_whole_windows():
+    """Every retained window survives WHOLE, in both tiers, with no dup or loss.
+
+    This is the real check on the fp rebuild. Its new-body length is pure config
+    arithmetic (``k_fp*ws + local_tokens``) rather than a mask count — no host
+    sync — which is only correct if the fp store really is
+    ``[sink ‖ full windows by id ‖ possibly-partial newest]``. If that assumption
+    ever breaks, the rebuild silently slices at the wrong offsets and windows
+    come out shredded — so assert on window integrity, not on the length.
+    """
+    ws, num_sink, H, D = 2, 0, 2, 4
+    prefill = 8
+    cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=num_sink, prefill_len=prefill)
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 2, 2, 1
+    store = cache._stores[0]
+
+    torch.manual_seed(7)
+    kp = torch.randn(1, H, prefill, D)
+    cache.update(kp, kp.clone(), 0, cache_kwargs={
+        "cache_position": torch.arange(prefill),
+        "window_scores": torch.rand(1, H, _merged_W(cache, ws, num_sink, prefill)),
+    })
+
+    saw_q = False
+    for t in range(prefill, prefill + 20):
+        k1 = torch.randn(1, H, 1, D)
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        cache.update(k1, k1.clone(), 0, cache_kwargs={
+            "cache_position": torch.arange(t, t + 1),
+            "window_scores": torch.rand(1, H, W),
+        })
+        st = cache._states[0]
+        fp_pos = st.position_ids[0].tolist()
+        assert fp_pos == sorted(fp_pos), "fp store must stay chronological"
+        assert len(set(fp_pos)) == len(fp_pos), "fp store duplicated a token"
+
+        q_pos = []
+        if store.num_active_windows:
+            saw_q = True
+            order = store.table.active_order(store.num_active_windows)
+            q_pos = store.table.slot_pos[0][order[0]].reshape(-1).tolist()
+
+        assert not (set(fp_pos) & set(q_pos)), "a token is in BOTH tiers"
+
+        # A window lives wholly in one tier and is never split or truncated —
+        # except the newest, which is still filling up.
+        newest = max(_windows_of(fp_pos + q_pos, num_sink, ws), default=-1)
+        for wid, ps in _windows_of(fp_pos, num_sink, ws).items():
+            if wid != newest:
+                assert len(ps) == ws, f"fp window {wid} has {len(ps)}/{ws} tokens"
+        for wid, ps in _windows_of(q_pos, num_sink, ws).items():
+            assert len(ps) == ws, f"Q window {wid} has {len(ps)}/{ws} tokens"
+
+        store.validate()
+
+    assert saw_q, "Q tier never populated — demotion path not exercised"
+
+
+def test_slot_table_stays_within_its_bound():
+    """Live entries never exceed top_k_fp + N_q — the bound n_slots_for relies on.
+
+    If this ever failed, free_slots() would hand out an occupied slot and a live
+    window's codes would be silently overwritten, so it is worth asserting
+    rather than trusting the derivation.
+    """
+    ws, num_sink, H, D = 2, 0, 2, 4
+    prefill = 8
+    cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=num_sink, prefill_len=prefill)
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 2, 2, 1
+    store = cache._stores[0]
+    bound = pol.top_k_fp + pol.N_q
+
+    torch.manual_seed(11)
+    kp = torch.randn(1, H, prefill, D)
+    cache.update(kp, kp.clone(), 0, cache_kwargs={
+        "cache_position": torch.arange(prefill),
+        "window_scores": torch.rand(1, H, _merged_W(cache, ws, num_sink, prefill)),
+    })
+    for t in range(prefill, prefill + 24):
+        k1 = torch.randn(1, H, 1, D)
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        cache.update(k1, k1.clone(), 0, cache_kwargs={
+            "cache_position": torch.arange(t, t + 1),
+            "window_scores": torch.rand(1, H, W),
+        })
+        if store.table is not None:
+            assert int(store.table.n_live.max()) <= bound, (
+                f"live entries exceeded top_k_fp + N_q = {bound}"
+            )
+            assert store.table.n_slots >= bound
+            store.validate()
 
 
 # ---------------------------------------------------------------------------
@@ -266,5 +390,5 @@ def test_flash_eager_two_tier_parity():
         ek, ev = eager.update(k1.clone(), v1.clone(), 0,
                               cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
         assert torch.equal(fk, ek) and torch.equal(fv, ev)
-        assert flash._stores[0].active_ids() == eager._stores[0].active_ids()
+        assert _active(flash._stores[0]) == _active(eager._stores[0])
         assert flash.get_seq_length(0) == eager.get_seq_length(0)

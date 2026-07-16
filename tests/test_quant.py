@@ -174,62 +174,127 @@ class TestRoPEInverse:
         assert torch.allclose(k_back, k_post, atol=1e-5)
 
 
+def _store(ws=4, D=8, H=2, n_slots=8, B=1):
+    s = QuantizedStore(window_size=ws, head_dim=D, num_kv_heads=H, n_slots=n_slots)
+    s.ensure(B, torch.device("cpu"))
+    return s
+
+
+def _demote_one(store, wid, k_pre, v, pos, row=0):
+    """Demote a single window through the batched API (B=1, one lane)."""
+    B = store.table.batch_size
+    slot = store.table.free_slots(1)
+    valid = torch.zeros(B, 1, dtype=torch.bool)
+    valid[row, 0] = True
+    w = torch.full((B, 1), -1, dtype=torch.long)
+    w[row, 0] = wid
+    store.demote_many(
+        slot, valid, w,
+        k_pre.unsqueeze(0).unsqueeze(0).expand(B, 1, *k_pre.shape),
+        v.unsqueeze(0).unsqueeze(0).expand(B, 1, *v.shape),
+        pos.unsqueeze(0).unsqueeze(0).expand(B, 1, pos.shape[0]),
+    )
+    store.commit_active_count(store.num_active_windows + 1)
+    return slot
+
+
+def _slot_of(store, wid):
+    w = torch.tensor([[wid]], dtype=torch.long)
+    has, active, slot, _ = store.lookup(w)
+    return has[0, 0].item(), active[0, 0].item(), slot
+
+
 class TestStore:
     def _make_window(self, H=2, W=4, D=8, seed=0):
         g = torch.Generator().manual_seed(seed)
         return torch.randn(H, W, D, generator=g)
 
     def test_demote_promote_roundtrip(self):
-        store = QuantizedStore(window_size=4, head_dim=8, num_kv_heads=2)
+        store = _store()
         k_pre = self._make_window(seed=1)
         v = self._make_window(seed=2)
         pos = torch.arange(8, 12, dtype=torch.long)
-        store.demote(5, k_pre, v, pos)
+        _demote_one(store, 5, k_pre, v, pos)
         assert store.num_active_windows == 1
-        k_hat, v_hat, pos_out = store.promote(5, out_dtype=torch.float32)
-        assert torch.equal(pos_out, pos)
-        # promotion made it dormant
+
+        has, active, slot = _slot_of(store, 5)
+        assert has and active
+        valid = torch.ones(1, 1, dtype=torch.bool)
+        k_hat, v_hat, pos_out = store.promote_many(slot, valid, out_dtype=torch.float32)
+        store.commit_active_count(0)
+        assert torch.equal(pos_out[0, 0], pos)
+        # promotion made it dormant — entry retained, not freed (§6, §10)
         assert store.num_active_windows == 0
-        assert store.ledger.num_dormant == 1
+        has, active, _ = _slot_of(store, 5)
+        assert has and not active
+        assert int(store.table.n_live[0]) == 1
         # dequant error bounded
+        k_hat = k_hat[0, 0]
         rngk = k_pre.amax(1, keepdim=True) - k_pre.amin(1, keepdim=True)
         assert torch.all((k_hat - k_pre).abs().amax(1) <= rngk.squeeze(1) / 30.0 * 1.05 + 1e-3)
 
     def test_redemotion_reactivates_no_requantize(self):
-        store = QuantizedStore(window_size=4, head_dim=8, num_kv_heads=2)
+        store = _store()
         k_pre = self._make_window(seed=3)
         v = self._make_window(seed=4)
         pos = torch.arange(0, 4, dtype=torch.long)
-        store.demote(7, k_pre, v, pos)
-        codes_before = store.ledger.get(7).key_codes.clone()
+        slot = _demote_one(store, 7, k_pre, v, pos)
+        codes_before = store.table.key_codes[0, slot[0, 0]].clone()
 
-        # promote (dormant) then re-demote with DIFFERENT tensors — must be ignored.
-        store.promote(7, out_dtype=torch.float32)
-        garbage = torch.randn(2, 4, 8) * 99.0
-        store.demote(7, garbage, garbage, torch.arange(500, 504))
-        assert store.num_active_windows == 1
-        codes_after = store.ledger.get(7).key_codes
-        assert torch.equal(codes_before, codes_after)          # codes never changed
-        assert torch.equal(store.ledger.get(7).position_range, pos)  # positions frozen
+        # promote (dormant), then re-demote: reactivation is a bit flip and must
+        # not touch the codes or the frozen position_range (§10).
+        valid = torch.ones(1, 1, dtype=torch.bool)
+        store.promote_many(slot, valid, out_dtype=torch.float32)
+        store.commit_active_count(0)
 
-    def test_demote_new_twice_raises(self):
-        store = QuantizedStore(window_size=4, head_dim=8, num_kv_heads=2)
+        has, active, slot2 = _slot_of(store, 7)
+        assert has and not active
+        store.reactivate_many(slot2, valid)
+        store.commit_active_count(1)
+
+        has, active, _ = _slot_of(store, 7)
+        assert has and active
+        codes_after = store.table.key_codes[0, slot[0, 0]]
+        assert torch.equal(codes_before, codes_after)              # codes never changed
+        assert torch.equal(store.table.slot_pos[0, slot[0, 0]], pos)  # positions frozen
+        store.validate()
+
+    def test_slot_table_invariants_hold(self):
+        store = _store()
         k = self._make_window()
-        store.demote(1, k, k, torch.arange(4))
-        # active entry already exists; demote() reactivate-path only fires for
-        # DORMANT entries, so demoting an active id is a no-op reactivation error.
-        with pytest.raises(ValueError):
-            store.ledger.reactivate(1)
+        _demote_one(store, 1, k, k, torch.arange(4))
+        _demote_one(store, 2, k, k, torch.arange(4, 8))
+        store.validate()
+        # distinct ids land in distinct slots; free slots stay free
+        assert int(store.table.n_live[0]) == 2
+        assert torch.equal(store.active_ids(), torch.tensor([[1, 2]]))
+
+    def test_retain_only_frees_dropped_and_keeps_dormant(self):
+        """A dropped window's slot is freed; a promoted (dormant) one is not (§6)."""
+        store = _store()
+        k = self._make_window()
+        _demote_one(store, 1, k, k, torch.arange(4))
+        _demote_one(store, 2, k, k, torch.arange(4, 8))
+        assert int(store.table.n_live[0]) == 2
+
+        # Retain only window 1 -> window 2's slot is freed outright.
+        _, _, _, match = store.lookup(torch.tensor([[1]]))
+        store.retain_only(match)
+        store.commit_active_count(1)
+        assert int(store.table.n_live[0]) == 1
+        assert not _slot_of(store, 2)[0]
+        assert _slot_of(store, 1)[0]
+        store.validate()
 
 
 class TestMaterialize:
     def test_empty_qtier_returns_fp_unchanged(self):
         H, T, D = 2, 10, 8
-        store = QuantizedStore(window_size=4, head_dim=8, num_kv_heads=2)
+        store = _store(ws=4, D=8, H=2)
         rope = _RealRoPE(D)
-        fp_k = torch.randn(H, T, D)
-        fp_v = torch.randn(H, T, D)
-        fp_pos = torch.arange(T, dtype=torch.long)
+        fp_k = torch.randn(1, H, T, D)
+        fp_v = torch.randn(1, H, T, D)
+        fp_pos = torch.arange(T, dtype=torch.long).unsqueeze(0)
         eff_k, eff_v = materialize_effective_kv(
             fp_k, fp_v, fp_pos, store, num_sink=2, window_size=4, rope_module=rope
         )
@@ -253,7 +318,7 @@ class TestMaterialize:
         # reference full-fp keys (post-RoPE)
         k_post_all = rotate_key_window(k_pre_all, pos_all, rope)
 
-        store = QuantizedStore(window_size=ws, head_dim=D, num_kv_heads=H)
+        store = _store(ws=ws, D=D, H=H)
         q_windows = {1, 3}
         # build fp store = sink + fp windows (ids 0,2) in chronological order
         fp_k_parts = [k_post_all[:, :num_sink]]
@@ -264,20 +329,21 @@ class TestMaterialize:
             e = s + ws
             if w in q_windows:
                 # demote: store pre-RoPE keys + values + original positions
-                store.demote(w, k_pre_all[:, s:e], v_all[:, s:e], pos_all[s:e])
+                _demote_one(store, w, k_pre_all[:, s:e], v_all[:, s:e], pos_all[s:e])
             else:
                 fp_k_parts.append(k_post_all[:, s:e])
                 fp_v_parts.append(v_all[:, s:e])
                 fp_pos_parts.append(pos_all[s:e])
-        fp_k = torch.cat(fp_k_parts, dim=1)
-        fp_v = torch.cat(fp_v_parts, dim=1)
-        fp_pos = torch.cat(fp_pos_parts, dim=0)
+        fp_k = torch.cat(fp_k_parts, dim=1).unsqueeze(0)
+        fp_v = torch.cat(fp_v_parts, dim=1).unsqueeze(0)
+        fp_pos = torch.cat(fp_pos_parts, dim=0).unsqueeze(0)
 
         eff_k, eff_v = materialize_effective_kv(
             fp_k, fp_v, fp_pos, store, num_sink=num_sink, window_size=ws,
             rope_module=rope, out_dtype=torch.float32,
         )
-        assert eff_k.shape == (H, T, D)
+        assert eff_k.shape == (1, H, T, D)
+        eff_k, eff_v = eff_k[0], eff_v[0]
         # fp windows (sink, w0, w2) must be byte-identical; Q windows within error.
         assert torch.equal(eff_k[:, :num_sink], k_post_all[:, :num_sink])
         # whole-sequence closeness (Q windows carry int4 error only)
