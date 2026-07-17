@@ -287,28 +287,30 @@ class QuantizedStore:
 
         # Local import: `effective` owns the RoPE primitives and imports nothing
         # from this module, so this cannot cycle.
-        from .effective import rotate_key_window
+        from .effective import dequant_rotate_q_keys
 
         idx = self.table.active_order(self._n_active)          # [B, n_q] slots
         B, n = idx.shape
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
         k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(idx)
-        keys_pre = dequantize_key_windows(
-            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
-        )                                                      # [B*n, H, S, D]
+
+        # Keys: dequant + RoPE fused into one (optionally compiled) kernel — the
+        # ~20-launch elementwise chain that dominates the per-step read path
+        # (design §8). Window-major -> token-major and the per-token RoPE happen
+        # inside; bit-identical to the old dequant-then-rotate_key_window pair.
+        pos_flat = pos.reshape(B, n * S)
+        keys = dequant_rotate_q_keys(
+            k_codes, k_scale, k_zero, self.window_size, pos_flat,
+            rope_module, out_dtype, B, n, H, D,
+        )
+
+        # Values carry no RoPE (asymmetric store) — just dequant, then
+        # window-major -> token-major: [B, n, H, S, D] -> [B, H, n*S, D].
         values = dequantize_value_windows(
             v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
         )
-
-        # Window-major -> token-major: [B, n, H, S, D] -> [B, H, n*S, D]. RoPE is
-        # per-token pointwise, so rotating all n_q windows in ONE call is
-        # bit-identical to n_q per-window calls at a single launch.
-        k_flat = keys_pre.reshape(B, n, H, S, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * S, D)
         v_flat = values.reshape(B, n, H, S, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * S, D)
-        pos_flat = pos.reshape(B, n * S)
-
-        keys = rotate_key_window(k_flat, pos_flat, rope_module).to(out_dtype)
         vals = v_flat.to(out_dtype)
 
         result = (keys, vals, pos_flat)

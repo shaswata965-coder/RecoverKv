@@ -351,7 +351,9 @@ class WindowedCache(_HFCacheBase):
             retained_window_idx = policy.compute_retain_window_indices(
                 state.window_scores
             )
-            retain_token_idx = policy.expand_to_token_indices(retained_window_idx)
+            retain_token_idx = policy.expand_to_token_indices(
+                retained_window_idx, state.window_scores.shape[2]
+            )
 
             # Telemetry
             self.telemetry.record_scores(
@@ -616,8 +618,21 @@ class WindowedCache(_HFCacheBase):
         n_ev_fp_cur = W - local_w - n_q_prev            # evictable windows in fp now
         new_body_len = k_fp * ws + (T_body - n_ev_fp_cur * ws)
         i = torch.arange(new_body_len, device=device)
-        jj = (i // ws).unsqueeze(0).expand(B, -1)                      # [B, T_new]
-        off = (i % ws).unsqueeze(0)                                    # [1, T_new]
+        # The newest kept window can run LONGER than ws. When T_body is not a whole
+        # number of windows, the trailing partial window has no score column of its
+        # own yet, so the retain step (which works on the W scored windows) never
+        # counts it — physically it sits right after the newest retained window in
+        # the chronological body. Addressing it as a phantom rank n_fp would gather
+        # out of bounds (start_of_rank has only n_fp entries), so clamp the rank to
+        # the last kept window and let its offset run past ws: those <= ws-1 tail
+        # tokens fold into the newest local window, which we keep to the end anyway
+        # (negligible vs budget), and get re-split into their own window on the next
+        # scoring pass. When the body IS a whole number of kept windows this never
+        # triggers — i // ws already tops out at n_fp - 1 — so it is a no-op on every
+        # config that worked before.
+        rank = (i // ws).clamp(max=n_fp - 1)
+        jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
+        off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 
         start_of_rank = torch.searchsorted(body_wid, fp_wids)          # [B, n_fp]
         src_fp = (torch.gather(start_of_rank, 1, jj) + off).clamp_(0, max(T_body - 1, 0))

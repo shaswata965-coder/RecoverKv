@@ -205,11 +205,33 @@ def install_score_hooks(
 
     warned_once = [False]
 
+    # Fix: reuse the q_proj the real attention forward already computed this pass
+    # instead of redoing the projection in the score hook. A forward hook on each
+    # module.q_proj stashes its output here (keyed by layer); the score hook, which
+    # fires just after the attention forward completes, consumes it. Recomputing it
+    # was a re-read of ~6.7% of the layer's weights every step, at every batch size.
+    q_proj_stash: Dict[int, Any] = {}
+
+    def make_qproj_stash_hook(lidx: int):
+        def qproj_hook(_module, _inp, output):
+            # q_proj is called exactly once per attention forward, so this
+            # overwrites cleanly each step and never accumulates across layers.
+            q_proj_stash[lidx] = output
+        return qproj_hook
+
     for _name, module in model.named_modules():
         if not isinstance(module, attn_classes):
             continue
 
         this_layer_idx = layer_idx_map[id(module)]
+
+        # Capture this layer's q_proj output (pre-RoPE query). Skipped if the
+        # module has no q_proj submodule (the score hook then recomputes it).
+        if hasattr(module, "q_proj") and isinstance(module.q_proj, nn.Module):
+            q_handle = module.q_proj.register_forward_hook(
+                make_qproj_stash_hook(this_layer_idx)
+            )
+            handles._hook_handles.append(q_handle)
 
         def make_hook(lidx: int):
             def score_hook(module, args, kwargs, output):
@@ -259,15 +281,19 @@ def install_score_hooks(
                 if k_current is None:
                     return
 
-                # 1. Recompute post-RoPE query from the layer's own inputs.
+                # 1. Post-RoPE query from the layer's own inputs. Reuse the
+                #    q_proj output the attention forward just computed (stashed by
+                #    the q_proj forward hook above) rather than redoing the matmul;
+                #    fall back to a recompute if the stash is empty (e.g. the
+                #    module had no q_proj to hook). Same [B, T, H_q*D] tensor either
+                #    way, so the view/transpose/RoPE below are byte-identical.
                 head_dim = module.head_dim
                 input_shape = hidden_states.shape[:-1]
                 hidden_shape = (*input_shape, -1, head_dim)
-                q = (
-                    module.q_proj(hidden_states)
-                    .view(hidden_shape)
-                    .transpose(1, 2)
-                )  # [B, H_q, T, D]
+                q_raw = q_proj_stash.pop(lidx, None)
+                if q_raw is None:
+                    q_raw = module.q_proj(hidden_states)
+                q = q_raw.view(hidden_shape).transpose(1, 2)  # [B, H_q, T, D]
                 cos, sin = position_embeddings
                 q, _ = apply_rotary_pos_emb(q, q, cos, sin)
                 q = q.to(k_current.dtype)

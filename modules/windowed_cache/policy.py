@@ -249,7 +249,7 @@ class EvictionPolicy:
     # -----------------------------------------------------------------
 
     def expand_to_token_indices(
-        self, retained_window_idx: Tensor
+        self, retained_window_idx: Tensor, num_windows: int
     ) -> Tensor:
         """Expand window indices to absolute token indices.
 
@@ -260,6 +260,11 @@ class EvictionPolicy:
         ----------
         retained_window_idx : Tensor
             Shape ``[B, W_retained]``.
+        num_windows : int
+            The total scored-window count (``window_scores.shape[2]``, a host
+            int). Needed to locate the one window that can be partial — the
+            newest scored window, index ``num_windows - 1`` — so the valid-token
+            count can be computed without a device sync (see below).
 
         Returns
         -------
@@ -295,10 +300,34 @@ class EvictionPolicy:
         # (partial last window produces OOB token positions).
         valid_mask = all_idx < self.total_tokens  # [B, total]
 
-        # For batched gather we need rectangular tensors — count valid per row
-        # and truncate to the minimum across the batch.
-        valid_counts = valid_mask.sum(dim=1)          # [B]
-        min_valid = int(valid_counts.min().item())
+        # Rectangular gather needs one valid-token count. It is the SAME for every
+        # row, so we compute it as a host int rather than reducing the mask and
+        # stalling the pipeline on `.item()` every eviction. Three facts make this
+        # exact (they are the same ones batching rests on, BATCHING_PLAN.md §3):
+        #   * `total_tokens` is a scalar shared across the batch, and rows retain
+        #     different windows but always the same COUNT (W_retained);
+        #   * the only window that can be partial is the newest SCORED window,
+        #     index num_windows-1: its token indices are num_sink+(num_windows-1)*
+        #     ws + [0..ws-1], and every earlier retained window sits fully below
+        #     total_tokens; and
+        #   * that newest window is ALWAYS retained, because it is local and
+        #     local_windows >= 1 by config (an int local is a window_size multiple
+        #     >= window_size; a float local ceils then snaps up to one), and it is
+        #     the max retained index.
+        # So the valid count is sink + all retained windows minus that newest
+        # window's out-of-range tail. NB the tail must be measured off the newest
+        # window's START, not off total_tokens % ws: `total_tokens` can run ahead
+        # of the scored-window span (then the newest window is fully in range and
+        # there is NO tail), which a total_tokens%ws form gets wrong.
+        if W_retained == 0:
+            min_valid = min(self.num_sink_tokens, self.total_tokens)
+        else:
+            last_start = self.num_sink_tokens + (num_windows - 1) * self.window_size
+            last_valid = min(
+                max(self.total_tokens - last_start, 0), self.window_size
+            )
+            oob = self.window_size - last_valid   # newest window's OOB tail
+            min_valid = self.num_sink_tokens + W_retained * self.window_size - oob
 
         # Gather only valid indices: sort valid-first via the mask, take prefix
         # argsort of ~mask (False=0 sorts before True=1) gives valid-idx-first order
