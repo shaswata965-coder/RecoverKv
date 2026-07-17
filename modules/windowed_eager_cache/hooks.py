@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .scorer import compute_window_scores
+from .scorer import reduce_token_scores_to_windows, reduce_two_tier_scores
 
 try:
     from transformers.models.llama.modeling_llama import LlamaAttention
@@ -162,10 +162,28 @@ def install_score_hooks(
                         warned_once[0] = True
                     return
 
-                # attn_weights: [B, H_q, T, S]
-                # compute_window_scores sums across the T axis internally;
-                # every query row contributes (H2O cumulative, no obs_window).
-                scores = compute_window_scores(attn_weights, num_sink, window_size)
+                # attn_weights: [B, H_q, T, S] over the effective-K axis. Sum
+                # across the T (query) axis — every query row contributes (H2O
+                # cumulative, no obs_window) — to per-key received attention.
+                token_scores = attn_weights.sum(dim=-2)          # [B, H_q, S]
+
+                # At q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
+                # layout, so the key axis of attn_weights is unsorted too; undo
+                # it on the score axis with the scatter map update() stashed this
+                # pass (bit-identical to the old sorted reduce). Otherwise it is a
+                # single ascending-id run and the plain contiguous reduce applies.
+                meta_stash = getattr(cache, "_last_score_meta", None)
+                score_meta = meta_stash[lidx] if meta_stash is not None else None
+                if score_meta is not None:
+                    order, q_token_len = score_meta
+                    scores = reduce_two_tier_scores(
+                        token_scores, num_sink, window_size, q_token_len, order
+                    )
+                    meta_stash[lidx] = None
+                else:
+                    scores = reduce_token_scores_to_windows(
+                        token_scores, num_sink, window_size
+                    )
 
                 # Push into cache_kwargs; cache.update() accumulates across steps.
                 cache.cache_kwargs[lidx]["window_scores"] = scores

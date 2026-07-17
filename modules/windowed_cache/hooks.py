@@ -36,7 +36,11 @@ import torch.nn.functional as F
 
 import os
 
-from .scorer import compute_window_scores, reduce_token_scores_to_windows
+from .scorer import (
+    compute_window_scores,
+    reduce_token_scores_to_windows,
+    reduce_two_tier_scores,
+)
 
 
 def _prefill_score_chunk() -> int:
@@ -228,23 +232,28 @@ def install_score_hooks(
                 # Keys: already RoPE-applied and appended by cache.update()
                 # earlier in this same forward pass. At q > 0 the raw fp store
                 # misses the Q tier, so source the effective K (fp + dequantized,
-                # RoPE'd Q windows, interleaved chronologically) instead — the
-                # same tensor attention saw (design §8, §9).
+                # RoPE'd Q windows, concatenated as [sink ‖ body ‖ Q]) instead —
+                # the same tensor attention saw (design §8, §9).
+                score_meta = None
                 if getattr(cache, "_q", 0.0) > 0.0:
                     if cache._states[lidx].key_states is None:
                         return
-                    # Reuse the effective K that cache.update() already built
-                    # for this layer this pass (fix #2) instead of rebuilding it
-                    # (a second full Q-tier dequant + RoPE, per layer, per step).
-                    # Consume it so a later stray hook call can't read a stale
-                    # tensor; fall back to a fresh materialize if update() didn't
-                    # run for this layer.
+                    # Reuse the effective K + score-scatter map that
+                    # cache.update() already built for this layer this pass (fix
+                    # #2) instead of rebuilding them (a second full Q-tier dequant
+                    # + RoPE, per layer, per step). Consume them so a later stray
+                    # hook call can't read stale state; fall back to a fresh
+                    # materialize if update() didn't run for this layer.
                     stash = getattr(cache, "_last_effective_k", None)
+                    meta_stash = getattr(cache, "_last_score_meta", None)
                     if stash is not None and stash[lidx] is not None:
                         k_current = stash[lidx]  # [1, H_kv, S, D]
                         stash[lidx] = None
+                        if meta_stash is not None:
+                            score_meta = meta_stash[lidx]
+                            meta_stash[lidx] = None
                     else:
-                        k_current = cache._materialize(lidx)[0]  # [1, H_kv, S, D]
+                        k_current, _, score_meta = cache._materialize(lidx)
                 else:
                     k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
                 if k_current is None:
@@ -323,10 +332,20 @@ def install_score_hooks(
                 # Merge (H_kv, n_rep) back to H_q in the original head order.
                 token_scores = token_scores.reshape(B, H_q, S)
 
-                # 4. Reduce to per-window scores and hand off to the cache.
-                scores = reduce_token_scores_to_windows(
-                    token_scores, num_sink, window_size
-                )
+                # 4. Reduce to per-window scores and hand off to the cache. At
+                #    q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
+                #    layout, so undo it on the score axis (bit-identical to the
+                #    old sorted-layout reduce); otherwise it is a single
+                #    ascending-id run and the plain contiguous reduce applies.
+                if score_meta is not None:
+                    order, q_token_len = score_meta
+                    scores = reduce_two_tier_scores(
+                        token_scores, num_sink, window_size, q_token_len, order
+                    )
+                else:
+                    scores = reduce_token_scores_to_windows(
+                        token_scores, num_sink, window_size
+                    )
                 cache.cache_kwargs[lidx]["window_scores"] = scores
 
             return score_hook

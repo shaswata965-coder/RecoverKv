@@ -90,6 +90,63 @@ def reduce_token_scores_to_windows(
     return window_scores
 
 
+def reduce_two_tier_scores(
+    token_scores: Tensor,
+    num_sink: int,
+    window_size: int,
+    q_token_len: int,
+    order: Tensor,
+) -> Tensor:
+    """Per-window scores for the **unsorted** two-tier effective-K layout.
+
+    At ``q > 0`` the effective K is laid out ``[sink ‖ fp body ‖ Q]`` and is
+    *not* globally id-sorted (``materialize_effective_kv`` skips the reorder
+    because attention is order-free). This reduces that layout to the same
+    ``[B, H_q, W]`` per-window scores the sorted layout produced, **bit-for-bit**:
+
+    - Each tier is internally contiguous, ascending-id, window-size-aligned, and
+      no window straddles the tier boundary — so the ordinary contiguous
+      window-sum is correct within each tier. The fp body may have a trailing
+      partial (local) window, handled by the same right-pad as the single-tier
+      path; the Q tier is always whole windows.
+    - Reducing each tier independently never reorders any window's ``ws``
+      summands (they are position-ordered within their tier in both layouts), so
+      the sums are identical to the sorted path's contiguous reduce.
+    - ``order`` (from :func:`materialize_effective_kv`) is ``argsort`` of the
+      tier-concatenated per-window ids, i.e. it scatters the physical
+      ``[body ‖ Q]`` per-window sums back into **ascending-merged-id order** —
+      the order ``state.window_scores`` / ``original_window_ids`` are kept in, so
+      the running accumulation stays aligned.
+
+    Parameters
+    ----------
+    token_scores : Tensor
+        ``[B, H_q, S]`` per-key received attention, already summed over queries.
+    num_sink, window_size : int
+    q_token_len : int
+        Number of Q-tier tokens at the tail of ``token_scores`` (``n_q * ws``).
+    order : Tensor
+        ``[B, W]`` int64 scatter permutation, physical → ascending-merged-id.
+
+    Returns
+    -------
+    Tensor
+        ``[B, H_q, W]``. Sink tokens are **not** represented.
+    """
+    s = token_scores.shape[-1]
+    body_scores = token_scores[..., : s - q_token_len]
+    q_scores = token_scores[..., s - q_token_len :]
+
+    # fp body: strip sink, right-pad the trailing partial window, window-sum.
+    body_w = reduce_token_scores_to_windows(body_scores, num_sink, window_size)
+    # Q tier: whole windows, no sink — a direct contiguous window-sum.
+    q_w = reduce(q_scores, "b h (w s) -> b h w", "sum", s=window_size)
+
+    phys = torch.cat([body_w, q_w], dim=-1)                        # [B, H_q, W]
+    idx = order.unsqueeze(1).expand(phys.shape[0], phys.shape[1], order.shape[1])
+    return torch.gather(phys, -1, idx)
+
+
 def accumulate(state_scores: Tensor, new_scores: Tensor) -> Tensor:
     """Accumulate new window scores into existing state scores (in-place +=).
 

@@ -166,6 +166,12 @@ class WindowedCache(_HFCacheBase):
         # Stays None at q == 0 (the hook reads state.key_states directly there).
         self._last_effective_k: List[Optional[Tensor]] = [None] * num_layers
 
+        # Paired with _last_effective_k: the score-scatter map (order, q_token_len)
+        # that undoes the unsorted [sink ‖ body ‖ Q] effective-K layout on the
+        # score axis. None when the Q tier is empty (no reorder needed). Both
+        # backends' score hooks consume it; see modules.quant.effective.
+        self._last_score_meta: List[Optional[Any]] = [None] * num_layers
+
     # -----------------------------------------------------------------
     # HF Cache interface
     # -----------------------------------------------------------------
@@ -405,10 +411,12 @@ class WindowedCache(_HFCacheBase):
         #    attention (and the eager scorer) see both tiers; at q == 0 this is
         #    the live fp store, byte-identical to the single-tier cache.
         if self._q > 0.0:
-            eff_k, eff_v = self._materialize(layer_idx)
-            # Hand the effective K to the score hook (fix #2) so it need not
-            # rebuild it. Overwritten each step; the hook consumes (clears) it.
+            eff_k, eff_v, score_meta = self._materialize(layer_idx)
+            # Hand the effective K + its score-scatter map to the score hook
+            # (fix #2) so it need not rebuild them. Overwritten each step; the
+            # hook consumes (clears) them.
             self._last_effective_k[layer_idx] = eff_k
+            self._last_score_meta[layer_idx] = score_meta
             return eff_k, eff_v
         return state.key_states, state.value_states
 
@@ -416,16 +424,18 @@ class WindowedCache(_HFCacheBase):
     # Two-tier read path + eviction (design §5, §8) — q > 0, B = 1
     # -----------------------------------------------------------------
 
-    def _materialize(self, layer_idx: int) -> Tuple[Tensor, Tensor]:
-        """Interleave fp + Q tiers into the effective K/V for one layer.
+    def _materialize(self, layer_idx: int) -> Tuple[Tensor, Tensor, Any]:
+        """Build the ``[sink ‖ body ‖ Q]`` effective K/V for one layer.
 
-        Returns a freshly-built tensor; callers must not assume it aliases the
-        stored fp cache (design §9). Empty Q tier ⇒ the fp store, byte-identical.
+        Returns ``(eff_k, eff_v, score_meta)`` — freshly-built tensors (callers
+        must not assume they alias the stored fp cache, design §9) plus the
+        score-scatter map the hook needs, or ``score_meta=None`` at an empty Q
+        tier (the fp store, byte-identical).
         """
         state = self._states[layer_idx]
         store = self._stores[layer_idx]
         if store is None or store.num_active_windows == 0:
-            return state.key_states, state.value_states
+            return state.key_states, state.value_states, None
 
         return materialize_effective_kv(
             state.key_states,

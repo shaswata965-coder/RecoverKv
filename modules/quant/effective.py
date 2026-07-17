@@ -1,10 +1,13 @@
 """Effective K/V materialization — the two-tier read path (design.md §5, §8).
 
-Phase 1 (materialize-then-interleave): dequantize the Q store, apply RoPE at
-each Q window's **original absolute positions** (its immutable
-``position_range`` — eviction never rebases them), and interleave with the fp
-store **chronologically by window id** into one effective tensor for the
-standard attention path.
+Phase 1 (materialize-then-concat): dequantize the Q store, apply RoPE at each Q
+window's **original absolute positions** (its immutable ``position_range`` —
+eviction never rebases them), and concatenate with the fp store into one
+effective tensor laid out ``[sink ‖ fp body ‖ Q]`` for the standard attention
+path. The tiers are **not** globally id-sorted: attention is order-free, so the
+only consumer that cares about chronological order is the window scorer, and it
+undoes the layout cheaply on the ``[B, H, W]`` score axis (see
+:func:`materialize_effective_kv`) rather than on the K/V tensors.
 
 Two RoPE primitives, both built on the model's own ``apply_rotary_pos_emb`` so
 NTK/YaRN scaling is preserved:
@@ -141,21 +144,27 @@ def materialize_effective_kv(
 
     Returns
     -------
-    (eff_k, eff_v) : each ``[B, H_kv, T_total, D]`` where ``T_total = T_fp + T_q``.
+    (eff_k, eff_v, score_meta) : the effective K/V and a per-window scatter map.
 
-    ``T_total`` is the same for every row: the tier split keeps exactly
-    ``k_fp``/``n_q`` windows and both derive from config + ``W``, which are shared
-    across rows — so divergent eviction stays **rectangular** and the effective
-    K/V needs no padding or keep-mask (BATCHING_PLAN.md §3).
+    ``eff_k``/``eff_v`` are each ``[B, H_kv, T_total, D]`` where
+    ``T_total = T_fp + T_q``, laid out **unsorted** as ``[sink ‖ fp body ‖ Q]``
+    (see below). ``T_total`` is the same for every row: the tier split keeps
+    exactly ``k_fp``/``n_q`` windows and both derive from config + ``W``, which
+    are shared across rows — so divergent eviction stays **rectangular** and the
+    effective K/V needs no padding or keep-mask (BATCHING_PLAN.md §3).
+
+    ``score_meta`` is ``(order, q_token_len)`` — the input the window scorer
+    needs to undo the unsorted layout on the (tiny) score axis — or ``None`` when
+    the Q tier is empty (the fast path returns the fp store, and its post-sink
+    axis is already ascending-id, so no scatter is needed).
     """
     if out_dtype is None:
         out_dtype = fp_keys.dtype
 
     # Fast path: empty Q tier ⇒ effective K/V is the fp store, byte-identical.
     if store.num_active_windows == 0:
-        return fp_keys, fp_values
+        return fp_keys, fp_values, None
 
-    B, H, _, D = fp_keys.shape
     sink_k = fp_keys[:, :, :num_sink]
     sink_v = fp_values[:, :, :num_sink]
     body_k = fp_keys[:, :, num_sink:]
@@ -169,30 +178,30 @@ def materialize_effective_kv(
     # tier cannot change between evictions (§10).
     k_q, v_q, q_pos_flat = store.effective_q_tier(rope_module, out_dtype)
 
-    # Interleave chronologically, entirely ON DEVICE: concatenate the fp body
-    # with the Q tokens and sort the merged token axis by window id, per row.
-    #
-    # The rerotation design could scatter by absolute position (positions were
-    # renumbered to tile arange(T_total)); keeping original positions leaves gaps
-    # where windows were evicted, so they don't tile. But chronological order
-    # only needs the window-id ORDERING, not the positions themselves — so an
-    # argsort gets us there without the host ever seeing the ids. A stable sort
-    # keeps each window's tokens in position order, and a window is always
-    # wholly fp or wholly Q (eviction assigns tiers per window), so no window is
-    # ever split across the two sources.
-    #
-    # Doing this on the host instead — grouping the body, .tolist()ing the ids,
-    # sorting chunks in Python — costs ~4 GPU→CPU syncs per layer PER DECODE
-    # STEP (~16k per sample), which is pure pipeline stall. The row axis rides
-    # through for free: argsort just gains a dim.
-    merged_k = torch.cat([body_k, k_q], dim=2)
-    merged_v = torch.cat([body_v, v_q], dim=2)
-    merged_wids = torch.cat([
-        (body_pos.to(torch.long) - num_sink) // window_size,       # [B, n_body]
-        (q_pos_flat.to(torch.long) - num_sink) // window_size,     # [B, N*S]
-    ], dim=1)
-    order = torch.argsort(merged_wids, dim=1, stable=True)         # [B, T_m]
-    idx = order.unsqueeze(1).unsqueeze(-1).expand(B, H, order.shape[1], D)
-    eff_k = torch.cat([sink_k, torch.gather(merged_k, 2, idx)], dim=2)
-    eff_v = torch.cat([sink_v, torch.gather(merged_v, 2, idx)], dim=2)
-    return eff_k, eff_v
+    # Concatenate the two tiers UNSORTED: [sink ‖ fp body ‖ Q]. Attention is
+    # order-free (RoPE bakes each key's absolute position into its value), so it
+    # does not care that body and Q are not globally id-sorted — which lets us
+    # skip the per-token argsort + two [B, H, T_total, D] gathers the sorted
+    # layout used to pay every decode step. That reorder was never for attention;
+    # it was only so the window scorer, which chunks the physical key axis into
+    # window-size groups, saw windows in chronological id order. We hand that
+    # reorder to the scorer instead as a per-WINDOW permutation (~W entries, on
+    # the [B, H, W] score axis) rather than a per-TOKEN one on the K/V tensors.
+    eff_k = torch.cat([sink_k, body_k, k_q], dim=2)
+    eff_v = torch.cat([sink_v, body_v, v_q], dim=2)
+
+    # Score-scatter map. Every window is wholly one tier, and within a tier the
+    # windows are already ascending by id and window-size-aligned (fp body: the
+    # eviction rebuild lays it out [sink ‖ windows by ascending id]; Q: the store
+    # is window-major over active_order, ascending id). So the id at each
+    # window's start token, tier-concatenated, is the physical per-window id
+    # sequence, and ``argsort`` of it is exactly the placement that puts each
+    # tier's per-window score back in ascending-merged-id order — the order
+    # ``state.window_scores`` / ``original_window_ids`` are kept in. A stable
+    # sort is not required (window ids are unique) but costs nothing.
+    ws = window_size
+    body_win_ids = (body_pos[:, ::ws].to(torch.long) - num_sink) // ws   # [B, n_body]
+    q_win_ids = (q_pos_flat[:, ::ws].to(torch.long) - num_sink) // ws    # [B, n_q]
+    phys_win_ids = torch.cat([body_win_ids, q_win_ids], dim=1)           # [B, W]
+    order = torch.argsort(phys_win_ids, dim=1)                           # [B, W]
+    return eff_k, eff_v, (order, q_pos_flat.shape[1])

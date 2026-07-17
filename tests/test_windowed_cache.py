@@ -313,6 +313,59 @@ class TestScoring:
         ]).expand(B, H_q, -1)
         assert torch.allclose(retained_scores, expected_scores)
 
+    # -------------------------------------------------------------------
+    # 11. score-scatter (unsorted two-tier layout) == sorted reduce, bit-for-bit
+    # -------------------------------------------------------------------
+
+    def test_two_tier_reduce_matches_sorted_reduce_bitwise(self):
+        """reduce_two_tier_scores over the unsorted [sink ‖ body ‖ Q] layout is
+        BIT-IDENTICAL to the old contiguous reduce over the id-sorted layout.
+
+        Builds one set of per-key scores, lays them out both ways (sorted, and
+        unsorted-by-tier with the argsort scatter map materialize would emit),
+        and asserts the per-window scores are equal to the last bit — the whole
+        correctness claim of the score-scatter optimization.
+        """
+        from modules.windowed_cache.scorer import (
+            reduce_token_scores_to_windows,
+            reduce_two_tier_scores,
+        )
+
+        B, H, ws, num_sink = 2, 3, 4, 2
+        # Merged windows by ascending id 0..5; tier assignment is interleaved:
+        # even ids stay fp (body), odd ids are Q. The last window (id 5) is the
+        # partial local window (only 2 of ws tokens present) — it must land in
+        # the body tier, exercising the trailing right-pad.
+        n_full = 5
+        partial = 2
+        # Per-token scores for the sink + every full window + the partial tail,
+        # in ascending-id (sorted) physical order.
+        torch.manual_seed(7)
+        sink = torch.rand(B, H, num_sink)
+        win_tokens = [torch.rand(B, H, ws) for _ in range(n_full)]
+        tail = torch.rand(B, H, partial)
+        sorted_scores = torch.cat([sink, *win_tokens, tail], dim=-1)
+
+        # Reference: the pre-change path — contiguous reduce over sorted layout.
+        ref = reduce_token_scores_to_windows(sorted_scores, num_sink, ws)  # [B,H,6]
+
+        # Unsorted layout: [sink ‖ body(ids 0,2,4,5) ‖ Q(ids 1,3)].
+        body_ids = [0, 2, 4, 5]
+        q_ids = [1, 3]
+        tok = {i: win_tokens[i] for i in range(n_full)}
+        tok[5] = tail  # id 5 is the partial window
+        body = torch.cat([tok[i] for i in body_ids], dim=-1)
+        q = torch.cat([tok[i] for i in q_ids], dim=-1)
+        unsorted_scores = torch.cat([sink, body, q], dim=-1)
+
+        # order = argsort of the physical per-window ids [0,2,4,5,1,3].
+        phys_ids = torch.tensor(body_ids + q_ids)
+        order = torch.argsort(phys_ids).unsqueeze(0).expand(B, -1)
+        q_token_len = len(q_ids) * ws
+
+        got = reduce_two_tier_scores(unsorted_scores, num_sink, ws, q_token_len, order)
+        assert torch.equal(got, ref)
+
 
 # ---------------------------------------------------------------------------
 # Eviction / Rerotation Tests

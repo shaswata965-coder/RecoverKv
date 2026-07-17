@@ -115,15 +115,20 @@ def test_first_eviction_demotes_and_materializes():
     assert torch.equal(st.key_states[0][:, :2], k_post[:, 0:2])  # w0 untouched fp
     assert torch.equal(st.key_states[0][:, 2:], k_post[:, 6:8])  # w3 untouched fp
 
-    # Effective K/V re-inserts w1 chronologically at positions 2,3.
-    eff_k, eff_v = cache._materialize(0)
+    # Effective K/V is the UNSORTED [body: w0,w3 ‖ Q: w1] layout (num_sink=0).
+    eff_k, eff_v, score_meta = cache._materialize(0)
     assert eff_k.shape == (1, H, 6, D)                          # T_total = 4 + 2
     assert cache.get_seq_length(0) == 6
-    # fp windows byte-identical inside the effective tensor
+    # fp body windows are byte-identical, at their physical offsets: w0 | w3.
     assert torch.equal(eff_k[0][:, 0:2], k_post[:, 0:2])        # w0
-    assert torch.equal(eff_k[0][:, 4:6], k_post[:, 6:8])        # w3
-    # Q window w1 (positions 2,3) reconstructed within int4 error
-    assert (eff_k[0][:, 2:4] - k_post[:, 2:4]).abs().max() < 0.3
+    assert torch.equal(eff_k[0][:, 2:4], k_post[:, 6:8])        # w3
+    # Q window w1 follows the body, reconstructed within int4 error.
+    assert (eff_k[0][:, 4:6] - k_post[:, 2:4]).abs().max() < 0.3
+    # Score-scatter: physical ids [w0,w3 | w1] = [0,3,1]; argsort → [0,2,1]
+    # scatters back to ascending merged id [0,1,3].
+    order, q_token_len = score_meta
+    assert q_token_len == 2
+    assert order[0].tolist() == [0, 2, 1]
 
 
 def test_redemotion_after_promotion_reactivates():

@@ -295,16 +295,18 @@ class TestMaterialize:
         fp_k = torch.randn(1, H, T, D)
         fp_v = torch.randn(1, H, T, D)
         fp_pos = torch.arange(T, dtype=torch.long).unsqueeze(0)
-        eff_k, eff_v = materialize_effective_kv(
+        eff_k, eff_v, score_meta = materialize_effective_kv(
             fp_k, fp_v, fp_pos, store, num_sink=2, window_size=4, rope_module=rope
         )
         assert torch.equal(eff_k, fp_k)
         assert torch.equal(eff_v, fp_v)
+        assert score_meta is None  # empty Q tier ⇒ no score-scatter needed
 
     def test_interleave_reconstructs_full_sequence(self):
-        """Demote windows 1 & 3; materialize must rebuild [sink|w0|w1|w2|w3]
-        in chronological order with Q windows rotated at their ORIGINAL positions,
-        matching the all-fp reference within int4 quant error."""
+        """Demote windows 1 & 3; materialize lays out the UNSORTED effective K/V
+        as [sink ‖ fp body (w0,w2) ‖ Q (w1,w3)] with Q windows rotated at their
+        ORIGINAL positions (within int4 error), and returns the score-scatter map
+        that reorders the physical [body ‖ Q] window axis back to ascending id."""
         torch.manual_seed(0)
         H, D, ws, num_sink = 2, 8, 4, 2
         rope = _RealRoPE(D)
@@ -338,17 +340,37 @@ class TestMaterialize:
         fp_v = torch.cat(fp_v_parts, dim=1).unsqueeze(0)
         fp_pos = torch.cat(fp_pos_parts, dim=0).unsqueeze(0)
 
-        eff_k, eff_v = materialize_effective_kv(
+        eff_k, eff_v, score_meta = materialize_effective_kv(
             fp_k, fp_v, fp_pos, store, num_sink=num_sink, window_size=ws,
             rope_module=rope, out_dtype=torch.float32,
         )
         assert eff_k.shape == (1, H, T, D)
         eff_k, eff_v = eff_k[0], eff_v[0]
-        # fp windows (sink, w0, w2) must be byte-identical; Q windows within error.
+
+        # Physical layout is [sink ‖ body: w0,w2 ‖ Q: w1,w3] — NOT sorted.
+        # Reference token slices per window id (0-based, within the full seq).
+        def win(wid):
+            s = num_sink + wid * ws
+            return slice(s, s + ws)
+
+        # sink + fp body windows (w0, w2) are byte-identical, at their PHYSICAL
+        # (unsorted) offsets: sink | w0 | w2.
         assert torch.equal(eff_k[:, :num_sink], k_post_all[:, :num_sink])
-        # whole-sequence closeness (Q windows carry int4 error only)
-        assert (eff_k - k_post_all).abs().max() < 0.5
-        assert (eff_v - v_all).abs().max() < 0.5
-        # Q window 1 tokens (positions 6..9) rotated at ORIGINAL positions:
-        s1 = num_sink + 1 * ws
-        assert torch.allclose(eff_k[:, s1:s1 + ws], k_post_all[:, s1:s1 + ws], atol=0.3)
+        assert torch.equal(eff_k[:, num_sink:num_sink + ws], k_post_all[:, win(0)])
+        assert torch.equal(eff_k[:, num_sink + ws:num_sink + 2 * ws], k_post_all[:, win(2)])
+        assert torch.equal(eff_v[:, num_sink:num_sink + ws], v_all[:, win(0)])
+        assert torch.equal(eff_v[:, num_sink + ws:num_sink + 2 * ws], v_all[:, win(2)])
+
+        # Q windows (w1, w3) follow the body, rotated at ORIGINAL positions, so
+        # they match within int4 error only.
+        q_start = num_sink + 2 * ws
+        assert torch.allclose(eff_k[:, q_start:q_start + ws], k_post_all[:, win(1)], atol=0.3)
+        assert torch.allclose(eff_k[:, q_start + ws:q_start + 2 * ws], k_post_all[:, win(3)], atol=0.3)
+        assert (eff_v[:, q_start:q_start + ws] - v_all[:, win(1)]).abs().max() < 0.5
+        assert (eff_v[:, q_start + ws:q_start + 2 * ws] - v_all[:, win(3)]).abs().max() < 0.5
+
+        # Score-scatter map: physical per-window ids are [w0,w2 | w1,w3] = [0,2,1,3];
+        # argsort → [0,2,1,3] scatters them back to ascending merged id [0,1,2,3].
+        order, q_token_len = score_meta
+        assert q_token_len == 2 * ws
+        assert order[0].tolist() == [0, 2, 1, 3]
