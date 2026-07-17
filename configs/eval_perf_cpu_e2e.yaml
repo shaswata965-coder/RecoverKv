@@ -1,0 +1,69 @@
+# ============================================================================
+# StickyKV — CPU end-to-end perf run: the full perf pipeline, no GPU required.
+# ============================================================================
+# Same pipeline as eval_perf_batched.yaml (PerfRunner → windowed cache → score
+# hooks → eviction → TTFT/TPOT/throughput NPZ), but runnable on a CPU-only dev
+# box: eager backend, a small Llama-architecture model, fp32 (CPU fp16 matmul
+# is pathologically slow), synthetic input ids (timing does not depend on token
+# content; THUDM/LongBench needs a datasets<3 script loader this box may lack).
+#
+# This is NOT a measurement of the A100 numbers — absolute times are
+# meaningless here. What it IS: a true end-to-end exercise of q>0 at B>1 on
+# real transformers 4.47.1 through main.py, plus a relative-cost profile of the
+# cache hot path (materialize / score hook / eviction) that GPU wall-clock
+# hides behind kernel launches.
+_base_: eval_perf_batched.yaml
+
+model:
+  name: HuggingFaceTB/SmolLM2-135M
+  revision: main
+  dtype: float32
+
+perf:
+  data_source: null            # synthetic ids — no datasets dependency on CPU
+
+  configs:
+    # -- baseline: full KV cache (DynamicCache), eager attention -------------
+    - name: full_cache
+      cache_backend: dynamic
+      cache_package: null
+      attn_implementation: eager
+      cache_budget: null
+
+    # -- ours, fp16-only tier (q = 0) -----------------------------------------
+    - name: ours_b20_q00
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.20
+      quant_ratio: 0.0
+      install_hooks_for_measurement: true
+
+    # -- ours, two-tier (q = 0.5), memo auto (= OFF at B > 1) ----------------
+    - name: ours_b20_q50
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.20
+      quant_ratio: 0.5
+      install_hooks_for_measurement: true
+
+    # -- ours, two-tier (q = 0.5), memo forced ON — the A/B from the GPU grid -
+    - name: ours_b20_q50_memo_on
+      cache_backend: windowed
+      cache_package: eager
+      attn_implementation: eager
+      cache_budget: 0.20
+      quant_ratio: 0.5
+      quant_memoize_read: true
+      install_hooks_for_measurement: true
+
+  grid:
+    - { prefill_len: 512, gen_len: 128, batch_size: 4 }
+
+  num_warmup_runs: 1
+  num_measurement_runs: 2
+
+telemetry:
+  track_scores: false
+  output_dir: outputs/perf_cpu_e2e
