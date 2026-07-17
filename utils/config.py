@@ -253,14 +253,23 @@ class WindowConfig:
         else:
             local_tokens = int(lws)
 
+        # Mirrors WindowedCacheConfig.resolve(): sink + local over budget clamps
+        # to zero evictable windows rather than raising. Clamped, not just
+        # un-raised — a negative remaining floor-divides NEGATIVE and would hand
+        # back a negative top_k. See that resolver for the full note; the cache
+        # will over-retain against the requested budget and warns when it does.
         remaining = budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
-            raise ConfigValidationError(
-                f"cache_budget={cache_budget} on prefill_len={prefill_len} + "
-                f"max_tokens={max_tokens} yields budget_tokens={budget_tokens}, which is "
-                f"less than num_sink_tokens ({self.num_sink_tokens}) + local_tokens "
-                f"({local_tokens}). Increase cache_budget or reduce sink/local sizes."
+            log.warning(
+                "cache_budget=%s on prefill_len=%s + max_tokens=%s yields "
+                "budget_tokens=%s, below num_sink_tokens (%s) + local_tokens (%s). "
+                "Proceeding with top_k_windows=0: sink + local alone retain %s "
+                "tokens/row, exceeding the requested budget by %s tokens/row.",
+                cache_budget, prefill_len, max_tokens, budget_tokens,
+                self.num_sink_tokens, local_tokens,
+                self.num_sink_tokens + local_tokens, -remaining,
             )
+            remaining = 0
         return remaining // self.window_size
 
 

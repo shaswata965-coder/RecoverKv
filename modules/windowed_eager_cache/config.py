@@ -8,6 +8,7 @@ derived from byte-based budget accounting.
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
@@ -312,14 +313,39 @@ class WindowedCacheConfig:
         else:
             local_tokens = self.local_window_size
 
-        # Top-K evictable windows
+        # Top-K evictable windows.
+        #
+        # Sink + local may exceed the budget. That used to raise; it now clamps
+        # to zero evictable windows and proceeds, retaining sink + local only —
+        # an explicitly legal ResolvedConfig (see top_k_windows above).
+        #
+        # The clamp is not cosmetic. `remaining` feeds both top_k_windows and
+        # m_evict below, and Python floor division takes a negative remaining
+        # NEGATIVE (-5 // 8 == -1), which would propagate through top_k_fp / N_q
+        # into n_slots_for() and CacheState(capacity=...) as negative sizes —
+        # failing later, and far less legibly, than the check that was here.
+        #
+        # THE BUDGET IS THEN EXCEEDED, and silently would be the wrong kind of
+        # quiet: the retained cache is num_sink + local_tokens, not
+        # total_budget_tokens, so any bytes/compression figure derived from the
+        # requested budget is wrong for this config. Over-retaining against a
+        # nominal budget is the exact accounting error we fault the
+        # LongBenchSticky baseline for, so say so out loud rather than let a
+        # quiet over-retain look like a legitimate result.
         remaining = total_budget_tokens - self.num_sink_tokens - local_tokens
         if remaining < 0:
-            raise ValueError(
-                f"total_budget_tokens ({total_budget_tokens}) < "
-                f"num_sink_tokens ({self.num_sink_tokens}) + local_tokens ({local_tokens}). "
-                f"Increase cache_budget or reduce sink/local sizes."
+            warnings.warn(
+                f"cache_budget yields total_budget_tokens={total_budget_tokens}, "
+                f"below num_sink_tokens ({self.num_sink_tokens}) + local_tokens "
+                f"({local_tokens}). Proceeding with 0 evictable windows: the cache "
+                f"will retain {self.num_sink_tokens + local_tokens} tokens/row "
+                f"(sink + local), EXCEEDING the requested budget by "
+                f"{-remaining} tokens/row. Reported compression for this config is "
+                f"not the requested budget.",
+                RuntimeWarning,
+                stacklevel=2,
             )
+            remaining = 0
         top_k_windows = remaining // self.window_size
 
         # --- Two-tier split (design.md §7) --------------------------------

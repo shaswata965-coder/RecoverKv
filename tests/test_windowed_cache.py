@@ -183,19 +183,46 @@ class TestConfig:
             _make_config(cache_budget=True)  # type: ignore
 
     # -------------------------------------------------------------------
-    # 7. test_cache_budget_smaller_than_protected_raises
+    # 7. test_cache_budget_smaller_than_protected_proceeds
     # -------------------------------------------------------------------
 
-    def test_cache_budget_smaller_than_protected_raises(self):
-        """Budget too small for sink + local → ValueError."""
+    def test_cache_budget_smaller_than_protected_proceeds(self):
+        """Budget too small for sink + local → 0 evictable windows, not a raise.
+
+        Budget is advisory at this boundary: the run proceeds retaining sink +
+        local, which EXCEEDS the requested budget. The resolver warns rather
+        than raising, and every derived count must be non-negative — a negative
+        `remaining` floor-divides negative and would reach n_slots_for() and
+        CacheState(capacity=...) as a negative size.
+        """
         cfg = _make_config(
             cache_budget=0.05,
             num_sink_tokens=10,
             local_window_size=40,
         )
         model_cfg = _FakeModelConfig()
-        with pytest.raises(ValueError, match="total_budget_tokens"):
-            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        with pytest.warns(RuntimeWarning, match="EXCEEDING the requested budget"):
+            r = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+
+        assert r.top_k_windows == 0
+        assert r.top_k_fp == 0
+        assert r.N_q == 0
+        # Retains sink + local, over budget — the documented trade.
+        retained = r.num_sink_tokens + r.local_tokens
+        assert retained * r.bytes_per_token > r.total_budget_bytes
+
+    def test_budget_smaller_than_protected_stays_non_negative_at_q(self):
+        """The clamp must hold on the two-tier path too (q > 0 splits m_evict)."""
+        cfg = _make_config(
+            cache_budget=0.05,
+            num_sink_tokens=10,
+            local_window_size=40,
+            quant_ratio=0.5,
+        )
+        model_cfg = _FakeModelConfig()
+        with pytest.warns(RuntimeWarning):
+            r = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        assert r.top_k_windows == 0 and r.top_k_fp == 0 and r.N_q == 0
 
     # -------------------------------------------------------------------
     # 8. test_cache_budget_zero_evictable_is_legal

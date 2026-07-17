@@ -142,11 +142,18 @@ class TestConfig:
             _make_config(cache_budget=True)
 
     # 7
-    def test_cache_budget_smaller_than_protected_raises(self):
+    def test_cache_budget_smaller_than_protected_proceeds(self):
+        """Sink + local over budget → 0 evictable windows + warning, not a raise.
+
+        Mirrors the flash twin. The run proceeds retaining sink + local, which
+        exceeds the requested budget.
+        """
         cfg = _make_config(cache_budget=0.05, num_sink_tokens=10, local_window_size=40)
         model_cfg = _FakeModelConfig()
-        with pytest.raises(ValueError, match="total_budget_tokens"):
-            cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        with pytest.warns(RuntimeWarning, match="EXCEEDING the requested budget"):
+            r = cfg.resolve(100, model_cfg, torch.float16, max_tokens=50)
+        assert r.top_k_windows == 0 and r.top_k_fp == 0 and r.N_q == 0
+        assert (r.num_sink_tokens + r.local_tokens) * r.bytes_per_token > r.total_budget_bytes
 
     # 8
     def test_cache_budget_zero_evictable_is_legal(self):
