@@ -38,7 +38,7 @@ class _RealRoPE(torch.nn.Module):
         return emb.cos().to(x.dtype), emb.sin().to(x.dtype)
 
 
-def _make_cache(quant_ratio=0.5, ws=2, num_sink=0, prefill_len=8):
+def _make_cache(quant_ratio=0.5, ws=4, num_sink=0, prefill_len=16):
     cfg = WindowedCacheConfig(
         window_size=ws, num_sink_tokens=num_sink, local_window_size=ws,
         cache_budget=0.5, quant_ratio=quant_ratio,
@@ -57,13 +57,13 @@ def _active(store):
 
 
 def _codes_of(store, wid, row=0):
-    """The stored int4 key codes for a window id (active or dormant)."""
+    """The stored int2 key codes for a window id (active or dormant)."""
     has, _, slot, _ = store.lookup(torch.tensor([[wid]], dtype=torch.long))
     assert bool(has[0, 0]), f"window {wid} has no slot-table entry"
     return store.table.key_codes[row, slot[0, 0]]
 
 
-def _seed_prefill_state(cache, n_win=4, ws=2, num_sink=0, H=2, D=4):
+def _seed_prefill_state(cache, n_win=4, ws=4, num_sink=0, H=2, D=4):
     """Populate layer-0 state as if prefill produced n_win full windows."""
     T = num_sink + n_win * ws
     torch.manual_seed(0)
@@ -93,8 +93,8 @@ def test_b_gt_1_with_quant_is_supported():
 
 def test_first_eviction_demotes_and_materializes():
     """w0→fp (top), w1→Q (next), w2 dropped, w3 local-fp. Effective = [w0,w1,w3]."""
-    cache = _make_cache(quant_ratio=0.5, ws=2, num_sink=0)
-    H, D, ws = 2, 4, 2
+    cache = _make_cache(quant_ratio=0.5, ws=4, num_sink=0)
+    H, D, ws = 2, 4, 4
     k_pre, v, k_post, pos = _seed_prefill_state(cache, n_win=4, ws=ws)
     st = cache._states[0]
     st.window_scores = torch.zeros(1, 2, 4)
@@ -111,30 +111,30 @@ def test_first_eviction_demotes_and_materializes():
 
     # w1 is the sole Q window; w2 dropped; fp store holds w0 + w3.
     assert _active(store) == [1]
-    assert st.position_ids[0].tolist() == [0, 1, 6, 7]         # w0 ‖ w3
-    assert torch.equal(st.key_states[0][:, :2], k_post[:, 0:2])  # w0 untouched fp
-    assert torch.equal(st.key_states[0][:, 2:], k_post[:, 6:8])  # w3 untouched fp
+    assert st.position_ids[0].tolist() == [0, 1, 2, 3, 12, 13, 14, 15]  # w0 ‖ w3
+    assert torch.equal(st.key_states[0][:, :4], k_post[:, 0:4])    # w0 untouched fp
+    assert torch.equal(st.key_states[0][:, 4:], k_post[:, 12:16])  # w3 untouched fp
 
     # Effective K/V is the UNSORTED [body: w0,w3 ‖ Q: w1] layout (num_sink=0).
     eff_k, eff_v, score_meta = cache._materialize(0)
-    assert eff_k.shape == (1, H, 6, D)                          # T_total = 4 + 2
-    assert cache.get_seq_length(0) == 6
+    assert eff_k.shape == (1, H, 12, D)                        # T_total = 8 + 4
+    assert cache.get_seq_length(0) == 12
     # fp body windows are byte-identical, at their physical offsets: w0 | w3.
-    assert torch.equal(eff_k[0][:, 0:2], k_post[:, 0:2])        # w0
-    assert torch.equal(eff_k[0][:, 2:4], k_post[:, 6:8])        # w3
-    # Q window w1 follows the body, reconstructed within int4 error.
-    assert (eff_k[0][:, 4:6] - k_post[:, 2:4]).abs().max() < 0.3
+    assert torch.equal(eff_k[0][:, 0:4], k_post[:, 0:4])       # w0
+    assert torch.equal(eff_k[0][:, 4:8], k_post[:, 12:16])     # w3
+    # Q window w1 follows the body, reconstructed within int2 error.
+    assert (eff_k[0][:, 8:12] - k_post[:, 4:8]).abs().max() < 1.0
     # Score-scatter: physical ids [w0,w3 | w1] = [0,3,1]; argsort → [0,2,1]
     # scatters back to ascending merged id [0,1,3].
     order, q_token_len = score_meta
-    assert q_token_len == 2
+    assert q_token_len == 4
     assert order[0].tolist() == [0, 2, 1]
 
 
 def test_redemotion_after_promotion_reactivates():
     """Demote w1, promote it (dormant), then re-demote — codes unchanged (§10)."""
-    cache = _make_cache(quant_ratio=0.5, ws=2, num_sink=0)
-    H, D, ws = 2, 4, 2
+    cache = _make_cache(quant_ratio=0.5, ws=4, num_sink=0)
+    H, D, ws = 2, 4, 4
     k_pre, v, k_post, pos = _seed_prefill_state(cache, n_win=4, ws=ws)
     st = cache._states[0]
     st.window_scores = torch.zeros(1, 2, 4)
@@ -146,7 +146,7 @@ def test_redemotion_after_promotion_reactivates():
     store = cache._stores[0]
     codes_before = _codes_of(store, 1).clone()
 
-    # Now promote w1 back: fp store = [w0(0,1), w1(2,3), w3(6,7)] merged [0,1,3],
+    # Now promote w1 back: fp store = [w0(0-3), w1(4-7), w3(12-15)] merged [0,1,3],
     # rank so w1 stays top → both w0,w1 fp (top_k_fp=2), w3 local.
     st.window_scores = torch.zeros(1, 2, 3)
     st.window_scores[0, :, [0, 1]] = torch.tensor([10.0, 100.0])  # w1 outranks w0
@@ -154,10 +154,10 @@ def test_redemotion_after_promotion_reactivates():
     pol.top_k_fp, pol.N_q, pol.local_windows = 2, 0, 1
     cache._evict_two_tier(0, step=4)
 
-    # w1 promoted → dormant, fp store now holds it again at positions 2,3.
+    # w1 promoted → dormant, fp store now holds it again at positions 4..7.
     assert _active(store) == []
     assert int(store.table.n_live[0]) == 1  # dormant, retained not freed
-    assert st.position_ids[0].tolist() == [0, 1, 2, 3, 6, 7]
+    assert st.position_ids[0].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]
 
     # Re-demote w1 (drop w0, keep w1 in Q): codes must be bit-identical (no requant).
     st.window_scores = torch.zeros(1, 2, 3)
@@ -193,11 +193,11 @@ class TestReadMemoization:
 
     def _cache(self, memo, q=0.5):
         cfg = WindowedCacheConfig(
-            window_size=2, num_sink_tokens=0, local_window_size=2,
+            window_size=4, num_sink_tokens=0, local_window_size=4,
             cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
         )
         return WindowedCache(
-            config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
+            config=cfg, prefill_len=16, model_config=_FakeModelConfig(),
             kv_dtype=torch.float32, rope_module=_RealRoPE(4),
             num_layers=1, max_tokens=8,
         )
@@ -228,7 +228,7 @@ class TestReadMemoization:
         never rebased (§10), so the dequant + RoPE cannot move between evictions.
         If these ever diverged, the memo would be serving stale reads.
         """
-        ws, H, D, prefill = 2, 2, 4, 8
+        ws, H, D, prefill = 4, 2, 4, 16
         outs = []
         for memo in (True, False):
             c = self._cache(memo)
@@ -259,7 +259,7 @@ class TestReadMemoization:
     def test_memo_off_holds_nothing_between_reads(self):
         c = self._cache(False)
         c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 1, 1, 1
-        _seed_prefill_state(c, n_win=4, ws=2)
+        _seed_prefill_state(c, n_win=4, ws=4)
         st = c._states[0]
         st.window_scores = torch.zeros(1, 2, 4)
         st.window_scores[0, :, [0, 1, 2]] = torch.tensor([100.0, 50.0, 10.0])
@@ -289,8 +289,8 @@ def test_eviction_preserves_whole_windows():
     ever breaks, the rebuild silently slices at the wrong offsets and windows
     come out shredded — so assert on window integrity, not on the length.
     """
-    ws, num_sink, H, D = 2, 0, 2, 4
-    prefill = 8
+    ws, num_sink, H, D = 4, 0, 2, 4
+    prefill = 16
     cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=num_sink, prefill_len=prefill)
     pol = cache._policies[0]
     pol.top_k_fp, pol.N_q, pol.local_windows = 2, 2, 1
@@ -345,8 +345,8 @@ def test_slot_table_stays_within_its_bound():
     window's codes would be silently overwritten, so it is worth asserting
     rather than trusting the derivation.
     """
-    ws, num_sink, H, D = 2, 0, 2, 4
-    prefill = 8
+    ws, num_sink, H, D = 4, 0, 2, 4
+    prefill = 16
     cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=num_sink, prefill_len=prefill)
     pol = cache._policies[0]
     pol.top_k_fp, pol.N_q, pol.local_windows = 2, 2, 1
@@ -389,8 +389,8 @@ def test_end_to_end_generation_with_quant():
     """Full prefill + many decode steps at q>0. Asserts the two-tier machine
     stays self-consistent every step: T_fp + T_q == get_seq_length, effective
     K/V matches that length, positions valid, budget bounded, Q tier used."""
-    ws, num_sink, H, D = 2, 0, 2, 4
-    prefill = 8
+    ws, num_sink, H, D = 4, 0, 2, 4
+    prefill = 16
     cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=num_sink, prefill_len=prefill)
     # Controlled budget: keep 2 fp + 2 Q evictable windows + 1 local.
     pol = cache._policies[0]
@@ -450,7 +450,7 @@ def test_end_to_end_generation_with_quant():
 # ===========================================================================
 
 
-def _batched_cache(B, ws=2, num_sink=0, prefill=8, q=0.5, memo=None):
+def _batched_cache(B, ws=4, num_sink=0, prefill=16, q=0.5, memo=None):
     cfg = WindowedCacheConfig(
         window_size=ws, num_sink_tokens=num_sink, local_window_size=ws,
         cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
@@ -464,7 +464,7 @@ def _batched_cache(B, ws=2, num_sink=0, prefill=8, q=0.5, memo=None):
     return c
 
 
-def _drive(cache, kp, vp, kd, vd, scores, ws=2, num_sink=0):
+def _drive(cache, kp, vp, kd, vd, scores, ws=4, num_sink=0):
     """Prefill + decode a cache with pre-generated tensors. Returns per-step outs."""
     B, H, prefill, D = kp.shape
     outs = []
@@ -502,7 +502,7 @@ def _rows_diverge_scores(B, H, steps, prefill_W=4, maxW=32):
 
 def test_b_gt_1_rows_evict_divergently():
     """Rows retain DIFFERENT window sets in the Q tier, simultaneously."""
-    B, H, D, ws, prefill = 4, 2, 4, 2, 8
+    B, H, D, ws, prefill = 4, 2, 4, 4, 16
     cache = _batched_cache(B, ws=ws, prefill=prefill)
     g = torch.Generator().manual_seed(3)
     kp = torch.randn(B, H, prefill, D, generator=g)
@@ -530,7 +530,7 @@ def test_b_gt_1_row_equivalence_vs_solo_runs():
     cross-row leak — a shared slot, a mask reduced over the wrong axis, a count
     taken from row 0 — breaks this and almost nothing else.
     """
-    B, H, D, ws, prefill, steps = 4, 2, 4, 2, 8, 12
+    B, H, D, ws, prefill, steps = 4, 2, 4, 4, 16, 12
     g = torch.Generator().manual_seed(17)
     kp = torch.randn(B, H, prefill, D, generator=g)
     vp = torch.randn(B, H, prefill, D, generator=g)
@@ -557,16 +557,17 @@ def test_b_gt_1_row_equivalence_vs_solo_runs():
             )
 
 
-def _seed_rows(cache, B, H=2, D=4, seed=23):
-    """Seed layer-0 with B rows of 4 full windows at positions 0..7."""
+def _seed_rows(cache, B, H=2, D=4, seed=23, ws=4, n_win=4):
+    """Seed layer-0 with B rows of n_win full windows at positions 0..n_win*ws-1."""
     torch.manual_seed(seed)
     st = cache._states[0]
-    pos = torch.arange(8, dtype=torch.long)
-    k_pre = torch.randn(B, H, 8, D)
+    T = n_win * ws
+    pos = torch.arange(T, dtype=torch.long)
+    k_pre = torch.randn(B, H, T, D)
     k_post = rotate_key_window(k_pre, pos.unsqueeze(0).expand(B, -1), cache.rope_module)
-    st.replace(k_post, torch.randn(B, H, 8, D),
+    st.replace(k_post, torch.randn(B, H, T, D),
                pos.unsqueeze(0).expand(B, -1).contiguous())
-    st.original_window_ids = torch.arange(4).unsqueeze(0).expand(B, -1).contiguous()
+    st.original_window_ids = torch.arange(n_win).unsqueeze(0).expand(B, -1).contiguous()
     return st
 
 
@@ -579,8 +580,8 @@ def test_b_gt_1_ragged_demote_counts_allocate_correctly():
     tensor rather than by count, and this asserts the ragged case is real and
     that no row's allocation clobbers another's.
     """
-    B, H, D, ws = 3, 2, 4, 2
-    cache = _batched_cache(B, ws=ws, prefill=8)
+    B, H, D, ws = 3, 2, 4, 4
+    cache = _batched_cache(B, ws=ws, prefill=16)
     st = _seed_rows(cache, B)
     store = cache._stores[0]
     pol = cache._policies[0]
@@ -618,8 +619,8 @@ def test_b_gt_1_dormant_survives_promote_then_redemote():
     would pick up fp16 rounding from the promote-side dequant and could flip
     boundary codes). Asserted on the codes tensor itself, per row.
     """
-    B, H, D, ws = 3, 2, 4, 2
-    cache = _batched_cache(B, ws=ws, prefill=8)
+    B, H, D, ws = 3, 2, 4, 4
+    cache = _batched_cache(B, ws=ws, prefill=16)
     st = _seed_rows(cache, B, seed=29)
     store = cache._stores[0]
     pol = cache._policies[0]
@@ -668,7 +669,7 @@ def test_b_gt_1_dormant_survives_promote_then_redemote():
 @pytest.mark.parametrize("B", [2, 3, 4, 8])
 def test_b_gt_1_end_to_end_invariants(B):
     """The two-tier machine stays self-consistent per row at every batch size."""
-    H, D, ws, prefill, steps = 2, 4, 2, 8, 14
+    H, D, ws, prefill, steps = 2, 4, 4, 16, 14
     cache = _batched_cache(B, ws=ws, prefill=prefill)
     store = cache._stores[0]
     g = torch.Generator().manual_seed(41 + B)
@@ -704,7 +705,7 @@ from modules.windowed_eager_cache.config import WindowedCacheConfig as EagerCfg
 def test_flash_eager_two_tier_parity(B):
     """The twins share cache.py, so their two-tier results must be identical —
     at B>1 as well as B=1, since batching is a cache.py-level change."""
-    ws, num_sink, H, D, prefill = 2, 0, 2, 4, 8
+    ws, num_sink, H, D, prefill = 4, 0, 2, 4, 16
 
     def build(EWC, ECfg):
         cfg = ECfg(window_size=ws, num_sink_tokens=num_sink, local_window_size=ws,

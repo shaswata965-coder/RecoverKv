@@ -264,10 +264,10 @@ class QuantizedStore:
         never rebased (§10), so the dequant + RoPE are bit-identical until the
         ledger next changes — and it only changes at eviction. At
         ``window_size = 8`` that makes 7 of every 8 decode steps a cache hit on
-        the *large* tier (int4 holds the majority of retained windows).
+        the *large* tier (int2 holds the majority of retained windows).
 
         The memo is not free: it holds the whole tier **dequantized to fp16**,
-        which is ~4x the int4 codes it was computed from, per layer, for the
+        which is ~8x the int2 codes it was computed from, per layer, for the
         whole decode. At B = 1 that is invisible against the weights and the
         method is weight-bound anyway (BATCHING_PLAN.md §5), so it is pure win.
         At B > 1 it is charged per row and competes directly with batch capacity

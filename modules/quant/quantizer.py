@@ -1,10 +1,10 @@
-"""Hand-rolled KIVI-style affine int4 quantizer (design.md §2).
+"""Hand-rolled KIVI-style affine int2 quantizer (design.md §2).
 
 Numerics are pinned by the design and must not drift:
 
-- ``scale = (mx − mn) / 15``, ``zero = mn`` (float offset, **not** an integer
+- ``scale = (mx − mn) / 3``, ``zero = mn`` (float offset, **not** an integer
   zero-point), computed in fp32 over each quant group.
-- ``q = clamp(round((x − zero) / scale), 0, 15)`` — round-half-even (torch's
+- ``q = clamp(round((x − zero) / scale), 0, 3)`` — round-half-even (torch's
   default), clamp **before** the uint cast.
 - ``x̂ = q · scale + zero``.
 - Degenerate group (``mx == mn``): ``scale = 1`` ⇒ all codes 0 and ``x̂ = mn``.
@@ -17,14 +17,17 @@ Granularity (design.md §2):
 
 - **Keys** — per-channel at the window level: one ``(scale, zero)`` per
   ``(head, channel)`` for a window, i.e. mx/mn reduced over the **token** axis.
-  Stored **channel-major** ``[H_kv, D, window]`` and packed 2 tokens per byte.
+  Stored **channel-major** ``[H_kv, D, window]`` and packed 4 tokens per byte.
 - **Values** — per-token: one ``(scale, zero)`` per ``(head, token)``, i.e.
   mx/mn reduced over the **head_dim (channel)** axis. Stored **token-major**
-  ``[H_kv, window, D]`` and packed 2 channels per byte.
+  ``[H_kv, window, D]`` and packed 4 channels per byte.
 
-Nibble packing (design.md §2): two int4 codes that share a scale go in one
-byte; the **even-index** code occupies the low 4 bits. ``window_size`` must be
-even (head_dim always is), so there is never a tail nibble to pad.
+Crumb packing (design.md §2): four int2 codes that share a scale go in one
+byte; code index ``j`` occupies bits ``[2·(j mod 4), +2)`` (so index 0 is the
+lowest pair). ``window_size`` must be a multiple of 4 (head_dim always is), so
+there is never a tail to pad. At int2 the fp16 scale/zero grid is fixed
+overhead independent of the bit-width, so it becomes the *dominant* Q-window
+cost — see the budget resolver (config.py) for the byte accounting.
 
 All functions here operate on a **single window** for **one row** (B = 1 in
 v1) — shapes carry no batch axis. Keys/values come in token-major
@@ -38,7 +41,8 @@ from typing import Tuple
 import torch
 from torch import Tensor
 
-_LEVELS = 15.0  # int4 asymmetric: codes in [0, 15]
+_LEVELS = 3.0  # int2 asymmetric: codes in [0, 3]
+_CODES_PER_BYTE = 4  # int2: 4 crumbs per uint8
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +51,7 @@ _LEVELS = 15.0  # int4 asymmetric: codes in [0, 15]
 
 
 def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]:
-    """Affine asymmetric int4 quantize ``x`` grouped along ``group_dim``.
+    """Affine asymmetric int2 quantize ``x`` grouped along ``group_dim``.
 
     The quant group is the slice along ``group_dim``: mx/mn are reduced over
     that axis so every group shares one ``(scale, zero)``.
@@ -55,7 +59,7 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     Returns
     -------
     codes : uint8 Tensor
-        Same shape as ``x``; values in ``[0, 15]`` (unpacked, one code per
+        Same shape as ``x``; values in ``[0, 3]`` (unpacked, one code per
         element).
     scale, zero : fp16 Tensor
         Shape of ``x`` with ``group_dim`` reduced away (kept, not squeezed —
@@ -102,36 +106,42 @@ def _affine_dequantize(
 
 
 # ---------------------------------------------------------------------------
-# Nibble packing (design.md §2) — two codes per byte, even index in low bits
+# Crumb packing (design.md §2) — four int2 codes per byte, index 0 in low bits
 # ---------------------------------------------------------------------------
 
 
-def pack_nibbles_last(codes: Tensor) -> Tensor:
-    """Pack unsigned int4 codes (0–15) two-per-byte along the **last** axis.
+def pack_crumbs_last(codes: Tensor) -> Tensor:
+    """Pack unsigned int2 codes (0–3) four-per-byte along the **last** axis.
 
-    ``codes`` last dim must be even. The even-index code goes in the low nibble.
-    Returns a uint8 tensor with the last dim halved.
+    ``codes`` last dim must be a multiple of 4. Code index ``j`` goes into bits
+    ``[2·(j mod 4), +2)`` of its byte (index 0 in the two lowest bits). Returns
+    a uint8 tensor with the last dim quartered.
     """
-    if codes.shape[-1] % 2 != 0:
+    if codes.shape[-1] % _CODES_PER_BYTE != 0:
         raise ValueError(
-            f"pack_nibbles_last needs an even last dim, got {codes.shape[-1]}"
+            f"pack_crumbs_last needs a last dim divisible by {_CODES_PER_BYTE}, "
+            f"got {codes.shape[-1]}"
         )
     codes = codes.to(torch.uint8)
-    low = codes[..., 0::2]
-    high = codes[..., 1::2]
-    return (low | (high << 4)).to(torch.uint8)
+    c0 = codes[..., 0::4]
+    c1 = codes[..., 1::4]
+    c2 = codes[..., 2::4]
+    c3 = codes[..., 3::4]
+    return (c0 | (c1 << 2) | (c2 << 4) | (c3 << 6)).to(torch.uint8)
 
 
-def unpack_nibbles_last(packed: Tensor, n: int) -> Tensor:
-    """Inverse of :func:`pack_nibbles_last`; ``n`` = original last-dim length.
+def unpack_crumbs_last(packed: Tensor, n: int) -> Tensor:
+    """Inverse of :func:`pack_crumbs_last`; ``n`` = original last-dim length.
 
-    Returns a uint8 tensor whose last dim is ``n`` (== ``2 * packed.shape[-1]``
-    for even ``n``), values in ``[0, 15]``.
+    Returns a uint8 tensor whose last dim is ``n`` (== ``4 * packed.shape[-1]``
+    for ``n`` divisible by 4), values in ``[0, 3]``.
     """
     packed = packed.to(torch.uint8)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    out = torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], -1)
+    c0 = packed & 0x03
+    c1 = (packed >> 2) & 0x03
+    c2 = (packed >> 4) & 0x03
+    c3 = (packed >> 6) & 0x03
+    out = torch.stack([c0, c1, c2, c3], dim=-1).reshape(*packed.shape[:-1], -1)
     return out[..., :n]
 
 
@@ -147,20 +157,22 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     ----------
     k_win : Tensor
         Shape ``[H_kv, window, D]`` (token-major, pre-RoPE keys for one window).
-        ``window`` must be even.
+        ``window`` must be a multiple of 4.
 
     Returns
     -------
     packed : uint8 Tensor
-        Shape ``[H_kv, D, window // 2]`` — channel-major, 2 tokens per byte.
+        Shape ``[H_kv, D, window // 4]`` — channel-major, 4 tokens per byte.
     scale, zero : fp16 Tensor
         Shape ``[H_kv, D]`` — one grid per ``(head, channel)``.
     """
     if k_win.dim() != 3:
         raise ValueError(f"k_win must be [H_kv, window, D], got {tuple(k_win.shape)}")
     window = k_win.shape[1]
-    if window % 2 != 0:
-        raise ValueError(f"key window must be even, got {window}")
+    if window % _CODES_PER_BYTE != 0:
+        raise ValueError(
+            f"key window must be a multiple of {_CODES_PER_BYTE}, got {window}"
+        )
 
     # Quant group = token axis (dim 1) ⇒ scale/zero per (head, channel).
     codes, scale16, zero16 = _affine_quantize(k_win, group_dim=1)
@@ -169,7 +181,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
     # Channel-major, then pack along the token axis (now last).
     codes_cm = codes.transpose(1, 2).contiguous()  # [H_kv, D, window]
-    packed = pack_nibbles_last(codes_cm)            # [H_kv, D, window // 2]
+    packed = pack_crumbs_last(codes_cm)             # [H_kv, D, window // 4]
     return packed, scale, zero
 
 
@@ -185,11 +197,12 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     Parameters
     ----------
     k_wins : Tensor
-        ``[N, H_kv, window, D]`` token-major pre-RoPE keys. ``window`` even.
+        ``[N, H_kv, window, D]`` token-major pre-RoPE keys. ``window`` a
+        multiple of 4.
 
     Returns
     -------
-    packed : uint8 ``[N, H_kv, D, window // 2]`` — channel-major.
+    packed : uint8 ``[N, H_kv, D, window // 4]`` — channel-major.
     scale, zero : fp16 ``[N, H_kv, D]``.
     """
     if k_wins.dim() != 4:
@@ -197,8 +210,10 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
             f"k_wins must be [N, H_kv, window, D], got {tuple(k_wins.shape)}"
         )
     window = k_wins.shape[2]
-    if window % 2 != 0:
-        raise ValueError(f"key window must be even, got {window}")
+    if window % _CODES_PER_BYTE != 0:
+        raise ValueError(
+            f"key window must be a multiple of {_CODES_PER_BYTE}, got {window}"
+        )
 
     # Quant group = token axis (dim 2 with the batch axis) ⇒ grid per (N, head, channel).
     codes, scale16, zero16 = _affine_quantize(k_wins, group_dim=2)
@@ -206,7 +221,7 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     zero = zero16.squeeze(2)    # [N, H_kv, D]
 
     codes_cm = codes.transpose(2, 3).contiguous()  # [N, H_kv, D, window]
-    packed = pack_nibbles_last(codes_cm)           # [N, H_kv, D, window // 2]
+    packed = pack_crumbs_last(codes_cm)            # [N, H_kv, D, window // 4]
     return packed, scale, zero
 
 
@@ -219,11 +234,11 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     Parameters
     ----------
     v_wins : Tensor
-        ``[N, H_kv, window, D]`` token-major values. ``D`` even.
+        ``[N, H_kv, window, D]`` token-major values. ``D`` a multiple of 4.
 
     Returns
     -------
-    packed : uint8 ``[N, H_kv, window, D // 2]`` — token-major.
+    packed : uint8 ``[N, H_kv, window, D // 4]`` — token-major.
     scale, zero : fp16 ``[N, H_kv, window]``.
     """
     if v_wins.dim() != 4:
@@ -231,15 +246,17 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
             f"v_wins must be [N, H_kv, window, D], got {tuple(v_wins.shape)}"
         )
     D = v_wins.shape[3]
-    if D % 2 != 0:
-        raise ValueError(f"value head_dim must be even, got {D}")
+    if D % _CODES_PER_BYTE != 0:
+        raise ValueError(
+            f"value head_dim must be a multiple of {_CODES_PER_BYTE}, got {D}"
+        )
 
     # Quant group = channel axis ⇒ grid per (N, head, token).
     codes, scale16, zero16 = _affine_quantize(v_wins, group_dim=3)
     scale = scale16.squeeze(3)  # [N, H_kv, window]
     zero = zero16.squeeze(3)    # [N, H_kv, window]
 
-    packed = pack_nibbles_last(codes.contiguous())  # [N, H_kv, window, D // 2]
+    packed = pack_crumbs_last(codes.contiguous())  # [N, H_kv, window, D // 4]
     return packed, scale, zero
 
 
@@ -255,7 +272,7 @@ def dequantize_key_window(
     Returns token-major ``[H_kv, window, D]`` in ``out_dtype`` — the same
     layout the fp store uses, ready for RoPE at the window's positions.
     """
-    codes_cm = unpack_nibbles_last(packed, window)          # [H_kv, D, window]
+    codes_cm = unpack_crumbs_last(packed, window)           # [H_kv, D, window]
     codes = codes_cm.transpose(1, 2).contiguous()           # [H_kv, window, D]
     scale16 = scale.unsqueeze(1)                            # [H_kv, 1, D]
     zero16 = zero.unsqueeze(1)                              # [H_kv, 1, D]
@@ -278,7 +295,7 @@ def dequantize_key_windows(
 
     Parameters
     ----------
-    packed : uint8 ``[N, H_kv, D, window // 2]`` — channel-major, 2 tokens/byte.
+    packed : uint8 ``[N, H_kv, D, window // 4]`` — channel-major, 4 tokens/byte.
     scale, zero : fp16 ``[N, H_kv, D]`` — one grid per ``(window, head, channel)``.
     window : int — original (unpacked) token count.
 
@@ -286,7 +303,7 @@ def dequantize_key_windows(
     -------
     ``[N, H_kv, window, D]`` token-major, in ``out_dtype``.
     """
-    codes_cm = unpack_nibbles_last(packed, window)          # [N, H_kv, D, window]
+    codes_cm = unpack_crumbs_last(packed, window)           # [N, H_kv, D, window]
     codes = codes_cm.transpose(2, 3).contiguous()           # [N, H_kv, window, D]
     scale16 = scale.unsqueeze(2)                            # [N, H_kv, 1, D]
     zero16 = zero.unsqueeze(2)                              # [N, H_kv, 1, D]
@@ -304,20 +321,22 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     Parameters
     ----------
     v_win : Tensor
-        Shape ``[H_kv, window, D]`` (token-major). ``D`` must be even.
+        Shape ``[H_kv, window, D]`` (token-major). ``D`` must be a multiple of 4.
 
     Returns
     -------
     packed : uint8 Tensor
-        Shape ``[H_kv, window, D // 2]`` — token-major, 2 channels per byte.
+        Shape ``[H_kv, window, D // 4]`` — token-major, 4 channels per byte.
     scale, zero : fp16 Tensor
         Shape ``[H_kv, window]`` — one grid per ``(head, token)``.
     """
     if v_win.dim() != 3:
         raise ValueError(f"v_win must be [H_kv, window, D], got {tuple(v_win.shape)}")
     D = v_win.shape[2]
-    if D % 2 != 0:
-        raise ValueError(f"value head_dim must be even, got {D}")
+    if D % _CODES_PER_BYTE != 0:
+        raise ValueError(
+            f"value head_dim must be a multiple of {_CODES_PER_BYTE}, got {D}"
+        )
 
     # Quant group = channel axis (dim 2) ⇒ scale/zero per (head, token).
     codes, scale16, zero16 = _affine_quantize(v_win, group_dim=2)
@@ -325,7 +344,7 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     zero = zero16.squeeze(2)    # [H_kv, window]
 
     # Token-major already; pack along the channel axis (last).
-    packed = pack_nibbles_last(codes.contiguous())  # [H_kv, window, D // 2]
+    packed = pack_crumbs_last(codes.contiguous())  # [H_kv, window, D // 4]
     return packed, scale, zero
 
 
@@ -340,7 +359,7 @@ def dequantize_value_window(
 
     Returns token-major ``[H_kv, window, D]`` in ``out_dtype``.
     """
-    codes = unpack_nibbles_last(packed, head_dim)  # [H_kv, window, D]
+    codes = unpack_crumbs_last(packed, head_dim)   # [H_kv, window, D]
     scale16 = scale.unsqueeze(2)                   # [H_kv, window, 1]
     zero16 = zero.unsqueeze(2)                     # [H_kv, window, 1]
     return _affine_dequantize(codes, scale16, zero16, out_dtype)
@@ -357,7 +376,7 @@ def dequantize_value_windows(
 
     Parameters
     ----------
-    packed : uint8 ``[N, H_kv, window, D // 2]`` — token-major, 2 channels/byte.
+    packed : uint8 ``[N, H_kv, window, D // 4]`` — token-major, 4 channels/byte.
     scale, zero : fp16 ``[N, H_kv, window]`` — one grid per ``(window, head, token)``.
     head_dim : int — original (unpacked) channel count.
 
@@ -365,7 +384,7 @@ def dequantize_value_windows(
     -------
     ``[N, H_kv, window, D]`` token-major, in ``out_dtype``.
     """
-    codes = unpack_nibbles_last(packed, head_dim)  # [N, H_kv, window, D]
+    codes = unpack_crumbs_last(packed, head_dim)   # [N, H_kv, window, D]
     scale16 = scale.unsqueeze(3)                   # [N, H_kv, window, 1]
     zero16 = zero.unsqueeze(3)                     # [N, H_kv, window, 1]
     return _affine_dequantize(codes, scale16, zero16, out_dtype)

@@ -1,8 +1,8 @@
 # StickyKV — Quantization Design
 
 Two-tier windowed KV cache: **top-K** windows in full precision (fp16) plus
-**top-Q** windows in **int4** (hand-rolled KIVI-style), with a **per-window pinned
-scale/zero-point**. The int4 (Q) tier stores keys **pre-RoPE**; RoPE is applied
+**top-Q** windows in **int2** (hand-rolled KIVI-style), with a **per-window pinned
+scale/zero-point**. The int2 (Q) tier stores keys **pre-RoPE**; RoPE is applied
 fresh at read using each window's **original absolute positions** (which eviction
 never changes). This document records only **fixed** design choices. Supporting analysis, trade-offs, and open items live in
 [design_rationale.md](design_rationale.md); the decision record (original prompt,
@@ -18,8 +18,10 @@ them into three outcomes:
 
 - **K tier (fp16)** — the highest-ranked windows, plus the always-kept **sink**
   (first tokens) and **local** (most recent) windows. Stored full precision.
-- **Q tier (int4)** — the next band of windows: not good enough for fp16 but too
-  useful to drop. Stored quantized at ¼ the memory.
+- **Q tier (int2)** — the next band of windows: not good enough for fp16 but too
+  useful to drop. Stored quantized. The codes are ⅛ of fp16, but the per-window
+  fp16 scale/zero grid is fixed overhead (independent of bit-width), so the
+  realized memory is ~¼ (≈3.9× compression at `window_size = 8`), not ⅛ (§7).
 - **Dropped** — everything else.
 
 The two tiers live in two separate **gap-free** dense stores (§4). Windows migrate
@@ -43,48 +45,55 @@ interleave) is the shippable v1 and is fully CPU-testable.
   Quant error is set by a group's **dynamic range (max−min), not its count**: a
   single global scale is pinned by the largest outlier and obliterates small/median
   values, so groups are kept fine to localise range. But not arbitrarily fine — each
-  group costs a scale + zero, so over-fine grouping eats the int4 savings.
+  group costs a scale + zero, so over-fine grouping eats the int2 savings — and at
+  int2 the grid is already the *dominant* Q-window cost (§7), so this matters more.
 - **Affine, asymmetric — numerics pinned.** The distributions are skewed, so use
-  asymmetric affine int4 quantization, KIVI-reference float-offset form, computed in
+  asymmetric affine int2 quantization, KIVI-reference float-offset form, computed in
   fp32:
 
   ```
-  scale = (mx − mn) / 15                # mx/mn over the quant group
+  scale = (mx − mn) / 3                 # mx/mn over the quant group
   zero  = mn                            # float offset (not an integer zero-point)
-  q     = clamp(round((x − zero) / scale), 0, 15)   # round-half-even; clamp BEFORE the uint cast
+  q     = clamp(round((x − zero) / scale), 0, 3)    # round-half-even; clamp BEFORE the uint cast
   x̂     = q · scale + zero
   ```
 
   Degenerate group (`mx == mn`): set `scale = 1` → all codes 0 and `x̂ = mn`
-  exactly. **Scales and zeros are stored fp16 (pinned).** The fp8-scale option is
-  dropped: it saves ~1.5% of Q-tier bytes while injecting scale-quantization noise
-  into every dequant. Quantization runs against the **fp16-stored** `scale`/`zero`
-  (not the fp32 intermediates), so the grid the codes were fit to is bit-identical
-  to the grid used at every dequant. The float-offset form is used rather than an
-  integer zero-point because K/V groups often exclude zero — an integer zero-point
-  clamped to `[0, 15]` cannot represent an offset outside the group's own span.
+  exactly. **Scales and zeros are stored fp16 (pinned) — both of them.** At int2 the
+  fp16 grid is ~half of `b_q` (§7), so fp8 storage would save ~13% of Q-tier bytes,
+  not the ~1.5% it saved at int4 — but the analysis holds for the **scale** only.
+  The **zero** is an absolute offset (`= mn`), whose error under fp8 scales with
+  `|mn|` and is unbounded relative to the group range on the biased (massive-
+  activation) channels attention depends on, so fp8 zero is unsafe; and fp8 scale
+  alone buys a mixed-dtype grid for a modest win. Both stay fp16. Quantization runs
+  against the **fp16-stored** `scale`/`zero` (not the fp32 intermediates), so the
+  grid the codes were fit to is bit-identical to the grid used at every dequant. The
+  float-offset form is used rather than an integer zero-point because K/V groups
+  often exclude zero — an integer zero-point clamped to `[0, 3]` cannot represent an
+  offset outside the group's own span.
 - **Pinned grid.** Each window's **scale and zero-point are pinned at first
   quantization and never recomputed**. Codes are written exactly once in a window's
   lifetime: re-reads only dequantize, and a re-demotion **reactivates** the stored
   ledger entry instead of re-quantizing (§10). Zero drift and zero compounding are
   therefore **structural** guarantees — no arithmetic path ever runs
   `quant(dequant(·))` — not numerical ones (§3, §8).
-- **Nibble packing (decided).** Pack the two int4 codes that **share a scale** into
+- **Crumb packing (decided).** Pack the four int2 codes that **share a scale** into
   one byte — i.e. pack along each tier's quantization-group axis:
   - **Keys** (per-channel scale, group = window along the token axis): store the Q
-    store **channel-major** `[H_kv, D, T_q]` and pack 2 consecutive tokens per byte →
-    `[H_kv, D, ceil(window/2)]` uint8, scale/zero `[H_kv, D]` per window.
+    store **channel-major** `[H_kv, D, T_q]` and pack 4 consecutive tokens per byte →
+    `[H_kv, D, window/4]` uint8, scale/zero `[H_kv, D]` per window.
   - **Values** (per-token scale, group = head_dim): keep token-major `[H_kv, T_q, D]`
-    and pack 2 consecutive channels per byte → `[H_kv, T_q, ceil(D/2)]` uint8,
+    and pack 4 consecutive channels per byte → `[H_kv, T_q, D/4]` uint8,
     scale/zero `[H_kv, T_q]`.
 
-  Both nibbles in every byte then share one scale → a single scale load per byte pair,
+  All four crumbs in every byte then share one scale → a single scale load per byte,
   branchless vectorized dequant, and (Phase 2) tile = window = scale group = packing
-  group. Nibbles are unsigned `[0,15]` (asymmetric zero-point); even-index code in the
-  low 4 bits. `window_size` must be even (head_dim always is), so no tail padding.
-  **Bring-up path:** validate with unpacked codes (one 4-bit value per byte, so
+  group. Crumbs are unsigned `[0,3]` (asymmetric zero-point); code index `j` occupies
+  bits `[2·(j mod 4), +2)` (index 0 in the two lowest bits). `window_size` must be a
+  multiple of 4 and `head_dim` too (head_dim always is), so no tail padding.
+  **Bring-up path:** validate with unpacked codes (one 2-bit value per byte, so
   `torch.gather` works token-wise), then switch to this packed layout; Phase 2 repacks
-  into uint32 words (8 nibbles) for 32-bit-aligned loads, same group axis.
+  into uint32 words (16 crumbs) for 32-bit-aligned loads, same group axis.
 - **Outlier handling (v1: none).** v1 ships **no outlier machinery**: per-channel
   key scales, pre-RoPE storage, and the two-tier split (the largest spikes sit in
   the fp tier, and the sink is always fp16) already absorb the dominant outlier
@@ -92,7 +101,7 @@ interleave) is the shippable v1 and is fully CPU-testable.
   beyond v1 altogether** (decision record in [design_history.md](design_history.md);
   analysis retained in [design_rationale.md](design_rationale.md)). The sole
   contingency — a micro dense-and-sparse fp16 side-list (~0.1–0.25%) — is added
-  **only if** the int4 LongBench gate misses.
+  **only if** the int2 LongBench gate misses.
 
 The quantizer is a shared module implementing exactly the scheme above; no numeric
 details remain open.
@@ -121,7 +130,7 @@ Two separate, gap-free dense stores per layer:
 
 - **fp store** — `[B, H_kv, T_fp, D]` fp16 keys/values + `position_ids`. Keys are
   rotated in place.
-- **Q store** — int4 codes + per-window scales/zeros + `position_ids`. Keys are
+- **Q store** — int2 codes + per-window scales/zeros + `position_ids`. Keys are
   stored **pre-RoPE** and rotated **at read** using each window's **original absolute
   positions** (fixed at window creation; eviction never rebases them).
 
@@ -154,7 +163,7 @@ order (below).
    ([policy.py:135](modules/windowed_cache/policy.py:135) `topk`s only the evictable
    slice and force-appends local).
 2. **Assign tiers.** Sink + local are **force-fp** (never eligible for Q — a
-   low-scoring local window must stay full precision, not fall to int4). Only the
+   low-scoring local window must stay full precision, not fall to int2). Only the
    **evictable band** is partitioned by rank: top `top_k_fp` → fp; next `N_q` → Q; the
    rest → dropped (`top_k_fp`, `N_q` from the budget resolver, §7). The fp store then
    holds `sink + local + top_k_fp`; the Q store holds `N_q`.
@@ -336,7 +345,7 @@ bound exact rather than merely likely. Allocation takes the lowest free slots; t
 | field | mutable? | purpose |
 |---|---|---|
 | `original_window_id` | no | chronological identity; used for the interleaved sort |
-| `codes` (int4) | no | packed quantized bits; never change after demotion |
+| `codes` (int2) | no | packed quantized bits; never change after demotion |
 | `scale`, `zero` | no | pinned affine grid; set once at demotion |
 | `position_range` | no | the window's **original absolute positions**; set once at demotion; what the read path feeds to RoPE |
 | `offset` | yes | byte offset into the Q store; shifts as the Q store compacts |
@@ -351,7 +360,7 @@ Entries **persist through promotion**: a promoted window's entry goes **dormant*
 (codes + scale/zero retained; `offset` invalid; excluded from reads and the
 interleave) rather than being freed, so a later re-demotion is a pure reactivation
 (§10). An entry is freed only when its window is dropped outright. Dormant codes are
-a small, freeable overhead — bounded by the fp tier's window count at int4 size —
+a small, freeable overhead — bounded by the fp tier's window count at int2 size —
 which the v1 budget resolver may ignore.
 
 ---
@@ -389,23 +398,32 @@ and stay fp:
 
 ```
 b_fp = bytes_per_token · window_size = 4 · H_kv · D · window_size    # one fp window
-b_q  = H_kv · D · window_size      # packed int4 codes, K + V   (= ¼ · b_fp)
+b_q  = H_kv · D · window_size / 2  # packed int2 codes, K + V   (½ of the int4 codes)
      + 4 · H_kv · D                # key scale+zero, per (head, channel), fp16
      + 4 · H_kv · window_size      # value scale+zero, per (head, token), fp16
 
 # evictable budget in bytes, then split by q:
 M_evict = (total_budget_tokens − num_sink_tokens − local_tokens) · bytes_per_token
 top_k_fp = ⌊ (1 − q) · M_evict / b_fp ⌋     # fp evictable windows  (Q tier disabled ⇒ q=0 ⇒ = today's top_k_windows)
-N_q      = ⌊     q   · M_evict / b_q ⌋      # int4 windows           (uses b_q, NOT b_fp)
+N_q      = ⌊     q   · M_evict / b_q ⌋      # int2 windows           (uses b_q, NOT b_fp)
 ```
+
+The int2 codes are **half** the int4 codes, but the fp16 scale/zero grid is
+**unchanged** — same per-`(head, channel)`/`(head, token)` granularity, same dtype —
+so it is fixed overhead that does not shrink with the bit-width. At `H_kv=8, D=128,
+window_size=8` that makes `b_q = 4096 + 4096 + 256 = 8448` B against `b_fp = 32768` B:
+**≈3.9× compression, and the grid is 51% of `b_q`** (the key grid alone is 48%). So the
+lever that pays at int2 is *amortizing the grid* (larger windows, coarser key groups —
+deferred), not the codes.
 
 `N_fp = num_sink_windows_equivalent + num_local_windows + top_k_fp` describes the fp
 store, but the resolver only needs `top_k_fp` (the evictable fp count) and `N_q`; sink
 and local are already handled by the untouched `num_sink_tokens` / `local_tokens`.
 
-- The resolver **must use `b_q`, not `b_fp`, for the Q tier** — the int4 tier holds ~4×
-  the windows of equal fp memory (minus overhead). Scale dtype is **fixed fp16** (§2),
-  so `N_q` is deterministic with no dtype input.
+- The resolver **must use `b_q`, not `b_fp`, for the Q tier** — the int2 tier holds
+  ~3.9× the windows of equal fp memory at `window_size = 8` (the fixed grid, not the
+  codes, sets this ratio). Scale dtype is **fixed fp16** (§2), so `N_q` is
+  deterministic with no dtype input.
 - **`q = 0` parity is exact by construction:** with `q = 0`, `N_q = 0` and
   `top_k_fp = ⌊ M_evict / b_fp ⌋ = (total_budget_tokens − num_sink_tokens − local_tokens)
   // window_size` — identical to today's `top_k_windows`. Keep the existing
@@ -418,11 +436,12 @@ and local are already handled by the untouched `num_sink_tokens` / `local_tokens
   can never exceed the budget.
 
 *Example* (β = 0.25, q = 0.5): the evictable budget splits 50/50 by memory ⇒
-`N_q ≈ 4 · top_k_fp` ⇒ ~4× as many evictable windows kept in int4 as in fp, at the same
-byte cost.
+`N_q ≈ 3.9 · top_k_fp` ⇒ ~3.9× as many evictable windows kept in int2 as in fp, at the
+same byte cost (`window_size = 8`).
 
-New config knobs: `β` (exists as `cache_budget`), `q` (default **0.0**), bit-width
-(fixed 4 in v1), group size (= `window_size`). Scale dtype is fixed fp16 (§2) — not a
+New config knobs: `β` (exists as `cache_budget`), `q` (default **0.0**), group size
+(= `window_size`). Bit-width is **fixed at int2** (not a knob) and scale dtype is fixed
+fp16 (§2) — not a
 knob.
 
 ---
@@ -430,7 +449,7 @@ knob.
 ## 8. Read / attention path and per-step cost
 
 **Read path (v1, materialize).** For each Q window: look it up in the ledger, take
-the int4 codes, dequantize to fp16, apply RoPE at the window's **original absolute
+the int2 codes, dequantize to fp16, apply RoPE at the window's **original absolute
 positions** (the immutable `position_range`), then interleave the fp and Q windows
 chronologically by window id (§5) and hand the result to the standard attention path.
 The fp tier is already rotated and ready. `update()` returns one normal fp tensor.
@@ -503,12 +522,13 @@ instead; callers must not assume the returned tensor aliases the stored fp cache
   the spec.) This is what "pinned grid by identity" means operationally, and it makes
   promote→demote oscillation free without explicit hysteresis.
 - **Quant group = the eviction window.** This pins one grid per window, which
-  promotion requires. `window_size` and bit-width are empirical knobs swept in
-  Suite C / LongBench — **no hardcoded floor**; pick by measured effective-
-  bits-vs-quality. (Scale dtype is fixed fp16, §2.) Effective key bits ≈
-  `4 + 32/window_size` (expectation-setting, not a rule).
-- **Precision: fp16 K tier, int4 Q tier.** Full-precision windows are fp16; the
-  quantized tier is int4 (§2, §7).
+  promotion requires. `window_size` is an empirical knob swept in Suite C /
+  LongBench — **no hardcoded floor**; pick by measured effective-bits-vs-quality.
+  Bit-width is fixed at int2 (Scale dtype is fixed fp16, §2.) Effective key bits ≈
+  `2 + 32/window_size` (expectation-setting, not a rule) — note the `32/window_size`
+  grid term, unchanged from int4, now **exceeds** the 2 code bits at `window_size ≤ 16`.
+- **Precision: fp16 K tier, int2 Q tier.** Full-precision windows are fp16; the
+  quantized tier is int2 (§2, §7).
 - **B>1 for equal-length prompts; ragged is still out of scope.** *(Amended — v1
   shipped B=1 only.)* Rows evict divergently, so the per-window record cannot be a
   host-side dict keyed by `original_window_id`: it is a dense `[B, N_slots, …]` **slot
@@ -542,17 +562,17 @@ correctness is the only goal.
   apply RoPE at the window's original absolute positions → interleave by window id`.
 - **Memory peak:** a transient fp16 copy of one layer's Q tier at a time
   (≈ `(Q-fp size)/num_layers`), freed immediately. The fp16 write-back is the real
-  cost (~4× the int4 read); Phase 2 eliminates it.
+  cost (~8× the int2 read); Phase 2 eliminates it.
 - **Exit criterion:** Suite C confirms net memory savings; Suite A Jaccard holds;
-  LongBench quality acceptable at int4. Only then move to Phase 2.
+  LongBench quality acceptable at int2. Only then move to Phase 2.
 
 ### Phase 2 — Triton GEMV tile: fused dequant-inside-attention (future work)
 
-A Triton decode kernel that loads int4 codes tile-by-tile, dequantizes to fp16 **in
+A Triton decode kernel that loads int2 codes tile-by-tile, dequantizes to fp16 **in
 registers**, and runs `Q·Kᵀ` before any write-back. The fp16 materialization is
-eliminated — only int4 codes are read from HBM.
+eliminated — only int2 codes (and the fp16 grid) are read from HBM.
 
-- **Storage: pre-RoPE** (same as Phase 1). Tile kernel: `load int4 → unpack → scale →
+- **Storage: pre-RoPE** (same as Phase 1). Tile kernel: `load int2 → unpack → scale →
   apply RoPE from cos/sin → MAC`. RoPE is arithmetic on already-loaded data — zero
   extra memory traffic in the bandwidth-bound decode regime. `cos/sin` for a window's
   **fixed** original absolute positions are computed once and reused — eviction never
@@ -567,11 +587,11 @@ eliminated — only int4 codes are read from HBM.
 ### Phase 3 — FlashInfer integration (production ceiling, not in scope)
 
 Replace the custom GEMV tile with FlashInfer's paged quantized decode attention
-(online softmax, GQA, paged blocks). **Note: FlashInfer is fp8/fp4-native — int4 is
-*not* a native FlashInfer path**; the int4 decode kernels in the literature (Atom)
-are custom builds on top of it. Phase 3 therefore either (a) re-targets the Q tier
-to fp8/nvfp4 for the native path, or (b) ports an Atom-style int4 kernel — decided
-when Phase 2 is profiled. Requires aligning `QuantizedStore`'s block layout with
+(online softmax, GQA, paged blocks). **Note: FlashInfer is fp8/fp4-native — int2 is
+*not* a native FlashInfer path** (even less so than int4); the sub-4-bit decode
+kernels in the literature (Atom, etc.) are custom builds on top of it. Phase 3
+therefore either (a) re-targets the Q tier to fp8/nvfp4 for the native path, or
+(b) ports an Atom-style low-bit kernel — decided when Phase 2 is profiled. Requires aligning `QuantizedStore`'s block layout with
 FlashInfer's paged KV convention. Strictly better than Phase 2 but adds a
 significant dependency and layout constraint. Deferred until Phase 2 is profiled.
 
@@ -605,7 +625,7 @@ promote→demote reactivation (codes bit-identical, no recompute), position-inva
 flash/eager parity.
 
 Gates: Suite C (peak memory + throughput/TPOT), Suite A (Jaccard drift vs fp-only),
-LongBench (quality at int4).
+LongBench (quality at int2).
 
 ---
 
@@ -624,7 +644,8 @@ sink (first few tokens) and the local window (the most recent one) are always ke
 **Three buckets instead of two.** Normally a window is either kept or deleted. We add
 a middle bucket. The best windows stay in full precision fp16 — that's the K tier.
 The ones not good enough for fp16 but still too useful to throw away, we squeeze down
-to int4, a quarter of the memory — that's the Q tier. Everything else is dropped.
+to int2 — with its fp16 scale/zero grid it lands at about a quarter of the memory
+(the raw codes are ⅛; the grid is the rest) — that's the Q tier. Everything else is dropped.
 
 **What happens at every eviction.**
 
@@ -661,7 +682,7 @@ means the codes are frozen forever and never drift.
 **The forward pass.**
 
 - The fp16 windows are already stamped and ready.
-- For each Q window we look it up in the ledger, grab the int4 codes, blow them back
+- For each Q window we look it up in the ledger, grab the int2 codes, blow them back
   up to fp16 (dequantize), and stamp them with RoPE using the window's original
   position numbers (its frozen `position_range`).
 - We glue the fp16 and freshly-stamped Q windows into one tensor and hand it to normal
@@ -671,5 +692,5 @@ means the codes are frozen forever and never drift.
 
 In Phase 1 we do this the simple way — blow up the whole Q tier, glue, attend. In
 Phase 2 we do the blow-up one window at a time *inside* the attention kernel, so the
-fp16 version is never written to memory; only the small int4 version ever lives in
+fp16 version is never written to memory; only the small int2 version ever lives in
 HBM.

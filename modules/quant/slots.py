@@ -3,15 +3,15 @@
 The batch-carrying replacement for the per-window ``Dict[int, LedgerEntry]``
 ledger. Same contract — §6's frozen record per Q window — but as tensors with a
 leading **row** axis, because rows evict divergently: row 0 may hold windows
-``{1, 5}`` in int4 while row 1 holds ``{4, 11}``. A dict keyed by window id
+``{1, 5}`` in int2 while row 1 holds ``{4, 11}``. A dict keyed by window id
 cannot express that; a slot table can.
 
 Layout (one layer, ``B`` rows, ``N`` slots)::
 
-    key_codes   [B, N, H_kv, D, ws//2]  uint8   channel-major, 2 tokens/byte
+    key_codes   [B, N, H_kv, D, ws//4]  uint8   channel-major, 4 tokens/byte
     key_scale   [B, N, H_kv, D]         fp16    pinned grid
     key_zero    [B, N, H_kv, D]         fp16
-    val_codes   [B, N, H_kv, ws, D//2]  uint8   token-major, 2 channels/byte
+    val_codes   [B, N, H_kv, ws, D//4]  uint8   token-major, 4 channels/byte
     val_scale   [B, N, H_kv, ws]        fp16
     val_zero    [B, N, H_kv, ws]        fp16
     slot_wid    [B, N]                  int64   original_window_id; -1 = free
@@ -95,10 +95,10 @@ class QuantSlotTable:
         self.head_dim = D
         self.num_kv_heads = H
 
-        self.key_codes = torch.zeros((B, N, H, D, S // 2), dtype=torch.uint8, device=device)
+        self.key_codes = torch.zeros((B, N, H, D, S // 4), dtype=torch.uint8, device=device)
         self.key_scale = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
         self.key_zero = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
-        self.val_codes = torch.zeros((B, N, H, S, D // 2), dtype=torch.uint8, device=device)
+        self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
         self.val_scale = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
         self.val_zero = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)

@@ -38,12 +38,12 @@ class ResolvedConfig:
     rerotate_on_evict: bool = False
     # --- two-tier quantization (design.md §7) ---
     # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
-    # and the int4 (Q) tier by memory. q=0 disables the Q tier entirely and every
+    # and the int2 (Q) tier by memory. q=0 disables the Q tier entirely and every
     # field below reduces to today's single-tier config (top_k_fp == top_k_windows,
     # N_q == 0), so the pure-fp16 path stays byte-identical.
     quant_ratio: float = 0.0
     top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
-    N_q: int = 0               # evictable int4 windows (0 when q=0)
+    N_q: int = 0               # evictable int2 windows (0 when q=0)
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
@@ -93,11 +93,13 @@ class WindowedCacheConfig:
         version.
     quant_ratio : float
         Two-tier split ``q`` in ``[0, 1]`` (design.md §7).  **Default 0.0** —
-        the Q (int4) tier is disabled and the cache is byte-identical to the
+        the Q (int2) tier is disabled and the cache is byte-identical to the
         single-tier fp16 path.  When ``q > 0``, the evictable window budget is
-        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int4 tier
-        (which holds ~4× the windows per byte).  Requires an even ``window_size``
-        (int4 nibble packing).
+        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int2 tier.
+        int2 halves the codes vs int4, but the fp16 scale/zero grid is fixed
+        overhead, so the honest gain is ~3.9× the windows per fp byte at
+        ``window_size = 8`` (see ``resolve``'s ``b_q``), not the naive 8×.
+        Requires a ``window_size`` divisible by 4 (int2 crumb packing).
     quant_memoize_read : bool, optional
         Cache the dequantized + RoPE'd Q tier between evictions, per layer.
         **Default ``None`` = auto: on at ``B == 1``, off above.**
@@ -222,11 +224,11 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_ratio must be in [0, 1], got {self.quant_ratio}"
             )
-        if self.quant_ratio > 0.0 and self.window_size % 2 != 0:
-            # int4 nibble packing needs an even window (2 codes/byte, design §2).
+        if self.quant_ratio > 0.0 and self.window_size % 4 != 0:
+            # int2 crumb packing needs a window divisible by 4 (4 codes/byte, §2).
             raise ValueError(
-                f"quant_ratio > 0 requires an even window_size (int4 packing), "
-                f"got window_size={self.window_size}"
+                f"quant_ratio > 0 requires a window_size divisible by 4 (int2 "
+                f"packing), got window_size={self.window_size}"
             )
 
         # -- quant_memoize_read --
@@ -287,6 +289,15 @@ class WindowedCacheConfig:
                     "model_config must provide head_dim or (num_attention_heads + hidden_size)"
                 )
             head_dim = hidden // num_heads
+
+        # int2 packs 4 value channels per byte, so head_dim must be a multiple
+        # of 4 (window_size is validated in __post_init__; head_dim only becomes
+        # known here). Real models satisfy this (128); assert it loudly.
+        if self.quant_ratio > 0.0 and head_dim % 4 != 0:
+            raise ValueError(
+                f"quant_ratio > 0 requires head_dim divisible by 4 (int2 crumb "
+                f"packing over the value channel axis), got head_dim={head_dim}"
+            )
 
         element_size = torch.tensor([], dtype=kv_dtype).element_size()
         # K + V, each shaped [num_kv_heads, head_dim] per token
@@ -354,10 +365,14 @@ class WindowedCacheConfig:
         # yields top_k_fp == top_k_windows and N_q == 0 by construction, so the
         # ResolvedConfig is field-for-field identical to the single-tier path.
         q = self.quant_ratio
-        # one fp window vs one int4 window, in bytes:
+        # one fp window vs one int2 window, in bytes. The int2 codes are half
+        # the int4 codes (2 bits/elem vs 4), but the fp16 scale/zero grid is
+        # UNCHANGED — same granularity, same dtype — so it is fixed overhead
+        # that now dominates the Q window (design.md §2, §7). window_size % 4 == 0
+        # is validated, so the // 2 below is exact.
         b_fp = bytes_per_token * self.window_size                       # K+V fp16
         b_q = (
-            num_kv_heads * head_dim * self.window_size                  # int4 codes, K+V
+            (num_kv_heads * head_dim * self.window_size) // 2           # int2 codes, K+V
             + 4 * num_kv_heads * head_dim                               # key scale+zero fp16
             + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
         )
