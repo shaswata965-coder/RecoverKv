@@ -93,8 +93,16 @@ def simulate_policy(
     w_act: np.ndarray,
     ew_act: np.ndarray,
     is_sticky: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Simulate Sticky-K (or Fresh-K) retention over evictable history windows.
+    n_q: int = 0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Simulate two-tier Sticky-K (or Fresh-K) retention over history windows.
+
+    The **fp tier** keeps ``history_budget_K`` evictable windows (the fp16
+    survivors).  On top of it a **Q tier** keeps the next ``n_q`` strongest
+    evictable windows *not already in fp* — the int4 survivors that a two-tier
+    cache holds instead of dropping (design.md §5, mirroring
+    ``policy.compute_two_tier_retain``: rank the band, top ``k_fp`` → fp, next
+    ``n_q`` → Q).  ``n_q == 0`` reduces to the single-tier drop policy exactly.
 
     Parameters
     ----------
@@ -102,31 +110,39 @@ def simulate_policy(
         Non-negative ground-truth window masses (e.g. base-run window scores,
         already reduced to a single layer or head).
     history_budget_K : int
-        Number of evictable windows the policy may retain.  ``<= 0`` means no
-        evictable window is ever kept (only the recency tail).
+        Number of evictable windows the **fp tier** may retain.  ``<= 0`` means
+        no fp window is kept (only the recency tail + Q tier).
     w_act, ew_act : np.ndarray[int] ``[T]``
         Total / evictable window counts per flush, from :func:`flush_geometry`.
     is_sticky : bool
-        ``True`` = Sticky-K (persistent set, single best-swap per flush);
-        ``False`` = Fresh-K (re-pick the top-K every flush, no memory).
+        ``True`` = Sticky-K fp tier (persistent set, single best-swap per flush);
+        ``False`` = Fresh-K (re-pick top-K every flush, no memory).  The Q tier
+        is always the fresh next-``n_q`` residual, matching the production
+        eviction which re-ranks the whole band every flush.
+    n_q : int
+        Number of extra evictable windows held in the int4 Q tier.
 
     Returns
     -------
     selection : np.ndarray[bool] ``[T, W]``
-        ``True`` where window ``w`` is retained at flush ``t`` — the evictable
-        Sticky-K set together with the always-kept local recency tail.
-    missed : np.ndarray[float] ``[T]``
-        Fraction of total valid-window truth mass sitting on evictable,
-        *non-retained* windows per flush.  Range ``[0, 1]``; 0 = all
-        important mass retained, 1 = nothing retained.
-
-        Normalised by the sum of scores over all valid windows at each flush
-        (evictable + local tail) so the value is independent of the raw score
-        magnitude, which grows over time as H2O scores accumulate.
+        ``True`` where window ``w`` is retained in the **fp tier** at flush ``t``
+        (plus the always-kept local tail).  Q-tier windows are *not* marked here
+        so the LIR thrashing analysis stays a pure fp-tier quantity.
+    missed_fp : np.ndarray[float] ``[T]``
+        Fraction of total valid-window mass on evictable windows *outside the fp
+        tier* — the single-tier "drop everything below fp" baseline (identical to
+        the legacy ``missed`` at ``n_q == 0``).
+    missed_kept : np.ndarray[float] ``[T]``
+        Fraction of total valid-window mass on evictable windows in **neither**
+        tier (truly dropped).  ``missed_fp - missed_kept`` is the mass the Q tier
+        rescues.  Both series are normalised by the sum of scores over all valid
+        windows (evictable + local tail), so they are in ``[0, 1]`` and
+        independent of the raw H2O score magnitude.
     """
     T, W = truth_masses.shape
     selection = np.zeros((T, W), dtype=bool)
-    missed = np.zeros(T, dtype=float)
+    missed_fp = np.zeros(T, dtype=float)
+    missed_kept = np.zeros(T, dtype=float)
     sticky: set[int] = set()
 
     for t in range(T):
@@ -176,18 +192,32 @@ def simulate_policy(
         for w in selected:
             selection[t, w] = True
 
+        # ── Q tier: next-n_q strongest evictable windows not already in fp ──
+        q_set: set[int] = set()
+        if n_q > 0:
+            residual = sorted(
+                (w for w in candidates if w not in selected),
+                key=lambda w: scores[w],
+                reverse=True,
+            )
+            q_set = set(residual[:n_q])
+        kept = selected | q_set
+
         # Missed mass = fraction of total valid-window mass on evictable windows
         # we did not keep.  Normalise by the sum over ALL valid windows (not
         # just evictable) so the value is in [0, 1] and independent of how
         # large the raw H2O cumulative scores happen to be at this flush.
         total_mass = float(scores[:wv].sum())
         if total_mass > 1e-12:
-            missed[t] = float(
+            missed_fp[t] = float(
                 sum(scores[w] for w in candidates if w not in selected)
             ) / total_mass
-        # else: all scores are zero — leave missed[t] = 0.0
+            missed_kept[t] = float(
+                sum(scores[w] for w in candidates if w not in kept)
+            ) / total_mass
+        # else: all scores are zero — leave both at 0.0
 
-    return selection, missed
+    return selection, missed_fp, missed_kept
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +289,9 @@ def compute_sticky_metrics(
     local_windows: int,
     history_budget_K: int,
     m: int = 3,
+    n_q: int = 0,
 ) -> Dict[str, np.ndarray]:
-    """Full Sticky-K analytics over base-run window scores.
+    """Full two-tier Sticky-K analytics over base-run window scores.
 
     The layer-level and global figures simulate the policy on **head-mean**
     masses — exactly what the production cache ranks when it evicts
@@ -277,21 +308,33 @@ def compute_sticky_metrics(
     local_windows : int
         Number of always-retained recency windows (``local_tokens // window_size``).
     history_budget_K : int
-        Evictable window budget (``top_k_windows``).
+        **fp-tier** evictable window budget.  For a single-tier run this is
+        ``top_k_windows``; for a two-tier run pass ``top_k_fp``.
     m : int
         "Ignored" duration threshold for LIR.
+    n_q : int
+        int4 Q-tier width (``N_q``).  ``0`` (default) reduces every series below
+        to the legacy single-tier numbers.
 
     Returns
     -------
-    dict with
-      ``global_lir``            float scalar — rescue rate over all layers/heads.
-      ``lir_per_layer``         ``[L]``      — rescue rate per layer (head-mean sim).
-      ``lir_per_head``          ``[L, H]``   — rescue rate per (layer, head).
-      ``missed_mass``           ``[T]``      — Sticky-K missed-mass trajectory
-                                               (mean over layers & samples).
-      ``missed_mass_per_layer`` ``[T, L]``   — Sticky-K missed mass per layer.
-      ``missed_mass_fresh``     ``[T]``      — Fresh-K baseline trajectory (global).
-      ``missed_mass_total``     float scalar — mean over flushes of ``missed_mass``.
+    dict with (all missed/recovered series normalised to ``[0, 1]``):
+      ``global_lir``               float — fp-tier rescue rate (all layers/heads).
+      ``lir_per_layer`` / ``lir_per_head`` — fp-tier rescue rate per granularity.
+      ``missed_mass`` (== ``missed_mass_fp``) ``[T]`` — fp-only-drop missed mass
+                                   (mass below the fp tier; the single-tier baseline).
+      ``missed_mass_per_layer`` ``[T, L]`` — fp-only missed mass per layer.
+      ``missed_mass_kept`` ``[T]`` / ``missed_mass_kept_per_layer`` ``[T, L]`` —
+                                   mass dropped by **neither** tier (the honest
+                                   two-tier missed mass; ≤ ``missed_mass``).
+      ``recovered_mass_q`` ``[T]`` / ``recovered_mass_q_per_layer`` ``[T, L]`` —
+                                   ``missed_mass − missed_mass_kept``: mass the Q
+                                   tier rescues (the visible benefit).
+      ``missed_mass_fresh`` / ``missed_mass_fresh_kept`` / ``recovered_mass_q_fresh``
+                                   ``[T]`` — Fresh-K counterparts (mirrors the
+                                   production two-tier eviction's per-flush re-rank).
+      ``missed_mass_total`` / ``missed_mass_kept_total`` / ``recovered_mass_q_total``
+                                   float scalars — mean over flushes.
     """
     base_ws = np.asarray(base_ws, dtype=np.float64)
     if base_ws.ndim != 5:
@@ -310,31 +353,37 @@ def compute_sticky_metrics(
     lir_layer_resc = np.zeros(L)
     lir_head_elig = np.zeros((L, H))
     lir_head_resc = np.zeros((L, H))
-    mm_layer = np.zeros((T, L))   # summed over samples (head-mean sim)
-    mm_fresh = np.zeros(T)        # summed over samples & layers (head-mean sim)
+    mm_layer = np.zeros((T, L))        # fp-only missed, summed over samples
+    mm_layer_kept = np.zeros((T, L))   # two-tier (kept) missed, summed over samples
+    mm_fresh = np.zeros(T)             # fp-only Fresh-K, summed over samples & layers
+    mm_fresh_kept = np.zeros(T)        # two-tier Fresh-K, summed over samples & layers
 
     for s in range(S):
         for li in range(L):
             # ── layer / global: head-mean masses (matches the real cache) ──
             masses_hm = base_ws[s, :, li, :, :].mean(axis=1)   # [T, W]
-            sel, miss = simulate_policy(
-                masses_hm, history_budget_K, w_act, ew_act, is_sticky=True
+            sel, miss_fp, miss_kept = simulate_policy(
+                masses_hm, history_budget_K, w_act, ew_act,
+                is_sticky=True, n_q=n_q,
             )
             e, r = lir_counts(sel, creation, w_act, m)
             lir_layer_elig[li] += e
             lir_layer_resc[li] += r
             glob_elig += e
             glob_resc += r
-            mm_layer[:, li] += miss
+            mm_layer[:, li] += miss_fp
+            mm_layer_kept[:, li] += miss_kept
 
-            _, miss_fresh = simulate_policy(
-                masses_hm, history_budget_K, w_act, ew_act, is_sticky=False
+            _, miss_fresh_fp, miss_fresh_kept = simulate_policy(
+                masses_hm, history_budget_K, w_act, ew_act,
+                is_sticky=False, n_q=n_q,
             )
-            mm_fresh += miss_fresh
+            mm_fresh += miss_fresh_fp
+            mm_fresh_kept += miss_fresh_kept
 
-            # ── per-head: each head simulated independently ──
+            # ── per-head: each head simulated independently (LIR only) ──
             for h in range(H):
-                sel_h, _ = simulate_policy(
+                sel_h, _, _ = simulate_policy(
                     base_ws[s, :, li, h, :], history_budget_K,
                     w_act, ew_act, is_sticky=True,
                 )
@@ -352,14 +401,31 @@ def compute_sticky_metrics(
     )
     missed_mass_per_layer = mm_layer / max(S, 1)
     missed_mass = missed_mass_per_layer.mean(axis=1)
+    missed_mass_kept_per_layer = mm_layer_kept / max(S, 1)
+    missed_mass_kept = missed_mass_kept_per_layer.mean(axis=1)
+    recovered_mass_q_per_layer = missed_mass_per_layer - missed_mass_kept_per_layer
+    recovered_mass_q = missed_mass - missed_mass_kept
     missed_mass_fresh = mm_fresh / max(S * L, 1)
+    missed_mass_fresh_kept = mm_fresh_kept / max(S * L, 1)
+    recovered_mass_q_fresh = missed_mass_fresh - missed_mass_fresh_kept
 
     return {
         "global_lir": np.array(_ratio(glob_resc, glob_elig), dtype=np.float64),
         "lir_per_layer": lir_per_layer,
         "lir_per_head": lir_per_head,
         "missed_mass": missed_mass,
+        "missed_mass_fp": missed_mass,                       # explicit alias
         "missed_mass_per_layer": missed_mass_per_layer,
+        "missed_mass_kept": missed_mass_kept,
+        "missed_mass_kept_per_layer": missed_mass_kept_per_layer,
+        "recovered_mass_q": recovered_mass_q,
+        "recovered_mass_q_per_layer": recovered_mass_q_per_layer,
         "missed_mass_fresh": missed_mass_fresh,
+        "missed_mass_fresh_kept": missed_mass_fresh_kept,
+        "recovered_mass_q_fresh": recovered_mass_q_fresh,
         "missed_mass_total": np.array(float(missed_mass.mean()), dtype=np.float64),
+        "missed_mass_kept_total": np.array(
+            float(missed_mass_kept.mean()), dtype=np.float64),
+        "recovered_mass_q_total": np.array(
+            float(recovered_mass_q.mean()), dtype=np.float64),
     }

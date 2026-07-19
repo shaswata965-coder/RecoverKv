@@ -78,8 +78,20 @@ def make_jaccard_trajectory(npz_paths: List[Path], out_dir: Path,
         jg = d["arrays"]["jaccard_global"]
         jpl = d["arrays"].get("jaccard_per_layer")
         name = d["metadata"].get("ours_npz_path", str(p))
-        # Panel 1: Global line
-        axes[0].plot(jg, label=Path(name).stem, linewidth=1.5)
+        stem = Path(name).stem
+        # Panel 1: Global line.  With a Q tier, overlay fp-only vs fp∪Q and shade
+        # the lift between them — the Jaccard the Q tier buys (schema ≥ 2.2).
+        jfp_g   = d["arrays"].get("jaccard_fp_global")
+        jkept_g = d["arrays"].get("jaccard_kept_global")
+        if jfp_g is not None and jkept_g is not None and not np.allclose(jfp_g, jkept_g):
+            steps = range(len(jkept_g))
+            axes[0].plot(jkept_g, linewidth=1.6, label=f"{stem} (fp∪Q kept)")
+            axes[0].plot(jfp_g, linewidth=1.1, linestyle="--", alpha=0.8,
+                         label=f"{stem} (fp only)")
+            axes[0].fill_between(steps, jfp_g, jkept_g, alpha=0.15,
+                                 label=f"{stem} (Q lift)")
+        else:
+            axes[0].plot(jg, label=stem, linewidth=1.5)
         axes[0].set_xlabel("Generation Step"); axes[0].set_ylabel("Jaccard")
         axes[0].set_title("Global Jaccard Trajectory"); axes[0].legend(fontsize=7)
         # Panel 2: Per-layer heatmap
@@ -142,10 +154,12 @@ def make_lir_trajectory(npz_paths: List[Path], out_dir: Path,
 # --- Plot 3: Missed mass trajectory ---
 def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
                                    dpi: int = 300, save_pdf: bool = False) -> None:
-    """Sticky-K vs Fresh-K absolute missed-mass trajectories over flushes.
+    """Missed-mass trajectories with the Q tier's rescued-mass band.
 
-    ``missed_mass`` / ``missed_mass_fresh`` are ``[T]`` (lower = the retained
-    set captures more of the true attention); ``missed_mass_per_layer`` is
+    ``missed_mass`` (fp-only drop) and ``missed_mass_kept`` (two-tier) are
+    ``[T]`` (lower = the retained set captures more of the true attention); the
+    shaded gap between them is ``recovered_mass_q`` — the mass the int4 Q tier
+    rescues that an fp-only drop would have lost.  ``missed_mass_per_layer`` is
     ``[T, L]`` and is shown as a heatmap.
     """
     if not HAS_MPL: return
@@ -154,10 +168,17 @@ def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
         d = _load_npz(str(p))
         mm = d["arrays"].get("missed_mass")
         mmf = d["arrays"].get("missed_mass_fresh")
+        mmk = d["arrays"].get("missed_mass_kept")
         mmpl = d["arrays"].get("missed_mass_per_layer")
         if mm is None: continue
         stem = Path(str(p)).stem
-        axes[0].plot(mm, linewidth=1.5, label=f"{stem} (Sticky-K)")
+        axes[0].plot(mm, linewidth=1.5, label=f"{stem} (fp-only drop)")
+        # Q tier credited: shade the mass it rescues (schema ≥ 2.2).
+        if mmk is not None and not np.allclose(mmk, mm):
+            axes[0].plot(mmk, linewidth=1.6, color="C2",
+                         label=f"{stem} (fp∪Q kept)")
+            axes[0].fill_between(range(len(mm)), mmk, mm, alpha=0.18, color="C2",
+                                 label=f"{stem} (Q rescued)")
         if mmf is not None:
             axes[0].plot(mmf, linewidth=1.0, linestyle="--", alpha=0.7,
                          label=f"{stem} (Fresh-K)")
@@ -166,7 +187,8 @@ def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
             axes[1].set_xlabel("Flush (step)"); axes[1].set_ylabel("Layer")
             axes[1].set_title("Per-Layer Missed Mass"); plt.colorbar(im, ax=axes[1])
     axes[0].set_xlabel("Flush (step)"); axes[0].set_ylabel("Missed Mass")
-    axes[0].set_title("Absolute Missed Mass Trajectory"); axes[0].legend(fontsize=7)
+    axes[0].set_title("Missed Mass — fp-only vs two-tier (Q rescued)")
+    axes[0].legend(fontsize=7)
     _save_fig(fig, out_dir, "missed_mass_distribution", dpi, save_pdf)
 
 # --- Plot 4: KL divergence heatmap ---

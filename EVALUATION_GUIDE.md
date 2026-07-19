@@ -192,6 +192,24 @@ jaccard  = intersection / union      # [T, L, H] ∈ [0, 1]
 - `final_step_heterogeneity()` (metrics.py:78): `j[-1].std(dim=-1)` → `[L]`
   (std across heads at the last step — measures per-layer agreement)
 
+**Tier-aware Jaccard (two-tier, schema ≥ 2.2).** The legacy Jaccard above slices
+ours' single-tier top-K, so with `quant_ratio > 0` a window kept in the int4 **Q
+tier** gets no credit — it scores as if dropped. The faithfulness runner therefore
+also computes, per `(step, layer)`, the overlap of ours' *retained* set against
+base's top-`n` windows of **matching size** (`faithfulness_runner._jaccard_sets` /
+`_base_top_ids`), split by tier:
+- `jaccard_fp`   — ours **fp-only** survivors vs base top-`|fp|` (≈ what an fp-only
+  drop would capture).
+- `jaccard_kept` — ours **fp ∪ Q** survivors vs base top-`|fp∪Q|` (Q credited — a
+  kept-quantized window no longer counts as a miss).
+- `jaccard_lift` = `jaccard_kept − jaccard_fp` — the Jaccard the Q tier buys.
+  (Usually ≥ 0, but negative if the Q tier holds windows base ranks low — itself a
+  useful signal that the tier is retaining junk.)
+
+The full survivor axis + tier tag comes from the ours npz's `all_window_ids` /
+`all_window_tier` (0=fp, 1=Q, 2=local); at `quant_ratio == 0` there is no Q tier,
+so `jaccard_fp == jaccard_kept == jaccard` and `jaccard_lift == 0`.
+
 #### Metric 2 — Cosine similarity
 
 **File:** `modules/evaluation/faithfulness_runner.py:33`  
@@ -311,9 +329,29 @@ alongside as a lower bound — Fresh-K is greedy-optimal per flush, so
 - `missed_mass_fresh`     — `[T]`, Fresh-K baseline.
 - `missed_mass_total`     — scalar, per-flush mean of `missed_mass`.
 
-`history_budget_K` = `top_k_windows`, `local_windows` = `local_window_size_resolved
-// window_size`, and `m` = metadata `lir_ignore_threshold` (default 3) — all read
-from the ours npz metadata.
+`local_windows` = `local_window_size_resolved // window_size`, and `m` = metadata
+`lir_ignore_threshold` (default 3) — all read from the ours npz metadata.
+
+**Two-tier missed mass (schema ≥ 2.2).** `simulate_policy` models the fp tier
+(`history_budget_K = top_k_fp` windows) **and** an int4 **Q tier** of the next `N_q`
+strongest evictable windows (`n_q` arg), mirroring `policy.compute_two_tier_retain`.
+Because the Q tier is physically kept, counting it as "missed" would penalise
+exactly the mass quantization *rescues*. So the runner reports:
+- `missed_mass` (== `missed_mass_fp`) — mass below the **fp** tier (fp-only-drop
+  baseline). At `q > 0` this uses `top_k_fp`, not `top_k_windows`.
+- `missed_mass_kept` — mass dropped by **neither** tier (the honest two-tier
+  number). Guaranteed `≤ missed_mass` (kept ⊇ fp).
+- `recovered_mass_q` = `missed_mass − missed_mass_kept` — mass the Q tier rescues
+  (**the visible benefit**), plus `_per_layer` / `_total` and Fresh-K counterparts
+  (`missed_mass_fresh_kept`, `recovered_mass_q_fresh`).
+- `recovered_mass_q_discounted` = `recovered_mass_q × q_tier_fidelity`, where
+  `q_tier_fidelity ∈ [0, 1]` is the mean cos-sim of ours' (dequantized) vs base's
+  head-mean mass over the Q windows — credits the Q tier only as far as its
+  quantized KV is faithful.
+
+At `quant_ratio == 0` (`N_q == 0`, `top_k_fp == top_k_windows`) every series above
+collapses to the legacy single-tier value: `missed_mass_kept == missed_mass`,
+`recovered_mass_q == 0`.
 
 ### Output
 
@@ -331,13 +369,25 @@ np.savez_compressed("outputs/faithfulness_results.npz",
     global_lir            scalar     Sticky-K rescue rate (global)
     lir_per_layer        [L]         rescue rate per layer
     lir_per_head         [L, H]      rescue rate per (layer, head)
-    missed_mass          [T]         Sticky-K absolute missed-mass trajectory
+    missed_mass          [T]         fp-only-drop missed-mass trajectory
     missed_mass_per_layer[T, L]      missed mass per layer
     missed_mass_fresh    [T]         Fresh-K baseline missed-mass trajectory
     missed_mass_total    scalar      per-flush mean of missed_mass
-    metadata_json     JSON string    provenance + SHA checksums  (schema v2.1)
+    # ── two-tier: Q tier credited (schema ≥ 2.2; collapse to above at q=0) ──
+    jaccard_fp / jaccard_kept / jaccard_lift          [T, L]   tier-aware Jaccard
+    jaccard_fp_global / jaccard_kept_global / _lift   [T]      + global means
+    missed_mass_kept [T] / _per_layer [T,L] / _total  scalar   two-tier missed mass
+    recovered_mass_q [T] / _per_layer / _total                 mass the Q tier rescues
+    recovered_mass_q_discounted [T] / _total                   × q_tier_fidelity
+    missed_mass_fresh_kept / recovered_mass_q_fresh   [T]      Fresh-K counterparts
+    q_tier_fidelity  scalar / _per_layer [L]                   Q dequant faithfulness
+    metadata_json     JSON string    provenance + SHA checksums  (schema v2.2)
 )
 ```
+
+The ours parity npz (schema ≥ 1.2) carries the tier inputs: `all_window_ids`
+`[S,T,L,W]` and `all_window_tier` `[S,T,L,W]` (0=fp, 1=Q, 2=local, -1=pad), plus
+`quant_ratio` / `top_k_fp` / `N_q` in its metadata.
 
 ---
 

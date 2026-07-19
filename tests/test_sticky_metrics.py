@@ -82,8 +82,8 @@ class TestSimulatePolicy:
         masses = np.random.RandomState(0).rand(T, W)
         w_act = np.full(T, W, dtype=int)
         ew_act = np.full(T, W, dtype=int)   # no local tail
-        sel, missed = SM.simulate_policy(masses, history_budget_K=W, w_act=w_act,
-                                         ew_act=ew_act, is_sticky=True)
+        sel, missed, _ = SM.simulate_policy(masses, history_budget_K=W, w_act=w_act,
+                                            ew_act=ew_act, is_sticky=True)
         assert np.allclose(missed, 0.0)
         assert sel.all()
 
@@ -92,8 +92,8 @@ class TestSimulatePolicy:
         masses = np.zeros((T, W))
         w_act = np.full(T, W, dtype=int)
         ew_act = np.full(T, 3, dtype=int)   # last 2 windows are local
-        sel, missed = SM.simulate_policy(masses, history_budget_K=0, w_act=w_act,
-                                         ew_act=ew_act, is_sticky=True)
+        sel, missed, _ = SM.simulate_policy(masses, history_budget_K=0, w_act=w_act,
+                                            ew_act=ew_act, is_sticky=True)
         # Budget 0 → no evictable kept, but local tail [3,5) always kept.
         assert sel[:, 3:].all()
         assert not sel[:, :3].any()
@@ -102,8 +102,8 @@ class TestSimulatePolicy:
         # One flush, 4 evictable windows, keep top-2 by mass.
         masses = np.array([[0.4, 0.1, 0.3, 0.2]])
         w_act = np.array([4]); ew_act = np.array([4])
-        sel, missed = SM.simulate_policy(masses, history_budget_K=2, w_act=w_act,
-                                         ew_act=ew_act, is_sticky=False)
+        sel, missed, _ = SM.simulate_policy(masses, history_budget_K=2, w_act=w_act,
+                                            ew_act=ew_act, is_sticky=False)
         # Top-2 are windows 0 (0.4) and 2 (0.3); missed = 0.1 + 0.2 = 0.3.
         assert sel[0].tolist() == [True, False, True, False]
         assert missed[0] == pytest.approx(0.3)
@@ -118,8 +118,8 @@ class TestSimulatePolicy:
             [0.0, 0.1, 1.0, 0.9],   # fresh -> {2, 3}; sticky swaps only 0->2 -> {1, 2}
         ])
         w_act = np.array([4, 4]); ew_act = np.array([4, 4])
-        sel_s, _ = SM.simulate_policy(masses, 2, w_act, ew_act, is_sticky=True)
-        sel_f, _ = SM.simulate_policy(masses, 2, w_act, ew_act, is_sticky=False)
+        sel_s, _, _ = SM.simulate_policy(masses, 2, w_act, ew_act, is_sticky=True)
+        sel_f, _, _ = SM.simulate_policy(masses, 2, w_act, ew_act, is_sticky=False)
         assert sel_s[1].tolist() == [False, True, True, False]   # {1, 2}
         assert sel_f[1].tolist() == [False, False, True, True]   # {2, 3}
 
@@ -168,3 +168,24 @@ class TestComputeStickyMetrics:
         assert float(out["missed_mass_total"]) == pytest.approx(
             float(out["missed_mass"].mean())
         )
+
+    def test_n_q_zero_collapses_to_single_tier(self):
+        # The Q tier off (default) must leave every legacy series untouched and
+        # recover nothing — the q == 0 back-compat guarantee.
+        out, _ = self._run()   # n_q defaults to 0
+        assert np.allclose(out["missed_mass_kept"], out["missed_mass"])
+        assert np.allclose(out["recovered_mass_q"], 0.0)
+        assert float(out["recovered_mass_q_total"]) == pytest.approx(0.0)
+
+    def test_q_tier_recovers_nonnegative_mass(self):
+        rng = np.random.RandomState(7)
+        base_ws = rng.rand(2, 12, 3, 4, 6).astype(np.float32)
+        common = dict(prefill_len=16, num_sink=0, window_size=8,
+                      local_windows=1, m=3)
+        # fp budget 1 + Q budget 2 vs fp-only budget 1.
+        two = SM.compute_sticky_metrics(base_ws, history_budget_K=1, n_q=2, **common)
+        # kept never misses more than fp; recovered is exactly the difference.
+        assert (two["missed_mass_kept"] <= two["missed_mass"] + 1e-9).all()
+        assert np.allclose(
+            two["recovered_mass_q"], two["missed_mass"] - two["missed_mass_kept"])
+        assert float(two["recovered_mass_q_total"]) > 0   # real mass gets rescued
