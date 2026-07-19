@@ -33,7 +33,8 @@ def _load_base_npz(path: str) -> dict:
 
 
 def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
-                          tk: int, ws_sz: int, lws):
+                          tk: int, ws_sz: int, lws,
+                          q_ids_row: Optional[Tensor] = None):
     """Extract one (sample, layer)'s parity arrays from a single row's scores.
 
     This is the per-row generalisation of the original single-sample extraction
@@ -49,11 +50,20 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
         used for the attention-fallback path where ids aren't tracked).
     tk, ws_sz, lws
         top-K windows, window size, and ``local_window_size`` (int or float).
+    q_ids_row : Tensor or None
+        Shape ``[n_active]`` — original ids of the windows currently held in the
+        int4 Q tier for this row/layer (``store.active_ids()[bi]``).  ``None`` at
+        ``quant_ratio == 0`` (no Q tier).  Used only to tag ``all_tier_arr``; it
+        does not affect any legacy array, so the ``q == 0`` path is unchanged.
 
     Returns
     -------
-    (tk_arr, ws_arr, ret_ids_arr, ret_sc_arr) : numpy arrays
-        Mirrors ``step_tk``/``step_ws``/``step_ret_ids``/``step_ret_scores``.
+    (tk_arr, ws_arr, ret_ids_arr, ret_sc_arr, all_ids_arr, all_tier_arr)
+        The first four mirror the legacy
+        ``step_tk``/``step_ws``/``step_ret_ids``/``step_ret_scores`` byte-for-byte.
+        The last two are new, aligned to ``ws_arr``'s ``W`` axis:
+        ``all_ids_arr`` ``[W]`` original id per score column, ``all_tier_arr``
+        ``[W]`` tier per column — 0 = fp-evictable, 1 = Q, 2 = local.
     """
     dev = ws_row.device
     W = ws_row.shape[-1]
@@ -98,7 +108,22 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
     ret_ids_arr = all_orig[order].numpy()            # [M]
     ret_compact = all_compact[order].to(dev)         # [M]
     ret_sc_arr = ws_row[:, ret_compact].cpu().to(torch.float16).numpy()  # [H_q, M]
-    return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr
+
+    # ── full survivor axis: id + tier per score column (new, additive) ──
+    # The score columns [0, W) are the merged survivor windows in chronological
+    # (compact) order.  original_window_ids maps each to its absolute id; the Q
+    # store's active_ids() names which of the *evictable* survivors are int4.
+    all_ids_full = (orig_row.cpu().long().numpy()
+                    if orig_row is not None
+                    else np.arange(W, dtype=np.int64))          # [W]
+    all_tier_arr = np.full(W, 2, dtype=np.int64)               # default: local
+    all_tier_arr[:eW] = 0                                       # evictable → fp
+    if q_ids_row is not None and eW > 0:
+        q_np = q_ids_row.detach().cpu().long().numpy()
+        if q_np.size:
+            is_q = np.isin(all_ids_full[:eW], q_np)
+            all_tier_arr[:eW][is_q] = 1                        # int4 Q tier
+    return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr, all_ids_full, all_tier_arr
 
 class OursParityRunner:
     def __init__(self, config: ExperimentConfig) -> None:
@@ -248,7 +273,10 @@ class OursParityRunner:
         samples_evict: List[np.ndarray] = []
         samples_ret_ids: List[np.ndarray] = []     # [num_steps, n_layers, M] int64, -1 pad
         samples_ret_scores: List[np.ndarray] = []  # [num_steps, n_layers, H_q, M] float16
+        samples_win_ids: List[np.ndarray] = []      # [num_steps, n_layers, W] int64, -1 pad
+        samples_win_tier: List[np.ndarray] = []     # [num_steps, n_layers, W] int64, -1 pad
 
+        resolved_cfg = None   # captured from the cache for tier metadata (below)
         t0 = time.time()
 
         batch_size = max(1, int(getattr(cfg.data, "batch_size", 1)))
@@ -293,6 +321,9 @@ class OursParityRunner:
                        rope_module=rope,
                        num_layers=n_layers,
                        max_tokens=gen_len)
+            # Resolved tier counts (top_k_fp / N_q / quant_ratio) for the npz
+            # metadata; identical across chunks, so capturing the last is fine.
+            resolved_cfg = cache.resolved
             hooks = install_hooks(model, cache, cache_config)
 
             # Per-row forced-token streams: [Bc, num_steps].
@@ -304,6 +335,8 @@ class OursParityRunner:
             all_evict      = [[] for _ in range(Bc)]
             all_ret_ids    = [[] for _ in range(Bc)]
             all_ret_scores = [[] for _ in range(Bc)]
+            all_win_ids    = [[] for _ in range(Bc)]   # [num_steps, n_layers, W] orig ids
+            all_win_tier   = [[] for _ in range(Bc)]   # [num_steps, n_layers, W] 0=fp,1=Q,2=local
             gen_kwargs: Dict[str, Any] = {}
             if cfg.cache.backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
@@ -349,8 +382,16 @@ class OursParityRunner:
                         # the batch); None marks "no scores yet" for this layer.
                         layer_wsv: List[Optional[Tensor]] = []
                         layer_orig: List[Optional[Tensor]] = []
+                        layer_qids: List[Optional[Tensor]] = []
                         for li in range(n_layers):
                             cs = cache._states[li]
+                            # Q-tier window ids for this layer (None at q==0 or
+                            # before the first eviction).  Same set for the whole
+                            # step; index per row below.
+                            _store = cache._stores[li]
+                            layer_qids.append(
+                                _store.active_ids() if _store is not None else None
+                            )
                             if cs.window_scores is not None:
                                 layer_wsv.append(cs.window_scores)            # [B, H_q, W]
                                 layer_orig.append(cs.original_window_ids)     # [B, W] or None
@@ -372,6 +413,7 @@ class OursParityRunner:
                         for bi in range(Bc):
                             all_evict[bi].append(evicted)
                             step_tk, step_ws, step_ret_ids, step_ret_scores = [], [], [], []
+                            step_win_ids, step_win_tier = [], []
                             for li in range(n_layers):
                                 ws_v = layer_wsv[li]
                                 if ws_v is None:
@@ -379,19 +421,31 @@ class OursParityRunner:
                                     step_ws.append(np.zeros((1, 1), dtype=np.float16))
                                     step_ret_ids.append(np.zeros(0, dtype=np.int64))
                                     step_ret_scores.append(np.zeros((1, 0), dtype=np.float16))
+                                    step_win_ids.append(np.full(1, -1, dtype=np.int64))
+                                    step_win_tier.append(np.full(1, -1, dtype=np.int64))
                                     continue
                                 orig_full = layer_orig[li]
                                 orig_row = orig_full[bi] if orig_full is not None else None
-                                a_tk, a_ws, a_rid, a_rsc = _extract_row_retained(
-                                    ws_v[bi], orig_row, tk, ws_sz, w.local_window_size)
+                                q_full = layer_qids[li]
+                                q_row = q_full[bi] if q_full is not None else None
+                                a_tk, a_ws, a_rid, a_rsc, a_wid, a_wtier = (
+                                    _extract_row_retained(
+                                        ws_v[bi], orig_row, tk, ws_sz,
+                                        w.local_window_size, q_row))
                                 step_tk.append(a_tk)
                                 step_ws.append(a_ws)
                                 step_ret_ids.append(a_rid)
                                 step_ret_scores.append(a_rsc)
+                                step_win_ids.append(a_wid)
+                                step_win_tier.append(a_wtier)
 
                             # ── stack per-layer results for this step/sample ──
                             all_topk[bi].append(np.stack(step_tk, 0))
                             all_ws[bi].append(np.stack(step_ws, 0))
+                            # Full survivor axis shares window_scores' W per step
+                            # (uniform across layers), so it stacks directly.
+                            all_win_ids[bi].append(np.stack(step_win_ids, 0))   # [n_layers, W]
+                            all_win_tier[bi].append(np.stack(step_win_tier, 0)) # [n_layers, W]
                             mM_s = max(len(x) for x in step_ret_ids)
                             mH_s = max(x.shape[0] for x in step_ret_scores)
                             p_rid = [np.pad(x, [(0, mM_s - len(x))], constant_values=-1)
@@ -412,6 +466,7 @@ class OursParityRunner:
             for bi in range(Bc):
                 s_topk, s_ws, s_evict = all_topk[bi], all_ws[bi], all_evict[bi]
                 s_rid, s_rsc = all_ret_ids[bi], all_ret_scores[bi]
+                s_wid, s_wtier = all_win_ids[bi], all_win_tier[bi]
 
                 mW = max(x.shape[-1] for x in s_ws)
                 mK = max(x.shape[-1] for x in s_topk)
@@ -419,10 +474,17 @@ class OursParityRunner:
                 ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in s_topk]
                 mH = max(x.shape[-2] for x in pws)
                 pws = [np.pad(x, [(0,0),(0,mH-x.shape[-2]),(0,0)]) if x.shape[-2]<mH else x for x in pws]
+                # Full survivor axis shares window_scores' W → pad to the same mW.
+                pwid = [np.pad(x, [(0,0),(0,mW-x.shape[-1])], constant_values=-1)
+                        if x.shape[-1] < mW else x for x in s_wid]
+                pwtier = [np.pad(x, [(0,0),(0,mW-x.shape[-1])], constant_values=-1)
+                          if x.shape[-1] < mW else x for x in s_wtier]
 
                 samples_topk.append(np.stack(ptk, 0))
                 samples_ws.append(np.stack(pws, 0))
                 samples_evict.append(np.array(s_evict, dtype=bool))
+                samples_win_ids.append(np.stack(pwid, 0))    # [num_steps, n_layers, mW]
+                samples_win_tier.append(np.stack(pwtier, 0)) # [num_steps, n_layers, mW]
 
                 # Pad retained arrays across steps (M and H_q may grow over time)
                 mM2  = max(x.shape[-1]  for x in s_rid)
@@ -449,8 +511,10 @@ class OursParityRunner:
         max_Hr = max(x.shape[-2] for x in samples_ret_scores)
         aligned_topk, aligned_ws = [], []
         aligned_ret_ids, aligned_ret_scores = [], []
-        for tkarr, wsarr, ridarr, rscarr in zip(
-                samples_topk, samples_ws, samples_ret_ids, samples_ret_scores):
+        aligned_win_ids, aligned_win_tier = [], []
+        for tkarr, wsarr, ridarr, rscarr, widarr, wtierarr in zip(
+                samples_topk, samples_ws, samples_ret_ids, samples_ret_scores,
+                samples_win_ids, samples_win_tier):
             if tkarr.shape[-1] < max_K:
                 tkarr = np.pad(tkarr, [(0,0),(0,0),(0, max_K - tkarr.shape[-1])],
                                constant_values=-1)
@@ -465,16 +529,27 @@ class OursParityRunner:
                 rscarr = np.pad(rscarr, [(0,0),(0,0),(0, max_Hr - rscarr.shape[-2]),(0,0)])
             if rscarr.shape[-1] < max_M:
                 rscarr = np.pad(rscarr, [(0,0),(0,0),(0,0),(0, max_M - rscarr.shape[-1])])
+            # Full survivor axis: same W axis as window_scores → pad to max_W.
+            if widarr.shape[-1] < max_W:
+                widarr = np.pad(widarr, [(0,0),(0,0),(0, max_W - widarr.shape[-1])],
+                                constant_values=-1)
+            if wtierarr.shape[-1] < max_W:
+                wtierarr = np.pad(wtierarr, [(0,0),(0,0),(0, max_W - wtierarr.shape[-1])],
+                                  constant_values=-1)
             aligned_topk.append(tkarr)
             aligned_ws.append(wsarr)
             aligned_ret_ids.append(ridarr)
             aligned_ret_scores.append(rscarr)
+            aligned_win_ids.append(widarr)
+            aligned_win_tier.append(wtierarr)
 
         top_window_indices     = np.stack(aligned_topk, 0)
         window_scores          = np.stack(aligned_ws, 0)
         eviction_step_mask     = np.stack(samples_evict, 0)
         retained_window_ids    = np.stack(aligned_ret_ids, 0)    # [S, T, L, M]
         retained_window_scores = np.stack(aligned_ret_scores, 0) # [S, T, L, H, M]
+        all_window_ids         = np.stack(aligned_win_ids, 0)    # [S, T, L, W]
+        all_window_tier        = np.stack(aligned_win_tier, 0)   # [S, T, L, W]
 
         elapsed = time.time() - t0
         log.info("Done: %d samples, %.1fs", num_samples, elapsed)
@@ -488,9 +563,16 @@ class OursParityRunner:
         else:
             lr = w.local_window_size
 
+        # Two-tier split for the faithfulness suite (design.md §7). At q==0 the
+        # resolver guarantees top_k_fp == top_k_windows and N_q == 0, so the
+        # tier-aware metrics collapse to the legacy single-tier numbers.
+        q_ratio  = float(getattr(resolved_cfg, "quant_ratio", 0.0)) if resolved_cfg else 0.0
+        top_k_fp = int(getattr(resolved_cfg, "top_k_fp", tk)) if resolved_cfg else tk
+        n_q      = int(getattr(resolved_cfg, "N_q", 0)) if resolved_cfg else 0
+
         env = capture_environment()
         meta = {
-            "schema_version": "1.1",                  # bumped: leading sample axis
+            "schema_version": "1.2",                  # bumped: full-survivor tier arrays
             "mode": "parity_ours",
             "seed": cfg.run.seed,
             "dataset": p.dataset,
@@ -508,6 +590,9 @@ class OursParityRunner:
             "num_sink_tokens": ns,
             "local_window_size_resolved": lr,
             "top_k_windows": tk,
+            "quant_ratio": q_ratio,
+            "top_k_fp": top_k_fp,
+            "N_q": n_q,
             "model_name": cfg.model.name,
             "model_revision": cfg.model.revision,
             "dtype": cfg.model.dtype,
@@ -531,6 +616,8 @@ class OursParityRunner:
             generated_tokens=base_gen_tokens,           # carry-through from base [num_samples, num_steps]
             retained_window_ids=retained_window_ids,    # [S, T, L, M] original IDs, -1 pad
             retained_window_scores=retained_window_scores,  # [S, T, L, H, M] ours' scores
+            all_window_ids=all_window_ids,              # [S, T, L, W] id per score col, -1 pad
+            all_window_tier=all_window_tier,            # [S, T, L, W] 0=fp,1=Q,2=local,-1=pad
             metadata_json=np.array([json.dumps(meta)], dtype=object),
         )
         with open(npz.with_suffix(".meta.json"), "w") as f:

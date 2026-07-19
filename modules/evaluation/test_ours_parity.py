@@ -181,12 +181,15 @@ class TestExtractRowRetained:
         ws_row = torch.zeros(2, 5)
         ws_row[:, 0] = 10.0
         ws_row[:, 3] = 8.0
-        tk_arr, ws_arr, ret_ids, ret_sc = _extract_row_retained(
+        tk_arr, ws_arr, ret_ids, ret_sc, all_ids, all_tier = _extract_row_retained(
             ws_row, None, tk=2, ws_sz=1, lws=1)
         assert tk_arr.tolist() == [0, 3]          # topk score order
         assert ret_ids.tolist() == [0, 3, 4]       # evictable ∪ local, sorted
         assert ws_arr.shape == (2, 5)
         assert ret_sc.shape == (2, 3)
+        # Full survivor axis: id per score column, tier 0=fp(evictable) 2=local.
+        assert all_ids.tolist() == [0, 1, 2, 3, 4]
+        assert all_tier.tolist() == [0, 0, 0, 0, 2]   # no Q tier passed
 
     def test_orig_ids_remap(self):
         from modules.evaluation.ours_parity_runner import _extract_row_retained
@@ -194,10 +197,12 @@ class TestExtractRowRetained:
         ws_row[:, 0] = 10.0
         ws_row[:, 3] = 8.0
         orig = torch.tensor([10, 11, 12, 13, 14])
-        tk_arr, _, ret_ids, _ = _extract_row_retained(
+        tk_arr, _, ret_ids, _, all_ids, all_tier = _extract_row_retained(
             ws_row, orig, tk=2, ws_sz=1, lws=1)
         assert tk_arr.tolist() == [10, 13]
         assert ret_ids.tolist() == [10, 13, 14]
+        assert all_ids.tolist() == [10, 11, 12, 13, 14]   # remapped orig ids
+        assert all_tier.tolist() == [0, 0, 0, 0, 2]
 
     def test_per_row_independence(self):
         """Two rows of one [B,H,W] tensor extract their own selections."""
@@ -206,8 +211,8 @@ class TestExtractRowRetained:
         ws[0, :, 1] = 10.0; ws[0, :, 0] = 5.0   # row 0 → windows 1,0
         ws[1, :, 2] = 10.0; ws[1, :, 3] = 5.0   # row 1 → windows 2,3
         orig = torch.arange(5)
-        tk0, _, rid0, _ = _extract_row_retained(ws[0], orig, tk=2, ws_sz=1, lws=1)
-        tk1, _, rid1, _ = _extract_row_retained(ws[1], orig, tk=2, ws_sz=1, lws=1)
+        tk0, _, rid0, _, _, _ = _extract_row_retained(ws[0], orig, tk=2, ws_sz=1, lws=1)
+        tk1, _, rid1, _, _, _ = _extract_row_retained(ws[1], orig, tk=2, ws_sz=1, lws=1)
         assert tk0.tolist() == [1, 0]
         assert rid0.tolist() == [0, 1, 4]
         assert tk1.tolist() == [2, 3]
@@ -219,7 +224,26 @@ class TestExtractRowRetained:
         ws_row = torch.zeros(2, 5)
         ws_row[:, 0] = 10.0
         ws_row[:, 1] = 8.0
-        tk_arr, _, ret_ids, _ = _extract_row_retained(
+        tk_arr, _, ret_ids, _, all_ids, all_tier = _extract_row_retained(
             ws_row, None, tk=2, ws_sz=1, lws=0.5)
         assert tk_arr.tolist() == [0, 1]
         assert ret_ids.tolist() == [0, 1, 2, 3, 4]
+        # eW=2 evictable (fp), remaining 3 are local.
+        assert all_tier.tolist() == [0, 0, 2, 2, 2]
+
+    def test_q_tier_tagging(self):
+        """Passing Q-tier ids tags those evictable columns tier 1 (int4)."""
+        from modules.evaluation.ours_parity_runner import _extract_row_retained
+        # W=6, ws_sz=1, local=2 (int) → eW=4 evictable.
+        ws_row = torch.tensor([[10., 1., 8., 3., 5., 9.],
+                               [10., 1., 8., 3., 5., 9.]])
+        orig = torch.arange(6)
+        q_ids = torch.tensor([1, 3])   # two evictable windows held in the Q tier
+        _, _, _, _, all_ids, all_tier = _extract_row_retained(
+            ws_row, orig, tk=2, ws_sz=1, lws=2, q_ids_row=q_ids)
+        assert all_ids.tolist() == [0, 1, 2, 3, 4, 5]
+        assert all_tier.tolist() == [0, 1, 0, 1, 2, 2]   # ids 1,3 → Q; 4,5 → local
+        # No Q ids ⇒ all evictable stay fp (q == 0 back-compat).
+        _, _, _, _, _, tier0 = _extract_row_retained(
+            ws_row, orig, tk=2, ws_sz=1, lws=2, q_ids_row=None)
+        assert tier0.tolist() == [0, 0, 0, 0, 2, 2]
