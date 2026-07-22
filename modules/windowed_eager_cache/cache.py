@@ -139,8 +139,18 @@ class WindowedCache(_HFCacheBase):
             + r.local_tokens
             + 2 * r.window_size              # a window of growth + slack
         )
+        # The prompt is resident until the FIRST eviction (EvictionPolicy.
+        # should_evict fires it at r.first_eviction_step, not at a window
+        # boundary), so the prefill buffer must cover the prompt plus every decode
+        # token appended up to and including that step: prefill_len +
+        # first_eviction_step + 1. The `window_size` term keeps the historical
+        # slack for large windows; the max() guarantees no safety-net realloc when
+        # window_size <= that step.
+        prefill_cap = prefill_len + max(
+            r.window_size, r.first_eviction_step + 1
+        )
         self._states: List[CacheState] = [
-            CacheState(capacity=steady, prefill_capacity=prefill_len + r.window_size)
+            CacheState(capacity=steady, prefill_capacity=prefill_cap)
             for _ in range(num_layers)
         ]
         self._policies: List[EvictionPolicy] = [

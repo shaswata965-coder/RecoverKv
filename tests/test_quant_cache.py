@@ -431,11 +431,18 @@ def test_end_to_end_generation_with_quant():
         # fp positions strictly increasing (no renumber, no dup)
         p = cache._states[0].position_ids[0]
         assert torch.all(p[1:] > p[:-1])
-        # Total retained stays bounded (compaction works): post-eviction fp is
-        # (top_k_fp + local)*ws, plus up to ws growth between ws-spaced evictions,
-        # plus the Q tier (N_q*ws), plus one window of slack.
-        cap = num_sink + (pol.top_k_fp + pol.N_q + pol.local_windows + 2) * ws
-        assert tfp + tq <= cap
+        step = t - prefill
+        if step < pol.first_eviction_step:
+            # Nothing evicts before the fixed first-eviction step: the whole
+            # prompt stays resident and the cache grows one fp token per step.
+            assert tq == 0 and tfp == prefill + step + 1
+        else:
+            # From the first eviction on, the two-tier budget bounds the cache:
+            # post-eviction fp is (top_k_fp + local)*ws, plus up to ws growth
+            # between ws-spaced evictions, plus the Q tier (N_q*ws) and a window
+            # of slack.
+            cap = num_sink + (pol.top_k_fp + pol.N_q + pol.local_windows + 2) * ws
+            assert tfp + tq <= cap
         assert store.num_active_windows <= pol.N_q
         if store.num_active_windows > 0:
             used_q = True

@@ -14,6 +14,8 @@ from typing import Any, Optional, Union
 
 import torch
 
+from .policy import FIRST_EVICTION_STEP
+
 
 # ---------------------------------------------------------------------------
 # ResolvedConfig (frozen, output of resolve())
@@ -36,6 +38,9 @@ class ResolvedConfig:
     total_budget_bytes: int
     total_budget_tokens: int
     rerotate_on_evict: bool = False
+    # Decode step at which the FIRST eviction fires, independent of window_size
+    # (EvictionPolicy.should_evict). Carried verbatim from WindowedCacheConfig.
+    first_eviction_step: int = FIRST_EVICTION_STEP
     # --- two-tier quantization (design.md §7) ---
     # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
     # and the int2 (Q) tier by memory. q=0 disables the Q tier entirely and every
@@ -142,6 +147,10 @@ class WindowedCacheConfig:
     rerotate_on_evict: bool = False
     quant_ratio: float = 0.0
     quant_memoize_read: Optional[bool] = None
+    # Decode step of the FIRST eviction, independent of window_size (default 8).
+    # See EvictionPolicy.should_evict; must be a non-negative int (0 = fire from
+    # the first decode step, the pre-fixed-offset behaviour).
+    first_eviction_step: int = FIRST_EVICTION_STEP
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -238,6 +247,19 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_memoize_read must be None (auto) or bool, got "
                 f"{type(self.quant_memoize_read).__name__}"
+            )
+
+        # -- first_eviction_step (non-negative int; bool rejected before int) --
+        if isinstance(self.first_eviction_step, bool) or not isinstance(
+            self.first_eviction_step, int
+        ):
+            raise ValueError(
+                f"first_eviction_step must be a non-negative int, got "
+                f"{self.first_eviction_step!r}"
+            )
+        if self.first_eviction_step < 0:
+            raise ValueError(
+                f"first_eviction_step must be >= 0, got {self.first_eviction_step}"
             )
 
     # -----------------------------------------------------------------
@@ -396,4 +418,5 @@ class WindowedCacheConfig:
             top_k_fp=top_k_fp,
             N_q=N_q,
             quant_memoize_read=self.quant_memoize_read,
+            first_eviction_step=self.first_eviction_step,
         )

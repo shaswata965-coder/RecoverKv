@@ -28,7 +28,7 @@ Tokens (prefill or generation step)
    ├── CacheState.append()            — grow the KV store
    ├── accumulate()                   — add new scores to running total
    ├── EvictionPolicy.should_evict()  — decide whether to compact now
-   │       (only True every window_size generation steps)
+   │       (first at a fixed step 8, then every window_size steps)
    └── [if evicting]
        ├── compute_retain_window_indices()  — top-K window selection
        ├── expand_to_token_indices()        — windows → absolute token positions
@@ -180,7 +180,11 @@ accumulate(state.window_scores, new_window_scores)   # scorer.py:64  (in-place +
 # 4. Check trigger
 step = self._generation_step[layer_idx]   # starts at 0, increments each gen step
 should_evict = policy.should_evict(step)  # policy.py:62
-#   → True iff  step > 0  AND  step % window_size == 0
+#   → the FIRST eviction fires at a fixed step (first_eviction_step, default 8),
+#     INDEPENDENT of window_size; nothing evicts before it. After that the natural
+#     window cadence resumes: True iff step % window_size == 0. So ws=12 → 8, 12,
+#     24, 36…; ws=8 → uniform 8, 16, 24…. (Edge: ws<8 suppresses sub-8 boundaries,
+#     then resumes at the next multiple — ws=3 → 8, 9, 12…)
 ```
 
 **Key insight:** scores accumulate monotonically. Every query in every forward pass
@@ -347,12 +351,16 @@ def append(self, key, value, pos=None):
 
 ## 7. Eviction Trigger Summary
 
+The first eviction fires at a fixed `first_eviction_step` (default 8), independent
+of `window_size`; the natural cadence resumes afterward.
+
 | Condition | `should_evict` result |
 |---|---|
 | Prefill step (first call to `update()`) | False (`not is_prefill` required) |
-| Generation step 0 | False (`step > 0` required) |
-| Generation step N where `N % window_size != 0` | False |
-| Generation step N where `N % window_size == 0` | True |
+| Generation step N where `N < first_eviction_step` | False (nothing evicts before it) |
+| Generation step N where `N == first_eviction_step` | True (the forced first eviction) |
+| Generation step N > `first_eviction_step`, `N % window_size == 0` | True |
+| Generation step N > `first_eviction_step`, `N % window_size != 0` | False |
 
 The cache grows freely through prefill and the first `window_size` generation
 steps; the first compaction fires at generation step `window_size`, then once

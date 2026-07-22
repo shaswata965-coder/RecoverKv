@@ -314,7 +314,8 @@ class OursParityRunner:
                 window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                 local_window_size=w.local_window_size, cache_budget=budget,
                 rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
-                quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0))
+                quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+                first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8))
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -354,12 +355,20 @@ class OursParityRunner:
                         out = model(input_ids=inp, past_key_values=cache, use_cache=True,
                                     return_dict=True, **gen_kwargs)
                         # cache.update() increments _generation_step AFTER the
-                        # eviction check, so to read "did this step evict" we
-                        # have to look at (step - 1) modulo ws_sz. The generation
-                        # step is shared across the batch.
-                        evicted = any((cache._generation_step[li] - 1) > 0 and
-                                      (cache._generation_step[li] - 1) % ws_sz == 0
-                                      for li in range(n_layers))
+                        # eviction check, so the step that was checked is
+                        # (_generation_step - 1). Ask the policy's should_evict
+                        # directly rather than re-deriving the cadence here — the
+                        # first eviction is at a fixed decode step, not a window
+                        # boundary (EvictionPolicy.should_evict), and this keeps the
+                        # mask from drifting. The generation step is shared across
+                        # the batch; -1 during prefill is guarded by should_evict's
+                        # `step < first_eviction_step` branch.
+                        evicted = any(
+                            cache._policies[li].should_evict(
+                                cache._generation_step[li] - 1
+                            )
+                            for li in range(n_layers)
+                        )
                         if getattr(out, "attentions", None):
                             for li in range(n_layers):
                                 a = out.attentions[li]

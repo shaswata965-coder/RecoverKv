@@ -841,6 +841,84 @@ class TestPreallocation:
 
 
 # ---------------------------------------------------------------------------
+# Eviction schedule — first eviction at a fixed step, independent of window_size
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionSchedule:
+    """should_evict fires the FIRST eviction at a fixed decode step (default 8),
+    independent of window_size, then resumes the natural window cadence at
+    absolute ``step % window_size == 0``."""
+
+    @staticmethod
+    def _fired(ws, upto, first=None):
+        """Steps in ``range(upto)`` at which should_evict fires, for window ``ws``."""
+        pol = EvictionPolicy(_make_resolved(window_size=ws))
+        if first is not None:
+            pol.first_eviction_step = first
+        return [s for s in range(upto) if pol.should_evict(s)]
+
+    @pytest.mark.parametrize("ws", [4, 8, 12, 16, 32])
+    def test_first_eviction_is_step_8_independent_of_ws(self, ws):
+        # First fire is step 8 for every window size — nothing earlier.
+        assert self._fired(ws, upto=9) == [8]
+
+    @pytest.mark.parametrize("ws", [1, 3, 4, 7, 8, 12, 16, 32])
+    def test_nothing_evicts_before_step_8(self, ws):
+        assert self._fired(ws, upto=8) == []
+
+    def test_cadence_ws12_matches_worked_example(self):
+        # The example from the design note: 8 (forced), 12, 24, 36, ...
+        assert self._fired(12, upto=40) == [8, 12, 24, 36]
+
+    def test_cadence_ws8_is_uniform(self):
+        assert self._fired(8, upto=40) == [8, 16, 24, 32]
+
+    def test_cadence_ws16_has_short_first_window(self):
+        assert self._fired(16, upto=40) == [8, 16, 32]
+
+    @pytest.mark.parametrize("ws,expected", [
+        (1, [8, 9, 10, 11, 12]),   # every step after the forced first
+        (3, [8, 9, 12, 15, 18]),   # 9 is the first multiple of 3 above 8
+        (4, [8, 12, 16, 20]),
+        (7, [8, 14, 21, 28]),
+    ])
+    def test_small_window_edge_cases_are_graceful(self, ws, expected):
+        # window_size 1-7 (smaller than the fixed offset): sub-8 boundaries are
+        # suppressed, the first eviction still lands at 8, cadence resumes after.
+        assert self._fired(ws, upto=expected[-1] + 1) == expected
+
+    def test_override_to_zero_reproduces_step0_schedule(self):
+        # The test-only affordance batching tests rely on: fire from step 0 and
+        # every window_size-th step after.
+        assert self._fired(1, upto=5, first=0) == [0, 1, 2, 3, 4]
+        assert self._fired(4, upto=13, first=0) == [0, 4, 8, 12]
+
+    # -- the config knob: WindowedCacheConfig -> ResolvedConfig -> EvictionPolicy
+
+    def test_first_eviction_step_defaults_to_8_through_config(self):
+        cfg = _make_config()
+        assert cfg.first_eviction_step == 8
+        resolved = cfg.resolve(100, _FakeModelConfig(), torch.float16, max_tokens=128)
+        assert resolved.first_eviction_step == 8
+        assert EvictionPolicy(resolved).first_eviction_step == 8
+
+    def test_config_knob_sets_the_first_eviction_step(self):
+        cfg = _make_config(first_eviction_step=5)
+        resolved = cfg.resolve(100, _FakeModelConfig(), torch.float16, max_tokens=128)
+        assert resolved.first_eviction_step == 5
+        pol = EvictionPolicy(resolved)
+        assert pol.first_eviction_step == 5
+        # and it actually moves the first fire (window_size default is 8 here)
+        assert [s for s in range(20) if pol.should_evict(s)][0] == 5
+
+    @pytest.mark.parametrize("bad", [-1, 2.0, True])
+    def test_invalid_first_eviction_step_is_rejected(self, bad):
+        with pytest.raises(ValueError, match="first_eviction_step"):
+            _make_config(first_eviction_step=bad)
+
+
+# ---------------------------------------------------------------------------
 # Batching — per-row independence under divergent eviction
 # ---------------------------------------------------------------------------
 
@@ -855,8 +933,9 @@ def _make_pos_keys(B, H_kv, T, D, start=0):
 def _divergent_scores(B, H_q):
     """Row 0 favours evictable windows {1,3}; row 1 favours {5,7}.
 
-    Per-call window_scores for prefill (8 windows) + 2 decode steps. The first
-    eviction now fires at decode step 0 (on the prefill scores), compacting the
+    Per-call window_scores for prefill (8 windows) + 2 decode steps. These tests
+    pin ``first_eviction_step = 0`` (see :func:`_drive_divergent_cache`) so the
+    first eviction fires at decode step 0 (on the prefill scores), compacting the
     8 prefill windows to 3 (each row's top-2 + the shared local window). So the
     widths track the *compacted* effective window count, exactly as the real
     score hook would size them: prefill 8 → step-0 scores 9 (8 + the new window)
@@ -874,10 +953,13 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
     """Drive a full WindowedCache through prefill + 2 decode steps.
 
     Geometry (window_size=1, num_sink=0, local=1, budget=0.375, prefill=8)
-    resolves to top_k=2, local_windows=1. Eviction fires every window_size
-    steps *including step 0*, so both decode calls evict: step 0 compacts the
-    prompt on the prefill scores, step 1 slides the local window forward.
-    Returns the layer-0 CacheState.
+    resolves to top_k=2, local_windows=1. This test targets the per-row eviction
+    *mechanics*, not the timing policy, so it pins ``first_eviction_step = 0`` —
+    reproducing the "fire from step 0" schedule (production's default is a fixed
+    step 8, which these 2-step runs would never reach). Eviction then fires every
+    window_size steps including step 0, so both decode calls evict: step 0
+    compacts the prompt on the prefill scores, step 1 slides the local window
+    forward. Returns the layer-0 CacheState.
     """
     model_cfg = _FakeModelConfig()
     cfg = WindowedCacheConfig(
@@ -888,6 +970,7 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
         kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
         num_layers=1, max_tokens=0,
     )
+    cache._policies[0].first_eviction_step = 0
     k = _make_pos_keys(B, H_kv, 8, D)
     cache.update(k, k.clone(), 0, cache_kwargs={
         "cache_position": torch.arange(8),
