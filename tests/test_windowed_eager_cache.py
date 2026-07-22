@@ -468,6 +468,42 @@ class TestFactory:
 
 
 # ===========================================================================
+# Eviction schedule + config knob (mirrors flash twin)
+# ===========================================================================
+
+
+class TestEvictionSchedule:
+    """First eviction at a fixed step (default 8), independent of window_size,
+    then the natural window cadence; configurable via WindowedCacheConfig."""
+
+    @staticmethod
+    def _fired(ws, upto, first=None):
+        pol = EvictionPolicy(_make_resolved(window_size=ws))
+        if first is not None:
+            pol.first_eviction_step = first
+        return [s for s in range(upto) if pol.should_evict(s)]
+
+    def test_first_eviction_step_8_then_ws_cadence(self):
+        assert self._fired(12, upto=40) == [8, 12, 24, 36]
+        assert self._fired(8, upto=40) == [8, 16, 24, 32]
+
+    @pytest.mark.parametrize("ws,expected", [(1, [8, 9, 10]), (3, [8, 9, 12]), (4, [8, 12, 16])])
+    def test_small_window_edge_cases(self, ws, expected):
+        assert self._fired(ws, upto=expected[-1] + 1) == expected
+
+    def test_config_knob_flows_to_policy(self):
+        cfg = _make_config(first_eviction_step=5)
+        resolved = cfg.resolve(100, _FakeModelConfig(), torch.float16, max_tokens=128)
+        assert resolved.first_eviction_step == 5
+        assert EvictionPolicy(resolved).first_eviction_step == 5
+
+    @pytest.mark.parametrize("bad", [-1, 2.0, True])
+    def test_invalid_first_eviction_step_is_rejected(self, bad):
+        with pytest.raises(ValueError, match="first_eviction_step"):
+            _make_config(first_eviction_step=bad)
+
+
+# ===========================================================================
 # Batching — per-row independence under divergent eviction (mirrors flash twin)
 # ===========================================================================
 
@@ -478,7 +514,8 @@ def _make_pos_keys(B, H_kv, T, D, start=0):
 
 
 def _divergent_scores(B, H_q):
-    # Widths track the COMPACTED effective window count: the first eviction now
+    # Widths track the COMPACTED effective window count. These tests pin
+    # first_eviction_step = 0 (see _drive_divergent_cache), so the first eviction
     # fires at decode step 0 on the prefill scores, dropping the 8 prompt windows
     # to 3, so step-1 sees 4 windows (3 survivors + 1 new), not 10. See the flash
     # twin's _divergent_scores docstring for the full schedule.
@@ -490,6 +527,9 @@ def _divergent_scores(B, H_q):
 
 
 def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
+    # Targets the per-row eviction MECHANICS, not the timing policy: pin
+    # first_eviction_step = 0 to reproduce the "fire from step 0" schedule
+    # (production defaults to a fixed step 8, which these 2-step runs never reach).
     model_cfg = _FakeModelConfig()
     cfg = WindowedCacheConfig(
         window_size=1, num_sink_tokens=0, local_window_size=1, cache_budget=0.375,
@@ -499,6 +539,7 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
         kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
         num_layers=1, max_tokens=0,
     )
+    cache._policies[0].first_eviction_step = 0
     k = _make_pos_keys(B, H_kv, 8, D)
     cache.update(k, k.clone(), 0, cache_kwargs={
         "cache_position": torch.arange(8),

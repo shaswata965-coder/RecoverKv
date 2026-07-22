@@ -16,6 +16,14 @@ if TYPE_CHECKING:
     from .config import ResolvedConfig
 
 
+#: Decode step of the **first** eviction, INDEPENDENT of ``window_size``. The
+#: first compaction always fires this many steps into decode, so a window-size
+#: sweep shares one first-eviction point instead of first evicting at a
+#: ws-dependent step (which confounds the comparison). 8 is the reference window
+#: the experiments are calibrated against. See :meth:`EvictionPolicy.should_evict`.
+FIRST_EVICTION_STEP = 8
+
+
 class EvictionPolicy:
     """Stateful eviction controller.
 
@@ -39,6 +47,11 @@ class EvictionPolicy:
         # counts stay aligned with the merged axis and get_seq_length (design §5).
         # At q=0, T_q == 0, so this is exactly the fp-only token count.
         self.total_tokens: int = 0
+        # Decode step of the first eviction — the config knob (default
+        # FIRST_EVICTION_STEP), carried through ResolvedConfig. An instance
+        # attribute so tests can also isolate eviction *mechanics* from this
+        # *timing* policy (e.g. set 0 to fire from the first decode step).
+        self.first_eviction_step: int = resolved.first_eviction_step
 
     # -----------------------------------------------------------------
     # State bookkeeping
@@ -63,17 +76,37 @@ class EvictionPolicy:
     def should_evict(self, step: int) -> bool:
         """Return ``True`` if eviction should run at decode *step*.
 
-        Fires at every ``window_size``-th step **including step 0**. Step 0 is
-        the first decode step, and it is the earliest point the prefill attention
-        scores are available: the score hook is a ``forward_hook`` that runs after
-        the attention module returns, so the prefill scores are produced *after*
-        the prefill ``update()`` and first land in ``cache_kwargs`` — where they
-        are consumed — at this step. Evicting here compresses the prompt against
-        those prefill scores (SnapKV-style) and releases the prefill-sized fp
-        buffer after one decode step instead of holding it for a full window
-        (cache.py's ``prefill_capacity`` note). Every later multiple of
-        ``window_size`` then slides as before, always a full window apart.
+        The **first** eviction fires at a fixed ``first_eviction_step`` (default
+        :data:`FIRST_EVICTION_STEP` = 8), **independent of ``window_size``** — so a
+        window-size sweep shares one first-compaction point instead of first
+        evicting at a ws-dependent step. Nothing evicts before it: the prompt stays
+        whole until then, and the prefill scores it is compressed against are
+        already available (the score hook is a ``forward_hook`` that runs after the
+        attention module, so the prefill scores land in ``cache_kwargs`` from the
+        first decode step). After the first eviction, the natural window cadence
+        resumes — every step where ``step % window_size == 0``, aligned to absolute
+        step 0. So:
+
+        * ``ws == 12`` → ``8`` (forced), ``12``, ``24``, ``36`` … — the first slide
+          after the forced eviction is a short ``8 → 12`` gap, then full windows.
+        * ``ws == 8`` → a uniform ``8``, ``16``, ``24`` …
+        * ``ws >= 9`` → ``8`` then multiples of ``ws`` (short first window, full
+          windows after).
+
+        Edge cases ``window_size`` 1–7 (smaller than the fixed offset) are handled
+        gracefully: the natural boundaries below step 8 are suppressed, the first
+        eviction still fires at 8, and the cadence resumes at the next multiple —
+        ``ws == 4`` → ``8, 12, 16`` …; ``ws == 3`` → ``8, 9, 12`` …; ``ws == 1`` →
+        ``8, 9, 10`` … . Nothing before ``first_eviction_step`` ever evicts.
+
+        Setting ``first_eviction_step`` to 0 reproduces the "fire from step 0"
+        schedule (step 0 plus every ``window_size``-th step) — used by the batching
+        tests to exercise eviction on short generations.
         """
+        if step < self.first_eviction_step:
+            return False
+        if step == self.first_eviction_step:
+            return True
         return step % self.window_size == 0
 
     # -----------------------------------------------------------------

@@ -165,12 +165,18 @@ class PerfRunner:
             # to measure both sides. See BATCHING_PLAN.md §5.
             memoize = c.get("quant_memoize_read",
                             getattr(cfg.cache, "quant_memoize_read", None))
+            # Decode step of the first eviction (independent of window_size);
+            # per-config override falling back to the shared cache setting.
+            first_eviction_step = c.get(
+                "first_eviction_step", getattr(cfg.cache, "first_eviction_step", 8)
+            )
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,
                       cache_budget=budget if budget is not None else 0.5,
                       rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                       quant_ratio=quant_ratio,
-                      quant_memoize_read=memoize)
+                      quant_memoize_read=memoize,
+                      first_eviction_step=first_eviction_step)
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():
