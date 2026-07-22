@@ -855,22 +855,29 @@ def _make_pos_keys(B, H_kv, T, D, start=0):
 def _divergent_scores(B, H_q):
     """Row 0 favours evictable windows {1,3}; row 1 favours {5,7}.
 
-    Returns the per-call window_scores for prefill (8 windows) + 2 decode
-    steps (9 then 10 windows; the new windows score ~0).
+    Per-call window_scores for prefill (8 windows) + 2 decode steps. The first
+    eviction now fires at decode step 0 (on the prefill scores), compacting the
+    8 prefill windows to 3 (each row's top-2 + the shared local window). So the
+    widths track the *compacted* effective window count, exactly as the real
+    score hook would size them: prefill 8 → step-0 scores 9 (8 + the new window)
+    → step-1 scores 4 (the 3 survivors + the new window). The new windows score
+    ~0, so both evictions rank purely by the prefill scores in ``s0``.
     """
     s0 = torch.zeros(B, H_q, 8)
     s0[0, :, [1, 3]] = 100.0
     if B > 1:
         s0[1, :, [5, 7]] = 100.0
-    return [s0, torch.zeros(B, H_q, 9), torch.zeros(B, H_q, 10)]
+    return [s0, torch.zeros(B, H_q, 9), torch.zeros(B, H_q, 4)]
 
 
 def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
     """Drive a full WindowedCache through prefill + 2 decode steps.
 
     Geometry (window_size=1, num_sink=0, local=1, budget=0.375, prefill=8)
-    resolves to top_k=2, local_windows=1; the first eviction fires on the 2nd
-    decode call (generation step 1).  Returns the layer-0 CacheState.
+    resolves to top_k=2, local_windows=1. Eviction fires every window_size
+    steps *including step 0*, so both decode calls evict: step 0 compacts the
+    prompt on the prefill scores, step 1 slides the local window forward.
+    Returns the layer-0 CacheState.
     """
     model_cfg = _FakeModelConfig()
     cfg = WindowedCacheConfig(
@@ -903,7 +910,8 @@ class TestBatching:
         state = _drive_divergent_cache(_divergent_scores(2, H_q), B=2)
 
         # original_window_ids is per-row [B, W_retained]; each row kept its own
-        # top-2 evictable windows plus the shared local window (9).
+        # top-2 evictable windows plus the shared local window. Step 0 compacts
+        # the prompt to {top-2, pos 8}; step 1 slides the local window to pos 9.
         assert state.original_window_ids.shape == (2, 3)
         assert state.original_window_ids[0].tolist() == [1, 3, 9]
         assert state.original_window_ids[1].tolist() == [5, 7, 9]

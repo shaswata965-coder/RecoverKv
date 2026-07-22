@@ -61,8 +61,20 @@ class EvictionPolicy:
     # -----------------------------------------------------------------
 
     def should_evict(self, step: int) -> bool:
-        """Return ``True`` if eviction should run at *step*."""
-        return step > 0 and step % self.window_size == 0
+        """Return ``True`` if eviction should run at decode *step*.
+
+        Fires at every ``window_size``-th step **including step 0**. Step 0 is
+        the first decode step, and it is the earliest point the prefill attention
+        scores are available: the score hook is a ``forward_hook`` that runs after
+        the attention module returns, so the prefill scores are produced *after*
+        the prefill ``update()`` and first land in ``cache_kwargs`` — where they
+        are consumed — at this step. Evicting here compresses the prompt against
+        those prefill scores (SnapKV-style) and releases the prefill-sized fp
+        buffer after one decode step instead of holding it for a full window
+        (cache.py's ``prefill_capacity`` note). Every later multiple of
+        ``window_size`` then slides as before, always a full window apart.
+        """
+        return step % self.window_size == 0
 
     # -----------------------------------------------------------------
     # Region helpers (computed from current state)
