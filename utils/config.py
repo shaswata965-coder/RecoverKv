@@ -101,7 +101,7 @@ class CacheConfig:
                 )
 
         # quant_ratio: two-tier int2 split (design.md §7). Full validation
-        # (even window_size when q>0, range) lives in WindowedCacheConfig; here
+        # (window_size % 4 when q>0, range) lives in WindowedCacheConfig; here
         # we only guard the obvious type/range so eval configs fail fast.
         if isinstance(self.quant_ratio, bool):
             raise ConfigValidationError("quant_ratio must be a float in [0, 1], got bool")

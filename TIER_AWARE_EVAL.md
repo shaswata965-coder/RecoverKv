@@ -70,8 +70,7 @@ python main.py --config configs/eval_parity_base.yaml
 
 # 2. OURS — our windowed cache WITH the Q tier on.  quant_ratio > 0 turns on the
 #    two-tier split; it needs a window_size divisible by 4 (int2 crumb packing).
-#    The eager config
-#    uses window_size 32, so just override the ratio:
+#    The eager config uses window_size 32, so just override the ratio:
 python main.py --config configs/eval_parity_ours_eager.yaml \
        --override cache.quant_ratio=0.5
 #   → outputs/parity_ours_eager_<dataset>.npz
