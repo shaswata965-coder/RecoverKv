@@ -25,6 +25,8 @@ _RUNNER_REGISTRY: dict[str, str] = {
     "perf": "modules.evaluation.perf_runner.PerfRunner",
     "longbench": "modules.evaluation.longbench_runner.LongBenchRunner",
     "longbench_score": "modules.evaluation.longbench_scoring.LongBenchScorer",
+    "ruler": "modules.evaluation.ruler_runner.RulerRunner",
+    "ruler_score": "modules.evaluation.ruler_scoring.RulerScorer",
     "visualize": "modules.evaluation.visualize.VisualizeRunner",
 }
 
