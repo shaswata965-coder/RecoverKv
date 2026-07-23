@@ -1,6 +1,6 @@
 # Tier-Aware Evaluation — Verification & Guide
 
-How the Jaccard (Suite A) and attention-mass (Suite B) suites treat the int4
+How the Jaccard (Suite A) and attention-mass (Suite B) suites treat the int2
 **Q tier** on `quant_batched`, how to run them, and what each metric means.
 This answers three questions, verified against the code.
 
@@ -69,7 +69,8 @@ python main.py --config configs/eval_parity_base.yaml
 #   → outputs/parity_base_<dataset>.npz
 
 # 2. OURS — our windowed cache WITH the Q tier on.  quant_ratio > 0 turns on the
-#    two-tier split; it needs an even window_size (int4 packing).  The eager config
+#    two-tier split; it needs a window_size divisible by 4 (int2 crumb packing).
+#    The eager config
 #    uses window_size 32, so just override the ratio:
 python main.py --config configs/eval_parity_ours_eager.yaml \
        --override cache.quant_ratio=0.5
@@ -89,7 +90,11 @@ python main.py --config configs/eval_visualize.yaml
 Notes:
 - The knob is **`cache.quant_ratio`** (`configs/base.yaml:24`). `0.0` = pure fp16
   (byte-identical to the single-tier path); `> 0` splits the evictable budget so the
-  int4 Q tier holds ~4× the windows per byte. Set it in the yaml or via `--override`.
+  int2 Q tier holds more windows per byte. The factor is **not** the naive 8×: the
+  fp16 scale/zero grid is fixed overhead that the 2-bit codes no longer dominate, so
+  it grows with `window_size` as the grid amortizes — ~3.9× at `window_size` 8, ~6.1×
+  at the `window_size` 32 this eager config uses (head_dim 128; see `resolve`'s
+  `b_q`). Set it in the yaml or via `--override`.
 - Step 3's config (`configs/eval_faithfulness.yaml`) points `base_npz_path` /
   `ours_npz_path` at the two outputs above.
 - **q = 0 sanity / back-compat:** run steps 2–3 with `--override cache.quant_ratio=0.0`

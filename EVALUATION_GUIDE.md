@@ -193,7 +193,7 @@ jaccard  = intersection / union      # [T, L, H] ∈ [0, 1]
   (std across heads at the last step — measures per-layer agreement)
 
 **Tier-aware Jaccard (two-tier, schema ≥ 2.2).** The legacy Jaccard above slices
-ours' single-tier top-K, so with `quant_ratio > 0` a window kept in the int4 **Q
+ours' single-tier top-K, so with `quant_ratio > 0` a window kept in the int2 **Q
 tier** gets no credit — it scores as if dropped. The faithfulness runner therefore
 also computes, per `(step, layer)`, the overlap of ours' *retained* set against
 base's top-`n` windows of **matching size** (`faithfulness_runner._jaccard_sets` /
@@ -333,7 +333,7 @@ alongside as a lower bound — Fresh-K is greedy-optimal per flush, so
 `lir_ignore_threshold` (default 3) — all read from the ours npz metadata.
 
 **Two-tier missed mass (schema ≥ 2.2).** `simulate_policy` models the fp tier
-(`history_budget_K = top_k_fp` windows) **and** an int4 **Q tier** of the next `N_q`
+(`history_budget_K = top_k_fp` windows) **and** an int2 **Q tier** of the next `N_q`
 strongest evictable windows (`n_q` arg), mirroring `policy.compute_two_tier_retain`.
 Because the Q tier is physically kept, counting it as "missed" would penalise
 exactly the mass quantization *rescues*. So the runner reports:

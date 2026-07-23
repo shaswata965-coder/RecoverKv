@@ -48,7 +48,7 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
-    quant_ratio: float = 0.0  # two-tier int4 split q in [0,1] (design.md §7); 0 disables the Q tier
+    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
     first_eviction_step: int = 8  # decode step of the FIRST eviction, independent of window_size
     # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
     # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
@@ -100,7 +100,7 @@ class CacheConfig:
                     f"got {self.local_window_size}"
                 )
 
-        # quant_ratio: two-tier int4 split (design.md §7). Full validation
+        # quant_ratio: two-tier int2 split (design.md §7). Full validation
         # (even window_size when q>0, range) lives in WindowedCacheConfig; here
         # we only guard the obvious type/range so eval configs fail fast.
         if isinstance(self.quant_ratio, bool):

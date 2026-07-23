@@ -11,7 +11,7 @@ One file, two ways to use it.
     out = model.generate(..., past_key_values=pkv)
     report_cache_memory(pkv, label="qasper bs=4 q=0.5")
 
-It prints an exact byte breakdown — fp16 tier, int4 Q tier (codes + grid),
+It prints an exact byte breakdown — fp16 tier, int2 Q tier (codes + grid),
 read memo, and bookkeeping — split into what is *semantically retained* (live)
 vs. what is *reserved in memory* (allocated), plus the two compression ratios
 the method exists to move: against an fp16 cache at the **same retention** (the
@@ -250,7 +250,7 @@ def _measure_windowed(
         t_q = 0
         n_active = 0
 
-        # -- int4 Q tier --
+        # -- int2 Q tier --
         store = stores[li] if li < len(stores) else None
         table = getattr(store, "table", None) if store is not None else None
         if table is not None:
@@ -480,7 +480,7 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
     )
     if r.q_content_alloc or r.kind == "windowed":
         lines.append(
-            f"{'int4 Q (codes+grid)':<26}"
+            f"{'int2 Q (codes+grid)':<26}"
             f"{_mb(r.q_content_live):>20}{_mb(r.q_content_alloc):>22}"
         )
     lines.append(
@@ -529,7 +529,7 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
         lines.append("-" * 72)
         lines.append(
             "NOTE: Q tier is empty (no eviction has run yet). Increase --gen or "
-            "lower --cache-budget so the cache compacts and the int4 tier fills."
+            "lower --cache-budget so the cache compacts and the int2 tier fills."
         )
     lines.append("=" * 72)
     return "\n".join(lines)

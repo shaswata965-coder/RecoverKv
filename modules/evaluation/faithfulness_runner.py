@@ -279,7 +279,7 @@ class FaithfulnessRunner:
                             ours_kept, _base_top_ids(base_hm, ew, len(ours_kept)))
                         # Q-tier fidelity: cos-sim of ours' (dequantized) vs base's
                         # head-mean mass over the Q windows — how faithfully the
-                        # int4 tier reproduces the true attention it holds.
+                        # int2 tier reproduces the true attention it holds.
                         if q_ids_t.numel() > 0:
                             q_cols = q_m.nonzero(as_tuple=True)[0]
                             o_q = o_ws_s[t, li, :, q_cols].mean(dim=0)   # [n_q]

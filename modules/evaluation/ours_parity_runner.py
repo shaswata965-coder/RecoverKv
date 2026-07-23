@@ -52,7 +52,7 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
         top-K windows, window size, and ``local_window_size`` (int or float).
     q_ids_row : Tensor or None
         Shape ``[n_active]`` — original ids of the windows currently held in the
-        int4 Q tier for this row/layer (``store.active_ids()[bi]``).  ``None`` at
+        int2 Q tier for this row/layer (``store.active_ids()[bi]``).  ``None`` at
         ``quant_ratio == 0`` (no Q tier).  Used only to tag ``all_tier_arr``; it
         does not affect any legacy array, so the ``q == 0`` path is unchanged.
 
@@ -112,7 +112,7 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
     # ── full survivor axis: id + tier per score column (new, additive) ──
     # The score columns [0, W) are the merged survivor windows in chronological
     # (compact) order.  original_window_ids maps each to its absolute id; the Q
-    # store's active_ids() names which of the *evictable* survivors are int4.
+    # store's active_ids() names which of the *evictable* survivors are int2.
     all_ids_full = (orig_row.cpu().long().numpy()
                     if orig_row is not None
                     else np.arange(W, dtype=np.int64))          # [W]
@@ -122,7 +122,7 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
         q_np = q_ids_row.detach().cpu().long().numpy()
         if q_np.size:
             is_q = np.isin(all_ids_full[:eW], q_np)
-            all_tier_arr[:eW][is_q] = 1                        # int4 Q tier
+            all_tier_arr[:eW][is_q] = 1                        # int2 Q tier
     return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr, all_ids_full, all_tier_arr
 
 class OursParityRunner:
