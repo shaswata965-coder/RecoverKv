@@ -1,0 +1,60 @@
+# ============================================================================
+# GSM8K — 80% cache budget (compression_ratio 0.20)
+# ============================================================================
+# READ THIS BEFORE INTERPRETING THE RESULT. The budget is sized against
+# prefill + max_new_tokens, but eviction only fires once the budget falls below
+# the sequence length the run ACTUALLY reaches. On GSM8K:
+#
+#   budget_tokens = 0.80 * (prefill + 512) ~= 513   (prefill ~130)
+#   sequence      = prefill + tokens_actually_generated
+#
+# So whether this budget binds depends entirely on when the model stops. A model
+# that emits EOS after ~200 reasoning tokens reaches ~330 tokens and is never
+# evicted — this run is then the full-cache baseline in disguise. A model that
+# runs to the 512-token cap reaches ~640 tokens and is genuinely compressed.
+#
+# Do not assume either. The runner measures it: read `pct_examples_no_eviction`
+# and `effective_retention` in meta.json (and the comparison table) before you
+# read the accuracy. If no-eviction is high, report this run as a control that
+# proves the harness reproduces baseline, not as a measurement of compression.
+#
+# Produces: outputs/gsm8k/budget80/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.80        # fraction RETAINED (DefensiveKV compression_ratio = 0.20)
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25   # fraction of the budget — scales with short prompts
+  quant_ratio: 0.0          # pure fp16; byte-identical to the single-tier path
+  first_eviction_step: 8
+
+window:                     # kept in sync to silence the disagreement warning
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/budget80
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

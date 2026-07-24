@@ -543,26 +543,233 @@ def rescore_many(paths: Iterable[Path], out_csv: Optional[Path] = None) -> List[
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Run-directory scoring (GSM8KRunner output) + budget comparison
+# ---------------------------------------------------------------------------
+
+
+def _binomial_ci95(p_pct: float, n: int) -> float:
+    """Half-width of the 95% CI on an accuracy of *p_pct*% over *n* examples."""
+    if n <= 0:
+        return float("nan")
+    p = p_pct / 100.0
+    return round(100.0 * 1.96 * math.sqrt(max(p * (1 - p), 0.0) / n), 2)
+
+
+def score_run_dir(run_dir: Path) -> Tuple[GSM8KReport, Dict[str, Any]]:
+    """Score one ``GSM8KRunner`` output directory.
+
+    Returns ``(report, meta)`` where *meta* is the run's ``meta.json`` (empty
+    dict if absent).
+    """
+    run_dir = Path(run_dir)
+    preds_path = run_dir / "predictions.jsonl"
+    if not preds_path.exists():
+        raise FileNotFoundError(f"{preds_path} not found")
+
+    rep = rescore_file(preds_path)
+
+    meta_path = run_dir / "meta.json"
+    meta: Dict[str, Any] = {}
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    return rep, meta
+
+
+_COMPARE_COLS = [
+    "run", "cache_budget", "n", "accuracy", "ci95", "accuracy_strict",
+    "marker_rate", "n_fallback", "n_looks_truncated", "n_generation_failed",
+    "effective_retention", "pct_examples_no_eviction", "dataset_sha",
+]
+
+
+def build_comparison_table(
+    run_dirs: Sequence[Path],
+    out_csv: Optional[Path] = None,
+) -> str:
+    """Score several runs and render a budget-comparison table.
+
+    Refuses to present the runs as comparable when their ``dataset_sha`` differ
+    — that is the failure mode where a "budget sweep" is really two different
+    datasets, and it is not detectable from the accuracy numbers alone.
+    """
+    rows: List[Dict[str, Any]] = []
+    for d in run_dirs:
+        d = Path(d)
+        try:
+            rep, meta = score_run_dir(d)
+        except Exception as e:
+            log.error("%s: could not be scored (%s)", d, e)
+            continue
+        scoreable = rep.n_total - rep.n_generation_failed - rep.n_empty
+        rows.append({
+            "run": d.name,
+            "cache_budget": meta.get("cache_budget"),
+            "n": scoreable,
+            "accuracy": rep.accuracy,
+            "ci95": _binomial_ci95(rep.accuracy, scoreable),
+            "accuracy_strict": rep.accuracy_strict,
+            "marker_rate": rep.marker_rate,
+            "n_fallback": rep.n_fallback,
+            "n_looks_truncated": rep.n_looks_truncated,
+            "n_generation_failed": rep.n_generation_failed,
+            "effective_retention": meta.get("effective_retention"),
+            "pct_examples_no_eviction": meta.get("pct_examples_no_eviction"),
+            "dataset_sha": (meta.get("dataset_sha") or "")[:12],
+            "_warnings": rep.warnings,
+        })
+
+    if not rows:
+        return "(no runs scored)"
+
+    lines: List[str] = []
+    header = (f"  {'run':<28} {'budget':>7} {'n':>5} {'acc':>7} {'+/-':>6} "
+              f"{'strict':>7} {'mark%':>6} {'trunc':>6} {'retain':>7} {'noEvic%':>8}")
+    lines.append("=" * len(header))
+    lines.append("  GSM8K BUDGET COMPARISON")
+    lines.append("=" * len(header))
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for r in rows:
+        budget = "full" if r["cache_budget"] is None else f"{r['cache_budget']:.2f}"
+        retain = "-" if r["effective_retention"] is None else f"{r['effective_retention']:.3f}"
+        noev = "-" if r["pct_examples_no_eviction"] is None else f"{r['pct_examples_no_eviction']:.1f}"
+        lines.append(
+            f"  {r['run'][:28]:<28} {budget:>7} {r['n']:>5} {r['accuracy']:>7.2f} "
+            f"{r['ci95']:>6.2f} {r['accuracy_strict']:>7.2f} {r['marker_rate']:>6.1f} "
+            f"{r['n_looks_truncated']:>6} {retain:>7} {noev:>8}"
+        )
+
+    # ---- validity gates -----------------------------------------------------
+    lines.append("")
+    shas = {r["dataset_sha"] for r in rows if r["dataset_sha"]}
+    if len(shas) > 1:
+        lines.append(
+            "  !! FATAL: runs used DIFFERENT datasets (dataset_sha: "
+            f"{', '.join(sorted(shas))}). These accuracies are not comparable. "
+            "Rebuild once with `python -m data.gsm8k_loader` and re-run every budget "
+            "against that one directory."
+        )
+    else:
+        # ASCII only: these tables are read over ssh on cp1252 consoles, where a
+        # stray em-dash prints as a replacement char and makes the gate look broken.
+        lines.append(
+            f"  dataset_sha {shas.pop() if shas else 'unknown'} -- identical across runs. OK"
+        )
+
+    worst_ci = max((r["ci95"] for r in rows), default=0.0)
+    lines.append(
+        f"  Noise floor: budgets differing by less than ~{2 * worst_ci:.1f} points "
+        f"are statistically indistinguishable."
+    )
+
+    low_marker = [r for r in rows if r["marker_rate"] < 90.0]
+    if low_marker:
+        lines.append(
+            "  !! marker_rate < 90% on: "
+            + ", ".join(r["run"] for r in low_marker)
+            + " -- those rows are measuring output format, not correctness."
+        )
+    no_evic = [r for r in rows
+               if r["pct_examples_no_eviction"] not in (None, "")
+               and r["pct_examples_no_eviction"] > 10.0]
+    if no_evic:
+        lines.append(
+            "  !! budget never bound on >10% of examples for: "
+            + ", ".join(r["run"] for r in no_evic)
+            + " -- those rows are the full-cache baseline in disguise."
+        )
+    failed = [r for r in rows if r["n_generation_failed"]]
+    if failed:
+        lines.append(
+            "  !! generation failures on: " + ", ".join(r["run"] for r in failed)
+            + " -- not comparable to clean runs until re-run."
+        )
+
+    for r in rows:
+        for w in r["_warnings"]:
+            lines.append(f"  [{r['run']}] {w}")
+
+    table = "\n".join(lines)
+
+    if out_csv is not None:
+        out_csv = Path(out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_COMPARE_COLS)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k) for k in _COMPARE_COLS})
+        log.info("Comparison written to %s", out_csv)
+
+    return table
+
+
+class GSM8KScorer:
+    """Post-hoc scorer, invoked via ``main.py`` with ``run.mode=gsm8k_score``.
+
+    Scores every run directory under ``outputs/gsm8k/`` and prints the budget
+    comparison table.
+    """
+
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def run(self) -> None:
+        base_dir = Path(
+            getattr(getattr(self.config, "gsm8k", None), "results_dir", "outputs/gsm8k")
+        )
+        if not base_dir.exists():
+            log.error("No %s directory found — run mode=gsm8k first.", base_dir)
+            return
+
+        run_dirs = sorted(
+            d for d in base_dir.iterdir()
+            if d.is_dir() and (d / "predictions.jsonl").exists()
+        )
+        if not run_dirs:
+            log.error("No run directories with predictions.jsonl under %s", base_dir)
+            return
+
+        table = build_comparison_table(run_dirs, base_dir / "comparison.csv")
+        print("\n" + table + "\n")
+
+
 def _cli_main() -> None:
     parser = argparse.ArgumentParser(
         description="Re-score GSM8K predictions with extraction diagnostics."
     )
     parser.add_argument(
-        "--predictions", type=str, nargs="+", required=True,
+        "--predictions", type=str, nargs="*", default=[],
         help="Prediction file(s) or glob(s): *_df.csv or *.jsonl",
+    )
+    parser.add_argument(
+        "--runs", type=str, nargs="*", default=[],
+        help="GSM8KRunner output directories to compare (each holds predictions.jsonl)",
     )
     parser.add_argument("--out_csv", type=str, default=None, help="Comparison CSV path")
     args = parser.parse_args()
 
-    paths: List[Path] = []
-    for pattern in args.predictions:
-        hits = sorted(_glob.glob(pattern))
-        paths.extend(Path(h) for h in hits) if hits else paths.append(Path(pattern))
+    if not args.predictions and not args.runs:
+        parser.error("pass --predictions and/or --runs")
 
-    if not paths:
-        parser.error("no prediction files matched")
+    if args.runs:
+        run_dirs: List[Path] = []
+        for pattern in args.runs:
+            hits = sorted(_glob.glob(pattern))
+            run_dirs.extend(Path(h) for h in hits) if hits else run_dirs.append(Path(pattern))
+        print("\n" + build_comparison_table(
+            run_dirs, Path(args.out_csv) if args.out_csv else None
+        ) + "\n")
 
-    rescore_many(paths, Path(args.out_csv) if args.out_csv else None)
+    if args.predictions:
+        paths: List[Path] = []
+        for pattern in args.predictions:
+            hits = sorted(_glob.glob(pattern))
+            paths.extend(Path(h) for h in hits) if hits else paths.append(Path(pattern))
+        if not paths:
+            parser.error("no prediction files matched")
+        rescore_many(paths, Path(args.out_csv) if args.out_csv else None)
 
 
 if __name__ == "__main__":

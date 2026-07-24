@@ -437,6 +437,47 @@ class RulerConfig:
 
 
 # ---------------------------------------------------------------------------
+# GSM8K config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GSM8KConfig:
+    """GSM8K chain-of-thought evaluation (modes ``gsm8k`` / ``gsm8k_score``)."""
+
+    #: Directory produced by ``python -m data.gsm8k_loader --out <dir>``.
+    data_dir: str = "data/gsm8k_cot"
+    output_dir: str = "outputs/gsm8k/run"
+    #: Parent directory scanned by ``gsm8k_score`` for run directories.
+    results_dir: str = "outputs/gsm8k"
+    num_samples: Union[int, str] = "max"  # cap applied BEFORE sharding
+    shard: int = 0
+    num_shards: int = 1
+    skip_oom: bool = False
+    aggressive_cache_clear: bool = False
+    #: Override the dataset's per-example generation budget. None (default) uses
+    #: the dataset value (512). Only for smoke runs — lowering it truncates
+    #: reasoning mid-chain and collapses accuracy, which is exactly the defect
+    #: the CoT dataset exists to avoid. Recorded in meta.json when set.
+    max_new_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.num_samples = _validate_num_samples(self.num_samples, "gsm8k.num_samples")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ConfigValidationError(
+                f"gsm8k.max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}"
+            )
+        if self.num_shards < 1:
+            raise ConfigValidationError(
+                f"gsm8k.num_shards must be >= 1, got {self.num_shards!r}"
+            )
+        if not (0 <= self.shard < self.num_shards):
+            raise ConfigValidationError(
+                f"gsm8k.shard must be in [0, {self.num_shards}), got {self.shard!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # ExperimentConfig (top-level)
 # ---------------------------------------------------------------------------
 
@@ -457,6 +498,7 @@ class ExperimentConfig:
     visualize: VisualizeConfig = field(default_factory=VisualizeConfig)
     longbench: LongBenchConfig = field(default_factory=LongBenchConfig)
     ruler: RulerConfig = field(default_factory=RulerConfig)
+    gsm8k: GSM8KConfig = field(default_factory=GSM8KConfig)
 
     # Paths
     base_run_npz: Optional[str] = None
@@ -509,6 +551,7 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         visualize=VisualizeConfig(**vis_raw),
         longbench=LongBenchConfig(**lb_raw),
         ruler=RulerConfig(**ruler_raw),
+        gsm8k=GSM8KConfig(**d.get("gsm8k", {})),
         base_run_npz=d.get("base_run_npz"),
         output_path=d.get("output_path"),
     )
