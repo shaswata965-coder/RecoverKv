@@ -1,0 +1,38 @@
+# ============================================================================
+# GSM8K — full-cache baseline (no compression)
+# ============================================================================
+# This is the reference the compressed runs are measured against. Expect
+# ~80-85 accuracy with marker_rate > 95% on Llama-3.1-8B-Instruct.
+# If this run does not land there, NOTHING downstream is interpretable —
+# fix it before running any budget.
+#
+# Produces: outputs/gsm8k/full_cache/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic          # DynamicCache — no eviction, no quantization
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/full_cache
+  results_dir: outputs/gsm8k
+  num_samples: max          # override to e.g. 20 for a smoke run
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false
