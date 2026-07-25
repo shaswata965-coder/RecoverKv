@@ -188,6 +188,85 @@ class TestMiddleTruncation:
 
 
 # ---------------------------------------------------------------------------
+# Test: max_length auto-fits to the model's context window
+# ---------------------------------------------------------------------------
+
+class TestMaxLengthAutoFit:
+    """`max_length: null` must fit the prompt inside max_position_embeddings.
+
+    Regression for a Mistral-v0.2 (32K) LongBench run that inherited a config
+    written for Llama-3.1 (128K): narrativeqa prompts reached 35083 tokens, past
+    the window, so RoPE positions were out of distribution and every score for
+    that dataset was noise rather than a measurement.
+    """
+
+    @staticmethod
+    def _runner(model_max, max_length, model_name="Mistral-7B-Instruct-v0.2",
+                chat_overhead=10):
+        import types
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        r = LongBenchRunner.__new__(LongBenchRunner)
+        r._chat_overhead_cache = {}
+        r._auto_fit_logged = set()
+        r._over_context_warned = False
+        r.config = types.SimpleNamespace(model=types.SimpleNamespace(name=model_name))
+        r.lb = types.SimpleNamespace(max_length=max_length)
+        r.model = types.SimpleNamespace(
+            config=types.SimpleNamespace(max_position_embeddings=model_max)
+        )
+        # Stub the tokenizer-dependent overhead so the test stays offline.
+        r._chat_template_overhead = lambda _tok, ds: (
+            0 if ds in LongBenchRunner.NO_CHAT_TEMPLATE_DATASETS else chat_overhead
+        )
+        return r
+
+    def test_auto_fits_short_context_model(self):
+        """Prompt budget + template + generation must land inside the window."""
+        r = self._runner(model_max=32768, max_length=None)
+        budget = r._resolve_max_length(None, "narrativeqa", 128)
+        assert budget is not None
+        assert budget + 10 + 128 <= 32768
+        # And it must actually bite on the 35083-token example that failed.
+        assert budget < 35083
+
+    def test_auto_is_noop_on_long_context_model(self):
+        """Llama-3.1's 128K fits every LongBench prompt — must not truncate."""
+        r = self._runner(model_max=131072, max_length=None,
+                         model_name="Llama-3.1-8B-Instruct")
+        budget = r._resolve_max_length(None, "narrativeqa", 128)
+        assert budget > 100_000  # far above the longest LongBench prompt
+
+    def test_explicit_value_wins(self):
+        """A positive max_length reproduces the published protocol verbatim."""
+        r = self._runner(model_max=32768, max_length=31500)
+        assert r._resolve_max_length(None, "narrativeqa", 128) == 31500
+
+    def test_zero_opts_out_and_warns(self):
+        """max_length: 0 disables truncation entirely, loudly."""
+        r = self._runner(model_max=32768, max_length=0)
+        assert r._resolve_max_length(None, "narrativeqa", 128) is None
+        assert r._over_context_warned is True
+
+    def test_unknown_context_window_leaves_prompt_alone(self):
+        """No max_position_embeddings → no basis to truncate; stay untouched."""
+        r = self._runner(model_max=None, max_length=None)
+        assert r._resolve_max_length(None, "narrativeqa", 128) is None
+
+    def test_few_shot_dataset_reserves_no_template(self):
+        """NO_CHAT_TEMPLATE_DATASETS skip the template, so reserve nothing for it."""
+        r = self._runner(model_max=32768, max_length=None)
+        few_shot = r._resolve_max_length(None, "trec", 64)
+        chat = r._resolve_max_length(None, "narrativeqa", 64)
+        assert few_shot == chat + 10
+
+    def test_longer_generation_shrinks_the_budget(self):
+        """The reserve tracks max_gen_len so generation can't cross the window."""
+        r = self._runner(model_max=32768, max_length=None)
+        assert (r._resolve_max_length(None, "narrativeqa", 512)
+                == r._resolve_max_length(None, "narrativeqa", 128) - 384)
+
+
+# ---------------------------------------------------------------------------
 # Test: greedy decoding enforced
 # ---------------------------------------------------------------------------
 

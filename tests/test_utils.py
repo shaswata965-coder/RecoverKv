@@ -235,6 +235,76 @@ model:
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent.yaml")
 
+    def test_window_geometry_under_window_block_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        """`cache:` is the single source of truth for window geometry.
+
+        Regression: window_size/num_sink_tokens/local_window_size were declared on
+        BOTH CacheConfig and WindowConfig with different defaults (8/4/0.25 vs
+        32/4/256). LongBench and perf read cache.*, the parity suites read
+        window.*, so a config that set only one block silently ran the other's
+        values — a whole sweep could be labelled ws=32 while running ws=64.
+        This must fail at load, not warn.
+        """
+        cfg_file = tmp_path / "drifted.yaml"
+        cfg_file.write_text(
+            """
+run:
+  mode: longbench
+cache:
+  window_size: 64
+  num_sink_tokens: 5
+window:
+  window_size: 32
+  num_sink_tokens: 4
+"""
+        )
+        with pytest.raises(CfgValidationError) as exc:
+            load_config(cfg_file)
+        msg = str(exc.value)
+        assert "window_size" in msg and "num_sink_tokens" in msg
+        assert "cache:" in msg  # tells the user where to move them
+
+    def test_window_block_with_only_top_k_is_accepted(self, tmp_path: Path) -> None:
+        """top_k_windows has no CacheConfig equivalent and stays on `window:`."""
+        cfg_file = tmp_path / "ok.yaml"
+        cfg_file.write_text(
+            """
+run:
+  mode: parity_ours
+cache:
+  window_size: 64
+  num_sink_tokens: 5
+window:
+  top_k_windows: 7
+"""
+        )
+        config = load_config(cfg_file)
+        assert config.window.top_k_windows == 7
+        assert config.cache.window_size == 64
+        assert config.cache.num_sink_tokens == 5
+
+    def test_empty_window_block_loads(self, tmp_path: Path) -> None:
+        """A bare `window:` key parses as None — must not crash the loader."""
+        cfg_file = tmp_path / "empty.yaml"
+        cfg_file.write_text("run:\n  mode: longbench\nwindow:\n")
+        assert load_config(cfg_file).window.top_k_windows is None
+
+    def test_resolved_top_k_reads_cache_geometry(self) -> None:
+        """WindowConfig.resolved_top_k derives K from cache.*, not its own fields."""
+        from utils.config import WindowConfig
+
+        cache = CacheConfig(cache_budget=0.25, window_size=8,
+                            num_sink_tokens=4, local_window_size=32)
+        w = WindowConfig()
+        # budget_tokens = 0.25 * (1000 + 24) = 256; 256 - 4 sink - 32 local = 220
+        assert w.resolved_top_k(cache, prefill_len=1000, max_tokens=24) == 220 // 8
+        # An explicit override still short-circuits the derivation.
+        assert WindowConfig(top_k_windows=3).resolved_top_k(
+            cache, prefill_len=1000, max_tokens=24
+        ) == 3
+
 
 class TestValidateParityPair:
     def test_matching_configs_pass(self) -> None:

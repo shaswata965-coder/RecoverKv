@@ -110,7 +110,7 @@ class BaseParityRunner:
         # H2O-style cumulative scoring: no observation window — every query row contributes.
         # top_k_windows is derived from cache.cache_budget so the Jaccard signal slices
         # at exactly the K the production eviction policy would have kept.
-        tk = w.resolved_top_k(cfg.cache.cache_budget, prefill_len, gen_len)
+        tk = w.resolved_top_k(cfg.cache, prefill_len, gen_len)
         ns, ws_sz = w.num_sink_tokens, w.window_size
 
         # Per-sample storage

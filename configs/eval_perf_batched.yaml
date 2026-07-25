@@ -80,7 +80,7 @@ model:
   revision: main
   dtype: float16
 
-window:
+cache:
   window_size: 8            # must be a MULTIPLE OF 4 for quant_ratio > 0 (int2 crumb packing)
   num_sink_tokens: 5
   local_window_size: 64     # int -> must be a multiple of window_size

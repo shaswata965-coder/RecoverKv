@@ -115,6 +115,10 @@ class LongBenchRunner:
         self.model = None
         self.tokenizer = None
         self._over_context_warned = False
+        # Auto-fit bookkeeping (see _resolve_max_length): chat-template overhead
+        # is per-dataset because NO_CHAT_TEMPLATE_DATASETS skip the template.
+        self._chat_overhead_cache: dict[str, int] = {}
+        self._auto_fit_logged: set[str] = set()
 
     @staticmethod
     def _compute_metrics_sha() -> str:
@@ -190,7 +194,6 @@ class LongBenchRunner:
             from utils.cache_factory import assert_transformers_version_supported
 
             assert_transformers_version_supported()
-            self._warn_on_cache_window_disagreement()
 
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
@@ -332,14 +335,16 @@ class LongBenchRunner:
         )
 
         # 2. Tokenize and (optionally) middle-truncate.
-        #    max_length None / 0 / negative  -> NO truncation (full-context run;
-        #    matches DefensiveKV, which uses Llama-3.1-8B's 128K window and does
-        #    not pre-truncate). A positive value reproduces official
-        #    THUDM/LongBench middle-truncation for short-context models.
-        max_length = getattr(self.lb, "max_length", None)
+        #    A positive longbench.max_length reproduces official THUDM/LongBench
+        #    middle-truncation. null auto-fits to the model's context window so a
+        #    prompt never scores on out-of-distribution RoPE positions; 0 opts out.
+        #    See _resolve_max_length.
+        max_length = self._resolve_max_length(tokenizer, dataset_name, max_gen_len)
         tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
 
         if max_length and max_length > 0 and len(tokenized) > max_length:
+            if not getattr(self.lb, "max_length", None):
+                self._note_auto_fit(dataset_name, len(tokenized), max_length)
             half = max_length // 2
             # Middle truncation — byte-for-byte identical to THUDM/LongBench
             # pred.py and DefensiveKV: decode the head and tail halves
@@ -500,27 +505,113 @@ class LongBenchRunner:
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks
 
-    def _warn_if_over_context(self, context_length: int, max_gen_len: int) -> None:
-        """Warn (once) if prompt + generation exceeds the model's context window.
+    # Slack reserved on top of generation + chat template when auto-fitting a
+    # prompt to the context window. Middle truncation decodes two halves and
+    # re-encodes the concatenation, so the final token count drifts a few tokens
+    # from the requested length; this absorbs that drift.
+    _AUTO_FIT_SAFETY_MARGIN = 64
 
-        A prompt beyond ``max_position_embeddings`` produces out-of-distribution
-        RoPE positions: the run won't crash but scores become noise. The usual
-        cause is disabling truncation (``max_length: null``) on a short-context
-        model. Warn rather than raise so a long run isn't aborted by one example.
-        """
+    def _model_context_window(self) -> Optional[int]:
+        """The model's usable positional range, or None if it can't be read."""
         model_max = getattr(getattr(self.model, "config", None),
                             "max_position_embeddings", None)
+        return int(model_max) if model_max else None
+
+    def _chat_template_overhead(self, tokenizer, dataset_name: str) -> int:
+        """Tokens the chat template wraps around the prompt body (0 if unused).
+
+        Truncation happens *before* the chat template is applied, so its wrapper
+        tokens have to be reserved up front or an auto-fitted prompt can still
+        cross the context window after templating.
+        """
+        if not self._should_apply_chat_template(self.config.model.name, dataset_name):
+            return 0
+        cached = self._chat_overhead_cache.get(dataset_name)
+        if cached is not None:
+            return cached
+        try:
+            wrapped = tokenizer.apply_chat_template(
+                [{"role": "user", "content": ""}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            overhead = len(tokenizer(wrapped, truncation=False).input_ids)
+        except Exception:
+            # Same conservative fallback as the manual template in _predict.
+            overhead = 64
+        self._chat_overhead_cache[dataset_name] = overhead
+        return overhead
+
+    def _resolve_max_length(
+        self, tokenizer, dataset_name: str, max_gen_len: int
+    ) -> Optional[int]:
+        """Resolve ``longbench.max_length`` against the model's real context window.
+
+        Returns the token budget for the *pre-template* prompt, or None for no
+        truncation. See LongBenchConfig.max_length for the three modes; the point
+        of the auto mode is that a prompt never silently runs past
+        ``max_position_embeddings``, where RoPE positions are out of distribution
+        and the resulting scores are noise rather than a measurement.
+        """
+        configured = getattr(self.lb, "max_length", None)
+
+        if configured is not None and configured > 0:
+            return int(configured)          # explicit — reproduces published protocol
+
+        if configured == 0:                 # explicit opt-out
+            if not self._over_context_warned:
+                model_max = self._model_context_window()
+                log.warning(
+                    "longbench.max_length=0 disables truncation entirely. Prompts "
+                    "longer than the model's context window (%s) will use "
+                    "out-of-distribution RoPE positions and their scores will be "
+                    "unreliable. Set max_length to null to auto-fit instead.",
+                    model_max,
+                )
+                self._over_context_warned = True
+            return None
+
+        # auto (max_length: null)
+        model_max = self._model_context_window()
+        if not model_max:
+            return None                     # can't read a window — leave untouched
+        reserve = (max_gen_len
+                   + self._chat_template_overhead(tokenizer, dataset_name)
+                   + self._AUTO_FIT_SAFETY_MARGIN)
+        return max(model_max - reserve, 1)
+
+    def _note_auto_fit(self, dataset_name: str, original: int, budget: int) -> None:
+        """Log once per dataset when auto-fit actually truncates something."""
+        if dataset_name in self._auto_fit_logged:
+            return
+        self._auto_fit_logged.add(dataset_name)
+        log.info(
+            "%s: middle-truncating prompts to %d tokens to fit the model's "
+            "context window (%s). First hit was %d tokens. Set "
+            "longbench.max_length explicitly to pin a different budget, or 0 to "
+            "disable truncation (scores then become unreliable past the window).",
+            dataset_name, budget, self._model_context_window(), original,
+        )
+
+    def _warn_if_over_context(self, context_length: int, max_gen_len: int) -> None:
+        """Last-resort net: prompt + generation still past the context window.
+
+        With auto-fit this should not fire; if it does, the reserve above was too
+        small for this tokenizer/template, so report it at ERROR — the example's
+        score is not trustworthy and that must not be silent.
+        """
+        model_max = self._model_context_window()
         if not model_max:
             return
         needed = context_length + max_gen_len
         if needed > model_max and not self._over_context_warned:
-            log.warning(
+            log.error(
                 "Prompt+generation = %d tokens exceeds the model's context "
                 "window (%d). Positions beyond the window are out-of-distribution "
-                "and scores will be unreliable. Either set longbench.max_length "
-                "to truncate, or use a longer-context model (e.g. "
-                "Llama-3.1-8B-Instruct, 128K). Suppressing further warnings.",
-                needed, model_max,
+                "and these scores are unreliable. Set longbench.max_length to a "
+                "value below %d, or use a longer-context model. Suppressing "
+                "further warnings.",
+                needed, model_max, model_max - max_gen_len,
             )
             self._over_context_warned = True
 
@@ -586,11 +677,13 @@ class LongBenchRunner:
             # fraction of the cache BUDGET (not the full context), resolved here
             # at the max_length upper bound (the runtime resolves against each
             # example's own prefill length).
-            # When truncation is disabled (max_length null), fall back to the
-            # model's context window for this informational estimate; the
-            # runtime policy resolves local_window_size against each example's
-            # real prefill length regardless.
-            max_len = getattr(self.lb, "max_length", None)
+            # Under auto-fit (max_length null) the upper bound is the resolved
+            # per-dataset budget; fall back to the model's context window if that
+            # can't be read. The runtime policy resolves local_window_size against
+            # each example's real prefill length regardless.
+            max_len = self._resolve_max_length(
+                self.tokenizer, dataset_name, max_gen_len
+            )
             if not max_len:
                 max_len = getattr(
                     getattr(self.model, "config", None),
@@ -629,7 +722,13 @@ class LongBenchRunner:
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,
+            # Both the knob and what it actually resolved to, so a result file is
+            # self-describing under auto-fit (max_length null).
             "max_length": getattr(self.lb, "max_length", 7500),
+            "max_length_effective": self._resolve_max_length(
+                self.tokenizer, dataset_name, max_gen_len
+            ),
+            "model_context_window": self._model_context_window(),
             "max_gen_len": max_gen_len,
             "num_samples_requested": getattr(self.lb, "num_samples", "max"),
             "seed": cfg.run.seed,
@@ -647,29 +746,6 @@ class LongBenchRunner:
         meta_path = output_dir / f"{dataset_name}.meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2, default=str)
-
-    def _warn_on_cache_window_disagreement(self) -> None:
-        """Warn if cfg.cache.* and cfg.window.* disagree on shared fields.
-
-        LongBench reads window parameters from cfg.cache (CacheConfig), but
-        parity runners read from cfg.window (WindowConfig). The two dataclasses
-        have different defaults, so a user who only sets cfg.window.* while
-        switching to LongBench would silently inherit CacheConfig's defaults.
-        """
-        cfg = self.config
-        pairs = [
-            ("window_size", cfg.cache.window_size, cfg.window.window_size),
-            ("num_sink_tokens", cfg.cache.num_sink_tokens, cfg.window.num_sink_tokens),
-            ("local_window_size", cfg.cache.local_window_size, cfg.window.local_window_size),
-        ]
-        for name, cache_val, window_val in pairs:
-            if cache_val != window_val:
-                log.warning(
-                    "cfg.cache.%s=%r != cfg.window.%s=%r — LongBench uses "
-                    "cfg.cache.* for the runtime cache. Update cfg.cache.%s "
-                    "if you meant the cfg.window.* value.",
-                    name, cache_val, name, window_val, name,
-                )
 
     def _get_tokenizer_sha(self) -> str:
         """Get tokenizer SHA for reproducibility."""

@@ -25,10 +25,6 @@ cache:
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
   quant_ratio: 0.0                          # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
 
-window:
-  window_size: 8
-  num_sink_tokens: 5
-  local_window_size: 128
 
 telemetry:
   track_scores: false                       # mandatory; see prompt 04 §1

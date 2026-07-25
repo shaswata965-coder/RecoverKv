@@ -215,18 +215,31 @@ class ParityConfig:
 
 @dataclass
 class WindowConfig:
+    """Parity-only knob. Window **geometry** lives in :class:`CacheConfig`.
 
-    window_size: int = 32
-    num_sink_tokens: int = 4
-    local_window_size: Union[int, float] = 256
+    ``window_size`` / ``num_sink_tokens`` / ``local_window_size`` used to be
+    declared here *as well as* on ``CacheConfig``, with different defaults (32/4/256
+    vs 8/4/0.25). Runners disagreed on which to read — LongBench and perf took
+    ``cache.*``, the parity suites took ``window.*`` — so a config that set only one
+    block silently ran the other block's values and mislabelled every number in the
+    sweep. ``cache.*`` is now the single source of truth for all four runners and a
+    ``window:`` block carrying the moved keys is rejected at load (see
+    :func:`_reject_moved_window_keys`).
+
+    What remains here is the one field with no ``CacheConfig`` equivalent: the
+    parity suites' optional explicit top-K override.
+    """
+
     top_k_windows: Optional[int] = None
 
     def resolved_top_k(
-        self, cache_budget: Optional[float], prefill_len: int, max_tokens: int
+        self, cache: "CacheConfig", prefill_len: int, max_tokens: int
     ) -> int:
+        """Derive top-K evictable windows from the cache geometry + budget."""
         if self.top_k_windows is not None:
             return int(self.top_k_windows)
 
+        cache_budget = cache.cache_budget
         if cache_budget is None:
             raise ConfigValidationError(
                 "Cannot derive top_k_windows: window.top_k_windows is unset and "
@@ -243,13 +256,13 @@ class WindowConfig:
         # Resolve local_window_size to a concrete int (mirrors WindowedCacheConfig):
         # a float local_window_size is a fraction of the CACHE BUDGET (not the
         # post-sink context), so the local region can never exceed the budget.
-        lws = self.local_window_size
+        lws = cache.local_window_size
         if isinstance(lws, float):
             raw = lws * budget_tokens
             ceiled = math.ceil(raw)
-            remainder = ceiled % self.window_size
+            remainder = ceiled % cache.window_size
             if remainder:
-                ceiled += self.window_size - remainder
+                ceiled += cache.window_size - remainder
             local_tokens = ceiled
         else:
             local_tokens = int(lws)
@@ -259,7 +272,7 @@ class WindowConfig:
         # un-raised — a negative remaining floor-divides NEGATIVE and would hand
         # back a negative top_k. See that resolver for the full note; the cache
         # will over-retain against the requested budget and warns when it does.
-        remaining = budget_tokens - self.num_sink_tokens - local_tokens
+        remaining = budget_tokens - cache.num_sink_tokens - local_tokens
         if remaining < 0:
             log.warning(
                 "cache_budget=%s on prefill_len=%s + max_tokens=%s yields "
@@ -267,11 +280,11 @@ class WindowConfig:
                 "Proceeding with top_k_windows=0: sink + local alone retain %s "
                 "tokens/row, exceeding the requested budget by %s tokens/row.",
                 cache_budget, prefill_len, max_tokens, budget_tokens,
-                self.num_sink_tokens, local_tokens,
-                self.num_sink_tokens + local_tokens, -remaining,
+                cache.num_sink_tokens, local_tokens,
+                cache.num_sink_tokens + local_tokens, -remaining,
             )
             remaining = 0
-        return remaining // self.window_size
+        return remaining // cache.window_size
 
 
 # ---------------------------------------------------------------------------
@@ -352,10 +365,20 @@ class LongBenchConfig:
     include_chinese: bool = False
     use_e_variants: bool = False    # LongBench-E length-stratified variants
     # Prompt truncation budget. A positive int reproduces official LongBench
-    # middle-truncation for short-context models. None / 0 disables truncation
-    # (full-context runs — matches DefensiveKV, which uses Llama-3.1-8B's 128K
-    # window and does NOT pre-truncate). Generation lengths are separate and
-    # come per-dataset from dataset2maxlen.json.
+    # middle-truncation for short-context models. Generation lengths are separate
+    # and come per-dataset from dataset2maxlen.json.
+    #
+    # Three modes (see LongBenchRunner._resolve_max_length):
+    #   <positive int>  explicit truncation length — reproduces the published
+    #                   THUDM/LongBench protocol for a given model.
+    #   None (auto)     fit to the model's own context window: truncate only when
+    #                   the prompt would otherwise run past max_position_embeddings.
+    #                   A no-op on long-context models (Llama-3.1-8B's 128K fits
+    #                   every LongBench prompt), and the guard that stops a 32K
+    #                   model from scoring out-of-distribution RoPE positions.
+    #   0               opt out entirely — never truncate, even past the context
+    #                   window. Produces unreliable scores on a short-context
+    #                   model; warns loudly. Use only to reproduce a legacy run.
     max_length: Optional[int] = 7500
     output_dir: str = "outputs/longbench/full_cache"
     seed: int = 42
@@ -479,6 +502,31 @@ def _merge_dicts(base: dict, override: dict) -> dict:
     return merged
 
 
+# Window geometry that used to be declared on BOTH CacheConfig and WindowConfig.
+# `cache.*` is now the single source of truth; these keys under `window:` are a
+# hard error rather than a warning, because a warning still let a whole sweep run
+# and be written out under the wrong labels.
+_WINDOW_KEYS_MOVED_TO_CACHE = ("window_size", "num_sink_tokens", "local_window_size")
+
+
+def _reject_moved_window_keys(win_raw: dict[str, Any]) -> None:
+    """Fail fast on a ``window:`` block that still carries cache geometry."""
+    moved = [k for k in _WINDOW_KEYS_MOVED_TO_CACHE if k in win_raw]
+    if not moved:
+        return
+    shown = "\n".join(f"  {k}: {win_raw[k]!r}" for k in moved)
+    raise ConfigValidationError(
+        f"window.{{{', '.join(moved)}}} moved to the `cache:` block — `cache.*` is "
+        f"now the single source of truth for window geometry, read by every runner "
+        f"(longbench, perf, base/ours parity).\n\n"
+        f"Move these under `cache:` and delete them from `window:`:\n{shown}\n\n"
+        f"`window:` now holds only `top_k_windows` (the parity suites' optional "
+        f"top-K override). This is an error, not a warning: the two blocks had "
+        f"different defaults (32/4/256 vs 8/4/0.25), so a config setting only one "
+        f"of them ran values it never declared."
+    )
+
+
 def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
     """Convert a flat/nested dict to an ``ExperimentConfig``."""
     # Parse perf configs list if present
@@ -496,6 +544,11 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
     # Parse ruler config
     ruler_raw = d.get("ruler", {})
 
+    # Window geometry lives on `cache:` only — reject the old duplicated keys.
+    # `or {}` because a `window:` key with no children parses as None.
+    win_raw = d.get("window") or {}
+    _reject_moved_window_keys(win_raw)
+
     return ExperimentConfig(
         run=RunConfig(**d.get("run", {})),
         model=ModelConfig(**d.get("model", {})),
@@ -503,7 +556,7 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         data=DataConfig(**d.get("data", {})),
         telemetry=TelemetryConfig(**d.get("telemetry", {})),
         parity=ParityConfig(**d.get("parity", {})),
-        window=WindowConfig(**d.get("window", {})),
+        window=WindowConfig(**win_raw),
         perf=PerfConfig(**perf_kwargs),
         faithfulness=FaithfulnessConfig(**d.get("faithfulness", {})),
         visualize=VisualizeConfig(**vis_raw),
@@ -590,8 +643,8 @@ def validate_parity_pair(
         "article_id": ours_config.parity.article_index,
         "prefill_len": eff_prefill,
         "gen_len": eff_gen,
-        "window_size": ours_config.window.window_size,
-        "num_sink_tokens": ours_config.window.num_sink_tokens,
+        "window_size": ours_config.cache.window_size,
+        "num_sink_tokens": ours_config.cache.num_sink_tokens,
         "model_name": ours_config.model.name,
         "model_revision": ours_config.model.revision,
     }

@@ -12,7 +12,7 @@ model:
   revision: main
   dtype: float16
 
-window:
+cache:
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 256

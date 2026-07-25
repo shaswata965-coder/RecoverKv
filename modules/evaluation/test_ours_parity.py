@@ -50,11 +50,11 @@ def _make_ours_config(base_npz_path, seed=42, backend_package="eager",
         model=ModelConfig(name="test-model", revision="main",
                          dtype="float16", attn_implementation=attn_impl),
         cache=CacheConfig(backend="windowed", backend_package=backend_package,
-                         cache_budget=0.25),
+                         cache_budget=0.25, window_size=8, num_sink_tokens=4,
+                         local_window_size=32),
         parity=ParityConfig(dataset="wikitext-103", article_index=0,
                            prefill_len=100, gen_len=10),
-        window=WindowConfig(window_size=8, num_sink_tokens=4,
-                           local_window_size=32, top_k_windows=2),  # explicit override
+        window=WindowConfig(top_k_windows=2),  # explicit override
         telemetry=TelemetryConfig(output_dir="outputs"),
         base_run_npz=str(base_npz_path),
     )

@@ -153,7 +153,9 @@ class PerfRunner:
             # cache_position (transformers <= 4.47).
             assert_transformers_version_supported()
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
-            w = cfg.window
+            # Window geometry comes from cfg.cache — the single source of truth
+            # shared with the longbench and parity runners (see WindowConfig).
+            w = cfg.cache
             # quant_ratio is per-config (like cache_budget), falling back to the
             # shared cache.quant_ratio; 0.0 keeps the pure-fp16 path (design.md §7).
             quant_ratio = c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0))
