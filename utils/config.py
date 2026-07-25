@@ -392,6 +392,51 @@ class LongBenchConfig:
 
 
 # ---------------------------------------------------------------------------
+# RULER config
+# ---------------------------------------------------------------------------
+
+
+def _validate_num_samples(ns: Union[int, str], field_label: str) -> Union[int, str]:
+    """Shared 'max' | non-negative-int validation for num_samples fields."""
+    if isinstance(ns, bool):
+        # bool is a subclass of int in Python; explicitly reject it.
+        raise ConfigValidationError(
+            f"{field_label} must be 'max' or a non-negative int, got bool {ns!r}"
+        )
+    if isinstance(ns, str):
+        if ns.strip().lower() != "max":
+            raise ConfigValidationError(f"{field_label} string must be 'max', got {ns!r}")
+        return "max"
+    if isinstance(ns, int):
+        if ns < 0:
+            raise ConfigValidationError(f"{field_label} int must be >= 0, got {ns!r}")
+        return ns
+    raise ConfigValidationError(
+        f"{field_label} must be 'max' or a non-negative int, got {type(ns).__name__}: {ns!r}"
+    )
+
+
+@dataclass
+class RulerConfig:
+
+    data_dir: str = ""  # e.g. .../defensivekv_dataset/ruler/4096
+    tasks: Optional[List[str]] = None  # None = all 13 RULER tasks
+    output_dir: str = "outputs/ruler"
+    seed: int = 42
+    resume: bool = False            # skip tasks whose jsonl already exists
+    skip_oom: bool = False          # record OOM'd examples as pred=null
+    aggressive_cache_clear: bool = False
+    num_samples: Union[int, str] = "max"  # cap per task, applied after task filtering
+    # Capture a utils/cache_memory.py byte-accounting report per example and
+    # write <task>.memory.jsonl + <task>.memory_summary.json alongside the
+    # predictions. Cheap (introspects existing tensors, allocates nothing).
+    capture_memory: bool = False
+
+    def __post_init__(self) -> None:
+        self.num_samples = _validate_num_samples(self.num_samples, "ruler.num_samples")
+
+
+# ---------------------------------------------------------------------------
 # ExperimentConfig (top-level)
 # ---------------------------------------------------------------------------
 
@@ -411,6 +456,7 @@ class ExperimentConfig:
     faithfulness: FaithfulnessConfig = field(default_factory=FaithfulnessConfig)
     visualize: VisualizeConfig = field(default_factory=VisualizeConfig)
     longbench: LongBenchConfig = field(default_factory=LongBenchConfig)
+    ruler: RulerConfig = field(default_factory=RulerConfig)
 
     # Paths
     base_run_npz: Optional[str] = None
@@ -447,6 +493,9 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
     # Parse longbench config
     lb_raw = d.get("longbench", {})
 
+    # Parse ruler config
+    ruler_raw = d.get("ruler", {})
+
     return ExperimentConfig(
         run=RunConfig(**d.get("run", {})),
         model=ModelConfig(**d.get("model", {})),
@@ -459,6 +508,7 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         faithfulness=FaithfulnessConfig(**d.get("faithfulness", {})),
         visualize=VisualizeConfig(**vis_raw),
         longbench=LongBenchConfig(**lb_raw),
+        ruler=RulerConfig(**ruler_raw),
         base_run_npz=d.get("base_run_npz"),
         output_path=d.get("output_path"),
     )

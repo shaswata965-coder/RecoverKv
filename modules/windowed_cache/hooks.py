@@ -96,6 +96,11 @@ try:
 except ImportError:
     Qwen2Attention = None  # type: ignore[assignment,misc]
 
+try:
+    from transformers.models.mistral.modeling_mistral import MistralAttention
+except ImportError:
+    MistralAttention = None  # type: ignore[assignment,misc]
+
 
 def _get_attn_classes() -> Tuple:
     """Return a tuple of attention module classes to target."""
@@ -104,6 +109,8 @@ def _get_attn_classes() -> Tuple:
         classes.append(LlamaAttention)
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
+    if MistralAttention is not None:
+        classes.append(MistralAttention)
     return tuple(classes)
 
 
@@ -239,6 +246,20 @@ def install_score_hooks(
                 position_embeddings = _extract_arg(
                     args, kwargs, "position_embeddings", 1
                 )
+                if position_embeddings is None and hasattr(module, "rotary_emb"):
+                    # Older-style attention modules (e.g. MistralAttention in
+                    # transformers<=4.45) never receive position_embeddings as a
+                    # forward argument -- the top-level model doesn't compute it
+                    # at all (unlike Llama's refactored interface). Each layer
+                    # instead computes (cos, sin) itself from its own
+                    # self.rotary_emb(x, position_ids). Recompute the same way;
+                    # x is only used for its .dtype/.device, so hidden_states
+                    # stands in fine for the value-states shape rotary_emb wants.
+                    position_ids = _extract_arg(args, kwargs, "position_ids", 2)
+                    if hidden_states is not None and position_ids is not None:
+                        position_embeddings = module.rotary_emb(
+                            hidden_states, position_ids
+                        )
                 if hidden_states is None or position_embeddings is None:
                     if not warned_once[0]:
                         warnings.warn(

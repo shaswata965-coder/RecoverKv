@@ -37,6 +37,11 @@ try:
 except ImportError:
     Qwen2Attention = None  # type: ignore[assignment,misc]
 
+try:
+    from transformers.models.mistral.modeling_mistral import MistralAttention
+except ImportError:
+    MistralAttention = None  # type: ignore[assignment,misc]
+
 
 def _get_attn_classes() -> Tuple:
     """Return a tuple of attention module classes to target."""
@@ -45,6 +50,8 @@ def _get_attn_classes() -> Tuple:
         classes.append(LlamaAttention)
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
+    if MistralAttention is not None:
+        classes.append(MistralAttention)
     return tuple(classes)
 
 
