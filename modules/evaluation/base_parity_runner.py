@@ -3,6 +3,20 @@
 Runs the stock HF model with DynamicCache and output_attentions=True.
 Computes Top-K window rankings from attention matrices at each step.
 No hooks, no eviction. Saves generated tokens for ours runner replay.
+
+Two window-score arrays are recorded:
+
+  ``window_scores``       ``[S, T, L, H, W]`` fp16 — *cumulative* H2O scores,
+                          the signal the eviction policy ranks on.
+  ``step_window_scores``  ``[S, T, L, W]`` fp32 — the head-mean mass deposited
+                          by **this step's** query rows alone (step 0 = the
+                          whole prefill).  Recorded because it cannot be
+                          recovered from the cumulative array: by ``T = 1024``
+                          one fp16 ulp of the accumulated score exceeds half a
+                          per-step delta, so differencing returns noise.  The
+                          QEvict observation suite scores routing decisions
+                          against future attention and needs this signal
+                          (``modules/evaluation/qevict_observations.py``).
 """
 from __future__ import annotations
 import json, math, time
@@ -116,6 +130,7 @@ class BaseParityRunner:
         # Per-sample storage
         samples_topk: List[np.ndarray] = []     # each: [num_steps, num_layers, K]
         samples_ws: List[np.ndarray] = []        # each: [num_steps, num_layers, H_q, W]
+        samples_step_ws: List[np.ndarray] = []   # each: [num_steps, num_layers, W]
         samples_gen_toks: List[np.ndarray] = []  # each: [num_steps]
         samples_shas: List[str] = []
 
@@ -157,6 +172,7 @@ class BaseParityRunner:
             # Per-row, per-step accumulators (one list per sample in the chunk).
             all_topk = [[] for _ in range(Bc)]
             all_ws   = [[] for _ in range(Bc)]
+            all_step_ws = [[] for _ in range(Bc)]   # per-step (non-cumulative)
             gen_toks = [[] for _ in range(Bc)]
             input_ids = tokens.clone()
             pkv = DynamicCache()
@@ -170,10 +186,24 @@ class BaseParityRunner:
                     next_tok = out.logits[:, -1, :].argmax(dim=-1)   # [Bc]
                     for bi in range(Bc):
                         gen_toks[bi].append(int(next_tok[bi].item()))
+                    step_ws_layers: List[np.ndarray] = []
                     for li in range(n_layers):
                         a = out.attentions[li]
                         # Sum over ALL query rows of this step (cumulative across steps via acc_scores).
                         ts = a.sum(dim=-2)
+                        # Per-step (non-cumulative) head-mean window mass: the
+                        # same post-sink windowing as the cumulative path, but
+                        # on this step's contribution alone.  Kept in fp32 —
+                        # it is unrecoverable from the fp16 cumulative array.
+                        sp = ts[..., ns:]
+                        rem_s = sp.shape[-1] % ws_sz
+                        if rem_s:
+                            sp = torch.nn.functional.pad(sp, (0, ws_sz - rem_s))
+                        W_s = sp.shape[-1] // ws_sz
+                        step_ws_layers.append(
+                            sp.reshape(sp.shape[0], sp.shape[1], W_s, ws_sz)
+                            .sum(-1).mean(dim=1)            # [B, W] head-mean
+                            .float().cpu().numpy())
                         if acc_scores[li] is None:
                             acc_scores[li] = ts.clone()
                         else:
@@ -218,6 +248,8 @@ class BaseParityRunner:
                             step_ws.append(a_ws)
                         all_topk[bi].append(np.stack(step_tk, 0))
                         all_ws[bi].append(np.stack(step_ws, 0))
+                        all_step_ws[bi].append(
+                            np.stack([x[bi] for x in step_ws_layers], 0))  # [L, W]
 
                     if (step+1) % 100 == 0:
                         log.info("  Step %d/%d", step+1, gen_len)
@@ -226,16 +258,19 @@ class BaseParityRunner:
             # sample order so the leading sample axis stays ordered).
             for bi in range(Bc):
                 s_topk, s_ws, s_gen = all_topk[bi], all_ws[bi], gen_toks[bi]
+                s_sws = all_step_ws[bi]
                 mW = max(x.shape[-1] for x in s_ws)
                 mK = max(x.shape[-1] for x in s_topk)
                 pws = [np.pad(x, [(0,0),(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in s_ws]
                 ptk = [np.pad(x, [(0,0),(0,mK-x.shape[-1])], constant_values=-1) if x.shape[-1]<mK else x for x in s_topk]
+                psws = [np.pad(x, [(0,0),(0,mW-x.shape[-1])]) if x.shape[-1]<mW else x for x in s_sws]
                 samples_topk.append(np.stack(ptk, 0))
                 samples_ws.append(np.stack(pws, 0))
+                samples_step_ws.append(np.stack(psws, 0))
                 samples_gen_toks.append(np.array(s_gen, dtype=np.int64))
 
             # Memory hygiene: free per-chunk tensors before the next chunk.
-            del acc_scores, all_topk, all_ws, gen_toks, pkv, input_ids, tokens
+            del acc_scores, all_topk, all_ws, all_step_ws, gen_toks, pkv, input_ids, tokens
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             import gc as _gc; _gc.collect()
@@ -243,19 +278,23 @@ class BaseParityRunner:
         # Align K and W across samples (could differ from sample to sample)
         max_K = max(x.shape[-1] for x in samples_topk)
         max_W = max(x.shape[-1] for x in samples_ws)
-        aligned_topk, aligned_ws = [], []
-        for tkarr, wsarr in zip(samples_topk, samples_ws):
+        aligned_topk, aligned_ws, aligned_step_ws = [], [], []
+        for tkarr, wsarr, swsarr in zip(samples_topk, samples_ws, samples_step_ws):
             if tkarr.shape[-1] < max_K:
                 tkarr = np.pad(tkarr, [(0, 0), (0, 0), (0, max_K - tkarr.shape[-1])],
                                constant_values=-1)
             if wsarr.shape[-1] < max_W:
                 wsarr = np.pad(wsarr, [(0, 0), (0, 0), (0, 0), (0, max_W - wsarr.shape[-1])])
+            if swsarr.shape[-1] < max_W:
+                swsarr = np.pad(swsarr, [(0, 0), (0, 0), (0, max_W - swsarr.shape[-1])])
             aligned_topk.append(tkarr)
             aligned_ws.append(wsarr)
+            aligned_step_ws.append(swsarr)
 
         # Stack along leading sample axis: [num_samples, num_steps, num_layers, ...]
         top_window_indices = np.stack(aligned_topk, 0)
         window_scores = np.stack(aligned_ws, 0)
+        step_window_scores = np.stack(aligned_step_ws, 0).astype(np.float32)
         generated_tokens = np.stack(samples_gen_toks, 0)
         eviction_step_mask = np.zeros((num_samples, gen_len), dtype=bool)
 
@@ -276,7 +315,7 @@ class BaseParityRunner:
 
         env = capture_environment()
         meta = {
-            "schema_version": "1.1",                     # bumped: leading sample axis
+            "schema_version": "1.2",                     # bumped: step_window_scores
             "mode": "parity_base",
             "seed": cfg.run.seed,
             "dataset": p.dataset,
@@ -312,6 +351,7 @@ class BaseParityRunner:
             str(npz),
             top_window_indices=top_window_indices,
             window_scores=window_scores,
+            step_window_scores=step_window_scores,   # [S, T, L, W] fp32, per-step
             eviction_step_mask=eviction_step_mask,
             generated_tokens=generated_tokens,
             metadata_json=np.array([json.dumps(meta)], dtype=object),
