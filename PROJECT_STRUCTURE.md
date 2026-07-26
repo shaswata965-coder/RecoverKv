@@ -45,18 +45,26 @@ C:\StickyKV/
 │   │   ├── hooks.py                 # Different: reads materialized attn_weights
 │   │   └── config.py                # Identical to flash backend
 │   │
-│   └── evaluation/                  # All four evaluation suite runners
+│   └── evaluation/                  # Evaluation suite runners (one per run.mode)
 │       ├── base_parity_runner.py    # Suite A — baseline (full cache reference run)
 │       ├── ours_parity_runner.py    # Suite A — ours (windowed cache, teacher-forced)
 │       ├── faithfulness_runner.py   # Suite B — score distribution comparison (no model)
+│       ├── qevict_observations.py   # Suite E — skew / FMM / revival (no model)
 │       ├── perf_runner.py           # Suite C — latency / throughput benchmarks
 │       ├── longbench_runner.py      # Suite D — LongBench generation
 │       ├── longbench_scoring.py     # Suite D — post-hoc metric scoring
 │       ├── longbench_metrics.py     # Suite D — vendored THUDM metrics (do not modify)
+│       ├── ruler_runner.py          # Suite F — RULER generation (external data)
+│       ├── ruler_scoring.py         # Suite F — DefensiveKV-ported string-match metrics
+│       ├── gsm8k_runner.py          # Suite G — GSM8K chain-of-thought generation
+│       ├── gsm8k_scoring.py         # Suite G — "#### <n>" extraction + validity gates
+│       ├── gsm8k_dataset.py         # Suite G — prompt/stop-string definitions
 │       └── visualize.py             # Visualization runner
 │
 ├── scripts/                         # Bash scripts for running evaluation suites
 │   ├── reproduce_all.sh             # Master script: runs all suites end-to-end
+│   ├── run_ruler.sh                 # Suite F — generate then score (needs DATA_DIR)
+│   ├── run_gsm8k_e2e.sh             # Suite G — build/baseline-gate/budgets/compare
 │   ├── run_parity_base.sh           # Suite A base
 │   ├── run_parity_ours_eager.sh     # Suite A ours (eager)
 │   ├── run_parity_ours_flash.sh     # Suite A ours (flash-attn2)
