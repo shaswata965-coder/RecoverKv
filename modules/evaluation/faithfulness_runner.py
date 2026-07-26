@@ -20,7 +20,7 @@ base run's window scores — the ground-truth attention masses — producing:
 No model loaded — pure tensor / numpy ops.
 """
 from __future__ import annotations
-import json, math, time
+import csv, json, math, time
 from pathlib import Path
 from typing import Any, Dict
 import numpy as np
@@ -511,5 +511,79 @@ class FaithfulnessRunner:
         np.savez_compressed(str(npz_path), **save_arrays)
         with open(npz_path.with_suffix(".meta.json"), "w") as f:
             json.dump(meta, f, indent=2, default=str)
+        self._write_summary(results, meta, npz_path)
         log.info("Saved faithfulness: %s", npz_path)
         return npz_path
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _write_summary(results: dict, meta: dict, npz_path: Path) -> None:
+        """Write the per-layer CSV + headline markdown beside the npz.
+
+        The npz is the machine-readable artifact and ``scripts/print_faithfulness.py``
+        renders a console report, but a run should also leave behind something
+        readable without Python — matching the QEvict suite's output contract.
+        """
+        def _tl(name: str) -> np.ndarray:      # [T, L] → per-layer mean
+            arr = np.asarray(results[name], dtype=float)
+            return arr.mean(axis=0) if arr.ndim == 2 else arr
+
+        jac = _tl("jaccard_per_layer")
+        cols = {
+            "jaccard": jac,
+            "jaccard_fp": _tl("jaccard_fp"),
+            "jaccard_kept": _tl("jaccard_kept"),
+            "jaccard_lift": _tl("jaccard_lift"),
+            "cos_sim": _tl("cos_sim"),
+            "pearson": _tl("pearson"),
+            "spearman": _tl("spearman"),
+            "kl_ours_base": _tl("kl_ours_base"),
+            "mass_ratio": _tl("mass_ratio"),
+            "missed_mass": _tl("missed_mass_per_layer"),
+            "missed_mass_kept": _tl("missed_mass_kept_per_layer"),
+            "recovered_mass_q": _tl("recovered_mass_q_per_layer"),
+            "lir": np.asarray(results["lir_per_layer"], dtype=float),
+            "q_tier_fidelity": np.asarray(
+                results["q_tier_fidelity_per_layer"], dtype=float),
+        }
+        n_layers = int(jac.shape[0])
+        csv_path = npz_path.with_name(npz_path.stem + "_per_layer.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["layer", *cols])
+            for li in range(n_layers):
+                writer.writerow([li] + [f"{float(v[li]):.6f}" if li < len(v)
+                                        else "" for v in cols.values()])
+
+        def _m(name: str) -> float:
+            return float(np.mean(cols[name]))
+
+        md = [
+            "# Faithfulness results (Suite A/B)",
+            "",
+            f"- Model: `{meta.get('model_name')}`  |  prefill {meta.get('prefill_len')}"
+            f" / gen {meta.get('gen_len')}  |  {n_layers} layers",
+            f"- Cache: budget {meta.get('cache_budget')}, window "
+            f"{meta.get('window_size')}, quant_ratio {meta.get('quant_ratio')}, "
+            f"top_k_fp {meta.get('top_k_fp')}, N_q {meta.get('N_q')}",
+            "",
+            "| metric | value | reading |",
+            "| --- | --- | --- |",
+            f"| Jaccard (top-K overlap) | {_m('jaccard'):.4f} | higher = same windows as oracle |",
+            f"| Jaccard fp / kept | {_m('jaccard_fp'):.4f} / {_m('jaccard_kept'):.4f} | kept credits the Q tier |",
+            f"| Jaccard lift (Q tier) | {_m('jaccard_lift'):+.4f} | gain from crediting int2 survivors |",
+            f"| Cosine similarity | {_m('cos_sim'):.4f} | higher = faithful scores |",
+            f"| Pearson / Spearman | {_m('pearson'):.4f} / {_m('spearman'):.4f} | higher = better |",
+            f"| KL(ours‖base) | {_m('kl_ours_base'):.4f} | lower = better |",
+            f"| Mass ratio (base/ours) | {_m('mass_ratio'):.4f} | ~1.0 = well matched |",
+            f"| Missed mass (fp only) | {_m('missed_mass'):.4f} | mass below the fp tier |",
+            f"| Missed mass (fp+Q kept) | {_m('missed_mass_kept'):.4f} | honest two-tier miss |",
+            f"| Recovered mass (Q tier) | {_m('recovered_mass_q'):.4f} | what int2 rescues |",
+            f"| Q-tier fidelity | {_m('q_tier_fidelity'):.4f} | dequant faithfulness |",
+            f"| Global LIR (Sticky-K, m=3) | {float(results['global_lir']):.4f} | pair-based; NOT the QEvict episode LIR |",
+            "",
+            f"Per-layer detail: `{csv_path.name}`.  Full arrays: `{npz_path.name}`.",
+            "",
+        ]
+        npz_path.with_name(npz_path.stem + "_summary.md").write_text(
+            "\n".join(md), encoding="utf-8")
