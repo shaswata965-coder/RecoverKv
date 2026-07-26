@@ -37,6 +37,13 @@ bash "$SCRIPT_DIR/run_parity_ours_eager.sh"
 echo "[4/8] Running faithfulness evaluation..."
 bash "$SCRIPT_DIR/run_faithfulness.sh"
 
+# --- Suite B2: QEvict observations (reuses the parity pair from [1]/[2]) ---
+echo "[4b/8] Running QEvict observation suite..."
+STAGE=observe \
+  BASE_NPZ="${BASE_NPZ:-outputs/parity_base_wikitext-103.npz}" \
+  OURS_NPZ="${OURS_NPZ:-outputs/parity_ours_eager_wikitext-103.npz}" \
+  bash "$SCRIPT_DIR/run_qevict_observations.sh"
+
 # --- Suite C: Performance ---
 echo "[5/8] Running performance benchmarks..."
 bash "$SCRIPT_DIR/run_perf.sh"
