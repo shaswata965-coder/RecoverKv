@@ -316,8 +316,13 @@ class EvictionPolicy:
     ) -> Tensor:
         """Expand window indices to absolute token indices.
 
-        Prepends sink prefix.  Trims trailing partial window via geometric
-        cap computed without touching tensor data (Python int arithmetic).
+        Prepends the sink prefix, appends the unscored tail, and trims the
+        trailing partial window via a geometric cap computed without touching
+        tensor data (Python int arithmetic).
+
+        Indices come out **ascending**: sink, then the retained windows (which
+        ``compute_retain_window_indices`` already sorted chronologically), then
+        the tail, which is newer than all of them.
 
         Parameters
         ----------
@@ -325,9 +330,11 @@ class EvictionPolicy:
             Shape ``[B, W_retained]``.
         num_windows : int
             The total scored-window count (``window_scores.shape[2]``, a host
-            int). Needed to locate the one window that can be partial — the
-            newest scored window, index ``num_windows - 1`` — so the valid-token
-            count can be computed without a device sync (see below).
+            int). Needed twice: to locate the one window that can be partial —
+            the newest scored window, index ``num_windows - 1`` — and to locate
+            the end of the scored span, past which sit the tokens the scores do
+            not cover yet. Both keep the valid-token count a host int, so no
+            device sync (see below).
 
         Returns
         -------
@@ -356,8 +363,39 @@ class EvictionPolicy:
         )
         token_idx = token_idx.reshape(B, -1)  # [B, W_retained * window_size]
 
-        # Concatenate sink + window tokens
-        all_idx = torch.cat([sink_idx, token_idx], dim=-1)  # [B, total]
+        # Tokens that arrived AFTER the newest scored window — the "unscored
+        # tail". Scores lag the store by exactly one `update()` (the hook is a
+        # forward_hook, so the scores read at step s were computed at step s-1),
+        # so at every eviction the token just appended has no score column and
+        # is invisible to the window arithmetic above.
+        #
+        # It must still be retained. It is the newest token in the cache — it is
+        # local by definition, and at an eviction step it is the CURRENT step's
+        # own key: dropping it means the query cannot attend to itself, and the
+        # token is gone from every later step too.
+        #
+        # It only actually goes missing when the scored span happens to be a
+        # whole number of windows: otherwise the newest window is partial and
+        # the tail token falls inside its zero-padded slot, so `token_idx`
+        # already covers it and `tail` is 0. That alignment-dependence is why
+        # this was invisible — it bites ~1 prompt in `window_size`. The two-tier
+        # (q > 0) path never had it: its rebuild sizes the newest window off the
+        # body length, so the tail folds into the local window (see cache.py's
+        # `new_body_len`). This makes q = 0 agree.
+        #
+        # `tail` is host arithmetic, like `min_valid` below — no device sync.
+        scored_end = self.num_sink_tokens + num_windows * self.window_size
+        tail = max(self.total_tokens - scored_end, 0)
+        pieces = [sink_idx, token_idx]
+        if tail > 0:
+            pieces.append(
+                torch.arange(
+                    scored_end, scored_end + tail, device=device, dtype=torch.long
+                ).unsqueeze(0).expand(B, -1)
+            )
+
+        # Concatenate sink + window tokens + unscored tail
+        all_idx = torch.cat(pieces, dim=-1)  # [B, total]
 
         # Mask out indices that exceed the actual sequence length
         # (partial last window produces OOB token positions).
@@ -382,15 +420,21 @@ class EvictionPolicy:
         # window's START, not off total_tokens % ws: `total_tokens` can run ahead
         # of the scored-window span (then the newest window is fully in range and
         # there is NO tail), which a total_tokens%ws form gets wrong.
+        # `tail` is added on both sides: its indices are all in range, so they
+        # add exactly `tail` valid lanes. When `tail > 0` the newest window is
+        # necessarily full (that is the only way a token can sit past it), so
+        # `oob` is 0 and the two terms never double-count.
         if W_retained == 0:
-            min_valid = min(self.num_sink_tokens, self.total_tokens)
+            min_valid = min(self.num_sink_tokens, self.total_tokens) + tail
         else:
             last_start = self.num_sink_tokens + (num_windows - 1) * self.window_size
             last_valid = min(
                 max(self.total_tokens - last_start, 0), self.window_size
             )
             oob = self.window_size - last_valid   # newest window's OOB tail
-            min_valid = self.num_sink_tokens + W_retained * self.window_size - oob
+            min_valid = (
+                self.num_sink_tokens + W_retained * self.window_size - oob + tail
+            )
 
         # Gather only valid indices: sort valid-first via the mask, take prefix
         # argsort of ~mask (False=0 sorts before True=1) gives valid-idx-first order
