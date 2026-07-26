@@ -602,3 +602,76 @@ class TestBatching:
         state.slice_and_keep(retain)
         assert state.position_ids[0].tolist() == [0, 2, 5]
         assert state.position_ids[1].tolist() == [101, 103, 104]
+
+
+# ---------------------------------------------------------------------------
+# Unscored tail — the token appended at an eviction step must survive it
+# ---------------------------------------------------------------------------
+
+
+class TestUnscoredTailIsRetained:
+    """Scores lag the store by one `update()`, so at every eviction the token
+    just appended has no score column. It must still be retained: it is the
+    newest token in the cache, and it is the evicting step's own key — dropping
+    it means that step's query cannot attend to itself, and the token is gone
+    from every later step too.
+
+    It only actually went missing when the scored span was a whole number of
+    windows (otherwise it lands in the newest window's zero-padded slot), which
+    is why it hid: ~1 prompt in `window_size`.
+    """
+
+    @staticmethod
+    def _expand(scored_span, ws=8, sink=4, top_k=2, local=16):
+        """Retain-token indices for a cache holding `scored_span` + 1 tokens."""
+        resolved = _make_resolved(
+            window_size=ws, num_sink_tokens=sink,
+            top_k_windows=top_k, local_tokens=local,
+        )
+        policy = EvictionPolicy(resolved)
+        # total_tokens runs one ahead of the scored span: the score hook fires
+        # after attention, so the token appended this step is not yet scored.
+        policy.initialize_after_prefill(scored_span + 1)
+        num_windows = -(-(scored_span - sink) // ws)   # ceil
+        scores = torch.randn(1, 4, num_windows)
+        retained = policy.compute_retain_window_indices(scores)
+        return policy.expand_to_token_indices(retained, num_windows), policy
+
+    @pytest.mark.parametrize("rem", [0, 1, 3, 7])
+    def test_newest_token_survives_at_every_alignment(self, rem):
+        ws, sink = 8, 4
+        scored_span = sink + 10 * ws + rem
+        idx, policy = self._expand(scored_span, ws=ws, sink=sink)
+        newest = policy.total_tokens - 1
+        assert newest in idx[0].tolist(), (
+            f"newest token {newest} dropped at alignment remainder {rem}"
+        )
+
+    @pytest.mark.parametrize("rem", [0, 1, 3, 7])
+    def test_indices_are_in_range_unique_and_ascending(self, rem):
+        ws, sink = 8, 4
+        scored_span = sink + 10 * ws + rem
+        idx, policy = self._expand(scored_span, ws=ws, sink=sink)
+        vals = idx[0].tolist()
+        assert all(0 <= v < policy.total_tokens for v in vals), vals
+        assert len(set(vals)) == len(vals), "duplicate token indices"
+        assert vals == sorted(vals), "indices must stay chronological"
+
+    def test_aligned_span_keeps_exactly_one_more_token_than_the_windows(self):
+        """The whole defect, stated as a count: sink + windows + 1 tail token."""
+        ws, sink, top_k, local = 8, 4, 2, 16
+        scored_span = sink + 10 * ws            # aligned: tail is a real token
+        idx, _ = self._expand(scored_span, ws=ws, sink=sink,
+                              top_k=top_k, local=local)
+        w_retained = top_k + local // ws
+        assert idx.shape[1] == sink + w_retained * ws + 1
+
+    def test_unaligned_span_has_no_separate_tail(self):
+        """When the newest window is partial the tail lands in its pad slot."""
+        ws, sink, top_k, local = 8, 4, 2, 16
+        scored_span = sink + 10 * ws + 3        # unaligned
+        idx, _ = self._expand(scored_span, ws=ws, sink=sink,
+                              top_k=top_k, local=local)
+        w_retained = top_k + local // ws
+        # newest window carries 3 scored + 1 unscored = 4 of its ws slots
+        assert idx.shape[1] == sink + (w_retained - 1) * ws + 4
