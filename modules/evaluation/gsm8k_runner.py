@@ -35,6 +35,7 @@ import torch
 from data.gsm8k_loader import load_gsm8k_dataset, read_manifest
 from modules.evaluation.gsm8k_dataset import STOP_STRINGS
 from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
 
@@ -242,7 +243,12 @@ class GSM8KRunner:
             )
         prompt = prompt + ex.get("answer_prefix", "")
 
-        inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
+        # encode_prompt, not tokenizer(): the templated string above already
+        # carries the BOS, and tokenizer()'s add_special_tokens default would
+        # add a second — shifting every position and spending a protected sink
+        # slot on a duplicate.
+        inputs = encode_prompt(tokenizer, prompt, truncation=False,
+                               return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
         # Pass the mask explicitly: pad_token == eos_token for Llama, so
         # transformers cannot infer it and warns on every example. At batch

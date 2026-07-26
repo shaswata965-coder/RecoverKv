@@ -36,6 +36,7 @@ import torch
 
 from data.ruler_loader import RULER_TASKS, load_ruler_dataset
 from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
 
@@ -321,8 +322,17 @@ class RulerRunner:
         # 2. Tokenize (no truncation — RULER splits are sized to fit the
         #    model's context window at generation time; DefensiveKV doesn't
         #    pre-truncate RULER either).
-        inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
+        #    encode_prompt, not tokenizer(): the templated string above already
+        #    carries the BOS, and tokenizer()'s add_special_tokens default would
+        #    add a second — shifting every position and spending a protected
+        #    sink slot on a duplicate. kvpress tokenizes without re-adding
+        #    specials; this matches it.
+        inputs = encode_prompt(tokenizer, prompt, truncation=False,
+                               return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
+        # Explicit mask: pad_token == eos_token on Llama, so transformers warns
+        # on every example otherwise. All-ones at batch size 1.
+        attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
         self._warn_if_over_context(context_length, max_gen_len)
@@ -337,6 +347,7 @@ class RulerRunner:
         # 4. Generate
         try:
             gen_kwargs = {
+                "attention_mask": attention_mask,
                 "max_new_tokens": max_gen_len,
                 "num_beams": 1,
                 "do_sample": False,

@@ -861,3 +861,63 @@ class TestFirstEvictionStepPlumbing:
         meta = json.loads(next(tmp_path.glob("*.meta.json")).read_text())
         assert meta["quant_ratio"] == 0.5
         assert "quant_memoize_read" in meta
+
+
+# ---------------------------------------------------------------------------
+# Chat-template gate — the model-NAME heuristic vs what the tokenizer says
+# ---------------------------------------------------------------------------
+
+
+class TestChatGateCrossCheck:
+    """`_should_apply_chat_template` reads the model NAME, matching THUDM. A
+    local checkpoint directory that happens not to contain "instruct"/"chat"
+    therefore disables the template on all 10 templated datasets silently —
+    every prompt goes in raw and the scores look like a method result."""
+
+    def _runner(self, model_name, chat_template):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.model.name = model_name
+        runner = LongBenchRunner(cfg)
+        tok = MagicMock()
+        tok.chat_template = chat_template
+        runner.tokenizer = tok
+        return runner
+
+    def test_warns_when_the_name_hides_an_instruct_model(self, caplog):
+        runner = self._runner("/scratch/ckpt/final", chat_template="{{ x }}")
+        with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+            runner._warn_if_chat_gate_looks_wrong()
+        assert any("chat template is DISABLED" in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    def test_warns_when_the_name_promises_a_template_there_is_not(self, caplog):
+        runner = self._runner("my-llama-instruct", chat_template=None)
+        with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+            runner._warn_if_chat_gate_looks_wrong()
+        assert any("tokenizer has none" in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    def test_quiet_when_name_and_tokenizer_agree(self, caplog):
+        for name, tmpl in (("llama-3.1-8b-instruct", "{{ x }}"),
+                           ("meta-llama/Meta-Llama-3-8B", None)):
+            caplog.clear()
+            runner = self._runner(name, chat_template=tmpl)
+            with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+                runner._warn_if_chat_gate_looks_wrong()
+            assert not [r for r in caplog.records if "chat template" in r.getMessage()], name
+
+    def test_missing_tokenizer_is_not_an_error(self):
+        runner = self._runner("x", chat_template=None)
+        runner.tokenizer = None
+        runner._warn_if_chat_gate_looks_wrong()   # must not raise
+
+    def test_few_shot_datasets_stay_untemplated_on_a_chat_model(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        for ds in LongBenchRunner.NO_CHAT_TEMPLATE_DATASETS:
+            assert not LongBenchRunner._should_apply_chat_template(
+                "llama-3.1-8b-instruct", ds
+            ), ds
+        assert LongBenchRunner._should_apply_chat_template(
+            "llama-3.1-8b-instruct", "qasper"
+        )
