@@ -1,0 +1,76 @@
+# ============================================================================
+# LongBench — Ours, prompt-compression operating point (first_eviction_step: 0)
+# ============================================================================
+# Same cache as longbench_ours_flash_attn.yaml, with the FIRST eviction moved
+# from decode step 8 to decode step 0.
+#
+# Why this config exists
+# ---------------------
+# At the default first_eviction_step=8 the prompt stays whole through decode
+# steps 0-7, so any dataset whose scored answer completes inside that window is
+# measured at FULL CACHE regardless of cache_budget. On LongBench that is every
+# dataset with max_gen_length=32 (hotpotqa, 2wikimqa, musique, triviaqa,
+# passage_count, passage_retrieval_en) plus trec (first-line label) and
+# narrativeqa (short answers) — i.e. the budget column does not bind on them.
+#
+# The prompt-compression baselines (SnapKV, AdaKV, CriticalKV, DefensiveKV)
+# prune at the end of prefill, so token 2 onward already attend over the
+# compressed cache. first_eviction_step=0 puts us at that same point: the
+# prefill forward pass still produces token 1 from the full prompt (true of
+# every method, including the baselines — their press hooks also fire after
+# prefill attention), and the compaction lands before token 2.
+#
+# Use this for the head-to-head table. Keep first_eviction_step=8 as a labelled
+# ablation, not as the comparison row.
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn               # imports modules.windowed_cache
+  cache_budget: 0.20                        # sweep 0.20 / 0.10 / 0.05
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
+  quant_ratio: 0.5                          # two-tier int4 split q in [0,1]; 0 = pure fp16
+  first_eviction_step: 0                    # <-- the point of this config
+
+  # NOTE on short datasets at low budget: local_window_size is a FIXED 128 here,
+  # so when 0.05 * (prefill + max_gen) < 133 the resolver clamps to zero
+  # evictable windows and retains sink+local instead, exceeding the nominal
+  # budget. It emits a RuntimeWarning when that happens — grep the run log
+  # before trusting a 5% cell on lcc / multi_news / repobench-p.
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false                       # mandatory; see prompt 04 §1
+
+longbench:
+  datasets:
+    # The four that decide whether the step-8 advantage was real. Two that were
+    # pinned at FullKV under step 8, two that genuinely moved with the budget.
+    - hotpotqa                              # max_gen 32 — was 95.8% of FullKV at every budget
+    - passage_retrieval_en                  # max_gen 32 — was 99.5% at every budget
+    - multi_news                            # max_gen 512 — moved 99.7% -> 76.5%
+    - qasper                                # max_gen 128 — moved 95.2% -> 83.3%
+  include_chinese: false
+  use_e_variants: false
+  max_length: null   # no pre-truncation — full context. Matches DefensiveKV.
+  output_dir: outputs/longbench/ours_step0_compression_0.8
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false
