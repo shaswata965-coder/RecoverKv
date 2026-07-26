@@ -16,12 +16,27 @@ if TYPE_CHECKING:
     from .config import ResolvedConfig
 
 
-#: Decode step of the **first** eviction, INDEPENDENT of ``window_size``. The
-#: first compaction always fires this many steps into decode, so a window-size
-#: sweep shares one first-eviction point instead of first evicting at a
-#: ws-dependent step (which confounds the comparison). 8 is the reference window
-#: the experiments are calibrated against. See :meth:`EvictionPolicy.should_evict`.
-FIRST_EVICTION_STEP = 8
+#: Decode step of the **first** eviction, INDEPENDENT of ``window_size``.
+#:
+#: **0 = compress the prompt at the earliest moment the design allows.** Prefill
+#: itself cannot evict — the score hook is a ``forward_hook`` that runs *after*
+#: the attention module, so during the prefill ``update()`` no scores exist yet.
+#: The prefill scores first become readable on decode step 0's ``update()``, and
+#: that is where the first compaction fires: the prompt is cut to budget before
+#: the step-0 query attends, so every token from the first decode step onward is
+#: generated against the compressed cache. That is the operating point the
+#: prompt-compression baselines (SnapKV / AdaKV / DefensiveKV) are measured at,
+#: which is what makes the comparison a comparison.
+#:
+#: A positive value delays the first compaction by that many decode steps and is
+#: kept as a knob for ablations (and for reproducing the earlier step-8 result
+#: set). It is *not* free: with ``first_eviction_step = N`` the prompt stays whole
+#: through decode steps ``0 … N-1``, so any answer that finishes inside that
+#: window is scored at FULL cache no matter what ``cache_budget`` says — which
+#: silently turns short-answer datasets budget-invariant.
+#:
+#: See :meth:`EvictionPolicy.should_evict`.
+FIRST_EVICTION_STEP = 0
 
 
 class EvictionPolicy:
@@ -48,9 +63,10 @@ class EvictionPolicy:
         # At q=0, T_q == 0, so this is exactly the fp-only token count.
         self.total_tokens: int = 0
         # Decode step of the first eviction — the config knob (default
-        # FIRST_EVICTION_STEP), carried through ResolvedConfig. An instance
-        # attribute so tests can also isolate eviction *mechanics* from this
-        # *timing* policy (e.g. set 0 to fire from the first decode step).
+        # FIRST_EVICTION_STEP = 0, i.e. compress the prompt before the step-0
+        # query attends), carried through ResolvedConfig. An instance attribute
+        # so ablations (and tests isolating eviction *mechanics* from this
+        # *timing* policy) can delay it without rebuilding the config.
         self.first_eviction_step: int = resolved.first_eviction_step
 
     # -----------------------------------------------------------------
@@ -76,32 +92,34 @@ class EvictionPolicy:
     def should_evict(self, step: int) -> bool:
         """Return ``True`` if eviction should run at decode *step*.
 
-        The **first** eviction fires at a fixed ``first_eviction_step`` (default
-        :data:`FIRST_EVICTION_STEP` = 8), **independent of ``window_size``** — so a
-        window-size sweep shares one first-compaction point instead of first
-        evicting at a ws-dependent step. Nothing evicts before it: the prompt stays
-        whole until then, and the prefill scores it is compressed against are
-        already available (the score hook is a ``forward_hook`` that runs after the
-        attention module, so the prefill scores land in ``cache_kwargs`` from the
-        first decode step). After the first eviction, the natural window cadence
-        resumes — every step where ``step % window_size == 0``, aligned to absolute
-        step 0. So:
+        The **first** eviction fires at a fixed ``first_eviction_step``,
+        **independent of ``window_size``**, so a window-size sweep shares one
+        first-compaction point instead of first evicting at a ws-dependent step
+        (which would confound the comparison). After it, the natural window
+        cadence resumes — every step where ``step % window_size == 0``, aligned to
+        absolute step 0.
 
-        * ``ws == 12`` → ``8`` (forced), ``12``, ``24``, ``36`` … — the first slide
-          after the forced eviction is a short ``8 → 12`` gap, then full windows.
-        * ``ws == 8`` → a uniform ``8``, ``16``, ``24`` …
-        * ``ws >= 9`` → ``8`` then multiples of ``ws`` (short first window, full
-          windows after).
+        **At the default** :data:`FIRST_EVICTION_STEP` **= 0** the two rules
+        coincide and the schedule is simply ``0, ws, 2*ws, …`` for every
+        ``window_size``: the prompt is compressed on the first decode step, before
+        that step's query attends, and every generated token from then on is
+        produced against the budgeted cache. Prefill itself cannot evict — the
+        score hook runs *after* the attention module, so no scores exist during
+        the prefill ``update()``; step 0 is the earliest point at which the
+        prefill scores are readable, and is where they are consumed.
 
-        Edge cases ``window_size`` 1–7 (smaller than the fixed offset) are handled
-        gracefully: the natural boundaries below step 8 are suppressed, the first
-        eviction still fires at 8, and the cadence resumes at the next multiple —
-        ``ws == 4`` → ``8, 12, 16`` …; ``ws == 3`` → ``8, 9, 12`` …; ``ws == 1`` →
-        ``8, 9, 10`` … . Nothing before ``first_eviction_step`` ever evicts.
+        With a **positive** ``first_eviction_step = N`` nothing evicts before step
+        ``N`` (the prompt stays whole through steps ``0 … N-1``), then:
 
-        Setting ``first_eviction_step`` to 0 reproduces the "fire from step 0"
-        schedule (step 0 plus every ``window_size``-th step) — used by the batching
-        tests to exercise eviction on short generations.
+        * ``ws == 8``, ``N == 8`` → a uniform ``8, 16, 24`` …
+        * ``ws == 12``, ``N == 8`` → ``8`` (forced), ``12``, ``24`` … — a short
+          ``8 → 12`` gap, then full windows.
+        * ``ws < N`` suppresses the natural boundaries below ``N`` and resumes at
+          the next multiple: ``ws == 3``, ``N == 8`` → ``8, 9, 12`` … .
+
+        Ablations aside, a positive value means every answer that terminates
+        within ``N`` decode steps is scored at full cache regardless of
+        ``cache_budget`` — see :data:`FIRST_EVICTION_STEP`.
         """
         if step < self.first_eviction_step:
             return False
@@ -298,8 +316,13 @@ class EvictionPolicy:
     ) -> Tensor:
         """Expand window indices to absolute token indices.
 
-        Prepends sink prefix.  Trims trailing partial window via geometric
-        cap computed without touching tensor data (Python int arithmetic).
+        Prepends the sink prefix, appends the unscored tail, and trims the
+        trailing partial window via a geometric cap computed without touching
+        tensor data (Python int arithmetic).
+
+        Indices come out **ascending**: sink, then the retained windows (which
+        ``compute_retain_window_indices`` already sorted chronologically), then
+        the tail, which is newer than all of them.
 
         Parameters
         ----------
@@ -307,9 +330,11 @@ class EvictionPolicy:
             Shape ``[B, W_retained]``.
         num_windows : int
             The total scored-window count (``window_scores.shape[2]``, a host
-            int). Needed to locate the one window that can be partial — the
-            newest scored window, index ``num_windows - 1`` — so the valid-token
-            count can be computed without a device sync (see below).
+            int). Needed twice: to locate the one window that can be partial —
+            the newest scored window, index ``num_windows - 1`` — and to locate
+            the end of the scored span, past which sit the tokens the scores do
+            not cover yet. Both keep the valid-token count a host int, so no
+            device sync (see below).
 
         Returns
         -------
@@ -338,8 +363,39 @@ class EvictionPolicy:
         )
         token_idx = token_idx.reshape(B, -1)  # [B, W_retained * window_size]
 
-        # Concatenate sink + window tokens
-        all_idx = torch.cat([sink_idx, token_idx], dim=-1)  # [B, total]
+        # Tokens that arrived AFTER the newest scored window — the "unscored
+        # tail". Scores lag the store by exactly one `update()` (the hook is a
+        # forward_hook, so the scores read at step s were computed at step s-1),
+        # so at every eviction the token just appended has no score column and
+        # is invisible to the window arithmetic above.
+        #
+        # It must still be retained. It is the newest token in the cache — it is
+        # local by definition, and at an eviction step it is the CURRENT step's
+        # own key: dropping it means the query cannot attend to itself, and the
+        # token is gone from every later step too.
+        #
+        # It only actually goes missing when the scored span happens to be a
+        # whole number of windows: otherwise the newest window is partial and
+        # the tail token falls inside its zero-padded slot, so `token_idx`
+        # already covers it and `tail` is 0. That alignment-dependence is why
+        # this was invisible — it bites ~1 prompt in `window_size`. The two-tier
+        # (q > 0) path never had it: its rebuild sizes the newest window off the
+        # body length, so the tail folds into the local window (see cache.py's
+        # `new_body_len`). This makes q = 0 agree.
+        #
+        # `tail` is host arithmetic, like `min_valid` below — no device sync.
+        scored_end = self.num_sink_tokens + num_windows * self.window_size
+        tail = max(self.total_tokens - scored_end, 0)
+        pieces = [sink_idx, token_idx]
+        if tail > 0:
+            pieces.append(
+                torch.arange(
+                    scored_end, scored_end + tail, device=device, dtype=torch.long
+                ).unsqueeze(0).expand(B, -1)
+            )
+
+        # Concatenate sink + window tokens + unscored tail
+        all_idx = torch.cat(pieces, dim=-1)  # [B, total]
 
         # Mask out indices that exceed the actual sequence length
         # (partial last window produces OOB token positions).
@@ -364,15 +420,21 @@ class EvictionPolicy:
         # window's START, not off total_tokens % ws: `total_tokens` can run ahead
         # of the scored-window span (then the newest window is fully in range and
         # there is NO tail), which a total_tokens%ws form gets wrong.
+        # `tail` is added on both sides: its indices are all in range, so they
+        # add exactly `tail` valid lanes. When `tail > 0` the newest window is
+        # necessarily full (that is the only way a token can sit past it), so
+        # `oob` is 0 and the two terms never double-count.
         if W_retained == 0:
-            min_valid = min(self.num_sink_tokens, self.total_tokens)
+            min_valid = min(self.num_sink_tokens, self.total_tokens) + tail
         else:
             last_start = self.num_sink_tokens + (num_windows - 1) * self.window_size
             last_valid = min(
                 max(self.total_tokens - last_start, 0), self.window_size
             )
             oob = self.window_size - last_valid   # newest window's OOB tail
-            min_valid = self.num_sink_tokens + W_retained * self.window_size - oob
+            min_valid = (
+                self.num_sink_tokens + W_retained * self.window_size - oob + tail
+            )
 
         # Gather only valid indices: sort valid-first via the mask, take prefix
         # argsort of ~mask (False=0 sorts before True=1) gives valid-idx-first order

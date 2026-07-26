@@ -1,0 +1,42 @@
+# ============================================================================
+# GSM8K — 20% cache budget (compression_ratio 0.80)
+# ============================================================================
+# 0.20 * (130 + 512) = ~128 retained tokens against a ~280-token sequence, so
+# the budget DOES bind here and eviction fires on essentially every example.
+# This is the run that actually measures compression.
+#
+# Produces: outputs/gsm8k/budget20/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20        # fraction RETAINED (DefensiveKV compression_ratio = 0.80)
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25   # fraction of the budget — scales with short prompts
+  quant_ratio: 0.0
+  first_eviction_step: 0        # compress the prompt before the 2nd token (default)
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/budget20
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

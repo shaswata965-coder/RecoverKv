@@ -21,6 +21,10 @@ echo "StickyKV — Full Reproduction Pipeline"
 echo "============================================"
 echo "Start time: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo ""
+echo "Eviction schedule: first_eviction_step=0 (repo default) — the prompt is"
+echo "compressed on decode step 0, before that step's query attends. Override"
+echo "with cache.first_eviction_step=N for the delayed-eviction ablation."
+echo ""
 
 # --- Suite A: Parity ---
 echo "[1/8] Running parity baseline..."
@@ -36,6 +40,13 @@ bash "$SCRIPT_DIR/run_parity_ours_eager.sh"
 # --- Suite B: Faithfulness ---
 echo "[4/8] Running faithfulness evaluation..."
 bash "$SCRIPT_DIR/run_faithfulness.sh"
+
+# --- Suite B2: QEvict observations (reuses the parity pair from [1]/[2]) ---
+echo "[4b/8] Running QEvict observation suite..."
+STAGE=observe \
+  BASE_NPZ="${BASE_NPZ:-outputs/parity_base_wikitext-103.npz}" \
+  OURS_NPZ="${OURS_NPZ:-outputs/parity_ours_eager_wikitext-103.npz}" \
+  bash "$SCRIPT_DIR/run_qevict_observations.sh"
 
 # --- Suite C: Performance ---
 echo "[5/8] Running performance benchmarks..."
@@ -59,6 +70,21 @@ bash "$SCRIPT_DIR/run_longbench_ours_eager.sh"
 # --- Scoring ---
 echo "[Score] Scoring LongBench results..."
 bash "$SCRIPT_DIR/score_longbench.sh"
+
+# --- Suite E: GSM8K (build -> baseline gate -> budgets -> comparison) ---
+echo "[9/10] Running GSM8K end-to-end..."
+bash "$SCRIPT_DIR/run_gsm8k_e2e.sh"
+
+# --- Suite F: RULER ---
+# Skipped unless RULER_DATA_DIR points at an unpacked length bucket: this repo
+# does not download RULER, and a silent skip beats a confusing failure at the
+# end of a multi-hour pipeline.
+if [ -n "${RULER_DATA_DIR:-}" ]; then
+  echo "[10/10] Running RULER..."
+  DATA_DIR="$RULER_DATA_DIR" bash "$SCRIPT_DIR/run_ruler.sh"
+else
+  echo "[10/10] Skipping RULER — set RULER_DATA_DIR=/path/to/ruler/4096 to include it."
+fi
 
 echo ""
 echo "============================================"

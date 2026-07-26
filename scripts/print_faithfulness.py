@@ -15,11 +15,45 @@ Usage (Kaggle cell):
     %run scripts/print_faithfulness.py
 """
 from __future__ import annotations
+import glob as _glob
 import json
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
 
 # ── Configuration ─────────────────────────────────────────────────────
-NPZ_PATH = "/kaggle/working/outputs/faithfulness/faithfulness_results.npz"
+# Resolution order: $FAITHFULNESS_NPZ, then argv[1], then the Kaggle default,
+# then a search of the usual output roots.  The path used to be hard-wired,
+# which broke every invocation that wrote its npz anywhere else.
+_DEFAULT = "/kaggle/working/outputs/faithfulness/faithfulness_results.npz"
+_SEARCH_ROOTS = ("outputs", "/kaggle/working/outputs", ".")
+
+# The report is drawn with box characters; a non-UTF-8 console (Windows cp1252)
+# would otherwise raise UnicodeEncodeError mid-table.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _resolve_npz() -> str:
+    explicit = os.environ.get("FAITHFULNESS_NPZ") or (
+        sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].endswith(".npz") else None)
+    if explicit:
+        return explicit
+    if Path(_DEFAULT).exists():
+        return _DEFAULT
+    for root in _SEARCH_ROOTS:
+        hits = sorted(_glob.glob(f"{root}/**/faithfulness_results.npz",
+                                 recursive=True))
+        if hits:
+            return hits[0]
+    raise FileNotFoundError(
+        "No faithfulness_results.npz found. Set FAITHFULNESS_NPZ=<path>, pass "
+        "the path as an argument, or run the faithfulness suite first.")
+
+
+NPZ_PATH = _resolve_npz()
 
 # ── Load ──────────────────────────────────────────────────────────────
 data = np.load(NPZ_PATH, allow_pickle=True)

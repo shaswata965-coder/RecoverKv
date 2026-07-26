@@ -1,0 +1,25 @@
+# ============================================================================
+# StickyKV — QEvict observation suite (skew / window-level / revival)
+# ----------------------------------------------------------------------------
+# Post-processing only: reads the same parity_base + parity_ours pair as the
+# faithfulness suite, no model load.  Analysis knobs (FMM horizon, LIR
+# inactivity/horizon, transition lags, pool factor) use the module defaults —
+# to tune them, call the module CLI directly:
+#
+#   python -m modules.evaluation.qevict_observations \
+#       --base-npz outputs/parity_base_wikitext-103.npz \
+#       --ours-npz outputs/parity_ours_eager_wikitext-103.npz \
+#       --output-dir outputs/qevict_observations --fmm-horizon 32
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: qevict_observations
+  seed: 42
+
+faithfulness:
+  base_npz_path: outputs/parity_base_wikitext-103.npz
+  ours_npz_path: outputs/parity_ours_eager_wikitext-103.npz
+
+telemetry:
+  output_dir: outputs

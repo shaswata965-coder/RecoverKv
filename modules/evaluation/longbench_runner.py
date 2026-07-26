@@ -25,6 +25,8 @@ from data.longbench_loader import (
     LONGBENCH_EN_DATASETS,
     load_longbench_dataset,
 )
+from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
+from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
 from utils.logger import get_logger
@@ -222,6 +224,7 @@ class LongBenchRunner:
 
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
+        self._warn_if_chat_gate_looks_wrong()
 
         datasets = getattr(self.lb, "datasets", LONGBENCH_EN_DATASETS)
         if isinstance(datasets, str):
@@ -238,6 +241,7 @@ class LongBenchRunner:
             output_dir,
             self.is_windowed,
         )
+        log_operating_point(self.config, self.is_windowed)
 
         for dataset_name in datasets:
             jsonl_path = output_dir / f"{dataset_name}.jsonl"
@@ -401,19 +405,28 @@ class LongBenchRunner:
         self._log_prompt_preview(dataset_name, prompt, templated)
 
         # 4. Tokenize final prompt.
-        #    add_special_tokens is OFF once the chat template has run: every
-        #    template emits its own BOS (Mistral "<s> [INST]", LLaMA-3
-        #    "<|begin_of_text|>"), so letting the tokenizer prepend another
-        #    yields a doubled BOS the model never saw in training. THUDM's
-        #    pred.py builds the LLaMA-2 wrapper as a bare "[INST]...[/INST]"
-        #    string and relies on the tokenizer for the single BOS; kvpress
-        #    (and therefore DefensiveKV) uses the template and passes
-        #    add_special_tokens=False. Both end up with exactly one.
-        inputs = tokenizer(
-            prompt, truncation=False, return_tensors="pt",
-            add_special_tokens=not templated,
-        )
+        #    encode_prompt, not tokenizer(): every chat template emits its own
+        #    BOS (Mistral "<s> [INST]", LLaMA-3 "<|begin_of_text|>"), and
+        #    tokenizer()'s add_special_tokens default would prepend a second —
+        #    shifting every position and spending one protected sink slot on a
+        #    duplicate. THUDM's pred.py builds the LLaMA-2 wrapper as a bare
+        #    "[INST]...[/INST]" string and relies on the tokenizer for the single
+        #    BOS; kvpress (and therefore DefensiveKV) uses the template and
+        #    passes add_special_tokens=False. Both end up with exactly one.
+        #
+        #    It decides from the prompt STRING rather than from `templated`, so
+        #    the few-shot datasets that skip the template
+        #    (NO_CHAT_TEMPLATE_DATASETS) still get their BOS from the tokenizer,
+        #    and a template embedding the BOS in a form the prefix test misses is
+        #    caught by its post-check instead of silently reintroducing the bug.
+        inputs = encode_prompt(tokenizer, prompt, truncation=False,
+                               return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
+        # Pass the mask explicitly: pad_token == eos_token on Llama, so
+        # transformers cannot infer it and warns on every example. All-ones at
+        # batch size 1, so the result is unchanged — but leaving it implicit
+        # buries real warnings under thousands of spurious ones.
+        attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
         # Guard: a prompt longer than the model's positional range yields
@@ -434,6 +447,7 @@ class LongBenchRunner:
         # 6. Generate
         try:
             gen_kwargs = {
+                "attention_mask": attention_mask,
                 "max_new_tokens": max_gen_len,
                 "num_beams": 1,
                 "do_sample": False,
@@ -500,6 +514,18 @@ class LongBenchRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+            # Same failure mode as first_eviction_step below: omitted, and the
+            # YAML knob is silently inert. LongBench generates one example at a
+            # time, so the auto rule (memo on at B == 1) hides it — a config
+            # asking for it OFF got it ON anyway.
+            quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            # Without this the knob was inert here: LongBench fell through to
+            # WindowedCacheConfig's default whatever the YAML said, while the
+            # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
+            # the prompt is compressed before the second decode token, which is
+            # the operating point the prompt-compression baselines
+            # (SnapKV/AdaKV/DefensiveKV) are measured at.
+            first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
         # Get RoPE module
@@ -673,6 +699,12 @@ class LongBenchRunner:
         which must stay raw so the model continues the worked-example format
         instead of switching into chat-assistant mode — matches THUDM/LongBench
         + DefensiveKV, which blanks `tokenizer.chat_template` on those tasks.
+
+        :meth:`_warn_if_chat_gate_looks_wrong` still cross-checks this against
+        the model name and warns when the two disagree. The tokenizer decides, so
+        a name-based miss can no longer change the prompt — but a disagreement
+        means the run is not labelled the way its checkpoint suggests, which is
+        worth a line in the log.
         """
         if dataset_name in cls.NO_CHAT_TEMPLATE_DATASETS:
             return False
@@ -697,6 +729,47 @@ class LongBenchRunner:
             "%s: chat_template=%s | prompt head %r ... tail %r",
             dataset_name, "applied" if templated else "SKIPPED", head, tail,
         )
+
+    def _warn_if_chat_gate_looks_wrong(self) -> None:
+        """Flag a model name that disagrees with what its tokenizer ships.
+
+        The gate itself reads the tokenizer (see
+        :meth:`_should_apply_chat_template`), so neither case here can silently
+        change the prompt the way the old name-based gate did — a checkout
+        directory named ``/scratch/ckpt/final`` no longer drops the template.
+        What a disagreement does mean is that the run is not what its checkpoint
+        name suggests, and that is worth one line in the log rather than a
+        surprise in a score table.
+
+        Kept as a warning, not an override: the tokenizer is the authority on
+        prompt format, and the reference implementations (kvpress, DefensiveKV)
+        gate on it too.
+        """
+        tok = self.tokenizer
+        if tok is None:
+            return
+        name = self.config.model.name
+        name_says_chat = "instruct" in name.lower() or "chat" in name.lower()
+        has_template = getattr(tok, "chat_template", None) is not None
+        if has_template and not name_says_chat:
+            log.warning(
+                "model.name=%r contains neither 'instruct' nor 'chat', but this "
+                "tokenizer HAS a chat template, so the 10 templated datasets ARE "
+                "being chat-wrapped. Expected for an instruct model under a local "
+                "path; if this is genuinely a base model carrying a stray "
+                "template, the prompts are being wrapped in a format it was never "
+                "trained on.",
+                name,
+            )
+        elif name_says_chat and not has_template:
+            log.warning(
+                "model.name=%r looks like an instruct model, but its tokenizer "
+                "ships NO chat template, so every dataset is prompted RAW. On a "
+                "real instruct model that costs most of the score on the "
+                "generative tasks — check the checkpoint is complete "
+                "(tokenizer_config.json carries chat_template).",
+                name,
+            )
 
     @staticmethod
     def _post_process(pred: str, dataset_name: str) -> str:
@@ -784,6 +857,12 @@ class LongBenchRunner:
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
+            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
+            # The tier split IS the method on this branch, so a sidecar without
+            # it cannot attribute a finished run to an operating point. The
+            # RULER and GSM8K sidecars have always recorded it; this one did not.
+            "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
+            "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

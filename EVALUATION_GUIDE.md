@@ -391,6 +391,126 @@ The ours parity npz (schema ≥ 1.2) carries the tier inputs: `all_window_ids`
 
 ---
 
+## 3b. Suite E — QEvict Observations (design-premise evidence)
+
+Suites A/B ask *"does our cache match the oracle?"*. Suite E asks *"is the
+design premise true?"* — is importance skewed enough to justify tiering, is a
+window-level decision defensible, and does dropped importance come back?
+
+**Files:** `utils/qevict_metrics.py` (pure numpy metrics),
+`modules/evaluation/qevict_observations.py` (npz adapter, CLI, runner).
+**Input:** the same `parity_base` + `parity_ours` pair Suite B consumes.
+**Cost:** CPU post-processing, seconds — no model load.
+
+### Observation I — skewed importance
+
+`concentration_curve()` sorts each event's valid window scores descending and
+reports `C(p)`: the mass held by the top `p` fraction of windows. Reported at
+p ∈ {5, 10, 20, 40}%, inverted for mass targets {50, 80, 90}%, with the
+concentration gap `C(p) − p`. The fp and fp+Q capacity fractions are *derived*
+from `top_k_fp` / `N_q` / `local_windows`, so the figure shows where our real
+tier boundaries fall on the measured curve.
+
+### Observation II — window-level decisions
+
+Two metrics over the accessible set, at each real routing event (the steps in
+`eviction_step_mask`, so `first_eviction_step` and the `step % ws` cadence are
+respected — at the default `first_eviction_step = 0` that is trace indices
+`1, ws+1, 2·ws+1, …`, since trace index 0 is the prefill forward and decode
+step *d* lands at index *d* + 1):
+
+- **Future Missed Mass** — of the attention arriving in the next `H` decode
+  steps on windows that *already existed* at the decision, what fraction sits
+  on windows the policy dropped. Forward-looking, unlike Suite B's
+  instantaneous `missed_mass`. Events with fewer than `H` future steps recorded
+  are **censored**, not truncated; `events_scored` reports how many survive.
+- **Selection Churn** — Jaccard distance between consecutive accessible sets.
+
+Scored for four policies: the two *measured* sets from the ours npz tier tags
+(`measured_fp_only`, `measured_fp_plus_q`) and a *simulated* byte-matched pair
+that differs only in decision granularity (`simulated_unit_g<ws>` vs
+`simulated_block_g<ws·pool>` — both retain `(top_k_fp // pool) · pool` units).
+`units dropped` is reported alongside so a run where nothing was evicted (short
+prefill, or `N_q` wide enough to hold the whole band) is visibly vacuous rather
+than a spurious FMM of 0.
+
+> For the true **token**-vs-window comparison, record the base run with
+> `window.window_size=1` and pass `--pool-factor 8`. At the usual `ws=32` the
+> comparison is 32-token vs 64-token decisions.
+
+### Observation III — historical importance revives
+
+`episode_lir()` — the *episode* form of LIR. Each maximal inactive run counts
+**once**, becomes eligible at its `m`-th consecutive miss, and is rescued only
+if a hit lands within the next `H` events; episodes whose horizon runs past the
+trace end are dropped from numerator *and* denominator. Run twice:
+
+| selection | meaning |
+|---|---|
+| `oracle` | base-run top-`top_k_fp` — the headroom a promotion path could capture |
+| `policy_fp` | our real fp tier — what Q→fp promotion actually recovers today |
+
+`binary_transition()` adds the lag-δ flip matrix: **P01** (cold→hot, the
+promotion argument) and **P10** (hot→cold, the demotion argument).
+
+> **Do not compare this LIR to Suite B's `global_lir`.** Suite B counts every
+> `(event, window)` lookback pair, accepts a rescue arbitrarily far in the
+> future, applies no censoring, and simulates Sticky-K on ground truth
+> (`m = 3`, hard-wired). They are different estimators of related quantities.
+
+### Bootstrap axis
+
+Traces are `(sample, layer)` pairs; `--trace-axis sample` groups per-trace
+statistics by article *after* computing them (accessible sets cannot be
+averaged across layers). With one article the intervals are over layers of one
+prompt — within-run variability, not population CIs. Use `data.num_samples>=8`
+for reported numbers.
+
+### Per-step mass (why the base schema bumped to 1.2)
+
+Observation II needs the mass deposited *by each step*, which cannot be
+recovered from the cumulative fp16 `window_scores`: by `T≈1000` one fp16 ulp of
+the accumulated score is comparable to a whole per-step delta. `BaseParityRunner`
+therefore records `step_window_scores` `[S, T, L, W]` in fp32 (head-mean; step 0
+is the prefill). Older npzs fall back to differencing, with a warning and a
+`step_mass_negative_fraction` diagnostic — usable for short runs only.
+
+### Output
+
+```
+outputs/qevict_observations/
+  observation1_mass_table.csv          top_fraction, mass, CI, concentration_gap
+  observation1_coverage_table.csv      target_mass, required window fraction, CI
+  observation1_curve.csv               the full C(p) curve + band
+  observation2_summary_table.csv       per-policy FMM, churn, units kept/dropped
+  observation2_paired_comparison.csv   paired absolute + relative reductions
+  observation3_lir_grid_{oracle,policy_fp}.csv          LIR over (m, H)
+  observation3_transition_table_*.csv                   P01/P10 per lag
+  observation3_quantifiable_result_*.csv                the headline row
+  observation3_primary_episodes_*.csv                   one row per episode
+  paper_results.md                     rendered report + manuscript sentences
+  all_results.json                     everything above, machine-readable
+  qevict_observations.npz + .meta.json raw arrays + provenance/SHAs
+  observation{1,2,3}_*.pdf             figures (skipped if matplotlib absent)
+```
+
+### Running it
+
+```bash
+# Full chain (parity base → parity ours → observations)
+PROFILE=kaggle bash scripts/run_qevict_observations.sh     # T4/P100-sized
+PROFILE=hpc    bash scripts/run_qevict_observations.sh     # A100-sized
+
+# Analysis only, over npzs you already have
+STAGE=observe BASE_NPZ=... OURS_NPZ=... bash scripts/run_qevict_observations.sh
+
+# Kaggle notebook / config route
+!python scripts/kaggle_entry.py --suite qevict_observations \
+    --override faithfulness.base_npz_path=outputs/parity_base_wikitext-103_ab12cd34.npz
+```
+
+---
+
 ## 4. Suite D — LongBench
 
 ### Runner
@@ -468,6 +588,101 @@ f1_score(prediction.split(), ground_truth.split())
 
 ---
 
+## 4b. Suite F — RULER (needle-in-a-haystack)
+
+**Runner:** `modules/evaluation/ruler_runner.py` (`run.mode: ruler`)
+**Scorer:** `modules/evaluation/ruler_scoring.py` (`run.mode: ruler_score`, or
+`python -m modules.evaluation.ruler_scoring --predictions_dir <dir>`)
+**Loader:** `data/ruler_loader.py` — 13 tasks, one `datasets.save_to_disk`
+directory per context length (4096 / 16384 / 32768).
+**Launcher:** `DATA_DIR=/path/to/ruler/4096 bash scripts/run_ruler.sh`
+
+The data is **not** downloaded by this repo — point `ruler.data_dir` at an
+unpacked length bucket.
+
+Prompt protocol follows `kvpress.pipeline.KVPressTextGenerationPipeline`
+exactly: `chat_template(context + question, add_generation_prompt=True) +
+answer_prefix`, no pre-truncation.
+
+Metrics are ported verbatim from DefensiveKV's `calculate_metrics.py`, so scores
+are directly comparable to its published RULER numbers:
+
+- `qa_*` → `string_match_part` (1 if **any** reference substring is in the pred)
+- everything else → `string_match_all` (fraction of references found)
+
+> **Null predictions are DROPPED, not scored as 0** — matching that reference
+> implementation, and *differing* from `longbench_scoring.score_predictions`,
+> which follows THUDM/LongBench's convention of keeping nulls in the
+> denominator. The two suites are not interchangeable on failed generations;
+> `dropped` is reported per task in the CSV.
+
+With `ruler.capture_memory: true` each example also emits a
+`utils/cache_memory.py` byte-accounting report, written to
+`<task>.memory.jsonl` + `<task>.memory_summary.json`. Read the memo caveat in
+§4d before quoting a compression number off it.
+
+---
+
+## 4c. Suite G — GSM8K (chain-of-thought arithmetic)
+
+**Runner:** `modules/evaluation/gsm8k_runner.py` (`run.mode: gsm8k`)
+**Scorer:** `modules/evaluation/gsm8k_scoring.py` (`run.mode: gsm8k_score`, or
+`python -m modules.evaluation.gsm8k_scoring --runs <dirs...> --out_csv <path>`)
+**Loader:** `data/gsm8k_loader.py` — build once with
+`python -m data.gsm8k_loader --out data/gsm8k_cot`
+**Launcher:** `bash scripts/run_gsm8k_e2e.sh` (`SAMPLES=20` for a smoke run)
+
+The end-to-end script is build → full-cache baseline → **hard gate** → the two
+budgets → comparison table. The gate stops the run if the baseline does not
+reach `BASELINE_MIN` accuracy or if `marker_rate` falls below 90%, because a
+budget number means nothing against a baseline that does not reproduce.
+
+Two traps this suite is built to expose, both of which have burned this project:
+
+1. **Scoring termination instead of correctness.** The original imported
+   extractor measured whether generation terminated, which is why every method
+   appeared to *lose* accuracy at high budget. `gsm8k_scoring.py` extracts the
+   `#### <number>` marker and reports `marker_rate` alongside accuracy — if the
+   marker rate is low, accuracy is being carried by the last-number fallback and
+   is not trustworthy.
+2. **A budget that never binds.** GSM8K prompts are short (~130 tokens), so a
+   0.80 budget can exceed the sequence the run actually reaches and the "budget"
+   run is the full-cache baseline in disguise. The runner measures this
+   directly: read `pct_examples_no_eviction` and `effective_retention` in
+   `meta.json` **before** reading the accuracy.
+
+---
+
+## 4d. Eviction schedule and the memory memo — two things to state in the paper
+
+**Eviction schedule.** `cache.first_eviction_step` defaults to **0**: the prompt
+is compressed on decode step 0, before that step's query attends, so every token
+from the first decode step onward is generated against the budgeted cache. This
+is the operating point the prompt-compression baselines (SnapKV / AdaKV /
+CriticalKV / DefensiveKV) sit at — their press hooks also fire after prefill
+attention — and it is what makes the head-to-head a comparison.
+
+A positive value delays the first compaction and leaves any answer that
+terminates inside that window measured at **full cache** regardless of
+`cache_budget`. Every shipped config states the value explicitly, and every
+sidecar (`.meta.json`, and the parity `.npz` metadata) records it, so a finished
+run can be attributed after the fact. Label any delayed-eviction run as an
+ablation; never put one in a comparison row. See `EVICTION_LOGIC.md` §7.
+
+**The read memo is not cache state.** `quant_memoize_read` holds the whole Q
+tier dequantized to fp16 and is ON by default at `B = 1`. It is real resident
+memory, so `utils/cache_memory.py` counts it in `total_live` — and at `B = 1` it
+is usually the *largest* line item, which drags `compression_vs_fp16` below 1.0
+(the report then says the two-tier cache is bigger than fp16). It is a derived,
+recomputable copy of the Q tier, not state, so the report also publishes
+`compression_vs_fp16_excl_memo` / `reduction_vs_full_excl_memo` and flags the
+split in its printed output.
+
+**For a headline memory table, capture with `quant_memoize_read: false`**, where
+the two framings agree and there is only one number to quote.
+
+---
+
 ## 5. Metric Quick Reference
 
 | Suite | Metric | Range | Better |
@@ -480,6 +695,12 @@ f1_score(prediction.split(), ground_truth.split())
 | B | Mass ratio (base/ours) | (0, ∞) | ≈ 1 |
 | B | Global LIR (rescue rate) | [0, 1] | Lower (stable) |
 | B | Absolute missed mass | [0, ∞) | Lower |
+| E | Concentration `C(p)` / gap `C(p)−p` | [0, 1] | Higher (skew justifies tiering) |
+| E | Future Missed Mass (horizon `H`) | [0, 1] | Lower |
+| E | Selection Churn | [0, 1] | Lower (stable decisions) |
+| E | Episode Global LIR (oracle) | [0, 1] | Higher ⇒ more promotion headroom |
+| E | Episode Global LIR (`policy_fp`) | [0, 1] | Higher ⇒ Q→fp promotion working |
+| E | P01 / P10 at lag δ | [0, 1] | Higher ⇒ promotion / demotion pays |
 | D | Dataset-specific (F1/ROUGE/exact) | [0, 100] | Higher |
 
 ---
@@ -522,6 +743,17 @@ FaithfulnessRunner.run()                   [Suite B]
                     ├─► _kl()                 faithfulness_runner.py:52
                     └─► mass ratio            faithfulness_runner.py:217
                           └─► save faithfulness_results.npz
+
+run_observations()                         [Suite E]
+  └─► load base NPZ + ours NPZ  (alignment-checked, like Suite B)
+        └─► build_observation_inputs()
+              ├─► step_window_scores        (fp32 per-step mass; else differenced)
+              ├─► flush_geometry()          sticky_metrics.py:47  (shared geometry)
+              ├─► all_window_tier → measured fp-only / fp∪Q accessible sets
+              └─► oracle & policy_fp trinary selection matrices
+                    └─► concentration_curve() / future_missed_mass() /
+                        selection_churn() / episode_lir() / binary_transition()
+                          └─► save CSVs + paper_results.md + qevict_observations.npz
 
 LongBenchRunner.run()                      [Suite D]
   └─► model.generate() for each example

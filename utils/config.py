@@ -26,6 +26,68 @@ class ConfigValidationError(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Shared defaults
+# ---------------------------------------------------------------------------
+
+#: Decode step of the first eviction, for every YAML-driven runner.
+#:
+#: Mirrors ``modules.windowed_cache.policy.FIRST_EVICTION_STEP``; re-declared here
+#: rather than imported so that ``utils.config`` stays free of the cache packages
+#: (importing those pulls in the flash-attn hooks). ``tests/test_utils.py`` pins
+#: the two together so they cannot drift.
+#:
+#: Runners use it as the ``getattr(cfg.cache, ..., FIRST_EVICTION_STEP_DEFAULT)``
+#: fallback. A literal there is how this knob went inert in LongBench once
+#: already: the fallback silently disagreed with the config default, so a run
+#: could be at a different operating point than the YAML said.
+FIRST_EVICTION_STEP_DEFAULT = 0
+
+
+def log_operating_point(config, is_windowed: bool) -> None:
+    """Log the full cache operating point at the start of a generation run.
+
+    Every knob that changes a score, on one line, so a finished log says which
+    experiment it was. The three that have burned this project, all silent:
+
+    * ``first_eviction_step`` — a positive value leaves every answer that
+      terminates inside that window measured at FULL cache whatever
+      ``cache_budget`` says;
+    * ``quant_ratio`` — 0.0 is the single-tier fp16 method, not the two-tier
+      one this branch exists for, and the shipped RULER / GSM8K configs default
+      to it; and
+    * ``backend_package`` / ``attn_implementation`` — the pairing decides which
+      score hook runs at all.
+
+    None of these change anything visible in the predictions, so without this
+    line a wrong one is only discoverable by re-reading the config afterwards.
+    """
+    cache = getattr(config, "cache", None)
+    if cache is None:
+        return
+    if not is_windowed:
+        log.info("operating point: FULL CACHE (no eviction, no quantization)")
+        return
+
+    q = getattr(cache, "quant_ratio", 0.0)
+    log.info(
+        "operating point: budget=%s  window_size=%s  num_sink=%s  local=%s  "
+        "quant_ratio=%s (%s)  first_eviction_step=%s (%s)  backend=%s/%s",
+        getattr(cache, "cache_budget", None),
+        getattr(cache, "window_size", None),
+        getattr(cache, "num_sink_tokens", None),
+        getattr(cache, "local_window_size", None),
+        q,
+        "two-tier fp16+int2" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
+        getattr(cache, "first_eviction_step", None),
+        "prompt compressed on decode step 0"
+        if getattr(cache, "first_eviction_step", 0) == 0
+        else "DELAYED — short answers measured at full cache",
+        getattr(cache, "backend_package", None),
+        getattr(getattr(config, "model", None), "attn_implementation", None),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
 
@@ -49,7 +111,12 @@ class CacheConfig:
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
-    first_eviction_step: int = 8  # decode step of the FIRST eviction, independent of window_size
+    # Decode step of the FIRST eviction, independent of window_size. 0 (default)
+    # compresses the prompt on decode step 0 — before that step's query attends —
+    # so every generated token comes from the budgeted cache. A positive value
+    # delays it and leaves any answer finishing inside that window measured at
+    # FULL cache whatever cache_budget says. See modules/windowed_cache/policy.py.
+    first_eviction_step: int = FIRST_EVICTION_STEP_DEFAULT
     # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
     # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
     # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
@@ -460,6 +527,47 @@ class RulerConfig:
 
 
 # ---------------------------------------------------------------------------
+# GSM8K config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GSM8KConfig:
+    """GSM8K chain-of-thought evaluation (modes ``gsm8k`` / ``gsm8k_score``)."""
+
+    #: Directory produced by ``python -m data.gsm8k_loader --out <dir>``.
+    data_dir: str = "data/gsm8k_cot"
+    output_dir: str = "outputs/gsm8k/run"
+    #: Parent directory scanned by ``gsm8k_score`` for run directories.
+    results_dir: str = "outputs/gsm8k"
+    num_samples: Union[int, str] = "max"  # cap applied BEFORE sharding
+    shard: int = 0
+    num_shards: int = 1
+    skip_oom: bool = False
+    aggressive_cache_clear: bool = False
+    #: Override the dataset's per-example generation budget. None (default) uses
+    #: the dataset value (512). Only for smoke runs — lowering it truncates
+    #: reasoning mid-chain and collapses accuracy, which is exactly the defect
+    #: the CoT dataset exists to avoid. Recorded in meta.json when set.
+    max_new_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        self.num_samples = _validate_num_samples(self.num_samples, "gsm8k.num_samples")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ConfigValidationError(
+                f"gsm8k.max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}"
+            )
+        if self.num_shards < 1:
+            raise ConfigValidationError(
+                f"gsm8k.num_shards must be >= 1, got {self.num_shards!r}"
+            )
+        if not (0 <= self.shard < self.num_shards):
+            raise ConfigValidationError(
+                f"gsm8k.shard must be in [0, {self.num_shards}), got {self.shard!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # ExperimentConfig (top-level)
 # ---------------------------------------------------------------------------
 
@@ -480,6 +588,7 @@ class ExperimentConfig:
     visualize: VisualizeConfig = field(default_factory=VisualizeConfig)
     longbench: LongBenchConfig = field(default_factory=LongBenchConfig)
     ruler: RulerConfig = field(default_factory=RulerConfig)
+    gsm8k: GSM8KConfig = field(default_factory=GSM8KConfig)
 
     # Paths
     base_run_npz: Optional[str] = None
@@ -562,9 +671,48 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         visualize=VisualizeConfig(**vis_raw),
         longbench=LongBenchConfig(**lb_raw),
         ruler=RulerConfig(**ruler_raw),
+        gsm8k=GSM8KConfig(**d.get("gsm8k", {})),
         base_run_npz=d.get("base_run_npz"),
         output_path=d.get("output_path"),
     )
+
+
+def _load_raw_with_bases(
+    path: Path, _seen: Optional[List[Path]] = None
+) -> dict[str, Any]:
+    """Load *path* with its whole ``_base_`` chain resolved, nearest wins.
+
+    Inheritance used to stop after one hop, which quietly broke the chains that
+    are two deep — ``eval_perf_cpu_e2e -> eval_perf_batched -> base``. The
+    intermediate file's own ``_base_`` key survived into the merged dict, where
+    ``_dict_to_config`` ignores unknown keys, so ``base.yaml`` was never read
+    and nothing said so. It happens to be harmless today only because those two
+    configs re-declare every block base.yaml sets; anything added to base.yaml
+    later would have silently missed them.
+
+    Cycles raise rather than recurse forever.
+    """
+    path = path.resolve()
+    seen = list(_seen or [])
+    if path in seen:
+        chain = " -> ".join(p.name for p in seen + [path])
+        raise ConfigValidationError(f"Cyclic config inheritance: {chain}")
+    seen.append(path)
+
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+
+    base_ref = raw.pop("_base_", None)
+    if base_ref is None:
+        return raw
+
+    base_path = path.parent / base_ref
+    if not base_path.exists():
+        raise FileNotFoundError(
+            f"{path.name} declares _base_: {base_ref}, which does not exist "
+            f"({base_path})"
+        )
+    return _merge_dicts(_load_raw_with_bases(base_path, seen), raw)
 
 
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> ExperimentConfig:
@@ -588,15 +736,7 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Ex
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, "r") as f:
-        raw = yaml.safe_load(f) or {}
-
-    # Handle single-level config inheritance
-    if "_base_" in raw:
-        base_path = path.parent / raw.pop("_base_")
-        with open(base_path, "r") as f:
-            base_raw = yaml.safe_load(f) or {}
-        raw = _merge_dicts(base_raw, raw)
+    raw = _load_raw_with_bases(path)
 
     if overrides:
         raw = _merge_dicts(raw, overrides)

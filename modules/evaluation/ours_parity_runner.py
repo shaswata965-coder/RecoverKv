@@ -13,7 +13,10 @@ import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
 from utils.cache_factory import get_cache_classes, validate_backend_attn_pairing
-from utils.config import ConfigValidationError, ExperimentConfig, ParityValidationError
+from utils.config import (
+    FIRST_EVICTION_STEP_DEFAULT, ConfigValidationError, ExperimentConfig,
+    ParityValidationError,
+)
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_string, sha256_tokenizer
 from utils.logger import get_logger
@@ -315,7 +318,7 @@ class OursParityRunner:
                 local_window_size=w.local_window_size, cache_budget=budget,
                 rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                 quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
-                first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8))
+                first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT))
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -602,6 +605,18 @@ class OursParityRunner:
             "quant_ratio": q_ratio,
             "top_k_fp": top_k_fp,
             "N_q": n_q,
+            # The eviction SCHEDULE, alongside the eviction geometry above.
+            # Without it the eviction_step_mask in this npz cannot be attributed
+            # to an operating point after the fact, and Suites B and E read this
+            # npz as their only record of how the run was configured.
+            "first_eviction_step": int(
+                getattr(resolved_cfg, "first_eviction_step",
+                        getattr(cfg.cache, "first_eviction_step",
+                                FIRST_EVICTION_STEP_DEFAULT))
+            ),
+            "rerotate_on_evict": bool(
+                getattr(cfg.cache, "rerotate_on_evict", False)
+            ),
             "model_name": cfg.model.name,
             "model_revision": cfg.model.revision,
             "dtype": cfg.model.dtype,
@@ -615,7 +630,8 @@ class OursParityRunner:
         }
         od = Path(cfg.telemetry.output_dir); od.mkdir(parents=True, exist_ok=True)
         be = cfg.cache.backend_package or "unknown"
-        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_ours_{be}_{p.dataset}_{samples_shas[0][:8]}.npz"
+        # loader.slug, not p.dataset — a local corpus path is not a filename.
+        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_ours_{be}_{loader.slug}_{samples_shas[0][:8]}.npz"
         npz.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             str(npz),

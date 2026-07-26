@@ -32,7 +32,12 @@ dependencies:
 
   # ---------- Data / Config ----------
   - pyyaml>=6.0
-  - datasets>=2.16
+  # Upper bound is load-bearing, not caution: THUDM/LongBench is a *script*
+  # dataset and datasets>=3 refuses to execute dataset scripts at all
+  # ("Dataset scripts are no longer supported"), so an unpinned install cannot
+  # load the paper's main benchmark. Stage the JSONLs and set
+  # LONGBENCH_LOCAL_DIR if you must run a newer datasets.
+  - datasets>=2.16,<3
 
   # ---------- Visualization ----------
   - matplotlib>=3.7

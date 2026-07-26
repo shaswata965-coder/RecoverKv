@@ -7,8 +7,26 @@ Usage in Kaggle notebook cells:
     !python scripts/kaggle_entry.py --suite parity_base
     !python scripts/kaggle_entry.py --suite parity_ours
     !python scripts/kaggle_entry.py --suite faithfulness
+    !python scripts/kaggle_entry.py --suite qevict_observations
     !python scripts/kaggle_entry.py --suite perf
     !python scripts/kaggle_entry.py --suite visualize
+    !python scripts/kaggle_entry.py --suite ruler
+    !python scripts/kaggle_entry.py --suite gsm8k_budget20
+
+Scoring is post-hoc and runs off the written predictions, so it goes through the
+scorer modules rather than a suite:
+
+    !python -m modules.evaluation.gsm8k_scoring --runs outputs/gsm8k/*
+    !python -m modules.evaluation.ruler_scoring --predictions_dir outputs/ruler/...
+    !python scripts/kaggle_entry.py --suite longbench_ours --override \\
+        run.mode=longbench_score
+
+Every generation suite here runs at the repo-default first_eviction_step = 0:
+the prompt is compressed on decode step 0, before that step's query attends. To
+run the delayed-eviction ablation instead, pass it explicitly:
+
+    !python scripts/kaggle_entry.py --suite longbench_ours \\
+        --override cache.first_eviction_step=8
 """
 from __future__ import annotations
 import argparse
@@ -22,12 +40,21 @@ _SUITE_TO_CONFIG = {
     "parity_ours_eager": "configs/eval_parity_ours_eager.yaml",
     "parity_ours_flash": "configs/eval_parity_ours_flash.yaml",
     "faithfulness": "configs/eval_faithfulness.yaml",
+    "qevict_observations": "configs/eval_qevict.yaml",
     "perf": "configs/eval_perf.yaml",
     "visualize": "configs/eval_visualize.yaml",
     "longbench_full": "configs/longbench_full_cache.yaml",
     "longbench_ours": "configs/longbench_ours_eager.yaml",
     "longbench_ours_eager": "configs/longbench_ours_eager.yaml",
     "longbench_ours_flash": "configs/longbench_ours_flash_attn.yaml",
+    "longbench_ours_step0": "configs/longbench_ours_step0.yaml",
+    # RULER (needs ruler.data_dir pointing at an unpacked RULER length bucket)
+    "ruler": "configs/ruler_niah_mk3_omega16.yaml",
+    # GSM8K CoT — generation then scoring. Build the corpus first with
+    #   python -m data.gsm8k_loader --out data/gsm8k_cot
+    "gsm8k_full": "configs/gsm8k_full_cache.yaml",
+    "gsm8k_budget20": "configs/gsm8k_budget20.yaml",
+    "gsm8k_budget80": "configs/gsm8k_budget80.yaml",
 }
 
 def main():

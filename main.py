@@ -22,11 +22,15 @@ _RUNNER_REGISTRY: dict[str, str] = {
     "parity_base": "modules.evaluation.base_parity_runner.BaseParityRunner",
     "parity_ours": "modules.evaluation.ours_parity_runner.OursParityRunner",
     "faithfulness": "modules.evaluation.faithfulness_runner.FaithfulnessRunner",
+    "qevict_observations": (
+        "modules.evaluation.qevict_observations.QEvictObservationRunner"),
     "perf": "modules.evaluation.perf_runner.PerfRunner",
     "longbench": "modules.evaluation.longbench_runner.LongBenchRunner",
     "longbench_score": "modules.evaluation.longbench_scoring.LongBenchScorer",
     "ruler": "modules.evaluation.ruler_runner.RulerRunner",
     "ruler_score": "modules.evaluation.ruler_scoring.RulerScorer",
+    "gsm8k": "modules.evaluation.gsm8k_runner.GSM8KRunner",
+    "gsm8k_score": "modules.evaluation.gsm8k_scoring.GSM8KScorer",
     "visualize": "modules.evaluation.visualize.VisualizeRunner",
 }
 

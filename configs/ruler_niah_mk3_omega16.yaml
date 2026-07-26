@@ -1,0 +1,46 @@
+# ============================================================================
+# RULER 4096 — Ours (flash-attn backend), task=niah_multikey_3, window_size=16
+# ============================================================================
+# Captures a utils/cache_memory.py byte-accounting report per example
+# (ruler.capture_memory) so retained-bytes / compression-ratio can be read
+# off directly, alongside the task's accuracy score.
+# quant_ratio=0.0 -> pure fp16 windowed cache (Q tier disabled). Set > 0.0
+# to sweep in the two-tier int2 split (needs window_size % 4 == 0, which 16 is).
+# Produces: outputs/ruler/4096_niah_mk3_omega16/
+_base_: base.yaml
+
+run:
+  mode: ruler
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn                # imports modules.windowed_cache
+  cache_budget: 0.20                        # cache 20%
+  window_size: 16                           # omega=16
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens
+  quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16
+  rerotate_on_evict: false
+  first_eviction_step: 0                    # compress the prompt before the 2nd token (default)
+
+telemetry:
+  track_scores: false                       # mandatory; see prompt 04 §1
+
+ruler:
+  data_dir: /home/ee/visitor/man_misn.visitor/kv_cache/DefensiveKV/defensivekv_dataset/ruler/4096
+  tasks:
+    - niah_multikey_3
+  num_samples: max
+  capture_memory: true                      # per-example utils/cache_memory.py report
+  output_dir: outputs/ruler/4096_niah_mk3_omega16
+  seed: 42
+  resume: true
+  skip_oom: false
+  aggressive_cache_clear: false

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
-from utils.config import ExperimentConfig
+from utils.config import FIRST_EVICTION_STEP_DEFAULT, ExperimentConfig
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
 
@@ -170,7 +170,7 @@ class PerfRunner:
             # Decode step of the first eviction (independent of window_size);
             # per-config override falling back to the shared cache setting.
             first_eviction_step = c.get(
-                "first_eviction_step", getattr(cfg.cache, "first_eviction_step", 8)
+                "first_eviction_step", getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT)
             )
             cc = WCC(window_size=w.window_size, num_sink_tokens=w.num_sink_tokens,
                       local_window_size=w.local_window_size,

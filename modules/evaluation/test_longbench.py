@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import torch
 
 # ---------------------------------------------------------------------------
 # Helpers — lightweight config stubs (no YAML needed)
@@ -817,3 +818,231 @@ class TestLongBenchConfig:
         assert cfg.longbench.datasets == ["narrativeqa"]
         assert cfg.longbench.max_length == 4096
         assert cfg.longbench.aggressive_cache_clear is True
+
+
+# ---------------------------------------------------------------------------
+# Test: first_eviction_step reaches the runtime cache (and the sidecar)
+# ---------------------------------------------------------------------------
+
+class TestFirstEvictionStepPlumbing:
+    """`cfg.cache.first_eviction_step` must reach the cache LongBench builds.
+
+    It used not to: `_setup_windowed_cache` omitted the kwarg, so every
+    LongBench run silently used WindowedCacheConfig's default of 8 no matter
+    what the YAML said, while the GSM8K/RULER/parity/perf runners honoured it.
+    Setting it to 0 is what puts the run at the same operating point as the
+    prompt-compression baselines, so a silently-ignored knob invalidates the
+    comparison rather than just mis-tuning it.
+    """
+
+    def _runner_with_stub_ctors(self, first_eviction_step):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.model.attn_implementation = "eager"
+        if first_eviction_step is not None:
+            cfg.cache.first_eviction_step = first_eviction_step
+
+        runner = LongBenchRunner(cfg)
+        captured = {}
+
+        def _capture_config(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        runner.WindowedCacheConfig = _capture_config
+        runner.WindowedCache = MagicMock(return_value=MagicMock())
+        runner.install_score_hooks = MagicMock(return_value=MagicMock())
+
+        rope = MagicMock()
+        model = MagicMock()
+        model.named_modules.return_value = [("model.rotary_emb", rope)]
+        model.config.num_hidden_layers = 2
+        runner.model = model
+
+        runner._setup_windowed_cache(torch.zeros(1, 128, dtype=torch.long), 32)
+        return captured
+
+    def test_step_zero_reaches_the_cache_config(self):
+        """first_eviction_step=0 is forwarded, not swallowed."""
+        captured = self._runner_with_stub_ctors(0)
+        assert captured["first_eviction_step"] == 0
+
+    def test_nondefault_step_reaches_the_cache_config(self):
+        """A non-zero, non-default value survives too (not a 0-only special case)."""
+        captured = self._runner_with_stub_ctors(3)
+        assert captured["first_eviction_step"] == 3
+
+    def test_absent_attribute_falls_back_to_the_shared_default(self):
+        """The getattr fallback must be the shared default, not a literal.
+
+        A literal here is exactly how this knob went inert once already: the
+        fallback disagreed with the dataclass default, so a run could sit at a
+        different operating point than the config claimed.
+        """
+        from utils.config import FIRST_EVICTION_STEP_DEFAULT
+        captured = self._runner_with_stub_ctors(None)
+        assert captured["first_eviction_step"] == FIRST_EVICTION_STEP_DEFAULT == 0
+
+    def test_sidecar_records_the_step(self, tmp_path):
+        """The .meta.json must record it, or a finished run is unattributable."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.model.attn_implementation = "eager"
+        cfg.cache.first_eviction_step = 0
+
+        runner = LongBenchRunner(cfg)
+        with patch.object(LongBenchRunner, "_get_tokenizer_sha", return_value="deadbeef"):
+            runner._write_meta(
+                dataset_name="narrativeqa",
+                num_examples=1,
+                max_gen_len=32,
+                run_start=0.0,
+                run_end=1.0,
+                eps=1.0,
+                output_dir=tmp_path,
+            )
+
+        metas = list(tmp_path.glob("*.meta.json"))
+        assert metas, f"no sidecar written into {tmp_path}"
+        meta = json.loads(metas[0].read_text())
+        assert meta["first_eviction_step"] == 0
+
+    def test_quant_memoize_read_reaches_the_cache_config(self):
+        """Same omission class as first_eviction_step, and just as silent.
+
+        LongBench runs one example at a time, so the auto rule (memo on at
+        B == 1) makes an ignored `False` look exactly like an honoured one.
+        """
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.cache.quant_memoize_read = False
+        cfg.model.attn_implementation = "eager"
+
+        runner = LongBenchRunner(cfg)
+        captured = {}
+        runner.WindowedCacheConfig = lambda **kw: (captured.update(kw), MagicMock())[1]
+        runner.WindowedCache = MagicMock(return_value=MagicMock())
+        runner.install_score_hooks = MagicMock(return_value=MagicMock())
+        model = MagicMock()
+        model.named_modules.return_value = [("model.rotary_emb", MagicMock())]
+        model.config.num_hidden_layers = 2
+        runner.model = model
+        runner._setup_windowed_cache(torch.zeros(1, 128, dtype=torch.long), 32)
+
+        assert captured["quant_memoize_read"] is False
+
+    def test_sidecar_records_the_tier_split(self, tmp_path):
+        """quant_ratio IS the method here — a sidecar without it is unattributable."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.cache.quant_ratio = 0.5
+        cfg.model.attn_implementation = "eager"
+
+        runner = LongBenchRunner(cfg)
+        with patch.object(LongBenchRunner, "_get_tokenizer_sha", return_value="deadbeef"):
+            runner._write_meta(
+                dataset_name="narrativeqa", num_examples=1, max_gen_len=32,
+                run_start=0.0, run_end=1.0, eps=1.0, output_dir=tmp_path,
+            )
+
+        meta = json.loads(next(tmp_path.glob("*.meta.json")).read_text())
+        assert meta["quant_ratio"] == 0.5
+        assert "quant_memoize_read" in meta
+
+
+# ---------------------------------------------------------------------------
+# Chat-template gate — the TOKENIZER decides; the name is only cross-checked
+# ---------------------------------------------------------------------------
+
+
+class TestChatGateCrossCheck:
+    """`_should_apply_chat_template` reads the TOKENIZER: a model is a chat model
+    iff it ships a chat template. The name heuristic it replaced ("instruct"/
+    "chat" in the name) read whatever string `model.name` held, which on a
+    cluster is a checkout directory — so `.../mistral-7b-v0.2` silently dropped
+    the template on all 10 templated datasets and prompted an instruct model as
+    a base LM.
+
+    `_warn_if_chat_gate_looks_wrong` still cross-checks the name against the
+    tokenizer. It can no longer change the prompt, so what it reports is that
+    the run is not what its checkpoint name suggests."""
+
+    def _runner(self, model_name, chat_template):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.model.name = model_name
+        runner = LongBenchRunner(cfg)
+        tok = MagicMock()
+        tok.chat_template = chat_template
+        runner.tokenizer = tok
+        return runner
+
+    def test_warns_when_the_name_hides_an_instruct_model(self, caplog):
+        runner = self._runner("/scratch/ckpt/final", chat_template="{{ x }}")
+        with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+            runner._warn_if_chat_gate_looks_wrong()
+        assert any("tokenizer HAS a chat template" in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    def test_warns_when_the_name_promises_a_template_there_is_not(self, caplog):
+        runner = self._runner("my-llama-instruct", chat_template=None)
+        with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+            runner._warn_if_chat_gate_looks_wrong()
+        assert any("ships NO chat template" in r.getMessage()
+                   for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+    def test_quiet_when_name_and_tokenizer_agree(self, caplog):
+        for name, tmpl in (("llama-3.1-8b-instruct", "{{ x }}"),
+                           ("meta-llama/Meta-Llama-3-8B", None)):
+            caplog.clear()
+            runner = self._runner(name, chat_template=tmpl)
+            with caplog.at_level("WARNING", logger="modules.evaluation.longbench_runner"):
+                runner._warn_if_chat_gate_looks_wrong()
+            assert not [r for r in caplog.records if "chat template" in r.getMessage()], name
+
+    def test_missing_tokenizer_is_not_an_error(self):
+        runner = self._runner("x", chat_template=None)
+        runner.tokenizer = None
+        runner._warn_if_chat_gate_looks_wrong()   # must not raise
+
+    @staticmethod
+    def _tok(chat_template):
+        tok = MagicMock()
+        tok.chat_template = chat_template
+        return tok
+
+    def test_few_shot_datasets_stay_untemplated_on_a_chat_model(self):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        tok = self._tok("{{ x }}")
+        for ds in LongBenchRunner.NO_CHAT_TEMPLATE_DATASETS:
+            assert not LongBenchRunner._should_apply_chat_template(tok, ds), ds
+        assert LongBenchRunner._should_apply_chat_template(tok, "qasper")
+
+    def test_gate_follows_the_tokenizer_not_the_checkout_directory(self):
+        """The mistral regression: a checkout path matching neither "instruct"
+        nor "chat" must still be templated when the tokenizer ships a template.
+        Under the old name-based gate every templated dataset went in raw."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        assert LongBenchRunner._should_apply_chat_template(
+            self._tok("{{ x }}"), "qasper"
+        )
+
+    def test_a_base_model_is_never_templated(self):
+        """No template on the tokenizer means no template on the prompt, whatever
+        the name says — apply_chat_template would otherwise hard-error."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        assert not LongBenchRunner._should_apply_chat_template(
+            self._tok(None), "qasper"
+        )
