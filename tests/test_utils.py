@@ -506,8 +506,31 @@ class TestShippedEvalConfigsOperatingPoint:
                     f"window_size % 4 == 0, got {cfg.cache.window_size}"
                 )
 
-    def test_every_eval_config_is_at_the_comparison_operating_point(self) -> None:
-        """first_eviction_step=0 across the shipped set, so a sweep cannot mix
-        two operating points into one table."""
-        for name, cfg in self._eval_configs():
-            assert cfg.cache.first_eviction_step == 0, name
+    def test_configs_off_the_comparison_operating_point_are_reported(self) -> None:
+        """Reports, does not fail — same reasoning as the q=0 check above.
+
+        A delayed first eviction is a legitimate labelled ablation, so the shipped
+        set must not be pinned to step 0. But it is the more consequential of the
+        two knobs to get wrong by accident: at step N the prompt stays whole
+        through decode steps 0..N-1, so every answer that finishes inside that
+        window is measured at FULL cache whatever cache_budget says — which on
+        LongBench silently pins the six max_gen=32 datasets plus trec and
+        narrativeqa to budget-invariant scores.
+        """
+        import warnings
+
+        delayed = [
+            f"{name} (step {cfg.cache.first_eviction_step})"
+            for name, cfg in self._eval_configs()
+            if cfg.cache.first_eviction_step != 0
+        ]
+        if delayed:
+            warnings.warn(
+                f"{len(delayed)} eval config(s) not at first_eviction_step=0: "
+                f"{', '.join(delayed)}. Every answer finishing inside that window "
+                f"is measured at full cache whatever cache_budget says, so these "
+                f"cannot share a table with step-0 runs. Intended as a labelled "
+                f"ablation?",
+                UserWarning,
+                stacklevel=2,
+            )

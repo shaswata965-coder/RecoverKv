@@ -100,6 +100,21 @@ def log_operating_point(config, is_windowed: bool) -> None:
             "the method, set cache.quant_ratio > 0."
         )
 
+    # Same reasoning, and the more consequential of the two to get wrong by
+    # accident: at step N the prompt stays whole through decode steps 0..N-1, so
+    # any answer finishing inside that window is measured at FULL cache whatever
+    # cache_budget says. Those runs cannot share a table with step-0 runs.
+    fes = getattr(cache, "first_eviction_step", 0)
+    if fes:
+        log.warning(
+            "first_eviction_step=%s, not 0: the prompt stays whole through decode "
+            "steps 0-%s, so every answer that finishes inside that window is "
+            "measured at FULL cache whatever cache_budget says. Intended as a "
+            "labelled ablation? These numbers are not comparable with step-0 runs "
+            "or with the prompt-compression baselines.",
+            fes, fes - 1,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
