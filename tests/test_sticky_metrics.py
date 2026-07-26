@@ -14,12 +14,13 @@ from utils import sticky_metrics as SM
 
 class TestFlushGeometry:
     def test_counts_grow_and_match_creation(self):
-        # prefill 16, sink 0, window 8 → at t=0: ceil(17/8)=3 windows.
+        # Trace index 0 is the PREFILL forward, so the cache holds prefill_len
+        # tokens there: prefill 16, sink 0, window 8 → ceil(16/8) = 2 windows.
         w_act, ew_act, creation = SM.flush_geometry(
             num_steps=10, num_windows=8, prefill_len=16,
             num_sink=0, window_size=8, local_windows=1,
         )
-        assert w_act[0] == 3                  # ceil((16+0+1)/8) = 3
+        assert w_act[0] == 2                  # ceil((16+0)/8) = 2
         assert (np.diff(w_act) >= 0).all()    # non-decreasing
         assert (ew_act == np.maximum(w_act - 1, 0)).all()
         # creation[k] is the first flush where the window is valid.
@@ -28,6 +29,22 @@ class TestFlushGeometry:
             assert w_act[first] > k
             if first > 0:
                 assert w_act[first - 1] <= k
+
+    def test_index_zero_is_the_prefill_forward(self):
+        """The whole off-by-one, pinned.
+
+        The parity runners record one entry per ``model(...)`` call and the
+        first is the prompt, so index t holds prefill_len + t tokens. The old
+        ``+1`` form modelled index 0 as the first decode step and put every
+        window boundary one flush early — verified wrong against a recorded
+        base run, where the 24 -> 25 transition sits at t=5, not t=4.
+        """
+        w_act, _, _ = SM.flush_geometry(
+            num_steps=10, num_windows=64, prefill_len=192,
+            num_sink=4, window_size=8, local_windows=2,
+        )
+        # post-sink at t: 188 + t; 24 windows until it exceeds 192, i.e. t=5.
+        assert w_act[:6].tolist() == [24, 24, 24, 24, 24, 25]
 
     def test_cap_at_num_windows(self):
         w_act, _, _ = SM.flush_geometry(

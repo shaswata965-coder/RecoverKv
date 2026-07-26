@@ -1,0 +1,145 @@
+"""Tests for the RULER pipeline — scoring metrics, sidecar handling, config.
+
+The RULER path shipped with no tests at all, which is how the memory-sidecar
+glob below survived: the scorer's `*.jsonl` sweep picked up the runner's own
+`<task>.memory.jsonl` probe output and reported every row of it as a null
+prediction.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from data.ruler_loader import RULER_TASKS
+from modules.evaluation.ruler_scoring import (
+    _task_metric_fn,
+    compute_macro_average,
+    score_predictions,
+    string_match_all,
+    string_match_part,
+)
+
+
+# ---------------------------------------------------------------------------
+# Metric functions (ported verbatim from DefensiveKV calculate_metrics.py)
+# ---------------------------------------------------------------------------
+
+
+class TestStringMatchMetrics:
+    def test_part_scores_one_if_any_reference_matches(self):
+        assert string_match_part(["the answer is 42"], [["42", "99"]]) == 100.0
+
+    def test_part_is_case_insensitive(self):
+        assert string_match_part(["ANSWER: Foo"], [["foo"]]) == 100.0
+
+    def test_part_scores_zero_when_nothing_matches(self):
+        assert string_match_part(["nothing here"], [["42"]]) == 0.0
+
+    def test_all_scores_the_fraction_of_references_found(self):
+        # one of two references present -> 50
+        assert string_match_all(["contains 42"], [["42", "99"]]) == 50.0
+        assert string_match_all(["contains 42 and 99"], [["42", "99"]]) == 100.0
+
+    def test_all_averages_over_examples(self):
+        score = string_match_all(["42", "nope"], [["42"], ["99"]])
+        assert score == 50.0
+
+    @pytest.mark.parametrize("task", RULER_TASKS)
+    def test_every_task_dispatches_to_a_metric(self, task):
+        fn = _task_metric_fn(task)
+        assert fn in (string_match_part, string_match_all)
+
+    def test_qa_tasks_use_part_and_niah_uses_all(self):
+        assert _task_metric_fn("qa_1") is string_match_part
+        assert _task_metric_fn("qa_2") is string_match_part
+        assert _task_metric_fn("niah_multikey_3") is string_match_all
+
+
+# ---------------------------------------------------------------------------
+# score_predictions over a directory
+# ---------------------------------------------------------------------------
+
+
+def _write_jsonl(path, rows):
+    path.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+
+
+class TestScorePredictions:
+    def test_scores_one_task_file(self, tmp_path):
+        _write_jsonl(tmp_path / "niah_multikey_3.jsonl", [
+            {"pred": "the number is 8371", "answer": ["8371"]},
+            {"pred": "no idea", "answer": ["8371"]},
+        ])
+        scores = score_predictions(tmp_path)
+        assert scores == {"niah_multikey_3": 50.0}
+        assert compute_macro_average(scores) == 50.0
+
+    def test_null_predictions_are_dropped_not_zeroed(self, tmp_path):
+        """Matches DefensiveKV's calculate_metrics.py, and differs from
+        LongBench scoring, which counts nulls as 0 in the denominator."""
+        _write_jsonl(tmp_path / "niah_single_1.jsonl", [
+            {"pred": "8371", "answer": ["8371"]},
+            {"pred": None, "answer": ["8371"]},
+        ])
+        assert score_predictions(tmp_path) == {"niah_single_1": 100.0}
+
+    def test_memory_sidecar_is_not_scored_as_a_task(self, tmp_path):
+        """The whole reason this file exists.
+
+        `ruler.capture_memory: true` writes `<task>.memory.jsonl` beside the
+        predictions. It has no `pred` field, so the scorer's `*.jsonl` glob
+        used to report every row as a null prediction — a wall of
+        "N/N examples had pred=null (OOM/budget-too-small)" warnings that look
+        like the run failed.
+        """
+        _write_jsonl(tmp_path / "niah_multikey_3.jsonl", [
+            {"pred": "8371", "answer": ["8371"]},
+        ])
+        _write_jsonl(tmp_path / "niah_multikey_3.memory.jsonl", [
+            {"task": "niah_multikey_3", "total_live": 123, "memo_bytes": 45},
+        ])
+        scores = score_predictions(tmp_path)
+        assert scores == {"niah_multikey_3": 100.0}
+        assert "niah_multikey_3.memory" not in scores
+
+    def test_control_characters_are_stripped_before_matching(self, tmp_path):
+        _write_jsonl(tmp_path / "niah_single_2.jsonl", [
+            {"pred": "\n\t8371\x00", "answer": ["8371"]},
+        ])
+        assert score_predictions(tmp_path) == {"niah_single_2": 100.0}
+
+    def test_csv_is_written_with_the_expected_columns(self, tmp_path):
+        _write_jsonl(tmp_path / "niah_single_1.jsonl", [
+            {"pred": "8371", "answer": ["8371"]},
+            {"pred": None, "answer": ["8371"]},
+        ])
+        out = tmp_path / "scores.csv"
+        score_predictions(tmp_path, out_csv=out)
+        header = out.read_text(encoding="utf-8").splitlines()[0]
+        assert header.split(",") == ["task", "num_examples", "score", "dropped"]
+
+
+# ---------------------------------------------------------------------------
+# Config plumbing — the eviction schedule must reach the cache
+# ---------------------------------------------------------------------------
+
+
+class TestRulerConfigPlumbing:
+    def test_ruler_config_defaults_to_step_zero_eviction(self):
+        from utils.config import CacheConfig, FIRST_EVICTION_STEP_DEFAULT
+
+        assert CacheConfig().first_eviction_step == FIRST_EVICTION_STEP_DEFAULT == 0
+
+    def test_shipped_ruler_config_is_at_step_zero(self):
+        """RULER answers are a handful of tokens: a delayed first eviction
+        would score every task at full cache whatever cache_budget says."""
+        from pathlib import Path
+        from utils.config import load_config
+
+        root = Path(__file__).resolve().parents[2]
+        cfg = load_config(root / "configs" / "ruler_niah_mk3_omega16.yaml")
+        assert cfg.run.mode == "ruler"
+        assert cfg.cache.first_eviction_step == 0

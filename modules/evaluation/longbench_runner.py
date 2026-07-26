@@ -462,11 +462,16 @@ class LongBenchRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+            # Same failure mode as first_eviction_step below: omitted, and the
+            # YAML knob is silently inert. LongBench generates one example at a
+            # time, so the auto rule (memo on at B == 1) hides it — a config
+            # asking for it OFF got it ON anyway.
+            quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
             # Without this the knob was inert here: LongBench fell through to
-            # WindowedCacheConfig's default (8) whatever the YAML said, while
-            # the GSM8K/RULER/parity/perf runners all honoured it. Setting it
-            # to 0 compresses the prompt before the second decode token, which
-            # is the operating point the prompt-compression baselines
+            # WindowedCacheConfig's default whatever the YAML said, while the
+            # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
+            # the prompt is compressed before the second decode token, which is
+            # the operating point the prompt-compression baselines
             # (SnapKV/AdaKV/DefensiveKV) are measured at.
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
@@ -630,6 +635,11 @@ class LongBenchRunner:
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
+            # The tier split IS the method on this branch, so a sidecar without
+            # it cannot attribute a finished run to an operating point. The
+            # RULER and GSM8K sidecars have always recorded it; this one did not.
+            "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
+            "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

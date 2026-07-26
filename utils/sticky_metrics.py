@@ -54,13 +54,24 @@ def flush_geometry(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-flush window counts and per-window creation flush.
 
-    A *flush* is one decode step ``t`` (0-indexed).  After flush ``t`` the
-    post-sink sequence holds ``Sp_t = prefill_len + t + 1 - num_sink`` tokens,
-    giving ``w_act = ceil(Sp_t / window_size)`` total history windows — capped
-    at the padded array width ``num_windows``.  (The ``+1`` and the cap match
-    ``faithfulness_runner._compute_metrics`` so all of Suite B agrees on the
-    valid-window count at each step.)  The last ``local_windows`` of those are
-    the always-retained recency tail; the rest are evictable candidates.
+    A *flush* is one recorded trace index ``t`` (0-indexed).  **Index 0 is the
+    prefill forward**, not the first decode step: the parity runners append one
+    entry per ``model(...)`` call and the first of those is the prompt.  So at
+    index ``t`` the cache holds ``prefill_len + t`` tokens, the post-sink
+    sequence holds ``Sp_t = prefill_len + t - num_sink``, and
+    ``w_act = ceil(Sp_t / window_size)`` — capped at the padded array width
+    ``num_windows``.  The last ``local_windows`` of those are the
+    always-retained recency tail; the rest are evictable candidates.
+
+    This used to carry a ``+ 1``, which modelled index 0 as the first decode
+    step and so ran one flush ahead of the data.  Checked against a recorded
+    base run (prefill 192, sink 4, ws 8) the true 24 -> 25 window transition is
+    at ``t = 5``; the ``+1`` form put it at ``t = 4``.  Every window's
+    ``creation`` was therefore one flush early, which shifts every revival
+    episode's start, and one step in every ``window_size`` admitted a
+    not-yet-existing window into the evictable band.
+    ``faithfulness_runner._compute_metrics`` carried the same ``+1`` and is
+    corrected in lockstep, so all of Suite B/E still agrees step for step.
 
     Returns
     -------
@@ -70,7 +81,7 @@ def flush_geometry(
         (``num_steps`` if it never appears within the recorded steps).
     """
     t = np.arange(num_steps)
-    Sp = np.maximum(1, prefill_len + t + 1 - num_sink)
+    Sp = np.maximum(1, prefill_len + t - num_sink)
     w_act = np.minimum(np.ceil(Sp / window_size).astype(int), num_windows)
     lnw = np.minimum(local_windows, w_act)
     ew_act = np.maximum(w_act - lnw, 0)

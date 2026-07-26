@@ -605,6 +605,18 @@ class OursParityRunner:
             "quant_ratio": q_ratio,
             "top_k_fp": top_k_fp,
             "N_q": n_q,
+            # The eviction SCHEDULE, alongside the eviction geometry above.
+            # Without it the eviction_step_mask in this npz cannot be attributed
+            # to an operating point after the fact, and Suites B and E read this
+            # npz as their only record of how the run was configured.
+            "first_eviction_step": int(
+                getattr(resolved_cfg, "first_eviction_step",
+                        getattr(cfg.cache, "first_eviction_step",
+                                FIRST_EVICTION_STEP_DEFAULT))
+            ),
+            "rerotate_on_evict": bool(
+                getattr(cfg.cache, "rerotate_on_evict", False)
+            ),
             "model_name": cfg.model.name,
             "model_revision": cfg.model.revision,
             "dtype": cfg.model.dtype,

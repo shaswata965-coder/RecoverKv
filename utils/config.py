@@ -580,6 +580,44 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
     )
 
 
+def _load_raw_with_bases(
+    path: Path, _seen: Optional[List[Path]] = None
+) -> dict[str, Any]:
+    """Load *path* with its whole ``_base_`` chain resolved, nearest wins.
+
+    Inheritance used to stop after one hop, which quietly broke the chains that
+    are two deep — ``eval_perf_cpu_e2e -> eval_perf_batched -> base``. The
+    intermediate file's own ``_base_`` key survived into the merged dict, where
+    ``_dict_to_config`` ignores unknown keys, so ``base.yaml`` was never read
+    and nothing said so. It happens to be harmless today only because those two
+    configs re-declare every block base.yaml sets; anything added to base.yaml
+    later would have silently missed them.
+
+    Cycles raise rather than recurse forever.
+    """
+    path = path.resolve()
+    seen = list(_seen or [])
+    if path in seen:
+        chain = " -> ".join(p.name for p in seen + [path])
+        raise ConfigValidationError(f"Cyclic config inheritance: {chain}")
+    seen.append(path)
+
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+
+    base_ref = raw.pop("_base_", None)
+    if base_ref is None:
+        return raw
+
+    base_path = path.parent / base_ref
+    if not base_path.exists():
+        raise FileNotFoundError(
+            f"{path.name} declares _base_: {base_ref}, which does not exist "
+            f"({base_path})"
+        )
+    return _merge_dicts(_load_raw_with_bases(base_path, seen), raw)
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> ExperimentConfig:
     """Load a YAML config file and return a typed ``ExperimentConfig``.
 
@@ -601,15 +639,7 @@ def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Ex
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
 
-    with open(path, "r") as f:
-        raw = yaml.safe_load(f) or {}
-
-    # Handle single-level config inheritance
-    if "_base_" in raw:
-        base_path = path.parent / raw.pop("_base_")
-        with open(base_path, "r") as f:
-            base_raw = yaml.safe_load(f) or {}
-        raw = _merge_dicts(base_raw, raw)
+    raw = _load_raw_with_bases(path)
 
     if overrides:
         raw = _merge_dicts(raw, overrides)

@@ -253,8 +253,12 @@ class FaithfulnessRunner:
 
             for t in range(T):
                 bws   = b_ws_s[t]    # [L, H, W_pad]
-                # Post-step seq length is prefill_len + (t+1); subtract sinks.
-                Sp_t  = max(1, prefill_len + t + 1 - ns)
+                # Trace index 0 is the PREFILL forward, so at index t the cache
+                # holds prefill_len + t tokens (not + t + 1 — that modelled
+                # index 0 as the first decode step and ran a flush ahead of the
+                # recorded data; see utils.sticky_metrics.flush_geometry, which
+                # is corrected in lockstep so Suite B and Suite E agree).
+                Sp_t  = max(1, prefill_len + t - ns)
                 W_act = min(math.ceil(Sp_t / ws_sz), W_pad)
 
                 for li in range(L):

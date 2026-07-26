@@ -151,10 +151,42 @@ class CacheMemoryReport:
         """
         return self.dense_full_context / self.total_live if self.total_live else None
 
+    # -- the same two ratios with the read memo taken out --------------------
+    #
+    # The memo is a *derived* fp16 copy of the Q tier, not cache state: dropping
+    # it costs recomputation, never correctness or a token. It is also charged
+    # per row and, at B = 1 (where the auto rule turns it ON), it is by far the
+    # largest line item — measured on a RULER example it was 16.3 of 21.4 MB,
+    # which drags `compression_vs_fp16` to 0.91x, i.e. the report says the
+    # two-tier cache is BIGGER than fp16.
+    #
+    # Both framings are honest and neither is the whole story, so publish the
+    # pair rather than picking one: `*_excl_memo` is the cache-state figure a
+    # compression claim should quote, `compression_vs_fp16` is the resident
+    # footprint you actually pay at that batch size. For a headline memory
+    # table, run the capture with quant_memoize_read: false and the two agree.
+
+    @property
+    def total_live_excl_memo(self) -> int:
+        return self.total_live - self.memo_bytes
+
+    @property
+    def compression_vs_fp16_excl_memo(self) -> Optional[float]:
+        t = self.total_live_excl_memo
+        return self.fp16_equiv_retained / t if t else None
+
+    @property
+    def reduction_vs_full_excl_memo(self) -> Optional[float]:
+        t = self.total_live_excl_memo
+        return self.dense_full_context / t if t else None
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["compression_vs_fp16"] = self.compression_vs_fp16
         d["reduction_vs_full"] = self.reduction_vs_full
+        d["total_live_excl_memo"] = self.total_live_excl_memo
+        d["compression_vs_fp16_excl_memo"] = self.compression_vs_fp16_excl_memo
+        d["reduction_vs_full_excl_memo"] = self.reduction_vs_full_excl_memo
         return d
 
 
@@ -521,6 +553,32 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
         f"vs dense fp16 @ full context: {_mb(r.dense_full_context)}  ->  "
         f"{c2:.2f}x smaller" if c2 else "vs full context: n/a"
     )
+    if r.memo_bytes:
+        # Say it out loud: at B = 1 the memo is usually the biggest line item,
+        # and both ratios above are computed WITH it. Quoting only the first
+        # number here would understate the method; quoting only the second
+        # would hide what the run actually occupies. Print both.
+        c1x = r.compression_vs_fp16_excl_memo
+        c2x = r.reduction_vs_full_excl_memo
+        share = 100.0 * r.memo_bytes / r.total_live if r.total_live else 0.0
+        lines.append("-" * 72)
+        lines.append(
+            f"NB the read memo is {share:.0f}% of TOTAL live. It is a derived "
+            f"fp16 copy of the Q tier,"
+        )
+        lines.append(
+            "   not cache state - recomputable, and OFF by default at B > 1. "
+            "Excluding it:"
+        )
+        lines.append(
+            f"   cache state {_mb(r.total_live_excl_memo)} live  ->  "
+            f"{c1x:.2f}x vs fp16 at same retention, "
+            f"{c2x:.2f}x vs full context" if c1x and c2x else "   n/a"
+        )
+        lines.append(
+            "   For a headline memory table run with quant_memoize_read: false, "
+            "where the two agree."
+        )
     if r.device_mem:
         parts = [f"{k}={v:,.1f}" for k, v in r.device_mem.items()]
         lines.append("-" * 72)
