@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import torch
 
 # ---------------------------------------------------------------------------
 # Helpers — lightweight config stubs (no YAML needed)
@@ -718,3 +719,91 @@ class TestLongBenchConfig:
         assert cfg.longbench.datasets == ["narrativeqa"]
         assert cfg.longbench.max_length == 4096
         assert cfg.longbench.aggressive_cache_clear is True
+
+
+# ---------------------------------------------------------------------------
+# Test: first_eviction_step reaches the runtime cache (and the sidecar)
+# ---------------------------------------------------------------------------
+
+class TestFirstEvictionStepPlumbing:
+    """`cfg.cache.first_eviction_step` must reach the cache LongBench builds.
+
+    It used not to: `_setup_windowed_cache` omitted the kwarg, so every
+    LongBench run silently used WindowedCacheConfig's default of 8 no matter
+    what the YAML said, while the GSM8K/RULER/parity/perf runners honoured it.
+    Setting it to 0 is what puts the run at the same operating point as the
+    prompt-compression baselines, so a silently-ignored knob invalidates the
+    comparison rather than just mis-tuning it.
+    """
+
+    def _runner_with_stub_ctors(self, first_eviction_step):
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.model.attn_implementation = "eager"
+        if first_eviction_step is not None:
+            cfg.cache.first_eviction_step = first_eviction_step
+
+        runner = LongBenchRunner(cfg)
+        captured = {}
+
+        def _capture_config(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        runner.WindowedCacheConfig = _capture_config
+        runner.WindowedCache = MagicMock(return_value=MagicMock())
+        runner.install_score_hooks = MagicMock(return_value=MagicMock())
+
+        rope = MagicMock()
+        model = MagicMock()
+        model.named_modules.return_value = [("model.rotary_emb", rope)]
+        model.config.num_hidden_layers = 2
+        runner.model = model
+
+        runner._setup_windowed_cache(torch.zeros(1, 128, dtype=torch.long), 32)
+        return captured
+
+    def test_step_zero_reaches_the_cache_config(self):
+        """first_eviction_step=0 is forwarded, not swallowed."""
+        captured = self._runner_with_stub_ctors(0)
+        assert captured["first_eviction_step"] == 0
+
+    def test_nondefault_step_reaches_the_cache_config(self):
+        """A non-zero, non-default value survives too (not a 0-only special case)."""
+        captured = self._runner_with_stub_ctors(3)
+        assert captured["first_eviction_step"] == 3
+
+    def test_absent_attribute_falls_back_to_eight(self):
+        """A config object without the field keeps the historical default."""
+        captured = self._runner_with_stub_ctors(None)
+        assert captured["first_eviction_step"] == 8
+
+    def test_sidecar_records_the_step(self, tmp_path):
+        """The .meta.json must record it, or a finished run is unattributable."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.model.attn_implementation = "eager"
+        cfg.cache.first_eviction_step = 0
+
+        runner = LongBenchRunner(cfg)
+        with patch.object(LongBenchRunner, "_get_tokenizer_sha", return_value="deadbeef"):
+            runner._write_meta(
+                dataset_name="narrativeqa",
+                num_examples=1,
+                max_gen_len=32,
+                run_start=0.0,
+                run_end=1.0,
+                eps=1.0,
+                output_dir=tmp_path,
+            )
+
+        metas = list(tmp_path.glob("*.meta.json"))
+        assert metas, f"no sidecar written into {tmp_path}"
+        meta = json.loads(metas[0].read_text())
+        assert meta["first_eviction_step"] == 0

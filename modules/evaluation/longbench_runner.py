@@ -461,6 +461,13 @@ class LongBenchRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+            # Without this the knob was inert here: LongBench fell through to
+            # WindowedCacheConfig's default (8) whatever the YAML said, while
+            # the GSM8K/RULER/parity/perf runners all honoured it. Setting it
+            # to 0 compresses the prompt before the second decode token, which
+            # is the operating point the prompt-compression baselines
+            # (SnapKV/AdaKV/DefensiveKV) are measured at.
+            first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8),
         )
 
         # Get RoPE module
@@ -621,6 +628,7 @@ class LongBenchRunner:
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
+            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", 8),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves
