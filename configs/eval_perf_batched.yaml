@@ -10,15 +10,18 @@
 # latency. BATCHING_PLAN.md §5.
 #
 # WHY THIS GRID — read before changing it. The cache does NOT evict during
-# prefill (should_evict is gated on `not is_prefill`), and the first eviction is
-# held to a fixed decode step (first_eviction_step, default 8), so the whole
-# prompt stays resident a little into decode and
+# prefill (should_evict is gated on `not is_prefill`, and no scores exist yet
+# anyway — the hook runs after the attention module). The first eviction fires
+# at first_eviction_step, which now defaults to 0, so the prompt is resident for
+# exactly one decode step and
 #
-#     peak_ours = max(prefill_len + first_eviction_step, budget_steady_state)
+#     peak_ours = max(prefill_len + first_eviction_step + 1, budget_steady_state)
 #
-# The +first_eviction_step is a handful of tokens on a multi-thousand-token
-# prompt, so the batch-capacity table below (which rounds to prefill_len) is
-# unchanged in practice.
+# At the default that is prefill_len + 1: the batch-capacity table below rounds
+# to prefill_len and is exact for practical purposes. (It stays near-exact for a
+# delayed first eviction too — the extra term is a handful of tokens on a
+# multi-thousand-token prompt — but only step 0 makes the PROMPT itself the peak
+# for one step rather than for a window of decode.)
 #
 # Compression only buys batch capacity where the STEADY STATE is the binding
 # constraint — i.e. where generation is long enough to outgrow the prompt.

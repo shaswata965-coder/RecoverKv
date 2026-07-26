@@ -28,7 +28,7 @@ Tokens (prefill or generation step)
    ├── CacheState.append()            — grow the KV store
    ├── accumulate()                   — add new scores to running total
    ├── EvictionPolicy.should_evict()  — decide whether to compact now
-   │       (first at a fixed step 8, then every window_size steps)
+   │       (first at decode step 0, then every window_size steps)
    └── [if evicting]
        ├── compute_retain_window_indices()  — top-K window selection
        ├── expand_to_token_indices()        — windows → absolute token positions
@@ -149,10 +149,20 @@ new_window_scores = merged_kwargs.get("window_scores")
 # 3. No eviction during prefill: should_evict requires `not is_prefill`.
 ```
 
-**Prefill does not evict.** The prefill hook computes the prefill window scores
-*after* this `update()` returns; they are consumed — and `state.window_scores`
-is initialized — on the first generation step's `update()`. The cache grows to
-`prefill_len` and is first compacted at generation step `window_size`.
+**Prefill does not evict — and cannot.** The prefill hook computes the prefill
+window scores *after* this `update()` returns; they are consumed — and
+`state.window_scores` is initialized — on the first generation step's
+`update()`. Decode step 0 is therefore the *earliest* point at which any
+eviction is possible, and at the default `first_eviction_step = 0` it is where
+the first one fires: the cache grows to `prefill_len`, then compacts to budget
+before the step-0 query attends. Every generated token from the first decode
+step onward comes from the budgeted cache.
+
+The one token this does not cover is the token the prefill forward itself
+produces, which is read off the full prompt. That is true of the
+prompt-compression baselines too (SnapKV / AdaKV / CriticalKV / DefensiveKV
+prune in a hook that also fires after prefill attention), so the comparison is
+like for like.
 
 ---
 
@@ -263,15 +273,26 @@ def slice_and_keep(self, retain_token_indices):
     self.key_states   = torch.gather(self.key_states,   dim=2, index=idx)
     self.value_states = torch.gather(self.value_states, dim=2, index=idx)
 
-    # Rebase position_ids to contiguous [0, 1, ..., T_retained-1]
-    T_new = self.key_states.shape[2]
-    self.position_ids = torch.arange(T_new, device=..., dtype=torch.long)
+    # Gather position_ids to the survivors' ORIGINAL absolute positions,
+    # per row (rows may evict different windows).
+    self.position_ids = torch.gather(self.position_ids, 1, retain_token_indices)
 ```
 
-After this call `key_states` and `value_states` have shape `[B, H_kv, T_retained, D]`
-and position_ids are `[0, 1, ..., T_retained-1]` — contiguous, no gaps.
+After this call `key_states` and `value_states` have shape
+`[B, H_kv, T_retained, D]` and `position_ids` holds each survivor's **original**
+absolute position — sparse, with gaps where windows were dropped.
 
-### 5d. Repair RoPE — `CacheState.rerotate_keys()`
+> **This is the default and it is deliberate.** Surviving keys keep the RoPE
+> rotation they were stored with, so their positions must stay original for the
+> query↔key relative phase to be right. Rebasing to `arange(T_retained)` is only
+> valid if the keys are *also* re-rotated **and** the query's position is rebased
+> to the compacted length every step — which HuggingFace `generate` does not do
+> (it advances `cache_position` monotonically on transformers ≤ 4.47). Keeping
+> original positions matches KVPress / H2O and is correct on any version.
+> `rerotate_keys` below is the opt-in `rerotate_on_evict: true` path, off by
+> default; it is the only thing that rebases `position_ids`.
+
+### 5d. Repair RoPE — `CacheState.rerotate_keys()` (opt-in, `rerotate_on_evict: true`)
 
 **File:** `modules/windowed_cache/state.py:137`
 
@@ -328,9 +349,9 @@ policy.set_total_after_compaction(state.seq_length)
 |---|---|---|
 | `key_states` | `[B, H_kv, T, D]` | Current K tensors |
 | `value_states` | `[B, H_kv, T, D]` | Current V tensors |
-| `position_ids` | `[T]` | Token positions (rebased to `arange(T)` after each eviction) |
+| `position_ids` | `[B, T]` | Survivors' ORIGINAL absolute positions, gathered per row at each eviction (only rebased to `arange(T)` on the opt-in `rerotate_on_evict` path) |
 | `window_scores` | `[B, H_q, W]` | Cumulative sum of attention received per window |
-| `original_window_ids` | `[W]` | Maps compact window index → original sequence window id |
+| `original_window_ids` | `[B, W]` | Maps compact window index → original sequence window id, per row |
 
 ### `CacheState.append()` (state.py:62)
 
@@ -351,8 +372,8 @@ def append(self, key, value, pos=None):
 
 ## 7. Eviction Trigger Summary
 
-The first eviction fires at a fixed `first_eviction_step` (default 8), independent
-of `window_size`; the natural cadence resumes afterward.
+The first eviction fires at a fixed `first_eviction_step`, independent of
+`window_size`; the natural cadence resumes afterward.
 
 | Condition | `should_evict` result |
 |---|---|
@@ -362,9 +383,21 @@ of `window_size`; the natural cadence resumes afterward.
 | Generation step N > `first_eviction_step`, `N % window_size == 0` | True |
 | Generation step N > `first_eviction_step`, `N % window_size != 0` | False |
 
-The cache grows freely through prefill and the first `window_size` generation
-steps; the first compaction fires at generation step `window_size`, then once
-every `window_size` steps after, amortizing the `O(T × N)` hook cost.
+**At the default `first_eviction_step = 0`** the two rules coincide (`0 % ws ==
+0` for every `ws`) and the schedule collapses to a uniform `0, ws, 2·ws, …` with
+no short first window. The prompt is compacted on the first decode step and the
+cache stays at budget for the rest of the run, with the hook cost amortized
+across `window_size` steps as before.
+
+**A positive value is an ablation, not a tuning knob.** With
+`first_eviction_step = N` the prompt stays whole through decode steps `0 … N-1`,
+so any answer that terminates inside that window is measured at FULL cache no
+matter what `cache_budget` says. At the old default of 8 that covered, on
+LongBench, every `max_gen_length = 32` dataset (hotpotqa, 2wikimqa, musique,
+triviaqa, passage_count, passage_retrieval_en) plus trec and narrativeqa — their
+scores came out budget-invariant because all four runs were the same computation
+up to the scored token. Label any such run as an ablation; never put it in a
+comparison row.
 
 ---
 
