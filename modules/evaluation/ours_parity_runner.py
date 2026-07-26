@@ -615,7 +615,8 @@ class OursParityRunner:
         }
         od = Path(cfg.telemetry.output_dir); od.mkdir(parents=True, exist_ok=True)
         be = cfg.cache.backend_package or "unknown"
-        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_ours_{be}_{p.dataset}_{samples_shas[0][:8]}.npz"
+        # loader.slug, not p.dataset — a local corpus path is not a filename.
+        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_ours_{be}_{loader.slug}_{samples_shas[0][:8]}.npz"
         npz.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             str(npz),

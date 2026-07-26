@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from data.corpus_loader import CorpusLoader
@@ -100,3 +102,99 @@ class TestGetArticle:
 
     def test_num_articles(self, mock_loader: CorpusLoader) -> None:
         assert mock_loader.num_articles() == 3
+
+
+class TestLocalCorpus:
+    """A corpus the user supplies as a file or directory (the Kaggle path).
+
+    Kaggle has no hub access and mounts the corpus at /kaggle/input/<name>, so
+    `parity.dataset` must accept a path as well as a built-in dataset name.
+    """
+
+    def _jsonl(self, tmp_path, rows, name="docs.jsonl"):
+        p = tmp_path / name
+        p.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        return p
+
+    def test_jsonl_with_text_field(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "alpha"}, {"text": "beta"}])
+        loader = CorpusLoader(str(p))
+        assert loader.load() == ["alpha", "beta"]          # file order preserved
+        assert loader.num_articles() == 2
+
+    def test_local_prefix_is_accepted(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "alpha"}])
+        assert CorpusLoader(f"local:{p}").load() == ["alpha"]
+
+    def test_alternate_field_names_and_bare_strings(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"content": "a"}, {"document": "b"}, "c"])
+        assert CorpusLoader(str(p)).load() == ["a", "b", "c"]
+
+    def test_single_string_field_is_used_as_fallback(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"weird_name": "a", "n_tokens": 3}])
+        assert CorpusLoader(str(p)).load() == ["a"]
+
+    def test_ambiguous_record_raises_with_keys(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"foo": "a", "bar": "b"}])
+        with pytest.raises(ValueError, match="cannot tell which field"):
+            CorpusLoader(str(p)).load()
+
+    def test_explicit_text_field_wins(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "ignored", "raw": "wanted"}])
+        assert CorpusLoader(str(p), text_field="raw").load() == ["wanted"]
+
+    def test_missing_explicit_field_raises(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "a"}])
+        with pytest.raises(ValueError, match="text_field"):
+            CorpusLoader(str(p), text_field="nope").load()
+
+    def test_json_array_and_wrapper(self, tmp_path):
+        flat = tmp_path / "flat.json"
+        flat.write_text(json.dumps(["a", "b"]), encoding="utf-8")
+        assert CorpusLoader(str(flat)).load() == ["a", "b"]
+        wrapped = tmp_path / "wrapped.json"
+        wrapped.write_text(json.dumps({"data": [{"text": "a"}]}), encoding="utf-8")
+        assert CorpusLoader(str(wrapped)).load() == ["a"]
+
+    def test_directory_is_walked_in_sorted_order(self, tmp_path):
+        d = tmp_path / "corpus"
+        (d / "nested").mkdir(parents=True)
+        (d / "b.txt").write_text("second", encoding="utf-8")
+        (d / "a.txt").write_text("first", encoding="utf-8")
+        (d / "nested" / "c.jsonl").write_text(
+            json.dumps({"text": "third"}), encoding="utf-8")
+        assert CorpusLoader(str(d)).load() == ["first", "second", "third"]
+
+    def test_blank_and_whitespace_articles_are_dropped(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "  a  "}, {"text": "   "}, {"text": ""}])
+        assert CorpusLoader(str(p)).load() == ["a"]
+
+    def test_empty_corpus_raises(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "  "}])
+        with pytest.raises(ValueError, match="no non-empty articles"):
+            CorpusLoader(str(p)).load()
+
+    def test_empty_directory_raises(self, tmp_path):
+        d = tmp_path / "empty"; d.mkdir()
+        with pytest.raises(ValueError, match="No .*files found"):
+            CorpusLoader(str(d)).load()
+
+    def test_malformed_jsonl_names_the_line(self, tmp_path):
+        p = tmp_path / "bad.jsonl"
+        p.write_text('{"text": "ok"}\nnot json\n', encoding="utf-8")
+        with pytest.raises(ValueError, match=r"bad\.jsonl:2"):
+            CorpusLoader(str(p)).load()
+
+    def test_unknown_name_that_is_not_a_path_still_raises(self):
+        with pytest.raises(ValueError, match="Unsupported dataset"):
+            CorpusLoader("wikitext-999")
+
+    def test_slug_is_filename_safe(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": "a"}], name="my docs v2.jsonl")
+        assert CorpusLoader(str(p)).slug == "my-docs-v2"
+        assert CorpusLoader("wikitext-103").slug == "wikitext-103"
+
+    def test_deterministic_sampling_on_a_local_corpus(self, tmp_path):
+        p = self._jsonl(tmp_path, [{"text": f"doc{i}"} for i in range(20)])
+        loader = CorpusLoader(str(p))
+        assert loader.sample_articles(5, seed=7) == loader.sample_articles(5, seed=7)
