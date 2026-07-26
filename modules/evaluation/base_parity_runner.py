@@ -345,7 +345,8 @@ class BaseParityRunner:
             "run_finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         od = Path(cfg.telemetry.output_dir); od.mkdir(parents=True, exist_ok=True)
-        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_base_{p.dataset}_{samples_shas[0][:8]}.npz"
+        # loader.slug, not p.dataset — a local corpus path is not a filename.
+        npz = Path(cfg.output_path) if cfg.output_path else od / f"parity_base_{loader.slug}_{samples_shas[0][:8]}.npz"
         npz.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
             str(npz),
