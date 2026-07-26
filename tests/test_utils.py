@@ -296,3 +296,55 @@ class TestValidateBackendAttnPairing:
     def test_unknown_backend(self) -> None:
         with pytest.raises(ConfigValidationError):
             validate_backend_attn_pairing("sdpa", "sdpa")
+
+
+# -----------------------------------------------------------------------
+# first_eviction_step — one default, no literals
+# -----------------------------------------------------------------------
+
+
+class TestFirstEvictionStepDefault:
+    """The YAML-side default and the cache-side default must be one number.
+
+    They are declared in two places on purpose (``utils.config`` must not import
+    the cache packages — that pulls in the flash-attn hooks), so nothing but a
+    test stops them drifting. When they drifted before, a LongBench run silently
+    sat at a different operating point than its config claimed.
+    """
+
+    def test_utils_default_matches_the_policy_constant(self) -> None:
+        from utils.config import FIRST_EVICTION_STEP_DEFAULT
+        from modules.windowed_cache.policy import FIRST_EVICTION_STEP
+        from modules.windowed_eager_cache.policy import (
+            FIRST_EVICTION_STEP as EAGER_FIRST_EVICTION_STEP,
+        )
+
+        assert FIRST_EVICTION_STEP_DEFAULT == FIRST_EVICTION_STEP
+        assert FIRST_EVICTION_STEP_DEFAULT == EAGER_FIRST_EVICTION_STEP
+
+    def test_default_is_step_zero(self) -> None:
+        """Pinned, not incidental: step 0 is the comparison operating point.
+
+        Anything above 0 leaves every answer that finishes inside that window
+        measured at full cache whatever ``cache_budget`` says.
+        """
+        from utils.config import CacheConfig, FIRST_EVICTION_STEP_DEFAULT
+
+        assert FIRST_EVICTION_STEP_DEFAULT == 0
+        assert CacheConfig().first_eviction_step == 0
+
+    def test_no_runner_hardcodes_a_fallback_literal(self) -> None:
+        """Every runner's getattr fallback must be the shared constant."""
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        bad = []
+        for path in (root / "modules" / "evaluation").glob("*_runner.py"):
+            for m in re.finditer(
+                r'getattr\(\s*[^,]+,\s*"first_eviction_step"\s*,\s*([^)]+)\)',
+                path.read_text(encoding="utf-8"),
+            ):
+                if m.group(1).strip() != "FIRST_EVICTION_STEP_DEFAULT":
+                    bad.append(f"{path.name}: {m.group(0)}")
+        assert not bad, "hard-coded first_eviction_step fallback(s): " + "; ".join(bad)

@@ -39,7 +39,8 @@ class ResolvedConfig:
     total_budget_tokens: int
     rerotate_on_evict: bool = False
     # Decode step at which the FIRST eviction fires, independent of window_size
-    # (EvictionPolicy.should_evict). Carried verbatim from WindowedCacheConfig.
+    # (EvictionPolicy.should_evict). Default 0 = compress the prompt on the first
+    # decode step. Carried verbatim from WindowedCacheConfig.
     first_eviction_step: int = FIRST_EVICTION_STEP
     # --- two-tier quantization (design.md §7) ---
     # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
@@ -145,9 +146,12 @@ class WindowedCacheConfig:
     rerotate_on_evict: bool = False
     quant_ratio: float = 0.0
     quant_memoize_read: Optional[bool] = None
-    # Decode step of the FIRST eviction, independent of window_size (default 8).
-    # See EvictionPolicy.should_evict; must be a non-negative int (0 = fire from
-    # the first decode step, the pre-fixed-offset behaviour).
+    # Decode step of the FIRST eviction, independent of window_size. Default 0:
+    # the prompt is compressed on decode step 0, before that step's query
+    # attends, so every generated token is produced against the budgeted cache.
+    # Must be a non-negative int; a positive value delays the first compaction
+    # and leaves short answers measured at full cache (see FIRST_EVICTION_STEP
+    # and EvictionPolicy.should_evict).
     first_eviction_step: int = FIRST_EVICTION_STEP
 
     def __post_init__(self) -> None:

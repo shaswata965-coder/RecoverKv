@@ -28,7 +28,7 @@ cache:
   local_window_size: 128                    # fixed tokens
   quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16
   rerotate_on_evict: false
-  first_eviction_step: 8
+  first_eviction_step: 0                    # compress the prompt before the 2nd token (default)
 
 window:
   window_size: 16

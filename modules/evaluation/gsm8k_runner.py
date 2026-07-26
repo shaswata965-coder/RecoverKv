@@ -34,6 +34,7 @@ import torch
 
 from data.gsm8k_loader import load_gsm8k_dataset, read_manifest
 from modules.evaluation.gsm8k_dataset import STOP_STRINGS
+from utils.config import FIRST_EVICTION_STEP_DEFAULT
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
 
@@ -342,7 +343,7 @@ class GSM8KRunner:
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
-            first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8),
+            first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
         rope = None
@@ -493,7 +494,7 @@ class GSM8KRunner:
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "local_window_size": cfg.cache.local_window_size,
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
-            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", 8),
+            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "stop_strings": STOP_STRINGS if self._supports_stop_strings() else None,
             "decoding": "greedy",

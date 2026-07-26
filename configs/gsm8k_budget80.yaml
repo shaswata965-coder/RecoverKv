@@ -39,7 +39,7 @@ cache:
   num_sink_tokens: 4
   local_window_size: 0.25   # fraction of the budget — scales with short prompts
   quant_ratio: 0.0          # pure fp16; byte-identical to the single-tier path
-  first_eviction_step: 8
+  first_eviction_step: 0        # compress the prompt before the 2nd token (default)
 
 window:                     # kept in sync to silence the disagreement warning
   window_size: 8

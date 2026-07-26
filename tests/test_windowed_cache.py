@@ -846,9 +846,9 @@ class TestPreallocation:
 
 
 class TestEvictionSchedule:
-    """should_evict fires the FIRST eviction at a fixed decode step (default 8),
-    independent of window_size, then resumes the natural window cadence at
-    absolute ``step % window_size == 0``."""
+    """should_evict fires the FIRST eviction at a fixed decode step (default 0 —
+    the prompt is compressed before the step-0 query attends), independent of
+    window_size, then resumes the natural cadence at ``step % window_size == 0``."""
 
     @staticmethod
     def _fired(ws, upto, first=None):
@@ -858,50 +858,55 @@ class TestEvictionSchedule:
             pol.first_eviction_step = first
         return [s for s in range(upto) if pol.should_evict(s)]
 
-    @pytest.mark.parametrize("ws", [4, 8, 12, 16, 32])
-    def test_first_eviction_is_step_8_independent_of_ws(self, ws):
-        # First fire is step 8 for every window size — nothing earlier.
-        assert self._fired(ws, upto=9) == [8]
+    # -- the default: step 0, then every window_size-th step ------------------
 
     @pytest.mark.parametrize("ws", [1, 3, 4, 7, 8, 12, 16, 32])
-    def test_nothing_evicts_before_step_8(self, ws):
-        assert self._fired(ws, upto=8) == []
-
-    def test_cadence_ws12_matches_worked_example(self):
-        # The example from the design note: 8 (forced), 12, 24, 36, ...
-        assert self._fired(12, upto=40) == [8, 12, 24, 36]
-
-    def test_cadence_ws8_is_uniform(self):
-        assert self._fired(8, upto=40) == [8, 16, 24, 32]
-
-    def test_cadence_ws16_has_short_first_window(self):
-        assert self._fired(16, upto=40) == [8, 16, 32]
+    def test_first_eviction_is_step_0_for_every_window_size(self, ws):
+        assert self._fired(ws, upto=1) == [0]
 
     @pytest.mark.parametrize("ws,expected", [
+        (1, [0, 1, 2, 3, 4]),
+        (3, [0, 3, 6, 9]),
+        (4, [0, 4, 8, 12]),
+        (8, [0, 8, 16, 24, 32]),
+        (12, [0, 12, 24, 36]),
+        (16, [0, 16, 32]),
+    ])
+    def test_default_cadence_is_uniform_multiples_of_ws(self, ws, expected):
+        # At first_eviction_step=0 the forced-first rule and the natural cadence
+        # coincide, so there is no short first window for ANY window size.
+        assert self._fired(ws, upto=expected[-1] + 1) == expected
+
+    # -- a delayed first eviction (the ablation) ------------------------------
+
+    @pytest.mark.parametrize("ws", [4, 8, 12, 16, 32])
+    def test_delayed_first_eviction_is_ws_independent(self, ws):
+        assert self._fired(ws, upto=9, first=8) == [8]
+
+    @pytest.mark.parametrize("ws", [1, 3, 4, 7, 8, 12, 16, 32])
+    def test_nothing_evicts_before_a_delayed_first_step(self, ws):
+        assert self._fired(ws, upto=8, first=8) == []
+
+    @pytest.mark.parametrize("ws,expected", [
+        (8, [8, 16, 24, 32]),      # uniform: the delay equals the window
+        (12, [8, 12, 24, 36]),     # short 8 -> 12 gap, then full windows
+        (16, [8, 16, 32]),
         (1, [8, 9, 10, 11, 12]),   # every step after the forced first
         (3, [8, 9, 12, 15, 18]),   # 9 is the first multiple of 3 above 8
         (4, [8, 12, 16, 20]),
         (7, [8, 14, 21, 28]),
     ])
-    def test_small_window_edge_cases_are_graceful(self, ws, expected):
-        # window_size 1-7 (smaller than the fixed offset): sub-8 boundaries are
-        # suppressed, the first eviction still lands at 8, cadence resumes after.
-        assert self._fired(ws, upto=expected[-1] + 1) == expected
-
-    def test_override_to_zero_reproduces_step0_schedule(self):
-        # The test-only affordance batching tests rely on: fire from step 0 and
-        # every window_size-th step after.
-        assert self._fired(1, upto=5, first=0) == [0, 1, 2, 3, 4]
-        assert self._fired(4, upto=13, first=0) == [0, 4, 8, 12]
+    def test_delayed_cadence_resumes_at_the_next_multiple(self, ws, expected):
+        assert self._fired(ws, upto=expected[-1] + 1, first=8) == expected
 
     # -- the config knob: WindowedCacheConfig -> ResolvedConfig -> EvictionPolicy
 
-    def test_first_eviction_step_defaults_to_8_through_config(self):
+    def test_first_eviction_step_defaults_to_zero_through_config(self):
         cfg = _make_config()
-        assert cfg.first_eviction_step == 8
+        assert cfg.first_eviction_step == 0
         resolved = cfg.resolve(100, _FakeModelConfig(), torch.float16, max_tokens=128)
-        assert resolved.first_eviction_step == 8
-        assert EvictionPolicy(resolved).first_eviction_step == 8
+        assert resolved.first_eviction_step == 0
+        assert EvictionPolicy(resolved).first_eviction_step == 0
 
     def test_config_knob_sets_the_first_eviction_step(self):
         cfg = _make_config(first_eviction_step=5)

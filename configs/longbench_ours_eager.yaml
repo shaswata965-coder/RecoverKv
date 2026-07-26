@@ -28,6 +28,7 @@ cache:
   num_sink_tokens: 4
   local_window_size: 0.25
   quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16. q>0 needs even window_size + batch_size 1.
+  first_eviction_step: 0                    # prompt compressed on decode step 0 (default); >0 leaves short answers at full cache
 
 telemetry:
   track_scores: false

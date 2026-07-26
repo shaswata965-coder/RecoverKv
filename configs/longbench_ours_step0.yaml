@@ -1,27 +1,31 @@
 # ============================================================================
-# LongBench — Ours, prompt-compression operating point (first_eviction_step: 0)
+# LongBench — Ours, two-tier (q=0.5) at the prompt-compression operating point
 # ============================================================================
-# Same cache as longbench_ours_flash_attn.yaml, with the FIRST eviction moved
-# from decode step 8 to decode step 0.
+# first_eviction_step: 0 is now the REPO DEFAULT, so this config no longer
+# exists to flip that knob. It is kept as the discriminating four-dataset
+# head-to-head subset at quant_ratio=0.5, and as the record of why step 0 is the
+# default.
 #
-# Why this config exists
-# ---------------------
-# At the default first_eviction_step=8 the prompt stays whole through decode
-# steps 0-7, so any dataset whose scored answer completes inside that window is
-# measured at FULL CACHE regardless of cache_budget. On LongBench that is every
-# dataset with max_gen_length=32 (hotpotqa, 2wikimqa, musique, triviaqa,
-# passage_count, passage_retrieval_en) plus trec (first-line label) and
-# narrativeqa (short answers) — i.e. the budget column does not bind on them.
+# Why step 0 is the default
+# -------------------------
+# At first_eviction_step=N the prompt stays whole through decode steps 0..N-1,
+# so any dataset whose scored answer completes inside that window is measured at
+# FULL CACHE regardless of cache_budget. At the old default N=8 that was, on
+# LongBench, every dataset with max_gen_length=32 (hotpotqa, 2wikimqa, musique,
+# triviaqa, passage_count, passage_retrieval_en) plus trec (first-line label)
+# and narrativeqa (short answers) — the budget column did not bind on them, and
+# their scores came out budget-invariant because all four runs were the same
+# computation up to the scored token.
 #
 # The prompt-compression baselines (SnapKV, AdaKV, CriticalKV, DefensiveKV)
-# prune at the end of prefill, so token 2 onward already attend over the
+# prune at the end of prefill, so token 2 onward already attends over the
 # compressed cache. first_eviction_step=0 puts us at that same point: the
 # prefill forward pass still produces token 1 from the full prompt (true of
 # every method, including the baselines — their press hooks also fire after
 # prefill attention), and the compaction lands before token 2.
 #
-# Use this for the head-to-head table. Keep first_eviction_step=8 as a labelled
-# ablation, not as the comparison row.
+# Set first_eviction_step > 0 only as a labelled ablation, never as a
+# comparison row.
 _base_: base.yaml
 
 run:
@@ -42,7 +46,7 @@ cache:
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
   quant_ratio: 0.5                          # two-tier int4 split q in [0,1]; 0 = pure fp16
-  first_eviction_step: 0                    # <-- the point of this config
+  first_eviction_step: 0                    # repo default; stated explicitly so the run is self-describing
 
   # NOTE on short datasets at low budget: local_window_size is a FIXED 128 here,
   # so when 0.05 * (prefill + max_gen) < 133 the resolver clamps to zero
@@ -60,8 +64,10 @@ telemetry:
 
 longbench:
   datasets:
-    # The four that decide whether the step-8 advantage was real. Two that were
-    # pinned at FullKV under step 8, two that genuinely moved with the budget.
+    # The four that decide whether the step-8 advantage was real. Two were
+    # pinned at FullKV under step 8, two genuinely moved with the budget. The
+    # percentages below are the STEP-8 numbers, kept as the thing this run is
+    # meant to overturn — they are not expected values for this config.
     - hotpotqa                              # max_gen 32 — was 95.8% of FullKV at every budget
     - passage_retrieval_en                  # max_gen 32 — was 99.5% at every budget
     - multi_news                            # max_gen 512 — moved 99.7% -> 76.5%

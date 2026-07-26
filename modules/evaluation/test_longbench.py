@@ -776,10 +776,16 @@ class TestFirstEvictionStepPlumbing:
         captured = self._runner_with_stub_ctors(3)
         assert captured["first_eviction_step"] == 3
 
-    def test_absent_attribute_falls_back_to_eight(self):
-        """A config object without the field keeps the historical default."""
+    def test_absent_attribute_falls_back_to_the_shared_default(self):
+        """The getattr fallback must be the shared default, not a literal.
+
+        A literal here is exactly how this knob went inert once already: the
+        fallback disagreed with the dataclass default, so a run could sit at a
+        different operating point than the config claimed.
+        """
+        from utils.config import FIRST_EVICTION_STEP_DEFAULT
         captured = self._runner_with_stub_ctors(None)
-        assert captured["first_eviction_step"] == 8
+        assert captured["first_eviction_step"] == FIRST_EVICTION_STEP_DEFAULT == 0
 
     def test_sidecar_records_the_step(self, tmp_path):
         """The .meta.json must record it, or a finished run is unattributable."""
