@@ -34,7 +34,7 @@ import torch
 
 from data.gsm8k_loader import load_gsm8k_dataset, read_manifest
 from modules.evaluation.gsm8k_dataset import STOP_STRINGS
-from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -171,6 +171,7 @@ class GSM8KRunner:
             self.is_windowed,
             output_dir,
         )
+        log_operating_point(self.config, self.is_windowed)
 
         skip_oom = getattr(self.gs, "skip_oom", False)
         run_start = time.time()

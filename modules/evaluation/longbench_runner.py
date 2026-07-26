@@ -25,7 +25,7 @@ from data.longbench_loader import (
     LONGBENCH_EN_DATASETS,
     load_longbench_dataset,
 )
-from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
@@ -213,6 +213,7 @@ class LongBenchRunner:
             output_dir,
             self.is_windowed,
         )
+        log_operating_point(self.config, self.is_windowed)
 
         for dataset_name in datasets:
             jsonl_path = output_dir / f"{dataset_name}.jsonl"

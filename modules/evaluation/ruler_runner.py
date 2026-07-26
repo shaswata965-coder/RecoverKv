@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from data.ruler_loader import RULER_TASKS, load_ruler_dataset
-from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -180,6 +180,7 @@ class RulerRunner:
             output_dir,
             self.is_windowed,
         )
+        log_operating_point(self.config, self.is_windowed)
 
         for task_name, task_examples in by_task.items():
             jsonl_path = output_dir / f"{task_name}.jsonl"
@@ -511,6 +512,18 @@ class RulerRunner:
             "bookkeeping_live": _stats("bookkeeping_live"),
             "reduction_vs_full": _stats("reduction_vs_full"),
             "compression_vs_fp16": _stats("compression_vs_fp16"),
+            # The summary is what anyone actually reads — the jsonl is for
+            # re-analysis — so it must carry BOTH compression framings, not just
+            # the memo-inclusive one. At B = 1 (where the memo defaults ON) the
+            # memo is the largest line item and drags compression_vs_fp16 below
+            # 1.0, i.e. the summary alone would report the two-tier cache as
+            # bigger than fp16. See utils/cache_memory.py.
+            "memo_bytes": _stats("memo_bytes"),
+            "total_live_excl_memo": _stats("total_live_excl_memo"),
+            "reduction_vs_full_excl_memo": _stats("reduction_vs_full_excl_memo"),
+            "compression_vs_fp16_excl_memo": _stats(
+                "compression_vs_fp16_excl_memo"
+            ),
             "retained_tokens": _stats("retained_tokens"),
             "observed_context_len": _stats("observed_context_len"),
         }

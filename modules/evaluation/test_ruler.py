@@ -143,3 +143,56 @@ class TestRulerConfigPlumbing:
         cfg = load_config(root / "configs" / "ruler_niah_mk3_omega16.yaml")
         assert cfg.run.mode == "ruler"
         assert cfg.cache.first_eviction_step == 0
+
+
+# ---------------------------------------------------------------------------
+# Memory summary — both compression framings, not just the memo-inclusive one
+# ---------------------------------------------------------------------------
+
+
+class TestMemorySummary:
+    """`<task>.memory_summary.json` is what anyone reads; the jsonl is for
+    re-analysis. At B=1 the read memo defaults ON and is the largest line item,
+    so a summary carrying only `compression_vs_fp16` reports the two-tier cache
+    as *bigger* than fp16."""
+
+    def _summary(self, tmp_path):
+        from modules.evaluation.ruler_runner import RulerRunner
+
+        runner = RulerRunner.__new__(RulerRunner)     # no config needed
+        runner._memory_reports = [
+            {
+                "total_live": 20 * 1024, "total_alloc": 22 * 1024,
+                "fp_content_live": 3 * 1024, "q_content_live": 1 * 1024,
+                "bookkeeping_live": 0, "memo_bytes": 16 * 1024,
+                "total_live_excl_memo": 4 * 1024,
+                "compression_vs_fp16": 0.8, "reduction_vs_full": 1.6,
+                "compression_vs_fp16_excl_memo": 4.0,
+                "reduction_vs_full_excl_memo": 8.0,
+                "retained_tokens": 128, "observed_context_len": 512,
+            }
+        ]
+        runner._write_memory("niah_single_1", tmp_path)
+        return json.loads(
+            (tmp_path / "niah_single_1.memory_summary.json").read_text(
+                encoding="utf-8")
+        )
+
+    def test_summary_carries_both_compression_framings(self, tmp_path):
+        s = self._summary(tmp_path)
+        for key in ("compression_vs_fp16", "compression_vs_fp16_excl_memo",
+                    "reduction_vs_full", "reduction_vs_full_excl_memo",
+                    "memo_bytes", "total_live_excl_memo"):
+            assert key in s, f"{key} missing from the memory summary"
+
+    def test_the_two_framings_actually_differ_here(self, tmp_path):
+        """Pins the failure this guards: memo-inclusive says <1x, excl says 4x."""
+        s = self._summary(tmp_path)
+        assert s["compression_vs_fp16"]["mean"] < 1.0
+        assert s["compression_vs_fp16_excl_memo"]["mean"] == 4.0
+
+    def test_per_example_jsonl_is_still_written(self, tmp_path):
+        self._summary(tmp_path)
+        lines = (tmp_path / "niah_single_1.memory.jsonl").read_text(
+            encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1 and json.loads(lines[0])["memo_bytes"] == 16 * 1024

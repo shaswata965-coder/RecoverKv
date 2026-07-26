@@ -43,6 +43,50 @@ class ConfigValidationError(ValueError):
 FIRST_EVICTION_STEP_DEFAULT = 0
 
 
+def log_operating_point(config, is_windowed: bool) -> None:
+    """Log the full cache operating point at the start of a generation run.
+
+    Every knob that changes a score, on one line, so a finished log says which
+    experiment it was. The three that have burned this project, all silent:
+
+    * ``first_eviction_step`` — a positive value leaves every answer that
+      terminates inside that window measured at FULL cache whatever
+      ``cache_budget`` says;
+    * ``quant_ratio`` — 0.0 is the single-tier fp16 method, not the two-tier
+      one this branch exists for, and the shipped RULER / GSM8K configs default
+      to it; and
+    * ``backend_package`` / ``attn_implementation`` — the pairing decides which
+      score hook runs at all.
+
+    None of these change anything visible in the predictions, so without this
+    line a wrong one is only discoverable by re-reading the config afterwards.
+    """
+    cache = getattr(config, "cache", None)
+    if cache is None:
+        return
+    if not is_windowed:
+        log.info("operating point: FULL CACHE (no eviction, no quantization)")
+        return
+
+    q = getattr(cache, "quant_ratio", 0.0)
+    log.info(
+        "operating point: budget=%s  window_size=%s  num_sink=%s  local=%s  "
+        "quant_ratio=%s (%s)  first_eviction_step=%s (%s)  backend=%s/%s",
+        getattr(cache, "cache_budget", None),
+        getattr(cache, "window_size", None),
+        getattr(cache, "num_sink_tokens", None),
+        getattr(cache, "local_window_size", None),
+        q,
+        "two-tier fp16+int2" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
+        getattr(cache, "first_eviction_step", None),
+        "prompt compressed on decode step 0"
+        if getattr(cache, "first_eviction_step", 0) == 0
+        else "DELAYED — short answers measured at full cache",
+        getattr(cache, "backend_package", None),
+        getattr(getattr(config, "model", None), "attn_implementation", None),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
