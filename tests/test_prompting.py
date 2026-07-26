@@ -82,10 +82,44 @@ class TestEncodePrompt:
         assert tok.calls[0]["return_tensors"] == "pt"
         assert tok.calls[0]["truncation"] is False
 
-    def test_tokenizer_without_bos_is_left_alone(self):
+    def test_tokenizer_without_bos_never_asks_for_special_tokens(self):
+        """Qwen2/Qwen2.5 have no bos_token: ``bos_token`` is None and the prompt
+        opens with ``<|im_start|>``, an ordinary token.
+
+        There is then no BOS to add and none to duplicate, so the decision is
+        False — matching kvpress, which encodes with add_special_tokens=False
+        unconditionally and hand-prepends ``bos_token`` only when there is no
+        chat template (for such a tokenizer, prepending nothing).
+
+        This previously asked for True on the reasoning that a Qwen tokenizer
+        adds nothing anyway. That is probably true and was still the wrong basis:
+        it bets on a tokenizer's post-processor instead of stating the intent,
+        which is the mistake that produced the doubled BOS.
+        """
         tok = _NoBosTokenizer()
         encode_prompt(tok, "hi")
-        assert tok.calls[0]["add_special_tokens"] is True
+        assert tok.calls[0]["add_special_tokens"] is False
+
+    def test_no_bos_tokenizer_is_false_templated_and_raw_alike(self):
+        """Both Qwen rows of the table in encode_prompt's docstring."""
+        templated = _NoBosTokenizer()
+        encode_prompt(templated, "<|im_start|>system\nYou are Qwen<|im_end|>\n")
+        assert templated.calls[0]["add_special_tokens"] is False
+
+        raw = _NoBosTokenizer()
+        encode_prompt(raw, "Passage: foo\n\nQuestion: bar")
+        assert raw.calls[0]["add_special_tokens"] is False
+
+    def test_the_bos_models_are_unchanged_by_the_no_bos_rule(self):
+        """Adding the `has BOS` conjunct must not move Llama or Mistral, whose
+        numbers were re-run on the previous rule."""
+        templated = _StubTokenizer()
+        encode_prompt(templated, "<s> [INST] hi [/INST]")
+        assert templated.calls[0]["add_special_tokens"] is False
+
+        raw = _StubTokenizer()
+        encode_prompt(raw, "Passage: foo")
+        assert raw.calls[0]["add_special_tokens"] is True
 
     def test_surviving_duplicate_bos_warns(self, caplog):
         """A template that embeds the BOS in a form the prefix test misses must

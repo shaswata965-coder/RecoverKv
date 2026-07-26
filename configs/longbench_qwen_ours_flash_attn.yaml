@@ -1,0 +1,62 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours (flash-attn backend)
+# ============================================================================
+# Windowed KV-cache with flash-attention-2 score extraction.
+# DefensiveKV headline: compression_ratio=0.8 (cache_budget=0.20).
+# Cache geometry is identical to configs/longbench_ours_flash_attn.yaml and
+# configs/longbench_mistral_ours_flash_attn.yaml, so the Llama, Mistral and Qwen
+# columns differ only by the model.
+# Produces: outputs/longbench/qwen_ours_flash_attn_compression_0.8/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  # See longbench_qwen_full_cache.yaml for the three Qwen2-specific points
+  # (q/k/v bias, no BOS token, declared-but-disabled sliding_window).
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn               # imports modules.windowed_cache
+  cache_budget: 0.20                        # DefensiveKV's headline; compression_ratio = 0.8
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
+  quant_ratio: 0.5                          # two-tier fp16+int2 split q in [0,1]; THE method here. Single-tier ablation: --override cache.quant_ratio=0.0
+  first_eviction_step: 0                    # repo default; stated explicitly so the run is self-describing
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                         # matches the Qwen full-cache config; see it for why
+  output_dir: outputs/longbench/qwen_ours_flash_attn_compression_0.8
+  seed: 42
+  resume: true                              # essential on a wall-clock-limited box
+  skip_oom: true
+  aggressive_cache_clear: false

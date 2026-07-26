@@ -1,0 +1,38 @@
+# ============================================================================
+# GSM8K — Qwen2.5-7B-Instruct, Full Cache Baseline
+# ============================================================================
+# Run this FIRST and read its accuracy before any budget number: the GSM8K
+# harness gates on it (scripts/run_gsm8k_e2e.sh, BASELINE_MIN), because a budget
+# number means nothing against a baseline that does not reproduce.
+# Produces: outputs/gsm8k/qwen_full_cache/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  # See longbench_qwen_full_cache.yaml for the three Qwen2-specific points
+  # (q/k/v bias, no BOS token, declared-but-disabled sliding_window).
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+cache:
+  backend: dynamic          # DynamicCache — no eviction, no quantization
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/qwen_full_cache
+  results_dir: outputs/gsm8k
+  num_samples: max          # override to e.g. 20 for a smoke run
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

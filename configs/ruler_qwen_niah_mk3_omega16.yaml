@@ -1,0 +1,55 @@
+# ============================================================================
+# RULER 4096 — Qwen2.5-7B-Instruct, Ours, task=niah_multikey_3, window_size=16
+# ============================================================================
+# Geometry identical to configs/ruler_niah_mk3_omega16.yaml (the Llama column),
+# so the two differ only by model.
+# Captures a utils/cache_memory.py byte-accounting report per example
+# (ruler.capture_memory) so retained-bytes / compression-ratio can be read off
+# directly, alongside the task's accuracy score.
+# quant_ratio=0.5 is the two-tier fp16+int2 method this branch exists for. Run
+# the single-tier fp16 ablation with --override cache.quant_ratio=0.0; the
+# operating point is printed at the start of every run either way.
+# Produces: outputs/ruler/qwen_4096_niah_mk3_omega16/
+_base_: base.yaml
+
+run:
+  mode: ruler
+  seed: 42
+
+model:
+  # See longbench_qwen_full_cache.yaml for the three Qwen2-specific points
+  # (q/k/v bias, no BOS token, declared-but-disabled sliding_window). The no-BOS
+  # one matters most here: RULER templates every task, so every prompt goes
+  # through encode_prompt's no-BOS path.
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn                # imports modules.windowed_cache
+  cache_budget: 0.20                        # cache 20%
+  window_size: 16                           # omega=16
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens
+  quant_ratio: 0.5                          # two-tier fp16+int2 split q in [0,1]; 0 = pure fp16
+  rerotate_on_evict: false
+  first_eviction_step: 0                    # compress the prompt before the 2nd token (default)
+
+telemetry:
+  track_scores: false                       # mandatory; see prompt 04 §1
+
+ruler:
+  # Override to wherever the RULER split is staged on the run host, e.g.
+  #   --override ruler.data_dir=/path/to/defensivekv_dataset/ruler/4096
+  data_dir: /home/ee/visitor/man_misn.visitor/kv_cache/DefensiveKV/defensivekv_dataset/ruler/4096
+  tasks:
+    - niah_multikey_3
+  num_samples: max
+  capture_memory: true                      # per-example utils/cache_memory.py report
+  output_dir: outputs/ruler/qwen_4096_niah_mk3_omega16
+  seed: 42
+  resume: true
+  skip_oom: false
+  aggressive_cache_clear: false

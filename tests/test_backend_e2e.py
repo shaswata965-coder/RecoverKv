@@ -44,14 +44,24 @@ UNEVICTED = PREFILL + GEN - 1
 
 #: Architectures every case below runs on.
 #:
-#: Mistral is not redundant with Llama here. The two model files diverge in the
-#: cache contract: Mistral's attention builds its own ``cache_kwargs`` and the
-#: FA2 variant omits ``cache_position`` (transformers 4.47.1), which is what
-#: `WindowedCache.update`'s position fallback exists for — window identity is
-#: ``(position - num_sink) // window_size``, so a wrong position scrambles the
-#: grouping eviction ranks. Running the same assertions on both is what stops a
-#: per-model-file convention from silently becoming a Llama-only assumption.
-ARCHITECTURES = ["llama", "mistral"]
+#: None of these is redundant with Llama — the model files diverge in exactly the
+#: places the cache touches:
+#:
+#: * **Mistral** builds its own ``cache_kwargs`` and the FA2 variant omits
+#:   ``cache_position`` (transformers 4.47.1), which is what
+#:   `WindowedCache.update`'s position fallback exists for. Window identity is
+#:   ``(position - num_sink) // window_size``, so a wrong position scrambles the
+#:   grouping eviction ranks. Mistral also keeps ``rotary_emb`` per attention
+#:   layer rather than on the model.
+#: * **Qwen2** carries a **bias on q/k/v** (Llama and Mistral do not), so the
+#:   flash hook's query must come from calling ``q_proj`` rather than from its
+#:   weight — a manual matmul would silently drop the bias and score a query the
+#:   model never used. It also declares ``sliding_window`` in its config, which
+#:   ``Qwen2Config`` nulls out unless ``use_sliding_window`` is set.
+#:
+#: Running the same assertions on all three is what stops a per-model-file
+#: convention from silently becoming a Llama-only assumption.
+ARCHITECTURES = ["llama", "mistral", "qwen2"]
 
 
 def _tiny_model(arch="llama"):
@@ -68,6 +78,15 @@ def _tiny_model(arch="llama"):
         # a compacted cache — the runners warn about it at load.
         cfg = MistralConfig(sliding_window=None, **kw)
         return MistralForCausalLM(cfg).eval(), cfg
+
+    if arch == "qwen2":
+        from transformers import Qwen2Config, Qwen2ForCausalLM
+
+        # use_sliding_window=False is what Qwen2.5-7B-Instruct ships, and
+        # Qwen2Config turns that into sliding_window=None regardless of the
+        # declared value — see test_qwen2_config_disables_its_declared_window.
+        cfg = Qwen2Config(use_sliding_window=False, sliding_window=4096, **kw)
+        return Qwen2ForCausalLM(cfg).eval(), cfg
 
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -233,6 +252,69 @@ def test_both_architectures_take_the_same_cache_trajectory(quant_ratio, arch):
     assert llama["fp_len"] == other["fp_len"]
     assert llama["merged_len"] == other["merged_len"]
     assert llama["q_windows"] == other["q_windows"]
+
+
+def test_qwen2_config_disables_its_declared_window():
+    """Qwen2 declares a sliding_window and then disables it.
+
+    ``Qwen2Config.__init__`` does ``self.sliding_window = sliding_window if
+    use_sliding_window else None``, and Qwen2.5-7B-Instruct ships
+    ``use_sliding_window: false``. So the runners' banded-attention warning —
+    which fires on a truthy ``config.sliding_window`` — stays correctly quiet on
+    Qwen, and would be a false alarm if this ever changed. Mistral v0.1, by
+    contrast, means its 4096 and the warning there is real.
+    """
+    from transformers import Qwen2Config
+
+    assert Qwen2Config(use_sliding_window=False, sliding_window=4096).sliding_window is None
+    assert Qwen2Config(use_sliding_window=True, sliding_window=4096).sliding_window == 4096
+
+
+@pytest.mark.parametrize("backend", ["eager", "flash"])
+def test_qwen2_query_scoring_includes_the_qkv_bias(backend):
+    """Qwen2 puts a bias on q_proj; Llama and Mistral do not.
+
+    The flash hook recomputes its own query, so it must obtain it by CALLING
+    ``q_proj`` (or reading that call's output) rather than by multiplying its
+    weight. A weight-only matmul drops the bias and scores a query the model
+    never used — eviction then ranks on subtly wrong attention, with nothing
+    raising. Fails if the bias is ever dropped: with a large bias the scored
+    query, and so the surviving window set, must change.
+    """
+    model, cfg = _tiny_model("qwen2")
+    assert model.model.layers[0].self_attn.q_proj.bias is not None, (
+        "Qwen2 is expected to carry a q_proj bias — this test is pointless without it"
+    )
+
+    Cache, Config, install = _backend(backend)
+    cache_cfg = Config(window_size=WS, num_sink_tokens=SINK,
+                       local_window_size=LOCAL, cache_budget=0.4, quant_ratio=0.0)
+
+    def survivors(model):
+        cache = Cache(config=cache_cfg, prefill_len=PREFILL, model_config=cfg,
+                      kv_dtype=torch.float32, rope_module=_find_rope(model),
+                      num_layers=cfg.num_hidden_layers, max_tokens=GEN)
+        hooks = install(model, cache, cache_cfg)
+        gen_kwargs = dict(max_new_tokens=GEN, do_sample=False, num_beams=1,
+                          past_key_values=cache, pad_token_id=0)
+        if backend == "eager":
+            gen_kwargs["output_attentions"] = True
+        torch.manual_seed(1)
+        ids = torch.randint(0, 256, (1, PREFILL))
+        with torch.no_grad():
+            model.generate(ids, **gen_kwargs)
+        hooks.remove()
+        return cache._states[0].position_ids[0].tolist()
+
+    before = survivors(model)
+    with torch.no_grad():
+        for layer in model.model.layers:
+            layer.self_attn.q_proj.bias.add_(50.0)
+    after = survivors(model)
+    assert before != after, (
+        "perturbing the q_proj bias did not change which tokens survived — the "
+        "scored query is being computed without the bias"
+    )
 
 
 @pytest.mark.parametrize("arch", ARCHITECTURES)

@@ -59,6 +59,15 @@ def _first_row(input_ids: Any) -> list:
     return [int(x) for x in seq[:2]]
 
 
+def tokenizer_has_bos(tokenizer: Any) -> bool:
+    """Whether this tokenizer has a BOS token at all.
+
+    Qwen2/Qwen2.5 do not: the prompt opens with ``<|im_start|>``, an ordinary
+    token, and ``bos_token`` is ``None``. Llama-3 and Mistral both do.
+    """
+    return bool(getattr(tokenizer, "bos_token", None))
+
+
 def prompt_carries_bos(tokenizer: Any, prompt: str) -> bool:
     """Whether *prompt* already opens with the tokenizer's BOS token."""
     bos = getattr(tokenizer, "bos_token", None)
@@ -71,6 +80,29 @@ def encode_prompt(tokenizer: Any, prompt: str, **kwargs: Any):
     A drop-in replacement for ``tokenizer(prompt, **kwargs)`` at any call site
     whose input may or may not have come out of ``apply_chat_template``.
 
+    The rule is ``add_special_tokens = the tokenizer has a BOS AND the prompt
+    does not already start with it``, which covers all four cases:
+
+    ========================  ================  ==================================
+    tokenizer / prompt        add_special       why
+    ========================  ================  ==================================
+    Llama/Mistral, templated  False             the template emitted the BOS
+    Llama/Mistral, raw         True             few-shot prompt; tokenizer supplies it
+    Qwen2, templated          False             no BOS exists to add or duplicate
+    Qwen2, raw                False             ditto
+    ========================  ================  ==================================
+
+    The ``has BOS`` conjunct is what makes the Qwen rows False, and that is not
+    cosmetic: it is what kvpress (and therefore DefensiveKV) does. It encodes
+    with ``add_special_tokens=False`` unconditionally and prepends ``bos_token``
+    by hand only when there is no chat template — which for a tokenizer with no
+    BOS prepends nothing. Deciding False here rather than relying on "a Qwen
+    tokenizer probably adds nothing anyway" removes the assumption instead of
+    betting on it, which is the same mistake that produced the doubled BOS.
+
+    Llama and Mistral are unaffected — for them ``has BOS`` is True, so the rule
+    reduces to the previous one exactly.
+
     ``kwargs`` are forwarded verbatim (``return_tensors``, ``truncation``, …).
     Passing ``add_special_tokens`` explicitly overrides the decision, so a caller
     that genuinely knows better still can.
@@ -81,7 +113,9 @@ def encode_prompt(tokenizer: Any, prompt: str, **kwargs: Any):
     which is exactly how it lasted this long.
     """
     if "add_special_tokens" not in kwargs:
-        kwargs["add_special_tokens"] = not prompt_carries_bos(tokenizer, prompt)
+        kwargs["add_special_tokens"] = (
+            tokenizer_has_bos(tokenizer) and not prompt_carries_bos(tokenizer, prompt)
+        )
 
     encoded = tokenizer(prompt, **kwargs)
 
