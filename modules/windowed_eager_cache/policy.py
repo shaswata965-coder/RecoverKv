@@ -16,12 +16,27 @@ if TYPE_CHECKING:
     from .config import ResolvedConfig
 
 
-#: Decode step of the **first** eviction, INDEPENDENT of ``window_size``. The
-#: first compaction always fires this many steps into decode, so a window-size
-#: sweep shares one first-eviction point instead of first evicting at a
-#: ws-dependent step (which confounds the comparison). 8 is the reference window
-#: the experiments are calibrated against. See :meth:`EvictionPolicy.should_evict`.
-FIRST_EVICTION_STEP = 8
+#: Decode step of the **first** eviction, INDEPENDENT of ``window_size``.
+#:
+#: **0 = compress the prompt at the earliest moment the design allows.** Prefill
+#: itself cannot evict — the score hook is a ``forward_hook`` that runs *after*
+#: the attention module, so during the prefill ``update()`` no scores exist yet.
+#: The prefill scores first become readable on decode step 0's ``update()``, and
+#: that is where the first compaction fires: the prompt is cut to budget before
+#: the step-0 query attends, so every token from the first decode step onward is
+#: generated against the compressed cache. That is the operating point the
+#: prompt-compression baselines (SnapKV / AdaKV / DefensiveKV) are measured at,
+#: which is what makes the comparison a comparison.
+#:
+#: A positive value delays the first compaction by that many decode steps and is
+#: kept as a knob for ablations (and for reproducing the earlier step-8 result
+#: set). It is *not* free: with ``first_eviction_step = N`` the prompt stays whole
+#: through decode steps ``0 … N-1``, so any answer that finishes inside that
+#: window is scored at FULL cache no matter what ``cache_budget`` says — which
+#: silently turns short-answer datasets budget-invariant.
+#:
+#: See :meth:`EvictionPolicy.should_evict`.
+FIRST_EVICTION_STEP = 0
 
 
 class EvictionPolicy:
@@ -48,9 +63,10 @@ class EvictionPolicy:
         # At q=0, T_q == 0, so this is exactly the fp-only token count.
         self.total_tokens: int = 0
         # Decode step of the first eviction — the config knob (default
-        # FIRST_EVICTION_STEP), carried through ResolvedConfig. An instance
-        # attribute so tests can also isolate eviction *mechanics* from this
-        # *timing* policy (e.g. set 0 to fire from the first decode step).
+        # FIRST_EVICTION_STEP = 0, i.e. compress the prompt before the step-0
+        # query attends), carried through ResolvedConfig. An instance attribute
+        # so ablations (and tests isolating eviction *mechanics* from this
+        # *timing* policy) can delay it without rebuilding the config.
         self.first_eviction_step: int = resolved.first_eviction_step
 
     # -----------------------------------------------------------------
@@ -76,32 +92,34 @@ class EvictionPolicy:
     def should_evict(self, step: int) -> bool:
         """Return ``True`` if eviction should run at decode *step*.
 
-        The **first** eviction fires at a fixed ``first_eviction_step`` (default
-        :data:`FIRST_EVICTION_STEP` = 8), **independent of ``window_size``** — so a
-        window-size sweep shares one first-compaction point instead of first
-        evicting at a ws-dependent step. Nothing evicts before it: the prompt stays
-        whole until then, and the prefill scores it is compressed against are
-        already available (the score hook is a ``forward_hook`` that runs after the
-        attention module, so the prefill scores land in ``cache_kwargs`` from the
-        first decode step). After the first eviction, the natural window cadence
-        resumes — every step where ``step % window_size == 0``, aligned to absolute
-        step 0. So:
+        The **first** eviction fires at a fixed ``first_eviction_step``,
+        **independent of ``window_size``**, so a window-size sweep shares one
+        first-compaction point instead of first evicting at a ws-dependent step
+        (which would confound the comparison). After it, the natural window
+        cadence resumes — every step where ``step % window_size == 0``, aligned to
+        absolute step 0.
 
-        * ``ws == 12`` → ``8`` (forced), ``12``, ``24``, ``36`` … — the first slide
-          after the forced eviction is a short ``8 → 12`` gap, then full windows.
-        * ``ws == 8`` → a uniform ``8``, ``16``, ``24`` …
-        * ``ws >= 9`` → ``8`` then multiples of ``ws`` (short first window, full
-          windows after).
+        **At the default** :data:`FIRST_EVICTION_STEP` **= 0** the two rules
+        coincide and the schedule is simply ``0, ws, 2*ws, …`` for every
+        ``window_size``: the prompt is compressed on the first decode step, before
+        that step's query attends, and every generated token from then on is
+        produced against the budgeted cache. Prefill itself cannot evict — the
+        score hook runs *after* the attention module, so no scores exist during
+        the prefill ``update()``; step 0 is the earliest point at which the
+        prefill scores are readable, and is where they are consumed.
 
-        Edge cases ``window_size`` 1–7 (smaller than the fixed offset) are handled
-        gracefully: the natural boundaries below step 8 are suppressed, the first
-        eviction still fires at 8, and the cadence resumes at the next multiple —
-        ``ws == 4`` → ``8, 12, 16`` …; ``ws == 3`` → ``8, 9, 12`` …; ``ws == 1`` →
-        ``8, 9, 10`` … . Nothing before ``first_eviction_step`` ever evicts.
+        With a **positive** ``first_eviction_step = N`` nothing evicts before step
+        ``N`` (the prompt stays whole through steps ``0 … N-1``), then:
 
-        Setting ``first_eviction_step`` to 0 reproduces the "fire from step 0"
-        schedule (step 0 plus every ``window_size``-th step) — used by the batching
-        tests to exercise eviction on short generations.
+        * ``ws == 8``, ``N == 8`` → a uniform ``8, 16, 24`` …
+        * ``ws == 12``, ``N == 8`` → ``8`` (forced), ``12``, ``24`` … — a short
+          ``8 → 12`` gap, then full windows.
+        * ``ws < N`` suppresses the natural boundaries below ``N`` and resumes at
+          the next multiple: ``ws == 3``, ``N == 8`` → ``8, 9, 12`` … .
+
+        Ablations aside, a positive value means every answer that terminates
+        within ``N`` decode steps is scored at full cache regardless of
+        ``cache_budget`` — see :data:`FIRST_EVICTION_STEP`.
         """
         if step < self.first_eviction_step:
             return False

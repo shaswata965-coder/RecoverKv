@@ -473,8 +473,9 @@ class TestFactory:
 
 
 class TestEvictionSchedule:
-    """First eviction at a fixed step (default 8), independent of window_size,
-    then the natural window cadence; configurable via WindowedCacheConfig."""
+    """First eviction at a fixed step (default 0 — the prompt is compressed
+    before the step-0 query attends), independent of window_size, then the
+    natural window cadence; configurable via WindowedCacheConfig."""
 
     @staticmethod
     def _fired(ws, upto, first=None):
@@ -483,13 +484,23 @@ class TestEvictionSchedule:
             pol.first_eviction_step = first
         return [s for s in range(upto) if pol.should_evict(s)]
 
-    def test_first_eviction_step_8_then_ws_cadence(self):
-        assert self._fired(12, upto=40) == [8, 12, 24, 36]
-        assert self._fired(8, upto=40) == [8, 16, 24, 32]
+    def test_default_is_step_0_then_ws_cadence(self):
+        assert self._fired(12, upto=40) == [0, 12, 24, 36]
+        assert self._fired(8, upto=40) == [0, 8, 16, 24, 32]
+
+    def test_delayed_first_step_then_ws_cadence(self):
+        assert self._fired(12, upto=40, first=8) == [8, 12, 24, 36]
+        assert self._fired(8, upto=40, first=8) == [8, 16, 24, 32]
 
     @pytest.mark.parametrize("ws,expected", [(1, [8, 9, 10]), (3, [8, 9, 12]), (4, [8, 12, 16])])
     def test_small_window_edge_cases(self, ws, expected):
-        assert self._fired(ws, upto=expected[-1] + 1) == expected
+        assert self._fired(ws, upto=expected[-1] + 1, first=8) == expected
+
+    def test_default_flows_from_config_to_policy(self):
+        cfg = _make_config()
+        assert cfg.first_eviction_step == 0
+        resolved = cfg.resolve(100, _FakeModelConfig(), torch.float16, max_tokens=128)
+        assert EvictionPolicy(resolved).first_eviction_step == 0
 
     def test_config_knob_flows_to_policy(self):
         cfg = _make_config(first_eviction_step=5)

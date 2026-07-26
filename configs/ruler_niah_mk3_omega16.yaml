@@ -5,7 +5,7 @@
 # (ruler.capture_memory) so retained-bytes / compression-ratio can be read
 # off directly, alongside the task's accuracy score.
 # quant_ratio=0.0 -> pure fp16 windowed cache (Q tier disabled). Set > 0.0
-# to sweep in the two-tier int4 split (needs an even window_size, which 16 is).
+# to sweep in the two-tier int2 split (needs window_size % 4 == 0, which 16 is).
 # Produces: outputs/ruler/4096_niah_mk3_omega16/
 _base_: base.yaml
 
@@ -28,7 +28,7 @@ cache:
   local_window_size: 128                    # fixed tokens
   quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16
   rerotate_on_evict: false
-  first_eviction_step: 8
+  first_eviction_step: 0                    # compress the prompt before the 2nd token (default)
 
 window:
   window_size: 16

@@ -26,6 +26,24 @@ class ConfigValidationError(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Shared defaults
+# ---------------------------------------------------------------------------
+
+#: Decode step of the first eviction, for every YAML-driven runner.
+#:
+#: Mirrors ``modules.windowed_cache.policy.FIRST_EVICTION_STEP``; re-declared here
+#: rather than imported so that ``utils.config`` stays free of the cache packages
+#: (importing those pulls in the flash-attn hooks). ``tests/test_utils.py`` pins
+#: the two together so they cannot drift.
+#:
+#: Runners use it as the ``getattr(cfg.cache, ..., FIRST_EVICTION_STEP_DEFAULT)``
+#: fallback. A literal there is how this knob went inert in LongBench once
+#: already: the fallback silently disagreed with the config default, so a run
+#: could be at a different operating point than the YAML said.
+FIRST_EVICTION_STEP_DEFAULT = 0
+
+
+# ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
 
@@ -49,7 +67,12 @@ class CacheConfig:
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
-    first_eviction_step: int = 8  # decode step of the FIRST eviction, independent of window_size
+    # Decode step of the FIRST eviction, independent of window_size. 0 (default)
+    # compresses the prompt on decode step 0 — before that step's query attends —
+    # so every generated token comes from the budgeted cache. A positive value
+    # delays it and leaves any answer finishing inside that window measured at
+    # FULL cache whatever cache_budget says. See modules/windowed_cache/policy.py.
+    first_eviction_step: int = FIRST_EVICTION_STEP_DEFAULT
     # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
     # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
     # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.

@@ -25,6 +25,7 @@ from data.longbench_loader import (
     LONGBENCH_EN_DATASETS,
     load_longbench_dataset,
 )
+from utils.config import FIRST_EVICTION_STEP_DEFAULT
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
 from utils.logger import get_logger
@@ -467,7 +468,7 @@ class LongBenchRunner:
             # to 0 compresses the prompt before the second decode token, which
             # is the operating point the prompt-compression baselines
             # (SnapKV/AdaKV/DefensiveKV) are measured at.
-            first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8),
+            first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
         # Get RoPE module
@@ -628,7 +629,7 @@ class LongBenchRunner:
             "window_size": cfg.cache.window_size,
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
-            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", 8),
+            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

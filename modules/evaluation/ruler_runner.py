@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from data.ruler_loader import RULER_TASKS, load_ruler_dataset
+from utils.config import FIRST_EVICTION_STEP_DEFAULT
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
 
@@ -400,7 +401,7 @@ class RulerRunner:
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
-            first_eviction_step=getattr(cfg.cache, "first_eviction_step", 8),
+            first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
         rope = None
@@ -543,7 +544,7 @@ class RulerRunner:
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
             "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
-            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", 8),
+            "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,
