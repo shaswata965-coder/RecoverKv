@@ -7,6 +7,7 @@ Usage in Kaggle notebook cells:
     !python scripts/kaggle_entry.py --suite parity_base
     !python scripts/kaggle_entry.py --suite parity_ours
     !python scripts/kaggle_entry.py --suite faithfulness
+    !python scripts/kaggle_entry.py --suite qevict_observations
     !python scripts/kaggle_entry.py --suite perf
     !python scripts/kaggle_entry.py --suite visualize
 """
@@ -22,6 +23,7 @@ _SUITE_TO_CONFIG = {
     "parity_ours_eager": "configs/eval_parity_ours_eager.yaml",
     "parity_ours_flash": "configs/eval_parity_ours_flash.yaml",
     "faithfulness": "configs/eval_faithfulness.yaml",
+    "qevict_observations": "configs/eval_qevict.yaml",
     "perf": "configs/eval_perf.yaml",
     "visualize": "configs/eval_visualize.yaml",
     "longbench_full": "configs/longbench_full_cache.yaml",

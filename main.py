@@ -22,6 +22,8 @@ _RUNNER_REGISTRY: dict[str, str] = {
     "parity_base": "modules.evaluation.base_parity_runner.BaseParityRunner",
     "parity_ours": "modules.evaluation.ours_parity_runner.OursParityRunner",
     "faithfulness": "modules.evaluation.faithfulness_runner.FaithfulnessRunner",
+    "qevict_observations": (
+        "modules.evaluation.qevict_observations.QEvictObservationRunner"),
     "perf": "modules.evaluation.perf_runner.PerfRunner",
     "longbench": "modules.evaluation.longbench_runner.LongBenchRunner",
     "longbench_score": "modules.evaluation.longbench_scoring.LongBenchScorer",
