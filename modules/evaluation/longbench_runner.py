@@ -26,6 +26,7 @@ from data.longbench_loader import (
     load_longbench_dataset,
 )
 from utils.config import FIRST_EVICTION_STEP_DEFAULT
+from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
 from utils.logger import get_logger
@@ -195,6 +196,7 @@ class LongBenchRunner:
 
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
+        self._warn_if_chat_gate_looks_wrong()
 
         datasets = getattr(self.lb, "datasets", LONGBENCH_EN_DATASETS)
         if isinstance(datasets, str):
@@ -373,9 +375,23 @@ class LongBenchRunner:
                     f"<|start_header_id|>assistant<|end_header_id|>\n\n"
                 )
 
-        # 4. Tokenize final prompt
-        inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
+        # 4. Tokenize final prompt.
+        #    encode_prompt, not tokenizer(): apply_chat_template returns a string
+        #    that ALREADY carries <|begin_of_text|>, and tokenizer()'s
+        #    add_special_tokens default would prepend a second one — shifting
+        #    every position and spending a protected sink slot on a duplicate
+        #    BOS. It decides per prompt, so the few-shot datasets that skip the
+        #    template (NO_CHAT_TEMPLATE_DATASETS) still get their BOS from the
+        #    tokenizer. THUDM/LongBench and DefensiveKV tokenize the templated
+        #    string without re-adding specials; this matches them.
+        inputs = encode_prompt(tokenizer, prompt, truncation=False,
+                               return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
+        # Pass the mask explicitly: pad_token == eos_token on Llama, so
+        # transformers cannot infer it and warns on every example. All-ones at
+        # batch size 1, so the result is unchanged — but leaving it implicit
+        # buries real warnings under thousands of spurious ones.
+        attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
         # Guard: a prompt longer than the model's positional range yields
@@ -396,6 +412,7 @@ class LongBenchRunner:
         # 6. Generate
         try:
             gen_kwargs = {
+                "attention_mask": attention_mask,
                 "max_new_tokens": max_gen_len,
                 "num_beams": 1,
                 "do_sample": False,
@@ -545,10 +562,55 @@ class LongBenchRunner:
         few-shot ICL datasets (NO_CHAT_TEMPLATE_DATASETS) must stay raw so the
         model continues the worked-example format instead of switching into
         chat-assistant mode. Matches THUDM/LongBench + DefensiveKV.
+
+        The instruct/chat test is on the model *name*, which is how THUDM does
+        it — but see :meth:`_warn_if_chat_gate_looks_wrong`: a local checkpoint
+        directory whose name does not happen to contain "instruct" or "chat"
+        silently loses the template on all 10 templated datasets.
         """
         name = model_name.lower()
         is_chat_model = "instruct" in name or "chat" in name
         return is_chat_model and dataset_name not in cls.NO_CHAT_TEMPLATE_DATASETS
+
+    def _warn_if_chat_gate_looks_wrong(self) -> None:
+        """Flag a model-name heuristic that disagrees with the tokenizer.
+
+        ``_should_apply_chat_template`` decides from the *name*, so pointing
+        ``model.name`` at a local directory — ``/scratch/ckpt/final``,
+        ``llama31_8b_it`` — turns the template off for every dataset without a
+        word of complaint. Every prompt then goes in raw, an instruct model is
+        queried out of distribution, and the scores are wrong in a way that
+        looks like a method result.
+
+        The tokenizer knows the truth (a base model carries no chat template),
+        so cross-check the two and say so when they disagree. This warns rather
+        than overrides: the name heuristic is what the reference implementations
+        use, and silently diverging from them would be its own problem.
+        """
+        tok = self.tokenizer
+        if tok is None:
+            return
+        name = self.config.model.name
+        name_says_chat = "instruct" in name.lower() or "chat" in name.lower()
+        has_template = getattr(tok, "chat_template", None) is not None
+        if has_template and not name_says_chat:
+            log.warning(
+                "model.name=%r contains neither 'instruct' nor 'chat', so the "
+                "chat template is DISABLED for every dataset — but this "
+                "tokenizer HAS a chat template. If this is an instruct model "
+                "under a local path, rename the path (or symlink it) to include "
+                "'instruct'; otherwise the 10 templated datasets are being run "
+                "with raw prompts and their scores are not comparable.",
+                name,
+            )
+        elif name_says_chat and not has_template:
+            log.warning(
+                "model.name=%r looks like an instruct model, so the chat "
+                "template is enabled — but this tokenizer has none, so "
+                "apply_chat_template will fall back to the hard-coded Llama-3 "
+                "template. Check that is the right format for this model.",
+                name,
+            )
 
     @staticmethod
     def _post_process(pred: str, dataset_name: str) -> str:
