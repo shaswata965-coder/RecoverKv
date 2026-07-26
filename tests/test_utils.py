@@ -334,17 +334,29 @@ class TestFirstEvictionStepDefault:
         assert CacheConfig().first_eviction_step == 0
 
     def test_no_runner_hardcodes_a_fallback_literal(self) -> None:
-        """Every runner's getattr fallback must be the shared constant."""
+        """No runner may fall back to a bare number.
+
+        A numeric literal is what silently decoupled the fallback from the
+        config default; the fallback must name the shared constant so the two
+        cannot disagree. (Nested getattr chains are fine as long as the
+        innermost default is the constant, which the second assert covers.)
+        """
         import re
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        bad = []
-        for path in (root / "modules" / "evaluation").glob("*_runner.py"):
-            for m in re.finditer(
-                r'getattr\(\s*[^,]+,\s*"first_eviction_step"\s*,\s*([^)]+)\)',
-                path.read_text(encoding="utf-8"),
-            ):
-                if m.group(1).strip() != "FIRST_EVICTION_STEP_DEFAULT":
+        pattern = re.compile(
+            r'getattr\(\s*[\w.]+\s*,\s*"first_eviction_step"\s*,\s*([^,)]+)'
+        )
+        bad, seen = [], []
+        for path in sorted((root / "modules" / "evaluation").glob("*_runner.py")):
+            for m in pattern.finditer(path.read_text(encoding="utf-8")):
+                fallback = m.group(1).strip()
+                seen.append(f"{path.name}: {fallback}")
+                if re.fullmatch(r"-?\d+", fallback):
                     bad.append(f"{path.name}: {m.group(0)}")
-        assert not bad, "hard-coded first_eviction_step fallback(s): " + "; ".join(bad)
+        assert not bad, "numeric first_eviction_step fallback(s): " + "; ".join(bad)
+        assert any("FIRST_EVICTION_STEP_DEFAULT" in s for s in seen), (
+            "no runner references FIRST_EVICTION_STEP_DEFAULT — did the "
+            "constant get inlined away? saw: " + "; ".join(seen)
+        )

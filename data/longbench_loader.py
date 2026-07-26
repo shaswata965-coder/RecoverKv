@@ -19,6 +19,8 @@ Each example has a fixed schema across all 16 datasets::
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import List, Optional
 
 from utils.logger import get_logger
@@ -82,8 +84,22 @@ TASK_CATEGORIES = {
 }
 
 
-LONGBENCH_LOCAL_DIR: str = (
-    "/home/ee/visitor/man_misn.visitor/kv_cache/LongBenchDataset"
+#: Where to look for ``<dataset>.jsonl`` before falling back to HuggingFace.
+#:
+#: Override with ``LONGBENCH_LOCAL_DIR=/path/to/jsonls`` (or ``data_dir=`` at the
+#: call site). The default is repo-relative so a fresh clone has somewhere to put
+#: the files; the previous default was one machine's absolute HPC path, which
+#: silently never matched anywhere else and sent every run to the HuggingFace
+#: path instead.
+#:
+#: The local route is not just a convenience. ``THUDM/LongBench`` is a *script*
+#: dataset, and ``datasets >= 3`` refuses to execute dataset scripts at all
+#: ("Dataset scripts are no longer supported"), so on a modern install the
+#: HuggingFace fallback cannot work. Either pin ``datasets < 3`` (see
+#: environment.yml) or stage the JSONLs here.
+LONGBENCH_LOCAL_DIR: str = os.environ.get(
+    "LONGBENCH_LOCAL_DIR",
+    str(Path(__file__).resolve().parent / "longbench"),
 )
 
 
@@ -125,16 +141,31 @@ def load_longbench_dataset(
 
     config_name = f"{dataset_name}_e" if use_e_variant else dataset_name
     log.info(
-        "Local file not found; loading LongBench dataset from HuggingFace: %s (config=%s)",
-        dataset_name,
-        config_name,
+        "Local file not found at %s; loading LongBench dataset from HuggingFace: "
+        "%s (config=%s)", local_path, dataset_name, config_name,
     )
-    ds = load_dataset(
-        "THUDM/LongBench",
-        config_name,
-        split="test",
-        streaming=streaming,
-    )
+    try:
+        ds = load_dataset(
+            "THUDM/LongBench",
+            config_name,
+            split="test",
+            streaming=streaming,
+        )
+    except RuntimeError as exc:
+        if "script" not in str(exc).lower():
+            raise
+        # datasets >= 3 refuses to execute dataset scripts, and THUDM/LongBench
+        # is one. Say what to do instead of letting the raw message strand a
+        # reproduction attempt on the paper's main benchmark.
+        raise RuntimeError(
+            f"Cannot load THUDM/LongBench with this `datasets` version: {exc}\n"
+            f"THUDM/LongBench is a script dataset and `datasets >= 3` no longer "
+            f"runs dataset scripts. Either:\n"
+            f"  * pip install 'datasets<3'  (what environment.yml pins), or\n"
+            f"  * stage the per-dataset JSONLs and point at them:\n"
+            f"      LONGBENCH_LOCAL_DIR=/path/to/jsonls  (looked for "
+            f"{dataset_name}.jsonl; tried {local_path})"
+        ) from exc
     return ds
 
 

@@ -813,3 +813,51 @@ class TestFirstEvictionStepPlumbing:
         assert metas, f"no sidecar written into {tmp_path}"
         meta = json.loads(metas[0].read_text())
         assert meta["first_eviction_step"] == 0
+
+    def test_quant_memoize_read_reaches_the_cache_config(self):
+        """Same omission class as first_eviction_step, and just as silent.
+
+        LongBench runs one example at a time, so the auto rule (memo on at
+        B == 1) makes an ignored `False` look exactly like an honoured one.
+        """
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.cache.quant_memoize_read = False
+        cfg.model.attn_implementation = "eager"
+
+        runner = LongBenchRunner(cfg)
+        captured = {}
+        runner.WindowedCacheConfig = lambda **kw: (captured.update(kw), MagicMock())[1]
+        runner.WindowedCache = MagicMock(return_value=MagicMock())
+        runner.install_score_hooks = MagicMock(return_value=MagicMock())
+        model = MagicMock()
+        model.named_modules.return_value = [("model.rotary_emb", MagicMock())]
+        model.config.num_hidden_layers = 2
+        runner.model = model
+        runner._setup_windowed_cache(torch.zeros(1, 128, dtype=torch.long), 32)
+
+        assert captured["quant_memoize_read"] is False
+
+    def test_sidecar_records_the_tier_split(self, tmp_path):
+        """quant_ratio IS the method here — a sidecar without it is unattributable."""
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        cfg = _StubConfig()
+        cfg.cache.backend = "windowed"
+        cfg.cache.backend_package = "eager"
+        cfg.cache.cache_budget = 0.20
+        cfg.cache.quant_ratio = 0.5
+        cfg.model.attn_implementation = "eager"
+
+        runner = LongBenchRunner(cfg)
+        with patch.object(LongBenchRunner, "_get_tokenizer_sha", return_value="deadbeef"):
+            runner._write_meta(
+                dataset_name="narrativeqa", num_examples=1, max_gen_len=32,
+                run_start=0.0, run_end=1.0, eps=1.0, output_dir=tmp_path,
+            )
+
+        meta = json.loads(next(tmp_path.glob("*.meta.json")).read_text())
+        assert meta["quant_ratio"] == 0.5
+        assert "quant_memoize_read" in meta

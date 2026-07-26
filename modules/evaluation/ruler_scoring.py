@@ -83,6 +83,14 @@ def score_predictions(
 
     for jsonl in sorted(predictions_dir.glob("*.jsonl")):
         task = jsonl.stem
+        # RulerRunner writes its byte-accounting probe to `<task>.memory.jsonl`
+        # in this same directory. A bare *.jsonl glob picks it up, calls it the
+        # task "<task>.memory", finds no `pred` on any row, and reports every
+        # one as a null prediction — a row of "N/N examples had pred=null
+        # (OOM/budget-too-small)" warnings that read exactly like a real
+        # failure. Skip non-prediction sidecars up front.
+        if task.endswith(".memory") or jsonl.name.endswith(".memory_summary.json"):
+            continue
         preds: List[str] = []
         refs: List[List[str]] = []
         n_total = 0
