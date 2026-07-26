@@ -549,6 +549,9 @@ class TestChatTemplateGating:
     Wrapping trec/triviaqa/samsum/lsht/lcc/repobench-p in a chat turn flips an
     instruct model into chat-assistant mode (meta-preambles), which tanks
     exact-/edit-match scores. Matches THUDM/LongBench pred.py + DefensiveKV.
+
+    Everything else is decided by the tokenizer's own chat template, never by
+    the model NAME — see _should_apply_chat_template.
     """
 
     FEW_SHOT = ["trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"]
@@ -558,27 +561,44 @@ class TestChatTemplateGating:
         "passage_retrieval_en",
     ]
 
+    @staticmethod
+    def _tok(chat_template):
+        import types
+        return types.SimpleNamespace(chat_template=chat_template)
+
     def test_few_shot_datasets_skip_chat_template(self):
         from modules.evaluation.longbench_runner import LongBenchRunner
         for ds in self.FEW_SHOT:
             assert not LongBenchRunner._should_apply_chat_template(
-                "meta-llama/Meta-Llama-3-8B-Instruct", ds
+                self._tok("{{ messages }}"), ds
             ), f"{ds} must NOT be chat-wrapped (few-shot ICL)"
 
     def test_other_datasets_get_chat_template(self):
         from modules.evaluation.longbench_runner import LongBenchRunner
         for ds in self.CHAT_WRAPPED:
             assert LongBenchRunner._should_apply_chat_template(
-                "meta-llama/Meta-Llama-3-8B-Instruct", ds
+                self._tok("{{ messages }}"), ds
             ), f"{ds} should be chat-wrapped"
 
     def test_base_model_never_wrapped(self):
         from modules.evaluation.longbench_runner import LongBenchRunner
-        # Non-instruct model: never apply chat template, regardless of dataset.
+        # No chat template on the tokenizer => base model => never wrapped.
         for ds in self.FEW_SHOT + self.CHAT_WRAPPED:
             assert not LongBenchRunner._should_apply_chat_template(
-                "meta-llama/Meta-Llama-3-8B", ds
+                self._tok(None), ds
             )
+
+    def test_gate_ignores_model_name(self):
+        """Regression: an instruct checkout whose directory name says nothing.
+
+        `/home/.../mistral-7b-v0.2` contains neither "instruct" nor "chat", so
+        the old name-substring gate silently prompted Mistral-7B-Instruct as a
+        base LM. The tokenizer carries the template, so the tokenizer decides.
+        """
+        from modules.evaluation.longbench_runner import LongBenchRunner
+        assert LongBenchRunner._should_apply_chat_template(
+            self._tok("{{ messages }}"), "gov_report"
+        )
 
     def test_exclusion_set_matches_official(self):
         from modules.evaluation.longbench_runner import LongBenchRunner

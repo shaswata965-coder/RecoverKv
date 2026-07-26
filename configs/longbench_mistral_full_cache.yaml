@@ -1,0 +1,67 @@
+# ============================================================================
+# LongBench — Mistral-7B-Instruct-v0.2, Full Cache Baseline
+# ============================================================================
+# The reference this branch's compressed Mistral runs are scored against.
+# Run this FIRST: a compressed number is only interpretable next to the
+# full-cache number from the identical protocol.
+# Produces: outputs/longbench/mistral_full_cache/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  # v0.2 specifically. v0.1 sets sliding_window=4096, which bands attention by
+  # cache-SLOT distance once the windowed cache compacts — not comparable.
+  # v0.2/v0.3 set sliding_window=null. A local checkout path works equally well:
+  # the chat template is now detected from the tokenizer, never from this string.
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                      # transformers.DynamicCache, no eviction
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  # The published model2maxlen value for mistral-7B-instruct-v0.2 in the
+  # THUDM/LongBench -> SnapKV -> AdaKV lineage. Reproduces those numbers
+  # verbatim and leaves headroom inside the 32768 window for the longest
+  # generation (gov_report/qmsum/multi_news at 512) plus the chat template:
+  # 31500 + 512 + ~7 = 32019.
+  #
+  # Do NOT inherit Llama-3.1's `null` here. On a 128K model null is a no-op; on
+  # this 32K model it means "auto-fit", which is safe but makes the truncation
+  # budget vary per dataset with max_gen_len — fine as a guard, wrong as a
+  # protocol you want to compare against published tables.
+  max_length: 31500
+  output_dir: outputs/longbench/mistral_full_cache
+  seed: 42
+  resume: false
+  skip_oom: true
+  aggressive_cache_clear: false

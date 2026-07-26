@@ -10,6 +10,7 @@ to the flash twin until the duplication is refactored away.
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -44,6 +45,10 @@ class WindowedCache(_HFCacheBase):
     (BATCHING_PLAN.md §3). Ragged / left-padded batches are not implemented, at
     either tier (BATCHING_PLAN.md §4 Phase 3).
 
+    Class-level flag, not per-instance: a LongBench run builds one cache per
+    example, and the missing-``cache_position`` condition is a property of the
+    model file, so warning once per process is the useful cardinality.
+
     Parameters
     ----------
     config : WindowedCacheConfig
@@ -62,6 +67,8 @@ class WindowedCache(_HFCacheBase):
     telemetry : Telemetry, optional
         Telemetry recorder.  Defaults to :class:`NullTelemetry`.
     """
+
+    _warned_no_cache_position: bool = False
 
     def __init__(
         self,
@@ -158,6 +165,10 @@ class WindowedCache(_HFCacheBase):
         ]
         self._generation_step: List[int] = [0] * num_layers
         self._prefill_done: List[bool] = [False] * num_layers
+        # Monotonic count of tokens ever appended, per layer. Never reset by
+        # eviction — it is the source of absolute positions when the attention
+        # module doesn't pass `cache_position` (see update()).
+        self._tokens_seen: List[int] = [0] * num_layers
         # Running counter of the next original-sequence window ID to assign
         # when new windows appear (post-eviction or as generation extends the cache).
         # Without this, the W_new > W_old branch would emit compact-space indices
@@ -250,14 +261,51 @@ class WindowedCache(_HFCacheBase):
 
         self._resolve_memoization(key_states.shape[0])
 
-        # Extract position_ids from cache_kwargs if provided
+        n_new = key_states.shape[2]
+
+        # Absolute positions for the incoming tokens.
+        #
+        # HF normally hands them over as cache_kwargs["cache_position"], but that
+        # is a per-model-file convention, not part of the Cache contract, and it
+        # is NOT universal: MistralFlashAttention2 (transformers 4.47.1) builds
+        # `cache_kwargs = {"sin": sin, "cos": cos}` and drops cache_position,
+        # while Mistral's eager/sdpa paths and every Llama path include it.
+        #
+        # Falling through to CacheState.append(pos=None) is silently wrong here:
+        # it auto-increments from the CURRENT length, which is the compacted
+        # length after an eviction. Positions are not decoration — window
+        # identity is `(position - num_sink) // window_size` (see _evict_two_tier)
+        # and surviving keys keep their original RoPE — so once the cache
+        # compacts, every later token is filed thousands of positions early, its
+        # window id collides with a survivor's, and eviction starts discarding by
+        # a scrambled grouping. The damage grows with decode length, so the
+        # long-generation datasets (gov_report, qmsum, multi_news at 512 tokens)
+        # lose the most.
+        #
+        # So derive them from our own monotonic token count instead of trusting
+        # the caller. Identical to cache_position whenever HF does supply it.
         pos = None
-        if cache_kwargs is not None and "cache_position" in cache_kwargs:
-            pos = cache_kwargs["cache_position"]
+        if cache_kwargs is not None:
+            pos = cache_kwargs.get("cache_position")
+        if pos is None:
+            seen = self._tokens_seen[layer_idx]
+            pos = torch.arange(
+                seen, seen + n_new, device=key_states.device, dtype=torch.long
+            )
+            if not WindowedCache._warned_no_cache_position:
+                WindowedCache._warned_no_cache_position = True
+                warnings.warn(
+                    "Attention module did not pass `cache_position` to "
+                    "Cache.update() (known: MistralFlashAttention2 on "
+                    "transformers 4.47.1). Deriving absolute positions from the "
+                    "cache's own token count instead.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        self._tokens_seen[layer_idx] += n_new
 
         # 1. Append
         state.append(key_states, value_states, pos)
-        n_new = key_states.shape[2]
         policy.extend_total_after_append(n_new)
 
         # Detect prefill vs generation

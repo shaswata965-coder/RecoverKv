@@ -1,0 +1,57 @@
+# ============================================================================
+# LongBench — Mistral-7B-Instruct-v0.2, Ours (eager backend, Kaggle-runnable)
+# ============================================================================
+# Windowed KV-cache with eager attention score extraction.
+# Use where flash-attn-2 isn't available (Kaggle T4/P100).
+# Produces: outputs/longbench/mistral_ours_eager_compression_0.8/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  # See longbench_mistral_full_cache.yaml for why v0.2 and not v0.1.
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  revision: main
+  dtype: float16
+  attn_implementation: eager                # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: eager                    # imports modules.windowed_eager_cache
+  cache_budget: 0.20
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 0.25
+  quant_ratio: 0.0                          # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                         # published mistral-7B-instruct-v0.2 budget; see the full-cache config
+  output_dir: outputs/longbench/mistral_ours_eager_compression_0.8
+  seed: 42
+  resume: true                              # essential on Kaggle (9-hour limit)
+  skip_oom: true
+  aggressive_cache_clear: true              # essential on Kaggle T4

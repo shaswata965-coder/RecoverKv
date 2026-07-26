@@ -1035,3 +1035,64 @@ class TestBatching:
         state.slice_and_keep(retain)
         assert state.position_ids[0].tolist() == [0, 2, 5]
         assert state.position_ids[1].tolist() == [101, 103, 104]
+
+
+# ---------------------------------------------------------------------------
+# Regression: attention modules that omit `cache_position`
+# ---------------------------------------------------------------------------
+
+class TestMissingCachePosition:
+    """Absolute positions must not depend on the caller passing cache_position.
+
+    `cache_kwargs["cache_position"]` is a per-model-file convention, not part of
+    the HF Cache contract. MistralFlashAttention2 (transformers 4.47.1) builds
+    `cache_kwargs = {"sin": sin, "cos": cos}` and omits it, while Mistral's
+    eager/sdpa paths and every Llama path include it.
+
+    Deriving positions from the current cache length instead is silently wrong
+    after the first eviction — the cache has compacted, so the next token is
+    filed thousands of positions early. Window identity is
+    `(position - num_sink) // window_size`, so the new token's window id then
+    collides with a survivor's and eviction ranks a scrambled grouping.
+    """
+
+    @staticmethod
+    def _drive(with_cache_position: bool, B=2, H_kv=2, D=8):
+        model_cfg = _FakeModelConfig()
+        cfg = WindowedCacheConfig(
+            window_size=1, num_sink_tokens=0, local_window_size=1,
+            cache_budget=0.375,
+        )
+        cache = WindowedCache(
+            config=cfg, prefill_len=8, model_config=model_cfg,
+            kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+            num_layers=1, max_tokens=0,
+        )
+        cache._policies[0].first_eviction_step = 0
+        scores = _divergent_scores(B, 4)
+
+        def kwargs(start, n, scores_i):
+            kw = {"window_scores": scores_i}
+            if with_cache_position:
+                kw["cache_position"] = torch.arange(start, start + n)
+            return kw
+
+        k = _make_pos_keys(B, H_kv, 8, D)
+        cache.update(k, k.clone(), 0, cache_kwargs=kwargs(0, 8, scores[0]))
+        for i, pos in enumerate((8, 9)):
+            k1 = _make_pos_keys(B, H_kv, 1, D, start=pos)
+            cache.update(k1, k1.clone(), 0, cache_kwargs=kwargs(pos, 1, scores[i + 1]))
+        return cache._states[0]
+
+    def test_positions_match_with_and_without_cache_position(self):
+        supplied = self._drive(with_cache_position=True)
+        omitted = self._drive(with_cache_position=False)
+        assert torch.equal(supplied.position_ids, omitted.position_ids)
+        assert torch.equal(supplied.key_states, omitted.key_states)
+
+    def test_post_eviction_token_keeps_its_absolute_position(self):
+        """The decode token appended after a compaction is filed at 9, not at
+        the compacted length (2). This is the assertion that fails pre-fix."""
+        omitted = self._drive(with_cache_position=False)
+        assert omitted.position_ids[0].tolist() == [1, 3, 9]
+        assert omitted.position_ids[1].tolist() == [5, 7, 9]

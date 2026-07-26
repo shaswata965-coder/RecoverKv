@@ -119,6 +119,7 @@ class LongBenchRunner:
         # is per-dataset because NO_CHAT_TEMPLATE_DATASETS skip the template.
         self._chat_overhead_cache: dict[str, int] = {}
         self._auto_fit_logged: set[str] = set()
+        self._prompt_preview_logged: set[str] = set()
 
     @staticmethod
     def _compute_metrics_sha() -> str:
@@ -183,6 +184,30 @@ class LongBenchRunner:
             device_map="auto",
         )
         model.eval()
+
+        if tokenizer.chat_template is None:
+            log.warning(
+                "Tokenizer for %s ships no chat template — every dataset will be "
+                "prompted raw. Correct for a base model; on an instruct model it "
+                "costs most of the score on the generative tasks.",
+                cfg.model.name,
+            )
+
+        # Mistral-7B-Instruct-v0.1 sets sliding_window=4096 (v0.2/v0.3 set null).
+        # Both the FA2 kernel and the sdpa mask builder band attention by
+        # *cache-slot* distance, which stops matching real token distance once
+        # the cache is compacted. Inert while the compacted cache is shorter than
+        # the window, but not something to discover from a score table.
+        sw = getattr(model.config, "sliding_window", None)
+        if sw and self.is_windowed:
+            log.warning(
+                "%s sets sliding_window=%s. The windowed cache keeps survivors at "
+                "their original positions but stores them compacted, so a banded "
+                "attention mask no longer corresponds to real token distance. "
+                "Prefer a model with sliding_window=null (e.g. "
+                "Mistral-7B-Instruct-v0.2) for comparable numbers.",
+                cfg.model.name, sw,
+            )
 
         return model, tokenizer
 
@@ -325,7 +350,6 @@ class LongBenchRunner:
 
         Follows THUDM/LongBench/pred.py + kvpress protocol exactly.
         """
-        cfg = self.config
         model = self.model
         tokenizer = self.tokenizer
 
@@ -356,29 +380,39 @@ class LongBenchRunner:
                 tokenized[:half], skip_special_tokens=True
             ) + tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
 
-        # 3. Apply chat template for LLaMA-3-8B-Instruct.
+        # 3. Apply the model's own chat template.
         #    Skipped for the few-shot ICL datasets (matches THUDM/LongBench +
         #    DefensiveKV) — wrapping their worked-example prompts in a chat
         #    turn breaks few-shot continuation. See NO_CHAT_TEMPLATE_DATASETS.
-        if self._should_apply_chat_template(cfg.model.name, dataset_name):
-            # Use the tokenizer's built-in chat template
+        templated = self._should_apply_chat_template(tokenizer, dataset_name)
+        if templated:
             messages = [{"role": "user", "content": prompt}]
-            try:
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except Exception:
-                # Fallback: manual LLaMA-3 template
-                prompt = (
-                    f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-                    f"{prompt}<|eot_id|>"
-                    f"<|start_header_id|>assistant<|end_header_id|>\n\n"
-                )
+            # No fallback: a template that fails to render must be a hard error.
+            # The old `except Exception` here substituted a hand-written LLaMA-3
+            # template, whose <|begin_of_text|> / <|start_header_id|> markers are
+            # ordinary text to any other tokenizer — a silently mis-formatted
+            # prompt that still produces plausible-looking (and worthless) scores.
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
 
-        # 4. Tokenize final prompt
-        inputs = tokenizer(prompt, truncation=False, return_tensors="pt")
+        self._log_prompt_preview(dataset_name, prompt, templated)
+
+        # 4. Tokenize final prompt.
+        #    add_special_tokens is OFF once the chat template has run: every
+        #    template emits its own BOS (Mistral "<s> [INST]", LLaMA-3
+        #    "<|begin_of_text|>"), so letting the tokenizer prepend another
+        #    yields a doubled BOS the model never saw in training. THUDM's
+        #    pred.py builds the LLaMA-2 wrapper as a bare "[INST]...[/INST]"
+        #    string and relies on the tokenizer for the single BOS; kvpress
+        #    (and therefore DefensiveKV) uses the template and passes
+        #    add_special_tokens=False. Both end up with exactly one.
+        inputs = tokenizer(
+            prompt, truncation=False, return_tensors="pt",
+            add_special_tokens=not templated,
+        )
         input_ids = inputs.input_ids.to(model.device)
         context_length = input_ids.shape[-1]
 
@@ -524,7 +558,7 @@ class LongBenchRunner:
         tokens have to be reserved up front or an auto-fitted prompt can still
         cross the context window after templating.
         """
-        if not self._should_apply_chat_template(self.config.model.name, dataset_name):
+        if not self._should_apply_chat_template(tokenizer, dataset_name):
             return 0
         cached = self._chat_overhead_cache.get(dataset_name)
         if cached is not None:
@@ -535,7 +569,13 @@ class LongBenchRunner:
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            overhead = len(tokenizer(wrapped, truncation=False).input_ids)
+            # add_special_tokens=False mirrors how _predict tokenizes a
+            # templated prompt; otherwise the reserve is off by the BOS.
+            overhead = len(
+                tokenizer(
+                    wrapped, truncation=False, add_special_tokens=False
+                ).input_ids
+            )
         except Exception:
             # Same conservative fallback as the manual template in _predict.
             overhead = 64
@@ -616,17 +656,47 @@ class LongBenchRunner:
             self._over_context_warned = True
 
     @classmethod
-    def _should_apply_chat_template(cls, model_name: str, dataset_name: str) -> bool:
+    def _should_apply_chat_template(cls, tokenizer, dataset_name: str) -> bool:
         """Whether to wrap the prompt in the model's chat template.
 
-        True only for instruct/chat models AND non-few-shot datasets. The
-        few-shot ICL datasets (NO_CHAT_TEMPLATE_DATASETS) must stay raw so the
-        model continues the worked-example format instead of switching into
-        chat-assistant mode. Matches THUDM/LongBench + DefensiveKV.
+        Decided by the TOKENIZER — a model is a chat model iff it ships a chat
+        template — not by substring-matching the model name. The name test this
+        replaced ("instruct" in name or "chat" in name) reads whatever string
+        `model.name` happens to hold, which on a cluster is a checkout directory:
+        `.../mistral-7b-v0.2` matches neither substring, so the template was
+        silently dropped and an instruct model was prompted as a base LM. That
+        is invisible in the output files and costs most of the score on the
+        generative datasets. kvpress (and therefore DefensiveKV) gates on
+        `tokenizer.chat_template is None` for exactly this reason.
+
+        Still False for the few-shot ICL datasets (NO_CHAT_TEMPLATE_DATASETS),
+        which must stay raw so the model continues the worked-example format
+        instead of switching into chat-assistant mode — matches THUDM/LongBench
+        + DefensiveKV, which blanks `tokenizer.chat_template` on those tasks.
         """
-        name = model_name.lower()
-        is_chat_model = "instruct" in name or "chat" in name
-        return is_chat_model and dataset_name not in cls.NO_CHAT_TEMPLATE_DATASETS
+        if dataset_name in cls.NO_CHAT_TEMPLATE_DATASETS:
+            return False
+        return getattr(tokenizer, "chat_template", None) is not None
+
+    def _log_prompt_preview(
+        self, dataset_name: str, prompt: str, templated: bool
+    ) -> None:
+        """Log the head/tail of the first prompt of each dataset, once.
+
+        The whole class of bug this guards against (wrong template, no template,
+        doubled BOS) is invisible in the prediction files and only shows up as a
+        depressed score, so the actual string fed to the model is worth one log
+        line per dataset.
+        """
+        if dataset_name in self._prompt_preview_logged:
+            return
+        self._prompt_preview_logged.add(dataset_name)
+        head = prompt[:120].replace("\n", "\\n")
+        tail = prompt[-80:].replace("\n", "\\n")
+        log.info(
+            "%s: chat_template=%s | prompt head %r ... tail %r",
+            dataset_name, "applied" if templated else "SKIPPED", head, tail,
+        )
 
     @staticmethod
     def _post_process(pred: str, dataset_name: str) -> str:
