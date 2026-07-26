@@ -430,3 +430,69 @@ class TestFirstEvictionStepDefault:
             "no runner references FIRST_EVICTION_STEP_DEFAULT — did the "
             "constant get inlined away? saw: " + "; ".join(seen)
         )
+
+
+# -----------------------------------------------------------------------
+# Shipped eval configs — the operating point they actually declare
+# -----------------------------------------------------------------------
+
+
+class TestShippedEvalConfigsOperatingPoint:
+    """Every shipped windowed eval config must declare the two-tier method.
+
+    The failure this guards is not a crash. Every LongBench / RULER / GSM8K
+    config on this branch shipped at ``quant_ratio: 0.0`` — i.e. the SINGLE-tier
+    fp16 cache — so running them as-is measured a different method from the one
+    the branch exists for, and nothing in the predictions said so. A whole result
+    set can be collected, scored and written up before anyone notices.
+    """
+
+    @staticmethod
+    def _eval_configs():
+        from pathlib import Path
+        from utils.config import load_config
+
+        root = Path(__file__).resolve().parents[1]
+        for path in sorted((root / "configs").glob("*.yaml")):
+            cfg = load_config(str(path))
+            if cfg.run.mode in ("longbench", "ruler", "gsm8k"):
+                yield path.name, cfg
+
+    def test_windowed_configs_enable_the_q_tier(self) -> None:
+        single = [
+            name for name, cfg in self._eval_configs()
+            if cfg.cache.backend == "windowed" and cfg.cache.quant_ratio == 0.0
+        ]
+        assert not single, (
+            "windowed eval config(s) at quant_ratio=0.0 — these measure the "
+            "single-tier fp16 cache, not the two-tier int2 method: "
+            + ", ".join(single)
+            + ". Run that arm as a labelled ablation via "
+            "--override cache.quant_ratio=0.0 instead of shipping it as the method."
+        )
+
+    def test_full_cache_configs_do_not_pretend_to_quantize(self) -> None:
+        """The baselines are the other half of the comparison: no eviction, no
+        Q tier. A quant_ratio > 0 on a dynamic backend is inert, so it would be a
+        label claiming something the run does not do."""
+        for name, cfg in self._eval_configs():
+            if cfg.cache.backend != "windowed":
+                assert cfg.cache.quant_ratio == 0.0, name
+                assert cfg.cache.cache_budget is None, name
+
+    def test_the_q_tier_geometry_is_valid_wherever_it_is_enabled(self) -> None:
+        """int2 packs 4 crumbs to a byte, so window_size must be divisible by 4.
+        A config that enables the Q tier at an invalid window size is a run that
+        cannot produce the numbers it is labelled with."""
+        for name, cfg in self._eval_configs():
+            if cfg.cache.backend == "windowed" and cfg.cache.quant_ratio > 0:
+                assert cfg.cache.window_size % 4 == 0, (
+                    f"{name}: quant_ratio={cfg.cache.quant_ratio} needs "
+                    f"window_size % 4 == 0, got {cfg.cache.window_size}"
+                )
+
+    def test_every_eval_config_is_at_the_comparison_operating_point(self) -> None:
+        """first_eviction_step=0 across the shipped set, so a sweep cannot mix
+        two operating points into one table."""
+        for name, cfg in self._eval_configs():
+            assert cfg.cache.first_eviction_step == 0, name

@@ -4,8 +4,9 @@
 # Captures a utils/cache_memory.py byte-accounting report per example
 # (ruler.capture_memory) so retained-bytes / compression-ratio can be read
 # off directly, alongside the task's accuracy score.
-# quant_ratio=0.0 -> pure fp16 windowed cache (Q tier disabled). Set > 0.0
-# to sweep in the two-tier int2 split (needs window_size % 4 == 0, which 16 is).
+# quant_ratio=0.5 is the two-tier fp16+int2 method this branch exists for. Run
+# the single-tier fp16 ablation with --override cache.quant_ratio=0.0; the
+# operating point is printed at the start of every run either way.
 # Produces: outputs/ruler/4096_niah_mk3_omega16/
 _base_: base.yaml
 
@@ -26,7 +27,7 @@ cache:
   window_size: 16                           # omega=16
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens
-  quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16
+  quant_ratio: 0.5                          # two-tier fp16+int2 split q in [0,1]; 0 = pure fp16
   rerotate_on_evict: false
   first_eviction_step: 0                    # compress the prompt before the 2nd token (default)
 
