@@ -86,6 +86,20 @@ def log_operating_point(config, is_windowed: bool) -> None:
         getattr(getattr(config, "model", None), "attn_implementation", None),
     )
 
+    # The line above states q, but a windowed run at q=0 is the one case where
+    # the operating point is a different METHOD rather than a different setting —
+    # the single-tier fp16 cache, not the two-tier int2 one — and it is not an
+    # error, so nothing else stops it. Say so at WARNING, because an INFO
+    # annotation is easy to lose in a long cluster log and the predictions carry
+    # no trace of which arm produced them.
+    if q == 0:
+        log.warning(
+            "quant_ratio=0.0 on a windowed run: this is the SINGLE-TIER fp16 "
+            "cache with the Q tier disabled, i.e. the ablation arm — not the "
+            "two-tier int2 method. Intended? If these numbers are meant to be "
+            "the method, set cache.quant_ratio > 0."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Config dataclasses
