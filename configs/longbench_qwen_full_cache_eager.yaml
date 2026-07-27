@@ -1,12 +1,10 @@
 # ============================================================================
-# LongBench - Qwen2.5-7B-Instruct (YaRN 128K), Ours - flash-attn-2
+# LongBench - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - eager
 # ============================================================================
-# Baseline for this column: configs/longbench_qwen_full_cache.yaml
-# The two differ ONLY in the cache block, so the delta IS the method.
-# Geometry matches configs/longbench_ours_flash_attn.yaml (Llama) and
-# configs/longbench_mistral_ours_flash_attn.yaml, so the three model
-# columns differ only by model.
-# Produces: outputs/longbench/qwen_ours_flash_attn_compression_0.8
+# Run this FIRST. A compressed number is only interpretable next to the
+# full-cache number from the IDENTICAL protocol - same model, same dtype,
+# same RoPE, same attention backend, same prompt budget.
+# Produces: outputs/longbench/qwen_full_cache_eager
 _base_: base.yaml
 
 run:
@@ -42,7 +40,7 @@ model:
   # comparable, not least. Run every column at the same dtype; the loader warns
   # when the configured dtype differs from the checkpoint's own.
   dtype: bfloat16
-  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+  attn_implementation: eager   # MUST match cache.backend_package
 
   # --- YaRN context extension, 32K -> 128K ---------------------------------
   # Mirrors the config.json the baseline runs use, so our rows and the baseline
@@ -84,14 +82,9 @@ model:
   use_sliding_window: false
 
 cache:
-  backend: windowed
-  backend_package: flash_attn
-  cache_budget: 0.20                        # fraction RETAINED; compression_ratio = 0.8
-  window_size: 8
-  num_sink_tokens: 5
-  local_window_size: 128                    # fixed tokens; ratio 0.25 would exceed cache_budget 0.20
-  quant_ratio: 0.5                          # two-tier fp16+int2 split q in [0,1]; THE method here. Single-tier ablation: --override cache.quant_ratio=0.0
-  first_eviction_step: 0                    # repo default; stated explicitly so the run is self-describing
+  backend: dynamic                      # transformers.DynamicCache, no eviction
+  backend_package: null
+  cache_budget: null
 
 telemetry:
   track_scores: false
@@ -126,8 +119,8 @@ longbench:
   # columns see and reads as a method result. The runner now logs the policy
   # at run start and warns when a configured value discards context headroom.
   max_length: null
-  output_dir: outputs/longbench/qwen_ours_flash_attn_compression_0.8
+  output_dir: outputs/longbench/qwen_full_cache_eager
   seed: 42
-  resume: true
+  resume: false
   skip_oom: true
-  aggressive_cache_clear: false
+  aggressive_cache_clear: true
