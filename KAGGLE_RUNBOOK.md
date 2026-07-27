@@ -49,7 +49,7 @@ knobs without touching the GPU.
 ### Cell 1 — Clone the repo
 
 ```python
-!git clone --depth 1 --branch quant_batched_fixed_int2_eviction \
+!git clone --depth 1 --branch int4_mistral \
     https://github.com/shaswata965-coder/StickyKV.git /kaggle/working/StickyKV
 %cd /kaggle/working/StickyKV
 !git log --oneline -3
@@ -147,8 +147,8 @@ OURS_NPZ = f"{WORK}/parity_ours.npz"
 concept and meaningless for a local directory.
 
 > **Geometry constraints** (enforced, fail-fast): with `quant_ratio > 0` the
-> int2 tier needs `window_size % 4 == 0` *and* the model's `head_dim % 4 == 0`
-> (crumb packing over the value-channel axis). An integer `local_window_size`
+> int4 tier needs an even `window_size` (nibble packing, 2 codes per byte;
+> `head_dim` is always even, so it never binds). An integer `local_window_size`
 > must be a multiple of `window_size`; a float in `(0, 1]` is a ratio instead.
 > `window_size=32` suits an 8B model; 8 or 16 is more sensible for a small one.
 
@@ -160,7 +160,7 @@ concept and meaningless for a local directory.
     base_run_npz={BASE_NPZ} output_path={OURS_NPZ}
 ```
 
-`quant_ratio=0.5` splits the retained band fp16/int2. Use `0.0` for a
+`quant_ratio=0.5` splits the retained band fp16/int4. Use `0.0` for a
 single-tier baseline; the tier-aware metrics then collapse to the legacy
 numbers by construction. Both runs must share every geometry field — both
 suites hard-fail on a mismatched pair rather than silently comparing two

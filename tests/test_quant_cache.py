@@ -57,7 +57,7 @@ def _active(store):
 
 
 def _codes_of(store, wid, row=0):
-    """The stored int2 key codes for a window id (active or dormant)."""
+    """The stored int4 key codes for a window id (active or dormant)."""
     has, _, slot, _ = store.lookup(torch.tensor([[wid]], dtype=torch.long))
     assert bool(has[0, 0]), f"window {wid} has no slot-table entry"
     return store.table.key_codes[row, slot[0, 0]]
@@ -122,8 +122,8 @@ def test_first_eviction_demotes_and_materializes():
     # fp body windows are byte-identical, at their physical offsets: w0 | w3.
     assert torch.equal(eff_k[0][:, 0:4], k_post[:, 0:4])       # w0
     assert torch.equal(eff_k[0][:, 4:8], k_post[:, 12:16])     # w3
-    # Q window w1 follows the body, reconstructed within int2 error.
-    assert (eff_k[0][:, 8:12] - k_post[:, 4:8]).abs().max() < 1.0
+    # Q window w1 follows the body, reconstructed within int4 error.
+    assert (eff_k[0][:, 8:12] - k_post[:, 4:8]).abs().max() < 0.3
     # Score-scatter: physical ids [w0,w3 | w1] = [0,3,1]; argsort → [0,2,1]
     # scatters back to ascending merged id [0,1,3].
     order, q_token_len = score_meta

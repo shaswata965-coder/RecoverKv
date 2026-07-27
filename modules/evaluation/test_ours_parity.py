@@ -232,7 +232,7 @@ class TestExtractRowRetained:
         assert all_tier.tolist() == [0, 0, 2, 2, 2]
 
     def test_q_tier_tagging(self):
-        """Passing Q-tier ids tags those evictable columns tier 1 (int2)."""
+        """Passing Q-tier ids tags those evictable columns tier 1 (int4)."""
         from modules.evaluation.ours_parity_runner import _extract_row_retained
         # W=6, ws_sz=1, local=2 (int) → eW=4 evictable.
         ws_row = torch.tensor([[10., 1., 8., 3., 5., 9.],

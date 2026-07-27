@@ -479,7 +479,7 @@ class TestShippedEvalConfigsOperatingPoint:
         if single:
             warnings.warn(
                 f"{len(single)} windowed eval config(s) at quant_ratio=0.0 — these "
-                f"measure the SINGLE-TIER fp16 cache, not the two-tier int2 "
+                f"measure the SINGLE-TIER fp16 cache, not the two-tier int4 "
                 f"method: {', '.join(single)}. Intended for the ablation arm; if "
                 f"these are meant to be the method, set quant_ratio > 0.",
                 UserWarning,
@@ -496,14 +496,14 @@ class TestShippedEvalConfigsOperatingPoint:
                 assert cfg.cache.cache_budget is None, name
 
     def test_the_q_tier_geometry_is_valid_wherever_it_is_enabled(self) -> None:
-        """int2 packs 4 crumbs to a byte, so window_size must be divisible by 4.
+        """int4 packs 2 nibbles to a byte, so window_size must be even.
         A config that enables the Q tier at an invalid window size is a run that
         cannot produce the numbers it is labelled with."""
         for name, cfg in self._eval_configs():
             if cfg.cache.backend == "windowed" and cfg.cache.quant_ratio > 0:
-                assert cfg.cache.window_size % 4 == 0, (
+                assert cfg.cache.window_size % 2 == 0, (
                     f"{name}: quant_ratio={cfg.cache.quant_ratio} needs "
-                    f"window_size % 4 == 0, got {cfg.cache.window_size}"
+                    f"window_size % 2 == 0, got {cfg.cache.window_size}"
                 )
 
     def test_configs_off_the_comparison_operating_point_are_reported(self) -> None:

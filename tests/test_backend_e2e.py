@@ -66,7 +66,7 @@ ARCHITECTURES = ["llama", "mistral", "qwen2"]
 
 def _tiny_model(arch="llama"):
     torch.manual_seed(0)
-    # head_dim = 64/4 = 16, divisible by 4 as the int2 Q tier requires.
+    # head_dim = 64/4 = 16, even as the int4 Q tier requires.
     kw = dict(vocab_size=256, hidden_size=64, intermediate_size=128,
               num_hidden_layers=2, num_attention_heads=4,
               num_key_value_heads=2, max_position_embeddings=512)
@@ -163,7 +163,7 @@ def _generate(backend, quant_ratio, first_eviction_step=None, arch="llama"):
         "n_generated": int(out.shape[-1] - PREFILL),
         # The fp store length is the signal that eviction ran. `get_seq_length`
         # is the MERGED count (T_fp + T_q) and barely moves at q > 0 — a demoted
-        # window still counts as its tokens, it just costs ~4x fewer bytes — so
+        # window still counts as its tokens, it just costs ~2.6x fewer bytes — so
         # asserting on it would pass whether or not anything evicted.
         "fp_len": cache._states[0].seq_length,
         "merged_len": cache.get_seq_length(0),

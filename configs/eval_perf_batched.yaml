@@ -51,13 +51,12 @@
 #
 # SWEEP
 #   cache_budget  0.20 / 0.10  — per-row memory; the 1:1 lever on max-B.
-#   quant_ratio   0.0  / 0.5   — how the evictable budget splits fp16 vs int2.
+#   quant_ratio   0.0  / 0.5   — how the evictable budget splits fp16 vs int4.
 #     The budget is enforced in BYTES and b_q already includes the fp16 scale/zero
 #     grid (config.py resolve()), so at a fixed budget q does NOT change per-row
 #     memory — b20_q00 ≈ b20_q50 MB/row. What q buys is RETAINED TOKENS at equal
-#     bytes: at int2, 813 (q=0) -> 1877 (q=0.5), i.e. ~2.3x the context for free
-#     (int4 gave 1413 / 1.74x — int2's smaller codes fit more Q windows). So
-#     expect q to move QUALITY (LongBench), not max-B. If
+#     bytes: at int4, 813 (q=0) -> 1413 (q=0.5), i.e. ~1.74x the context for free.
+#     So expect q to move QUALITY (LongBench), not max-B. If
 #     q>0 costs throughput at equal budget, that is the Phase-1 materialize read
 #     path (design.md §8) — §11's fused kernel is what fixes it, not this.
 #
@@ -84,7 +83,7 @@ model:
   dtype: float16
 
 cache:
-  window_size: 8            # must be a MULTIPLE OF 4 for quant_ratio > 0 (int2 crumb packing)
+  window_size: 8            # must be EVEN for quant_ratio > 0 (int4 nibble packing)
   num_sink_tokens: 5
   local_window_size: 64     # int -> must be a multiple of window_size
 

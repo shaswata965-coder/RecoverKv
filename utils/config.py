@@ -77,7 +77,7 @@ def log_operating_point(config, is_windowed: bool) -> None:
         getattr(cache, "num_sink_tokens", None),
         getattr(cache, "local_window_size", None),
         q,
-        "two-tier fp16+int2" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
+        "two-tier fp16+int4" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
         getattr(cache, "first_eviction_step", None),
         "prompt compressed on decode step 0"
         if getattr(cache, "first_eviction_step", 0) == 0
@@ -88,7 +88,7 @@ def log_operating_point(config, is_windowed: bool) -> None:
 
     # The line above states q, but a windowed run at q=0 is the one case where
     # the operating point is a different METHOD rather than a different setting —
-    # the single-tier fp16 cache, not the two-tier int2 one — and it is not an
+    # the single-tier fp16 cache, not the two-tier int4 one — and it is not an
     # error, so nothing else stops it. Say so at WARNING, because an INFO
     # annotation is easy to lose in a long cluster log and the predictions carry
     # no trace of which arm produced them.
@@ -96,7 +96,7 @@ def log_operating_point(config, is_windowed: bool) -> None:
         log.warning(
             "quant_ratio=0.0 on a windowed run: this is the SINGLE-TIER fp16 "
             "cache with the Q tier disabled, i.e. the ablation arm — not the "
-            "two-tier int2 method. Intended? If these numbers are meant to be "
+            "two-tier int4 method. Intended? If these numbers are meant to be "
             "the method, set cache.quant_ratio > 0."
         )
 
@@ -139,7 +139,7 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
-    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
+    quant_ratio: float = 0.0  # two-tier int4 split q in [0,1] (design.md §7); 0 disables the Q tier
     # Decode step of the FIRST eviction, independent of window_size. 0 (default)
     # compresses the prompt on decode step 0 — before that step's query attends —
     # so every generated token comes from the budgeted cache. A positive value
@@ -196,8 +196,8 @@ class CacheConfig:
                     f"got {self.local_window_size}"
                 )
 
-        # quant_ratio: two-tier int2 split (design.md §7). Full validation
-        # (window_size % 4 when q>0, range) lives in WindowedCacheConfig; here
+        # quant_ratio: two-tier int4 split (design.md §7). Full validation
+        # (even window_size when q>0, range) lives in WindowedCacheConfig; here
         # we only guard the obvious type/range so eval configs fail fast.
         if isinstance(self.quant_ratio, bool):
             raise ConfigValidationError("quant_ratio must be a float in [0, 1], got bool")

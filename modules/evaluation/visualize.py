@@ -158,7 +158,7 @@ def make_missed_mass_distribution(npz_paths: List[Path], out_dir: Path,
 
     ``missed_mass`` (fp-only drop) and ``missed_mass_kept`` (two-tier) are
     ``[T]`` (lower = the retained set captures more of the true attention); the
-    shaded gap between them is ``recovered_mass_q`` — the mass the int2 Q tier
+    shaded gap between them is ``recovered_mass_q`` — the mass the int4 Q tier
     rescues that an fp-only drop would have lost.  ``missed_mass_per_layer`` is
     ``[T, L]`` and is shown as a heatmap.
     """

@@ -11,7 +11,7 @@ One file, two ways to use it.
     out = model.generate(..., past_key_values=pkv)
     report_cache_memory(pkv, label="qasper bs=4 q=0.5")
 
-It prints an exact byte breakdown — fp16 tier, int2 Q tier (codes + grid),
+It prints an exact byte breakdown — fp16 tier, int4 Q tier (codes + grid),
 read memo, and bookkeeping — split into what is *semantically retained* (live)
 vs. what is *reserved in memory* (allocated), plus the two compression ratios
 the method exists to move: against an fp16 cache at the **same retention** (the
@@ -156,9 +156,12 @@ class CacheMemoryReport:
     # The memo is a *derived* fp16 copy of the Q tier, not cache state: dropping
     # it costs recomputation, never correctness or a token. It is also charged
     # per row and, at B = 1 (where the auto rule turns it ON), it is by far the
-    # largest line item — measured on a RULER example it was 16.3 of 21.4 MB,
-    # which drags `compression_vs_fp16` to 0.91x, i.e. the report says the
-    # two-tier cache is BIGGER than fp16.
+    # largest line item: the memo is the *fp16* image of the Q tier, so it costs
+    # `N_q * b_fp` against a Q tier that costs `N_q * b_q` — at the int4 ws=8
+    # reference geometry that is 2.61x the Q tier's own bytes, and it works out
+    # to the majority of `total_live`. That drags `compression_vs_fp16` toward
+    # (and on a long context below) 1.0, i.e. the report says the two-tier cache
+    # is BIGGER than fp16.
     #
     # Both framings are honest and neither is the whole story, so publish the
     # pair rather than picking one: `*_excl_memo` is the cache-state figure a
@@ -282,7 +285,7 @@ def _measure_windowed(
         t_q = 0
         n_active = 0
 
-        # -- int2 Q tier --
+        # -- int4 Q tier --
         store = stores[li] if li < len(stores) else None
         table = getattr(store, "table", None) if store is not None else None
         if table is not None:
@@ -512,7 +515,7 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
     )
     if r.q_content_alloc or r.kind == "windowed":
         lines.append(
-            f"{'int2 Q (codes+grid)':<26}"
+            f"{'int4 Q (codes+grid)':<26}"
             f"{_mb(r.q_content_live):>20}{_mb(r.q_content_alloc):>22}"
         )
     lines.append(
@@ -587,7 +590,7 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
         lines.append("-" * 72)
         lines.append(
             "NOTE: Q tier is empty (no eviction has run yet). Increase --gen or "
-            "lower --cache-budget so the cache compacts and the int2 tier fills."
+            "lower --cache-budget so the cache compacts and the int4 tier fills."
         )
     lines.append("=" * 72)
     return "\n".join(lines)

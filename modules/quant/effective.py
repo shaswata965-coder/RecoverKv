@@ -48,7 +48,7 @@ def _apply_rotary():
 # Fused dequant → RoPE for the Q-tier read path (design.md §8, "Phase 2")
 # ---------------------------------------------------------------------------
 #
-# The per-step read path dequantizes every active int2 key window and RoPE's it
+# The per-step read path dequantizes every active int4 key window and RoPE's it
 # (:meth:`QuantizedStore.effective_q_tier`). Eager, that is a chain of ~20 small
 # elementwise kernels per layer per step — unpack, upcast to fp32, affine
 # rescale, cast back, then the rotate_half/mul/add of RoPE — each launched

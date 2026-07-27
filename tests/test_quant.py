@@ -11,35 +11,35 @@ import torch
 from modules.quant.quantizer import (
     dequantize_key_window,
     dequantize_value_window,
-    pack_crumbs_last,
+    pack_nibbles_last,
     quantize_key_window,
     quantize_value_window,
-    unpack_crumbs_last,
+    unpack_nibbles_last,
 )
 
 
 # ---------------------------------------------------------------------------
-# Crumb packing (int2: 4 codes per byte)
+# Nibble packing (int4: 2 codes per byte)
 # ---------------------------------------------------------------------------
 
 
 class TestPacking:
     def test_pack_unpack_roundtrip(self):
-        codes = torch.randint(0, 4, (3, 4, 8), dtype=torch.uint8)
-        packed = pack_crumbs_last(codes)
-        assert packed.shape == (3, 4, 2)  # 8 codes / 4 per byte
-        out = unpack_crumbs_last(packed, 8)
+        codes = torch.randint(0, 16, (3, 4, 8), dtype=torch.uint8)
+        packed = pack_nibbles_last(codes)
+        assert packed.shape == (3, 4, 4)  # 8 codes / 2 per byte
+        out = unpack_nibbles_last(packed, 8)
         assert torch.equal(out, codes)
 
-    def test_index_order_low_to_high_bits(self):
-        # codes [1,2,3,0] -> byte = 1 | (2<<2) | (3<<4) | (0<<6) = 1+8+48 = 57
-        codes = torch.tensor([[1, 2, 3, 0]], dtype=torch.uint8)
-        packed = pack_crumbs_last(codes)
-        assert packed.item() == 57
+    def test_even_index_in_low_nibble(self):
+        # codes [1,2] -> byte = 1 | (2<<4) = 0x21 = 33
+        codes = torch.tensor([[1, 2]], dtype=torch.uint8)
+        packed = pack_nibbles_last(codes)
+        assert packed.item() == 33
 
-    def test_pack_rejects_non_multiple_of_four(self):
+    def test_pack_rejects_odd_last_dim(self):
         with pytest.raises(ValueError):
-            pack_crumbs_last(torch.zeros(6, dtype=torch.uint8))
+            pack_nibbles_last(torch.zeros(5, dtype=torch.uint8))
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ class TestKeyQuant:
         H, W, D = 8, 8, 128
         k = torch.randn(H, W, D)
         packed, scale, zero = quantize_key_window(k)
-        assert packed.shape == (H, D, W // 4)
+        assert packed.shape == (H, D, W // 2)
         assert packed.dtype == torch.uint8
         assert scale.shape == (H, D)
         assert zero.shape == (H, D)
@@ -62,7 +62,7 @@ class TestKeyQuant:
         assert k_hat.shape == (H, W, D)
 
     def test_roundtrip_error_bounded(self):
-        # int2 over a group of dynamic range R has max error <= scale/2 = R/6.
+        # int4 over a group of dynamic range R has max error <= scale/2 = R/30.
         H, W, D = 4, 8, 64
         k = torch.randn(H, W, D) * 3.0
         packed, scale, zero = quantize_key_window(k)
@@ -70,8 +70,8 @@ class TestKeyQuant:
         # Per (head, channel) range along the token axis.
         rng = k.amax(dim=1, keepdim=True) - k.amin(dim=1, keepdim=True)  # [H,1,D]
         max_err = (k_hat - k).abs().amax(dim=1)  # [H, D]
-        # Allow a hair over R/6 for fp16 grid rounding.
-        bound = (rng.squeeze(1) / 6.0) * 1.05 + 1e-3
+        # Allow a hair over R/30 for fp16 grid rounding.
+        bound = (rng.squeeze(1) / 30.0) * 1.05 + 1e-3
         assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
@@ -108,7 +108,7 @@ class TestValueQuant:
         H, W, D = 8, 6, 128
         v = torch.randn(H, W, D)
         packed, scale, zero = quantize_value_window(v)
-        assert packed.shape == (H, W, D // 4)
+        assert packed.shape == (H, W, D // 2)
         assert scale.shape == (H, W)
         assert zero.shape == (H, W)
 
@@ -122,7 +122,7 @@ class TestValueQuant:
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
         rng = v.amax(dim=2, keepdim=True) - v.amin(dim=2, keepdim=True)  # [H,W,1]
         max_err = (v_hat - v).abs().amax(dim=2)  # [H, W]
-        bound = (rng.squeeze(2) / 6.0) * 1.05 + 1e-3
+        bound = (rng.squeeze(2) / 30.0) * 1.05 + 1e-3
         assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
@@ -230,7 +230,7 @@ class TestStore:
         # dequant error bounded
         k_hat = k_hat[0, 0]
         rngk = k_pre.amax(1, keepdim=True) - k_pre.amin(1, keepdim=True)
-        assert torch.all((k_hat - k_pre).abs().amax(1) <= rngk.squeeze(1) / 6.0 * 1.05 + 1e-3)
+        assert torch.all((k_hat - k_pre).abs().amax(1) <= rngk.squeeze(1) / 30.0 * 1.05 + 1e-3)
 
     def test_redemotion_reactivates_no_requantize(self):
         store = _store()
@@ -304,7 +304,7 @@ class TestMaterialize:
     def test_interleave_reconstructs_full_sequence(self):
         """Demote windows 1 & 3; materialize lays out the UNSORTED effective K/V
         as [sink ‖ fp body (w0,w2) ‖ Q (w1,w3)] with Q windows rotated at their
-        ORIGINAL positions (within int2 error), and returns the score-scatter map
+        ORIGINAL positions (within int4 error), and returns the score-scatter map
         that reorders the physical [body ‖ Q] window axis back to ascending id."""
         torch.manual_seed(0)
         H, D, ws, num_sink = 2, 8, 4, 2
@@ -361,12 +361,12 @@ class TestMaterialize:
         assert torch.equal(eff_v[:, num_sink + ws:num_sink + 2 * ws], v_all[:, win(2)])
 
         # Q windows (w1, w3) follow the body, rotated at ORIGINAL positions, so
-        # they match within int2 error only (coarser than int4 — 4 levels).
+        # they match within int4 error only (16 levels).
         q_start = num_sink + 2 * ws
-        assert torch.allclose(eff_k[:, q_start:q_start + ws], k_post_all[:, win(1)], atol=1.0)
-        assert torch.allclose(eff_k[:, q_start + ws:q_start + 2 * ws], k_post_all[:, win(3)], atol=1.0)
-        assert (eff_v[:, q_start:q_start + ws] - v_all[:, win(1)]).abs().max() < 1.5
-        assert (eff_v[:, q_start + ws:q_start + 2 * ws] - v_all[:, win(3)]).abs().max() < 1.5
+        assert torch.allclose(eff_k[:, q_start:q_start + ws], k_post_all[:, win(1)], atol=0.3)
+        assert torch.allclose(eff_k[:, q_start + ws:q_start + 2 * ws], k_post_all[:, win(3)], atol=0.3)
+        assert (eff_v[:, q_start:q_start + ws] - v_all[:, win(1)]).abs().max() < 0.5
+        assert (eff_v[:, q_start + ws:q_start + 2 * ws] - v_all[:, win(3)]).abs().max() < 0.5
 
         # Score-scatter map: physical per-window ids are [w0,w2 | w1,w3] = [0,2,1,3];
         # argsort → [0,2,1,3] scatters them back to ascending merged id [0,1,2,3].

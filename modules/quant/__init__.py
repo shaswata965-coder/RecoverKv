@@ -12,11 +12,11 @@ Design realities baked in (design.md):
   ``position_range`` (its original absolute positions) is frozen at first
   demotion; the read path applies RoPE at those fixed positions every step. No
   rerotation, no position override (§5).
-- **Pinned grid by identity.** A window's int2 codes + fp16 scale/zero are
+- **Pinned grid by identity.** A window's int4 codes + fp16 scale/zero are
   written exactly once (first demotion) and never recomputed. A re-demotion
   reactivates the dormant slot; it never re-quantizes (§3, §10).
 - **The Q tier carries a batch axis.** Rows evict divergently — row 0 may hold
-  windows ``{1, 5}`` in int2 while row 1 holds ``{4, 11}`` — so the per-window
+  windows ``{1, 5}`` in int4 while row 1 holds ``{4, 11}`` — so the per-window
   record lives in a dense ``[B, N_slots, ...]`` slot table
   (:mod:`modules.quant.slots`), not a host-side dict keyed by window id. The
   retained counts stay equal across rows, so the effective K/V is dense and
@@ -30,10 +30,10 @@ from .quantizer import (
     dequantize_key_windows,
     dequantize_value_window,
     dequantize_value_windows,
-    pack_crumbs_last,
+    pack_nibbles_last,
     quantize_key_window,
     quantize_value_window,
-    unpack_crumbs_last,
+    unpack_nibbles_last,
 )
 
 __all__ = [
@@ -43,8 +43,8 @@ __all__ = [
     "quantize_value_window",
     "dequantize_value_window",
     "dequantize_value_windows",
-    "pack_crumbs_last",
-    "unpack_crumbs_last",
+    "pack_nibbles_last",
+    "unpack_nibbles_last",
 ]
 
 # Slots / store / effective are re-exported once written (see build order).

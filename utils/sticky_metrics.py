@@ -110,7 +110,7 @@ def simulate_policy(
 
     The **fp tier** keeps ``history_budget_K`` evictable windows (the fp16
     survivors).  On top of it a **Q tier** keeps the next ``n_q`` strongest
-    evictable windows *not already in fp* — the int2 survivors that a two-tier
+    evictable windows *not already in fp* — the int4 survivors that a two-tier
     cache holds instead of dropping (design.md §5, mirroring
     ``policy.compute_two_tier_retain``: rank the band, top ``k_fp`` → fp, next
     ``n_q`` → Q).  ``n_q == 0`` reduces to the single-tier drop policy exactly.
@@ -131,7 +131,7 @@ def simulate_policy(
         is always the fresh next-``n_q`` residual, matching the production
         eviction which re-ranks the whole band every flush.
     n_q : int
-        Number of extra evictable windows held in the int2 Q tier.
+        Number of extra evictable windows held in the int4 Q tier.
 
     Returns
     -------
@@ -324,7 +324,7 @@ def compute_sticky_metrics(
     m : int
         "Ignored" duration threshold for LIR.
     n_q : int
-        int2 Q-tier width (``N_q``).  ``0`` (default) reduces every series below
+        int4 Q-tier width (``N_q``).  ``0`` (default) reduces every series below
         to the legacy single-tier numbers.
 
     Returns

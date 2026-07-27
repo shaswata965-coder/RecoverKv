@@ -283,7 +283,7 @@ class FaithfulnessRunner:
                             ours_kept, _base_top_ids(base_hm, ew, len(ours_kept)))
                         # Q-tier fidelity: cos-sim of ours' (dequantized) vs base's
                         # head-mean mass over the Q windows — how faithfully the
-                        # int2 tier reproduces the true attention it holds.
+                        # int4 tier reproduces the true attention it holds.
                         if q_ids_t.numel() > 0:
                             q_cols = q_m.nonzero(as_tuple=True)[0]
                             o_q = o_ws_s[t, li, :, q_cols].mean(dim=0)   # [n_q]
@@ -575,14 +575,14 @@ class FaithfulnessRunner:
             "| --- | --- | --- |",
             f"| Jaccard (top-K overlap) | {_m('jaccard'):.4f} | higher = same windows as oracle |",
             f"| Jaccard fp / kept | {_m('jaccard_fp'):.4f} / {_m('jaccard_kept'):.4f} | kept credits the Q tier |",
-            f"| Jaccard lift (Q tier) | {_m('jaccard_lift'):+.4f} | gain from crediting int2 survivors |",
+            f"| Jaccard lift (Q tier) | {_m('jaccard_lift'):+.4f} | gain from crediting int4 survivors |",
             f"| Cosine similarity | {_m('cos_sim'):.4f} | higher = faithful scores |",
             f"| Pearson / Spearman | {_m('pearson'):.4f} / {_m('spearman'):.4f} | higher = better |",
             f"| KL(ours‖base) | {_m('kl_ours_base'):.4f} | lower = better |",
             f"| Mass ratio (base/ours) | {_m('mass_ratio'):.4f} | ~1.0 = well matched |",
             f"| Missed mass (fp only) | {_m('missed_mass'):.4f} | mass below the fp tier |",
             f"| Missed mass (fp+Q kept) | {_m('missed_mass_kept'):.4f} | honest two-tier miss |",
-            f"| Recovered mass (Q tier) | {_m('recovered_mass_q'):.4f} | what int2 rescues |",
+            f"| Recovered mass (Q tier) | {_m('recovered_mass_q'):.4f} | what int4 rescues |",
             f"| Q-tier fidelity | {_m('q_tier_fidelity'):.4f} | dequant faithfulness |",
             f"| Global LIR (Sticky-K, m=3) | {float(results['global_lir']):.4f} | pair-based; NOT the QEvict episode LIR |",
             "",

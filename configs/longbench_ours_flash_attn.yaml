@@ -23,7 +23,7 @@ cache:
   window_size: 8
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
-  quant_ratio: 0.5                          # two-tier fp16+int2 split q in [0,1]; THE method here. Single-tier ablation: --override cache.quant_ratio=0.0
+  quant_ratio: 0.5                          # two-tier fp16+int4 split q in [0,1]; THE method here. Single-tier ablation: --override cache.quant_ratio=0.0
   first_eviction_step: 0                    # prompt compressed on decode step 0 (default); >0 leaves short answers at full cache
 
 
