@@ -49,7 +49,7 @@ knobs without touching the GPU.
 ### Cell 1 — Clone the repo
 
 ```python
-!git clone --depth 1 --branch int4_mistral \
+!git clone --depth 1 --branch int4_qwen \
     https://github.com/shaswata965-coder/StickyKV.git /kaggle/working/StickyKV
 %cd /kaggle/working/StickyKV
 !git log --oneline -3
