@@ -8,6 +8,7 @@ from transformers.models.llama.modeling_llama import LlamaAttention
 from transformers.models.mistral.modeling_mistral import MistralAttention
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeAttention
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
 )
@@ -36,18 +37,36 @@ if is_flash_attn_2_available():
 
 # replace the vanilla flash attention in the model with the flash_attn_varlen_func for head-specific compression support
 def replace_var_flash_attn(model_name: str):
-    from kvpress.ada_attn import AdaLlamaFlashAttention, AdaMistralFlashAttention, AdaQwen3FlashAttention, AdaQwen3MoeFlashAttention
+    from kvpress.ada_attn import AdaLlamaFlashAttention, AdaMistralFlashAttention, AdaQwen2FlashAttention, AdaQwen3FlashAttention, AdaQwen3MoeFlashAttention
 
 
     print(
         f"Replacing vanilla flash attention in {model_name} with flash_attn_varlen_func for head-specific compression support."
     )
-    if "llama" in model_name.lower():
+
+    # A checkpoint directory name is not a reliable indicator of the architecture
+    # (e.g. "Qwen_2.5_32B" contains neither "qwen2" nor "qwen3"), so prefer the config.
+    model_type = None
+    try:
+        from transformers import AutoConfig
+
+        model_type = AutoConfig.from_pretrained(model_name).model_type
+    except Exception:
+        pass
+
+    if model_type == "llama" or (model_type is None and "llama" in model_name.lower()):
         LlamaAttention.forward = AdaLlamaFlashAttention.forward
 
-    elif "mistral" in model_name.lower():
+    elif model_type == "mistral" or (model_type is None and "mistral" in model_name.lower()):
         MistralAttention.forward = AdaMistralFlashAttention.forward
-    elif "qwen3" in model_name.lower():
+    elif model_type == "qwen2":
+        Qwen2Attention.forward = AdaQwen2FlashAttention.forward
+    elif model_type == "qwen3_moe":
+        print("Detected MoE model, replacing with AdaQwen3MoeFlashAttention.")
+        Qwen3MoeAttention.forward = AdaQwen3MoeFlashAttention.forward
+    elif model_type == "qwen3":
+        Qwen3Attention.forward = AdaQwen3FlashAttention.forward
+    elif model_type is None and "qwen3" in model_name.lower():
         is_moe = bool(re.search(r'-a\d+b', model_name.lower()))
         if is_moe:
             print("Detected MoE model, replacing with AdaQwen3MoeFlashAttention.")
@@ -506,6 +525,19 @@ class AdaLlamaFlashAttention(LlamaAttention):
             attn_weights = None
 
         return attn_output, attn_weights
+
+
+class AdaQwen2FlashAttention(Qwen2Attention):
+    """
+    Qwen2 flash attention module for AdaKV. This module inherits from `Qwen2Attention` as the weights of the module stays untouched.
+    Qwen2 shares Llama's attention layout (no q_norm/k_norm, same RoPE and projections), so the Llama forward is reused as is.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+
+    forward = AdaLlamaFlashAttention.forward
 
 
 class AdaMistralFlashAttention(MistralAttention):

@@ -108,6 +108,7 @@ def evaluate(
     max_new_tokens: Optional[int] = None,
     max_context_length: Optional[int] = None,
     compress_questions: bool = False,
+    tasks: Optional[str] = None,
 ):
     """
     Evaluate a model on a dataset using a press and save the results
@@ -228,16 +229,24 @@ def evaluate(
     df_context = df.groupby("context")
     assert all(df_context["answer_prefix"].nunique() == 1)
 
-    if dataset == "longbench": 
+    if tasks is not None:
+        # Allow overriding the evaluated tasks from the CLI, e.g. --tasks "lcc,repobench-p"
+        # Use --tasks all to evaluate every task in the dataset.
+        if str(tasks).strip().lower() == "all":
+            evalutated_tasks = None
+        else:
+            evalutated_tasks = [t.strip() for t in str(tasks).split(",") if t.strip()]
+    elif dataset == "longbench":
         # evalutated_tasks = ["qasper"]
         # evalutated_tasks = ["hotpotqa"]
-        evalutated_tasks = None # Test all
+        # evalutated_tasks = None # Test all
+        evalutated_tasks = ["2wikimqa", "qasper", "qmsum", "multi_news"]
     elif dataset == "ruler":
         # evalutated_tasks = ["niah_multivalue"]
         evalutated_tasks = None # Test all
     else:
         evalutated_tasks = None
-            
+
     for context, df_ in tqdm(df_context, total=df["context"].nunique()):
 
         task_name = df_["task"].iloc[0]
