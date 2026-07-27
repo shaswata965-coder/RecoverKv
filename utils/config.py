@@ -121,12 +121,103 @@ def log_operating_point(config, is_windowed: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: dtype names accepted by ``model.dtype``. Kept here rather than in each runner
+#: because all three used ``dtypes.get(name, torch.float16)`` — a silent fallback
+#: that turned a typo (``bloat16``) into an fp16 run with nothing in the log.
+DTYPE_NAMES = ("float16", "bfloat16", "float32")
+
+
 @dataclass
 class ModelConfig:
     name: str = "meta-llama/Meta-Llama-3-8B"
     revision: Optional[str] = None
     dtype: str = "float16"
     attn_implementation: str = "eager"  # "eager" | "flash_attention_2"
+
+    # --- overrides applied to the checkpoint's own HF config at load time ----
+    #
+    # A checkpoint ships one context/RoPE configuration; a long-context eval may
+    # need another (Qwen2.5's 32K config vs its YaRN-scaled 128K one). Editing a
+    # cached config.json by hand is invisible to the result files and unshareable,
+    # so declare it here instead: utils.model_loading applies these to the
+    # AutoConfig before the weights load, logs every change, and the runners
+    # record them in their meta sidecars.
+    #
+    # None means "leave the checkpoint's value alone" for all four.
+    max_position_embeddings: Optional[int] = None
+    #: e.g. {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}
+    rope_scaling: Optional[Dict[str, Any]] = None
+    sliding_window: Optional[int] = None
+    use_sliding_window: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.dtype not in DTYPE_NAMES:
+            raise ConfigValidationError(
+                f"model.dtype must be one of {list(DTYPE_NAMES)}, got {self.dtype!r}. "
+                f"This used to fall back to float16 silently, which made a typo "
+                f"indistinguishable from an intended fp16 run."
+            )
+        if self.attn_implementation not in ("eager", "flash_attention_2", "sdpa"):
+            raise ConfigValidationError(
+                f"model.attn_implementation must be 'eager', 'flash_attention_2' "
+                f"or 'sdpa', got {self.attn_implementation!r}"
+            )
+        mpe = self.max_position_embeddings
+        if mpe is not None:
+            if isinstance(mpe, bool) or not isinstance(mpe, int) or mpe <= 0:
+                raise ConfigValidationError(
+                    f"model.max_position_embeddings must be a positive int or null, "
+                    f"got {mpe!r}"
+                )
+        sw = self.sliding_window
+        if sw is not None:
+            if isinstance(sw, bool) or not isinstance(sw, int) or sw <= 0:
+                raise ConfigValidationError(
+                    f"model.sliding_window must be a positive int or null, got {sw!r}"
+                )
+        if self.use_sliding_window is not None and not isinstance(
+            self.use_sliding_window, bool
+        ):
+            raise ConfigValidationError(
+                f"model.use_sliding_window must be a bool or null, got "
+                f"{self.use_sliding_window!r}"
+            )
+        rs = self.rope_scaling
+        if rs is None:
+            return
+        if not isinstance(rs, dict):
+            raise ConfigValidationError(
+                f"model.rope_scaling must be a mapping or null, got "
+                f"{type(rs).__name__}"
+            )
+        # transformers accepts either key ("type" is the legacy spelling, which
+        # PretrainedConfig copies onto "rope_type"). Require one so a typo'd block
+        # cannot silently load as un-scaled RoPE.
+        rope_type = rs.get("rope_type", rs.get("type"))
+        if not rope_type:
+            raise ConfigValidationError(
+                f"model.rope_scaling needs a 'rope_type' (or legacy 'type') key, "
+                f"got {sorted(rs)}. Without it transformers validates as "
+                f"'default' and the scaling you asked for is silently not applied."
+            )
+        if "factor" not in rs:
+            raise ConfigValidationError(
+                f"model.rope_scaling needs a 'factor' key for rope_type="
+                f"{rope_type!r}; transformers raises KeyError on it at load."
+            )
+        factor = rs["factor"]
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+            raise ConfigValidationError(
+                f"model.rope_scaling.factor must be a number, got {factor!r}"
+            )
+        # transformers' _validate_yarn_parameters warns (not raises) unless the
+        # factor is a float, and a warning in a 9-hour run is a warning nobody
+        # reads. Normalise here so `factor: 4` and `factor: 4.0` behave alike.
+        rs["factor"] = float(factor)
+        if rs["factor"] < 1.0:
+            raise ConfigValidationError(
+                f"model.rope_scaling.factor must be >= 1.0, got {rs['factor']}"
+            )
 
 
 @dataclass

@@ -26,6 +26,8 @@ from data.longbench_loader import (
     load_longbench_dataset,
 )
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
+from utils.generation import unmappable_token_ids
+from utils.model_loading import describe_model_load
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
@@ -152,66 +154,23 @@ class LongBenchRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer (lazy, called once).
 
-        cfg = self.config
+        Delegates to :func:`utils.model_loading.load_model_and_tokenizer`, which
+        the RULER and GSM8K runners also use — the three suites diverging here is
+        what let the Qwen column run a different decoding protocol from the Llama
+        and Mistral columns.
+        """
+        from utils.model_loading import load_model_and_tokenizer
 
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
-
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint=(
+                "On LongBench that costs most of the score on the 10 "
+                "chat-templated datasets."
+            ),
+            is_windowed=self.is_windowed,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name,
-            cfg.model.dtype,
-            cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-
-        if tokenizer.chat_template is None:
-            log.warning(
-                "Tokenizer for %s ships no chat template — every dataset will be "
-                "prompted raw. Correct for a base model; on an instruct model it "
-                "costs most of the score on the generative tasks.",
-                cfg.model.name,
-            )
-
-        # Mistral-7B-Instruct-v0.1 sets sliding_window=4096 (v0.2/v0.3 set null).
-        # Both the FA2 kernel and the sdpa mask builder band attention by
-        # *cache-slot* distance, which stops matching real token distance once
-        # the cache is compacted. Inert while the compacted cache is shorter than
-        # the window, but not something to discover from a score table.
-        sw = getattr(model.config, "sliding_window", None)
-        if sw and self.is_windowed:
-            log.warning(
-                "%s sets sliding_window=%s. The windowed cache keeps survivors at "
-                "their original positions but stores them compacted, so a banded "
-                "attention mask no longer corresponds to real token distance. "
-                "Prefer a model with sliding_window=null (e.g. "
-                "Mistral-7B-Instruct-v0.2) for comparable numbers.",
-                cfg.model.name, sw,
-            )
-
-        return model, tokenizer
 
     def run(self) -> None:
         """Run predictions on all configured datasets."""
@@ -242,6 +201,7 @@ class LongBenchRunner:
             self.is_windowed,
         )
         log_operating_point(self.config, self.is_windowed)
+        self._log_truncation_policy()
 
         for dataset_name in datasets:
             jsonl_path = output_dir / f"{dataset_name}.jsonl"
@@ -457,12 +417,26 @@ class LongBenchRunner:
             }
 
             # THUDM/LongBench + DefensiveKV use PURE greedy with NO repetition
-            # penalty. Only pass one if the user explicitly opted in to a
-            # non-1.0 value; otherwise the default must stay absent so results
-            # match the published protocol exactly.
+            # penalty. Leaving the kwarg absent is NOT the same as leaving the
+            # penalty off — an unpassed knob falls through to the checkpoint's own
+            # generation_config, and Qwen2.5-7B-Instruct ships
+            # repetition_penalty=1.05 where Llama-3.1 and Mistral-v0.2 ship none.
+            # utils.model_loading.pin_greedy_generation_defaults resets those at
+            # load, so absence here now genuinely means 1.0 on every model. This
+            # branch stays as the explicit opt-in.
             rep_pen = getattr(self.lb, "repetition_penalty", 1.0)
             if rep_pen is not None and rep_pen != 1.0:
                 gen_kwargs["repetition_penalty"] = rep_pen
+
+            # Ids the model can emit but the tokenizer cannot map (Qwen2.5 pads
+            # its vocab to 152064 against a 151665-id tokenizer). They decode to
+            # '' — a prediction the metric then scores as if the model had said
+            # nothing there. None for Llama/Mistral, whose vocab has no gap, so
+            # their generation is untouched. GSM8K has always done this; doing it
+            # in only one of three suites was the inconsistency.
+            suppress = unmappable_token_ids(model, tokenizer)
+            if suppress:
+                gen_kwargs["suppress_tokens"] = suppress
 
             # output_attentions only for eager backend
             if self.cache_backend_package == "eager":
@@ -471,13 +445,19 @@ class LongBenchRunner:
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache
 
-            # samsum special handling: stop at newline
+            # samsum special handling: stop at newline (THUDM pred.py).
+            #
+            # ADD the newline to the model's real EOS set rather than replacing
+            # it with [tokenizer.eos_token_id, newline]. Those are not the same
+            # list: a checkpoint may stop on several ids, and generation_config is
+            # the authority on which. Qwen2.5 stops on BOTH <|im_end|> (151645,
+            # which is tokenizer.eos_token) and <|endoftext|> (151643) — and
+            # samsum is prompted RAW (NO_CHAT_TEMPLATE_DATASETS), so <|endoftext|>
+            # is the one a raw continuation actually emits. Dropping it left the
+            # model with no natural stop but the newline.
             if dataset_name == "samsum":
                 newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
-                gen_kwargs["eos_token_id"] = [
-                    tokenizer.eos_token_id,
-                    newline_id,
-                ]
+                gen_kwargs["eos_token_id"] = self._eos_ids_plus(newline_id)
                 gen_kwargs["min_length"] = context_length + 1
 
             with torch.no_grad():
@@ -500,6 +480,22 @@ class LongBenchRunner:
         self._cleanup_memory(cache)
 
         return pred
+
+    def _eos_ids_plus(self, extra_id: int) -> List[int]:
+        """The model's full EOS id set, plus *extra_id*, de-duplicated.
+
+        Reads ``generation_config.eos_token_id`` first (the authority — it may be
+        a list, as on Qwen2.5 and Llama-3.1) and falls back to the tokenizer's
+        single id. Order is preserved so the model's own ids stay first.
+        """
+        gen_cfg = getattr(self.model, "generation_config", None)
+        raw = getattr(gen_cfg, "eos_token_id", None) if gen_cfg else None
+        if raw is None:
+            raw = getattr(self.tokenizer, "eos_token_id", None)
+        ids = list(raw) if isinstance(raw, (list, tuple)) else ([raw] if raw is not None else [])
+        ids.append(extra_id)
+        seen: set = set()
+        return [i for i in ids if i is not None and not (i in seen or seen.add(i))]
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
@@ -645,6 +641,121 @@ class LongBenchRunner:
                    + self._chat_template_overhead(tokenizer, dataset_name)
                    + self._AUTO_FIT_SAFETY_MARGIN)
         return max(model_max - reserve, 1)
+
+    #: A configured max_length below this fraction of the model's usable range is
+    #: reported as discarded headroom. 0.9 clears the legitimate case (Mistral's
+    #: 31500 against a 32768 window is 0.977 of the usable 32256) while catching
+    #: the one that matters: the LongBenchConfig default of 7500 left in place on
+    #: a long-context model, which silently middle-truncates every prompt to a
+    #: fraction of what the other columns see and reads as a method result.
+    _HEADROOM_WARN_FRACTION = 0.9
+
+    def _log_truncation_policy(self) -> None:
+        """State the prompt-truncation policy once, at run start.
+
+        ``longbench.max_length`` decides how much of each prompt the model ever
+        sees, it defaults to 7500, and nothing in the prediction files records
+        which mode was in force — so a config that simply omits the key produces
+        a plausible-looking score table built on quarter-length prompts. That is
+        exactly the failure this line exists to make impossible to miss.
+        """
+        configured = getattr(self.lb, "max_length", None)
+        model_max = self._model_context_window()
+        if configured is None:
+            log.info(
+                "LongBench truncation: max_length=null (auto-fit) — prompts are "
+                "middle-truncated only when they would run past the model's "
+                "context window (%s).", model_max,
+            )
+            # Auto-fit on a long-context model means "never truncate", which the
+            # eager backend cannot survive. Check against the longest prompt the
+            # suite actually produces rather than the context window.
+            self._warn_if_eager_attention_cannot_fit(self._LONGEST_LONGBENCH_PROMPT)
+            return
+        if configured == 0:
+            return                              # _resolve_max_length already warns
+        log.info(
+            "LongBench truncation: max_length=%d (explicit, THUDM protocol); "
+            "model context window is %s.", configured, model_max,
+        )
+        if not model_max:
+            return
+        # The longest generation across the configured datasets is the fair
+        # reserve to compare against; using 512 unconditionally would understate
+        # the headroom on a QA-only run.
+        max_gen = max(
+            (self.dataset2maxlen.get(d, 128)
+             for d in (getattr(self.lb, "datasets", None) or [])),
+            default=512,
+        )
+        usable = model_max - max_gen
+        self._warn_if_eager_attention_cannot_fit(configured)
+        if usable > 0 and configured < self._HEADROOM_WARN_FRACTION * usable:
+            log.warning(
+                "longbench.max_length=%d discards %d tokens of the model's usable "
+                "context (%d = window %d - longest generation %d). Every prompt "
+                "longer than %d is middle-truncated, so these scores are NOT "
+                "comparable with a column run at a larger max_length — and "
+                "%d is this field's DEFAULT, so check it was chosen rather than "
+                "inherited. Set max_length: null to auto-fit to the window.",
+                configured, usable - configured, usable, model_max, max_gen,
+                configured, configured,
+            )
+
+    #: Order-of-magnitude length of the longest LongBench-EN prompts
+    #: (narrativeqa / musique / passage_count run to ~20-25k tokens). Used only
+    #: to size the eager-attention warning below when truncation is off.
+    _LONGEST_LONGBENCH_PROMPT = 20000
+
+    #: Warn when one attention matrix would exceed this. Deliberately generous:
+    #: the point is to catch "this cannot run at all", not to second-guess a
+    #: borderline fit on an 80 GB card.
+    _EAGER_ATTN_WARN_GB = 8.0
+
+    def _warn_if_eager_attention_cannot_fit(self, prompt_tokens: int) -> None:
+        """Flag an eager run whose attention matrix cannot fit in any GPU.
+
+        Eager attention materializes ``[B, H_q, T, T]``. That is quadratic in the
+        prompt, and LongBench prompts run to ~20k tokens: 22 GB for Qwen2.5-7B
+        (28 query heads) and 26 GB for Llama-3.1-8B (32) — per layer, per example,
+        on top of the weights. Flash-attention-2 never materializes it, which is
+        why only the eager column has this ceiling.
+
+        It matters because of how it fails. ``skip_oom: true`` (set in every
+        LongBench config) records an OOM'd example as ``pred=null``, and the
+        scorer counts a null as **0** rather than dropping it — correctly, since
+        dropping would inflate the mean. So an eager run that cannot fit does not
+        crash: it produces a complete, plausible, uniformly depressed score table.
+        The ``skipped=N`` column in the score log is the tell; this warning is so
+        the run is not started in the first place.
+        """
+        if self.cache_backend_package != "eager" and (
+            getattr(self.config.model, "attn_implementation", None) != "eager"
+        ):
+            return
+        cfg = getattr(self.model, "config", None)
+        heads = getattr(cfg, "num_attention_heads", None)
+        if not heads or not prompt_tokens:
+            return
+        import torch as _torch
+
+        elem = _torch.tensor([], dtype=_torch.float16).element_size()
+        gb = heads * prompt_tokens * prompt_tokens * elem / 1e9
+        if gb < self._EAGER_ATTN_WARN_GB:
+            return
+        log.warning(
+            "EAGER backend at ~%d-token prompts materializes a %.0f GB attention "
+            "matrix (%d heads x T^2), per layer per example. This will OOM; with "
+            "skip_oom=true those examples are recorded as pred=null and SCORED AS "
+            "ZERO, so the run completes and returns a uniformly depressed table "
+            "rather than failing. Set longbench.max_length to something the card "
+            "can hold (a %.0f GB budget is ~%d tokens), or use the "
+            "flash_attention_2 backend, which never materializes it. If you are "
+            "comparing the eager and flash columns, they must use the SAME "
+            "max_length or they are not the same protocol.",
+            prompt_tokens, gb, heads, self._EAGER_ATTN_WARN_GB,
+            int((self._EAGER_ATTN_WARN_GB * 1e9 / (heads * elem)) ** 0.5),
+        )
 
     def _note_auto_fit(self, dataset_name: str, original: int, budget: int) -> None:
         """Log once per dataset when auto-fit actually truncates something."""
@@ -871,6 +982,16 @@ class LongBenchRunner:
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,
+            # What the load path did to the checkpoint's own config, and the
+            # greedy pinning — without these a YaRN-scaled run is indistinguishable
+            # from an un-scaled one in the result files.
+            **describe_model_load(cfg),
+            "model_max_position_embeddings_effective": getattr(
+                getattr(self.model, "config", None), "max_position_embeddings", None
+            ),
+            "model_rope_scaling_effective": getattr(
+                getattr(self.model, "config", None), "rope_scaling", None
+            ),
             # Both the knob and what it actually resolved to, so a result file is
             # self-describing under auto-fit (max_length null).
             "max_length": getattr(self.lb, "max_length", 7500),
