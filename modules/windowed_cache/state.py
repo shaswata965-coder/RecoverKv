@@ -343,10 +343,24 @@ class CacheState:
             old_pos = old_pos.unsqueeze(0).expand(B, -1)
         cos_old, sin_old = rope_module(self.value_states, old_pos)
 
-        # Undo old rotation: cos(-θ)=cos(θ), sin(-θ)=-sin(θ)
+        # Undo old rotation: cos(-θ)=cos(θ), sin(-θ)=-sin(θ).
+        #
+        # Only an inverse when the rotary module folds no scaling into cos/sin.
+        # YaRN sets attention_scaling a = 0.1·ln(factor)+1 (1.1386 at factor=4),
+        # making the forward map a·R(θ); the negated-sin pass then lands on a²·k
+        # and the re-rotation below would emit a³·R(θ_new)·k against a true
+        # a·R(θ_new)·k. Divide the a² out here — the single place both the
+        # unrotate and the rotate see. a == 1 on llama3 / default / linear /
+        # dynamic rope, so Llama-3.1 and Mistral skip the branch and stay
+        # byte-identical. See modules.quant.effective.rope_attention_scaling.
         _, k_unrotated = apply_rotary_pos_emb(
             self.key_states, self.key_states, cos_old, -sin_old
         )
+        from modules.quant.effective import rope_attention_scaling
+
+        a = rope_attention_scaling(rope_module)
+        if a != 1.0:
+            k_unrotated = k_unrotated / (a * a)
 
         # New contiguous positions (same for every row)
         new_pos = (
