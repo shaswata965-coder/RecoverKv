@@ -36,6 +36,7 @@ import torch
 
 from data.ruler_loader import RULER_TASKS, load_ruler_dataset
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
+from utils.model_loading import describe_model_load
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -107,75 +108,22 @@ class RulerRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer (lazy, called once).
 
-        cfg = self.config
-
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
-
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name,
-            cfg.model.dtype,
-            cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-
-        self._warn_on_prompt_format_traps(model, tokenizer, cfg)
-
-        return model, tokenizer
-
-    def _warn_on_prompt_format_traps(self, model, tokenizer, cfg) -> None:
-        """Two silent prompt-format traps, both mirrored from LongBenchRunner.
-
-        Neither is an error — a base model with no template is a legitimate run,
-        and sliding_window is inert while the compacted cache stays shorter than
-        the band — but both change the numbers without changing anything visible
-        in the predictions.
+        Delegates to :func:`utils.model_loading.load_model_and_tokenizer`, shared
+        with the LongBench and GSM8K runners. It owns the prompt-format warnings
+        this method used to duplicate, the context/RoPE overrides, and the reset
+        of any sampling defaults the checkpoint ships (Qwen2.5's
+        repetition_penalty=1.05 applies under greedy decoding; Llama-3.1 and
+        Mistral-v0.2 ship none) — so the three model columns decode identically.
         """
-        if getattr(tokenizer, "chat_template", None) is None:
-            log.warning(
-                "Tokenizer for %s ships no chat template — RULER prompts will be "
-                "sent RAW. Correct for a base model; on an instruct model it "
-                "costs most of the score.",
-                cfg.model.name,
-            )
+        from utils.model_loading import load_model_and_tokenizer
 
-        # Mistral-7B-Instruct-v0.1 sets sliding_window=4096 (v0.2/v0.3 set null).
-        # Both the FA2 kernel and the sdpa mask builder band attention by
-        # *cache-slot* distance, which stops matching real token distance once the
-        # cache is compacted.
-        sw = getattr(model.config, "sliding_window", None)
-        if sw and self.is_windowed:
-            log.warning(
-                "%s sets sliding_window=%s. The windowed cache keeps survivors at "
-                "their original positions but stores them compacted, so a banded "
-                "attention mask no longer corresponds to real token distance. "
-                "Prefer a model with sliding_window=null (e.g. "
-                "Mistral-7B-Instruct-v0.2) for comparable numbers.",
-                cfg.model.name, sw,
-            )
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint="RULER templates every task, so this affects all of them.",
+            is_windowed=self.is_windowed,
+        )
 
     def run(self) -> None:
         """Run predictions on all configured RULER tasks."""
@@ -608,6 +556,16 @@ class RulerRunner:
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,
+            # What the load path did to the checkpoint's own config, and the
+            # greedy pinning — without these a YaRN-scaled run is indistinguishable
+            # from an un-scaled one in the result files.
+            **describe_model_load(cfg),
+            "model_max_position_embeddings_effective": getattr(
+                getattr(self.model, "config", None), "max_position_embeddings", None
+            ),
+            "model_rope_scaling_effective": getattr(
+                getattr(self.model, "config", None), "rope_scaling", None
+            ),
             "num_samples_requested": getattr(self.ruler, "num_samples", "max"),
             "capture_memory": getattr(self.ruler, "capture_memory", False),
             "seed": cfg.run.seed,

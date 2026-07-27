@@ -36,6 +36,7 @@ from data.gsm8k_loader import load_gsm8k_dataset, read_manifest
 from modules.evaluation.gsm8k_dataset import STOP_STRINGS
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.generation import unmappable_token_ids
+from utils.model_loading import describe_model_load
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -105,59 +106,22 @@ class GSM8KRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer (lazy, called once).
 
-        cfg = self.config
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
+        Delegates to :func:`utils.model_loading.load_model_and_tokenizer`, shared
+        with the LongBench and RULER runners. It owns the prompt-format warnings
+        this method used to duplicate, the context/RoPE overrides, and the reset
+        of any sampling defaults the checkpoint ships (Qwen2.5's
+        repetition_penalty=1.05 applies under greedy decoding; Llama-3.1 and
+        Mistral-v0.2 ship none) — so the three model columns decode identically.
+        """
+        from utils.model_loading import load_model_and_tokenizer
 
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name, revision=getattr(cfg.model, "revision", None)
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint="GSM8K templates every example, so this affects all of them.",
+            is_windowed=self.is_windowed,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name, cfg.model.dtype, cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-
-        # Two silent prompt-format traps, mirrored from LongBenchRunner. Neither
-        # is an error — a base model with no template is a legitimate run, and
-        # sliding_window is inert while the compacted cache stays shorter than the
-        # band — but both change the numbers without changing anything visible in
-        # the predictions.
-        if getattr(tokenizer, "chat_template", None) is None:
-            log.warning(
-                "Tokenizer for %s ships no chat template — GSM8K prompts will be "
-                "sent RAW. Correct for a base model; on an instruct model it "
-                "costs most of the score.",
-                cfg.model.name,
-            )
-        sw = getattr(model.config, "sliding_window", None)
-        if sw and self.is_windowed:
-            log.warning(
-                "%s sets sliding_window=%s. The windowed cache keeps survivors at "
-                "their original positions but stores them compacted, so a banded "
-                "attention mask no longer corresponds to real token distance. "
-                "Prefer a model with sliding_window=null (e.g. "
-                "Mistral-7B-Instruct-v0.2) for comparable numbers.",
-                cfg.model.name, sw,
-            )
-        return model, tokenizer
 
     # ------------------------------------------------------------------
     # run
@@ -528,6 +492,16 @@ class GSM8KRunner:
             "tokenizer_sha": self._get_tokenizer_sha(),
             "dtype": cfg.model.dtype,
             "attn_implementation": cfg.model.attn_implementation,
+            # What the load path did to the checkpoint's own config, and the
+            # greedy pinning — without these a YaRN-scaled run is indistinguishable
+            # from an un-scaled one in the result files.
+            **describe_model_load(cfg),
+            "model_max_position_embeddings_effective": getattr(
+                getattr(self.model, "config", None), "max_position_embeddings", None
+            ),
+            "model_rope_scaling_effective": getattr(
+                getattr(self.model, "config", None), "rope_scaling", None
+            ),
             "cache_type": "windowed" if self.is_windowed else "full_cache",
             "cache_backend_package": self.cache_backend_package,
             "cache_budget": budget,
