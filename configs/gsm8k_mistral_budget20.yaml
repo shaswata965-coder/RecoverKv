@@ -1,0 +1,52 @@
+# ============================================================================
+# GSM8K — Mistral-7B-Instruct-v0.2, 20% cache budget (compression_ratio 0.80)
+# ============================================================================
+# 0.20 * (prefill + 512) against a ~280-token sequence, so the budget DOES bind
+# here and eviction fires on essentially every example. This is the run that
+# actually measures compression — cf. gsm8k_budget80.yaml, whose own header
+# explains why 80% may not bind at all.
+#
+# Geometry identical to configs/gsm8k_budget20.yaml (the Llama column) and
+# configs/gsm8k_qwen_budget20.yaml (the Qwen column), so the three differ only
+# by model.
+# Produces: outputs/gsm8k/mistral_budget20/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  # v0.2 specifically. v0.1 sets sliding_window=4096; both the FA2 kernel and the
+  # sdpa mask builder band attention by *cache-slot* distance, which stops
+  # matching real token distance once the windowed cache compacts. v0.2/v0.3 set
+  # sliding_window=null. The runner warns at load if this is ever violated.
+  # Mistral HAS a BOS ("<s>"), so the templated prompt takes encode_prompt's
+  # add_special_tokens=False path — one BOS, not two (utils/prompting.py).
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20        # fraction RETAINED (DefensiveKV compression_ratio = 0.80)
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25   # fraction of the budget — scales with short prompts
+  quant_ratio: 0.5          # two-tier fp16+int4; single-tier ablation: --override cache.quant_ratio=0.0
+  first_eviction_step: 0        # compress the prompt before the 2nd token (default)
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/mistral_budget20
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false
