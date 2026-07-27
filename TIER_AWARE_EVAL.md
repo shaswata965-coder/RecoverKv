@@ -91,7 +91,8 @@ Notes:
   (byte-identical to the single-tier path); `> 0` splits the evictable budget so the
   int4 Q tier holds more windows per byte. The factor is **not** the naive 4×: the
   fp16 scale/zero grid is fixed overhead the 4-bit codes do not dominate, so it grows
-  with `window_size` as the grid amortizes — ~2.6× at `window_size` 8, ~3.5× at 32.
+  with `window_size` as the grid amortizes — ~2.6× at `window_size` 8, ~3.5× at the
+  `window_size` 32 this eager config uses (head_dim 128; see `resolve`'s `b_q`).
   Set it in the yaml or via `--override`.
 - Step 3's config (`configs/eval_faithfulness.yaml`) points `base_npz_path` /
   `ours_npz_path` at the two outputs above.
