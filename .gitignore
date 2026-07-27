@@ -1,7 +1,8 @@
 # Evaluation results and logs (user specific requirement)
+# Per-example dumps are ~166MB each and exceed GitHub's 100MB limit; score
+# files and summary tables are small and are tracked.
 evaluation/results/*.xlsx
-evaluation/results/*.csv
-evaluation/results/*.json
+evaluation/results/**/*_df.csv
 evaluation/logs/*
 
 # Python
@@ -137,6 +138,11 @@ data/
 *.csv
 outputs/
 output/
+
+# Re-allow evaluation score files (must follow the global *.csv rule above).
+# The per-example *_df.csv dumps stay ignored -- see the top of this file.
+!evaluation/results/**/*.csv
+evaluation/results/**/*_df.csv
 
 # Logs
 *.log

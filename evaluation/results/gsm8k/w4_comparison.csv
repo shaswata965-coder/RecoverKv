@@ -1,0 +1,11 @@
+run,press,compression_ratio,n,accuracy,ci95,accuracy_strict,marker_rate,n_fallback,n_looks_truncated,n_generation_failed,measured_context_compression,effective_retention,pct_examples_degenerate,pct_examples_press_skipped,compress_questions,batch_size,n_batch_size_backoffs,dataset_sha
+layerdkv_w4_cr0.20,layer_defensivekv,0.2,1319,84.23,1.97,83.85,96.97,40,37,0,0.2,0.59,0.0,0.0,True,32,0,fe0fc2f22dea
+layerdkv_w4_cr0.40,layer_defensivekv,0.4,1319,84.08,1.97,83.93,97.5,33,28,0,0.4,0.5824,0.0,0.0,True,32,0,fe0fc2f22dea
+layerdkv_w4_cr0.60,layer_defensivekv,0.6,1319,82.56,2.05,82.11,97.04,39,29,0,0.6,0.5744,0.0,0.0,True,32,0,fe0fc2f22dea
+layerdkv_w4_cr0.80,layer_defensivekv,0.8,1319,31.16,2.5,28.96,67.17,425,372,0,0.8,0.6278,0.0,0.0,True,32,0,fe0fc2f22dea
+layerdkv_w4_cr0.90,layer_defensivekv,0.9,1319,3.18,0.95,1.14,24.87,962,733,0,0.9,0.7034,0.0,0.0,True,32,0,fe0fc2f22dea
+dkv_w4_cr0.20,defensivekv,0.2,1319,84.76,1.94,84.46,97.04,39,34,0,0.2003,0.5931,0.0,0.0,True,32,0,fe0fc2f22dea
+dkv_w4_cr0.40,defensivekv,0.4,1319,81.65,2.09,81.12,96.74,43,37,0,0.4003,0.5865,0.0,0.0,True,32,0,fe0fc2f22dea
+dkv_w4_cr0.60,defensivekv,0.6,1319,76.04,2.3,75.59,95.98,53,45,0,0.6003,0.5828,0.0,0.0,True,32,0,fe0fc2f22dea
+dkv_w4_cr0.80,defensivekv,0.8,1319,11.52,1.72,7.35,41.47,764,697,0,0.8005,0.6765,0.0,0.0,True,32,0,fe0fc2f22dea
+dkv_w4_cr0.90,defensivekv,0.9,1319,3.11,0.94,1.29,30.17,902,688,0,0.9005,0.6926,0.0,0.0,True,32,0,fe0fc2f22dea
