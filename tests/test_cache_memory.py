@@ -2,10 +2,12 @@
 
 The read memo is a derived fp16 copy of the Q tier. It is real resident memory,
 so `total_live` counts it — but it is not cache state, and at B = 1 (where the
-auto rule turns it ON) it is the largest line item by far. Measured on a RULER
-example it was 16.3 MB of 21.4 MB, which pulls `compression_vs_fp16` to 0.91x:
-the report claimed the two-tier cache was *bigger* than fp16, for a method whose
-claim is ~3.9x. These pin the pair of ratios that keeps that legible.
+auto rule turns it ON) it is the largest line item by far: it is the fp16 image
+of the Q tier, so it costs `N_q * b_fp` against a Q tier costing `N_q * b_q`
+(2.61x more, at the int4 ws=8 reference geometry). That pulls
+`compression_vs_fp16` toward 1.0 and can push it below — the report then claims
+the two-tier cache is *bigger* than fp16, for a method whose cache-state figure
+is ~2.6x. These pin the pair of ratios that keeps that legible.
 """
 from __future__ import annotations
 

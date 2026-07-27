@@ -108,7 +108,7 @@ def _generate(backend, quant_ratio, first_eviction_step=None):
         "n_generated": int(out.shape[-1] - PREFILL),
         # The fp store length is the signal that eviction ran. `get_seq_length`
         # is the MERGED count (T_fp + T_q) and barely moves at q > 0 — a demoted
-        # window still counts as its tokens, it just costs ~4x fewer bytes — so
+        # window still counts as its tokens, it just costs ~2.6x fewer bytes — so
         # asserting on it would pass whether or not anything evicted.
         "fp_len": cache._states[0].seq_length,
         "merged_len": cache.get_seq_length(0),

@@ -870,7 +870,7 @@ def build_paper_summary(
             f"{_pct(cov_row['mean_required_fraction'])} of windows suffice for "
             f"{_pct(cov_row['target_mass'], 0)} of it.",
             "",
-            f"> Holding the low-rank band in int2 instead of dropping it lowers "
+            f"> Holding the low-rank band in int4 instead of dropping it lowers "
             f"Future Missed Mass over the next {obs2['horizon']} decode steps "
             f"from {_pct(fp_only['future_missed_mass_mean'])} to "
             f"{_pct(fp_q['future_missed_mass_mean'])} at a matched measured "

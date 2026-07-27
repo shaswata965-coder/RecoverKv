@@ -156,9 +156,12 @@ class CacheMemoryReport:
     # The memo is a *derived* fp16 copy of the Q tier, not cache state: dropping
     # it costs recomputation, never correctness or a token. It is also charged
     # per row and, at B = 1 (where the auto rule turns it ON), it is by far the
-    # largest line item — measured on a RULER example it was 16.3 of 21.4 MB,
-    # which drags `compression_vs_fp16` to 0.91x, i.e. the report says the
-    # two-tier cache is BIGGER than fp16.
+    # largest line item: the memo is the *fp16* image of the Q tier, so it costs
+    # `N_q * b_fp` against a Q tier that costs `N_q * b_q` — at the int4 ws=8
+    # reference geometry that is 2.61x the Q tier's own bytes, and it works out
+    # to the majority of `total_live`. That drags `compression_vs_fp16` toward
+    # (and on a long context below) 1.0, i.e. the report says the two-tier cache
+    # is BIGGER than fp16.
     #
     # Both framings are honest and neither is the whole story, so publish the
     # pair rather than picking one: `*_excl_memo` is the cache-state figure a

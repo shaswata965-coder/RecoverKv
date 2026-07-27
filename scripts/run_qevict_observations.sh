@@ -56,11 +56,11 @@ case "$PROFILE" in
 esac
 
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
-WINDOW="${WINDOW:-32}"          # must be divisible by 4 when QUANT > 0
+WINDOW="${WINDOW:-32}"          # must be even when QUANT > 0 (int4 nibble packing)
 SINK="${SINK:-4}"
 LOCAL="${LOCAL:-256}"
 BUDGET="${BUDGET:-0.25}"
-QUANT="${QUANT:-0.5}"           # two-tier int2 split; 0 = fp16-only cache
+QUANT="${QUANT:-0.5}"           # two-tier int4 split; 0 = fp16-only cache
 SEED="${SEED:-42}"
 STAGE="${STAGE:-all}"           # all | observe
 

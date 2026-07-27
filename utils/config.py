@@ -77,7 +77,7 @@ def log_operating_point(config, is_windowed: bool) -> None:
         getattr(cache, "num_sink_tokens", None),
         getattr(cache, "local_window_size", None),
         q,
-        "two-tier fp16+int2" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
+        "two-tier fp16+int4" if q > 0 else "SINGLE-TIER fp16, Q tier disabled",
         getattr(cache, "first_eviction_step", None),
         "prompt compressed on decode step 0"
         if getattr(cache, "first_eviction_step", 0) == 0
