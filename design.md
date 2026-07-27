@@ -57,8 +57,11 @@ interleave) is the shippable v1 and is fully CPU-testable.
 
   Degenerate group (`mx == mn`): set `scale = 1` → all codes 0 and `x̂ = mn`
   exactly. **Scales and zeros are stored fp16 (pinned).** The fp8-scale option is
-  dropped: it saves ~1.5% of Q-tier bytes while injecting scale-quantization noise
-  into every dequant. Quantization runs against the **fp16-stored** `scale`/`zero`
+  dropped: it injects scale-quantization noise into every dequant for a saving of
+  8.7% / 5.5% / 3.4% of `b_q` at `window_size` 8 / 16 / 32 (`H_kv=8, D=128` — the
+  scale is one fp16 of the 4-byte key grid per channel and of the 4-byte value grid
+  per token, so the saving shrinks as the codes grow with `window_size`). The
+  often-quoted ~1.5% is the `window_size = 128` figure, which no shipped config uses. Quantization runs against the **fp16-stored** `scale`/`zero`
   (not the fp32 intermediates), so the grid the codes were fit to is bit-identical
   to the grid used at every dequant. The float-offset form is used rather than an
   integer zero-point because K/V groups often exclude zero — an integer zero-point
