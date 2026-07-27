@@ -1,15 +1,14 @@
 # ============================================================================
-# GSM8K - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - flash-attn-2
+# LongBench - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - eager
 # ============================================================================
 # Run this FIRST. A compressed number is only interpretable next to the
 # full-cache number from the IDENTICAL protocol - same model, same dtype,
 # same RoPE, same attention backend, same prompt budget.
-# scripts/run_gsm8k_e2e.sh gates on this accuracy (BASELINE_MIN).
-# Produces: outputs/gsm8k/qwen_full_cache_flash
+# Produces: outputs/longbench/qwen_full_cache_eager
 _base_: base.yaml
 
 run:
-  mode: gsm8k
+  mode: longbench
   seed: 42
 
 model:
@@ -41,7 +40,7 @@ model:
   # comparable, not least. Run every column at the same dtype; the loader warns
   # when the configured dtype differs from the checkpoint's own.
   dtype: bfloat16
-  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+  attn_implementation: eager   # MUST match cache.backend_package
 
   # --- YaRN context extension, 32K -> 128K ---------------------------------
   # Mirrors the config.json the baseline runs use, so our rows and the baseline
@@ -90,12 +89,38 @@ cache:
 telemetry:
   track_scores: false
 
-gsm8k:
-  data_dir: data/gsm8k_cot
-  output_dir: outputs/gsm8k/qwen_full_cache_flash
-  results_dir: outputs/gsm8k
-  num_samples: max          # override to e.g. 20 for a smoke run
-  shard: 0
-  num_shards: 1
-  skip_oom: false
-  aggressive_cache_clear: false
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  # null = auto-fit to the model's own context window. With YaRN that window
+  # is 131072, so no LongBench prompt is ever truncated - byte-for-byte the
+  # same protocol as the Llama-3.1 column
+  # (configs/longbench_ours_flash_attn.yaml), which is the point.
+  #
+  # Do NOT omit this key: LongBenchConfig.max_length DEFAULTS to 7500, which
+  # silently middle-truncates every prompt to a quarter of what the other
+  # columns see and reads as a method result. The runner now logs the policy
+  # at run start and warns when a configured value discards context headroom.
+  max_length: null
+  output_dir: outputs/longbench/qwen_full_cache_eager
+  seed: 42
+  resume: false
+  skip_oom: true
+  aggressive_cache_clear: true

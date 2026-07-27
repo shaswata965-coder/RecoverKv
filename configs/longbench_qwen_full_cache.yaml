@@ -1,10 +1,10 @@
 # ============================================================================
-# LongBench — Qwen2.5-7B-Instruct, Full Cache Baseline
+# LongBench - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - flash-attn-2
 # ============================================================================
-# The reference this branch's compressed Qwen runs are scored against.
-# Run this FIRST: a compressed number is only interpretable next to the
-# full-cache number from the identical protocol.
-# Produces: outputs/longbench/qwen_full_cache/
+# Run this FIRST. A compressed number is only interpretable next to the
+# full-cache number from the IDENTICAL protocol - same model, same dtype,
+# same RoPE, same attention backend, same prompt budget.
+# Produces: outputs/longbench/qwen_full_cache_flash
 _base_: base.yaml
 
 run:
@@ -12,35 +12,74 @@ run:
   seed: 42
 
 model:
-  # Qwen2.5 is the `qwen2` model type — Qwen2ForCausalLM, which kvpress (and so
-  # DefensiveKV) lists among its tested architectures, and which both of our
-  # score hooks already match on Qwen2Attention.
-  #
-  # Three ways Qwen2 differs from Llama/Mistral, all handled, none of them a knob:
-  #   * q/k/v carry a BIAS. The flash hook obtains its query by calling q_proj
-  #     (or reading that call's output), so the bias is included; a weight-only
-  #     matmul would score a query the model never used.
-  #   * no BOS token at all — bos_token is None and the prompt opens with
-  #     <|im_start|>. utils.prompting.encode_prompt therefore passes
-  #     add_special_tokens=False, matching kvpress.
-  #   * the config declares sliding_window but ships use_sliding_window=false,
-  #     and Qwen2Config nulls the window out in that case — so banded attention
-  #     is off and comparable over a compacted cache, like Mistral v0.2.
-  #
-  # Unlike Qwen3/Gemma3 there is no q_norm/k_norm to apply (see kvpress
-  # utils.get_prerope_query_states, which special-cases those and not Qwen2).
+  # -------------------------------------------------------------------------
+  # Qwen2.5 is the `qwen2` model type - Qwen2ForCausalLM, which kvpress (and so
+  # DefensiveKV) lists among its tested architectures, and which both score
+  # hooks match on Qwen2Attention. Verified against the PINNED transformers
+  # 4.47.1 source, not assumed:
+  #   * Qwen2Attention defines head_dim and num_key_value_groups, so the flash
+  #     hook's [B,H_kv,groups,T,D] regrouping is right at 28 q-heads / 4 kv-heads;
+  #   * neither Qwen2Attention nor LlamaAttention defines `scaling` on 4.47.1, so
+  #     both take the hook's head_dim**-0.5 fallback - no asymmetry;
+  #   * Qwen2FlashAttention2 and Qwen2SdpaAttention subclass Qwen2Attention, and
+  #     Qwen2DecoderLayer passes every attention argument by keyword;
+  #   * q/k/v carry a BIAS (Llama/Mistral do not). Both hooks obtain the query by
+  #     CALLING q_proj, so the bias is included; a weight-only matmul would score
+  #     a query the model never used;
+  #   * no BOS token at all (bos_token is None; the prompt opens with
+  #     <|im_start|>), so utils.prompting.encode_prompt passes
+  #     add_special_tokens=False - matching kvpress.
+  # -------------------------------------------------------------------------
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  # Qwen2.5's own config declares bfloat16 — as do Llama-3.1 and Mistral-v0.2.
-  # float16 here matches the rest of the repo, and that symmetry is the point:
-  # a dtype that varies by column is indistinguishable from a method effect.
-  # On bf16-capable hardware (A100/H100) prefer
-  #   --override model.dtype=bfloat16
-  # applied to ALL THREE models together, never to Qwen alone. On T4/P100 there
-  # is no bf16 and float16 is the only option; watch for inf/nan on a bf16-native
-  # model at long context, which shows up as empty or repeated generations.
-  dtype: float16
-  attn_implementation: flash_attention_2
+
+  # Qwen2.5's RELEASED dtype. Not a style choice: Qwen2-family activations
+  # overflow fp16 at long context, which surfaces as empty or repeated
+  # generations - i.e. as a bad *method* result. Llama-3.1 and Mistral-v0.2 are
+  # also bf16-native, so bfloat16 is the choice that makes the three columns most
+  # comparable, not least. Run every column at the same dtype; the loader warns
+  # when the configured dtype differs from the checkpoint's own.
+  dtype: bfloat16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+  # --- YaRN context extension, 32K -> 128K ---------------------------------
+  # Mirrors the config.json the baseline runs use, so our rows and the baseline
+  # rows are the same model. utils/model_loading.py applies these to the
+  # AutoConfig BEFORE the weights load and every meta sidecar records them, so a
+  # scaled run can never be mistaken for an un-scaled one.
+  #
+  # Two things to know about this on the pinned transformers 4.47.1:
+  #   * _compute_yarn_parameters derives the correction range from
+  #     config.max_position_embeddings and IGNORES
+  #     original_max_position_embeddings (not in that version's accepted key set;
+  #     it also logs "Unrecognized keys"). So max_position_embeddings: 131072 is
+  #     load-bearing, not cosmetic. The key is kept because it is what every
+  #     other YaRN consumer reads and it records the intent.
+  #   * YaRN sets attention_scaling = 0.1*ln(factor)+1 = 1.1386 at factor 4.0,
+  #     which the rotary module folds into cos/sin. The two-tier read path
+  #     inverts RoPE analytically, so that scalar is divided back out in
+  #     modules/quant/effective.py; without it every int4 key would be 1.296x too
+  #     large. rope_type default/llama3 have attention_scaling 1.0, which is why
+  #     the Llama and Mistral columns never exercised this path.
+  #
+  # NOTE: static YaRN trades some short-context quality for the longer window,
+  # and every LongBench/GSM8K/RULER-4096 prompt fits inside the native 32K. It is
+  # here because the BASELINE is configured this way and matching it is what
+  # makes the columns comparable. To run at the native 32K instead, delete all
+  # four keys below and set longbench.max_length back to 31500 (the Mistral
+  # column's value).
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  # Declared by the checkpoint and disabled by it. Qwen2Config does
+  # `sliding_window = sliding_window if use_sliding_window else None`, so this
+  # pair resolves to None and banded attention stays OFF - which is what the
+  # windowed cache needs, since a band measured in cache SLOTS stops matching
+  # real token distance once the cache is compacted.
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
   backend: dynamic                      # transformers.DynamicCache, no eviction
@@ -70,17 +109,17 @@ longbench:
     - repobench-p
   include_chinese: false
   use_e_variants: false
-  # Same 32K context class as Mistral-7B-Instruct-v0.2, so the same THUDM
-  # model2maxlen budget: 31500 + 512 (longest generation) + the chat template
-  # fits inside 32768. Matching the Mistral column exactly is the point — these
-  # two runs should differ only by model.
+  # null = auto-fit to the model's own context window. With YaRN that window
+  # is 131072, so no LongBench prompt is ever truncated - byte-for-byte the
+  # same protocol as the Llama-3.1 column
+  # (configs/longbench_ours_flash_attn.yaml), which is the point.
   #
-  # Qwen2.5 advertises 131072 via YaRN, but that needs rope_scaling switched on
-  # in the config; the shipped config is 32768 and that is what this reproduces.
-  # Do NOT inherit Llama-3.1's `null`: on a 128K model it is a no-op, on a 32K
-  # model it means auto-fit, which is a good guard but a moving protocol.
-  max_length: 31500
-  output_dir: outputs/longbench/qwen_full_cache
+  # Do NOT omit this key: LongBenchConfig.max_length DEFAULTS to 7500, which
+  # silently middle-truncates every prompt to a quarter of what the other
+  # columns see and reads as a method result. The runner now logs the policy
+  # at run start and warns when a configured value discards context headroom.
+  max_length: null
+  output_dir: outputs/longbench/qwen_full_cache_flash
   seed: 42
   resume: false
   skip_oom: true

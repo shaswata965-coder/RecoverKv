@@ -1,11 +1,14 @@
 # ============================================================================
-# LongBench — Qwen2.5-7B-Instruct, Ours (eager backend, Kaggle-runnable)
+# LongBench - Qwen2.5-7B-Instruct (YaRN 128K), Ours - eager (Kaggle-runnable)
 # ============================================================================
-# Windowed KV-cache with eager attention score extraction.
-# Use where flash-attn-2 isn't available (Kaggle T4/P100).
-# Geometry matches configs/longbench_mistral_ours_eager.yaml and
-# configs/longbench_ours_eager.yaml so the three columns differ only by model.
-# Produces: outputs/longbench/qwen_ours_eager_compression_0.8/
+# Baseline for this column: configs/longbench_qwen_full_cache_eager.yaml
+# The two differ ONLY in the cache block, so the delta IS the method.
+# Geometry matches configs/longbench_ours_eager.yaml (Llama) and
+# configs/longbench_mistral_ours_eager.yaml. Use where flash-attn-2 is
+# unavailable (Kaggle T4/P100) - note those cards have NO bf16, so a run
+# there needs --override model.dtype=float16 and carries the fp16 caveat
+# spelled out in the model block below.
+# Produces: outputs/longbench/qwen_ours_eager_compression_0.8
 _base_: base.yaml
 
 run:
@@ -13,18 +16,79 @@ run:
   seed: 42
 
 model:
-  # See longbench_qwen_full_cache.yaml for the three Qwen2-specific points
-  # (q/k/v bias, no BOS token, declared-but-disabled sliding_window).
+  # -------------------------------------------------------------------------
+  # Qwen2.5 is the `qwen2` model type - Qwen2ForCausalLM, which kvpress (and so
+  # DefensiveKV) lists among its tested architectures, and which both score
+  # hooks match on Qwen2Attention. Verified against the PINNED transformers
+  # 4.47.1 source, not assumed:
+  #   * Qwen2Attention defines head_dim and num_key_value_groups, so the flash
+  #     hook's [B,H_kv,groups,T,D] regrouping is right at 28 q-heads / 4 kv-heads;
+  #   * neither Qwen2Attention nor LlamaAttention defines `scaling` on 4.47.1, so
+  #     both take the hook's head_dim**-0.5 fallback - no asymmetry;
+  #   * Qwen2FlashAttention2 and Qwen2SdpaAttention subclass Qwen2Attention, and
+  #     Qwen2DecoderLayer passes every attention argument by keyword;
+  #   * q/k/v carry a BIAS (Llama/Mistral do not). Both hooks obtain the query by
+  #     CALLING q_proj, so the bias is included; a weight-only matmul would score
+  #     a query the model never used;
+  #   * no BOS token at all (bos_token is None; the prompt opens with
+  #     <|im_start|>), so utils.prompting.encode_prompt passes
+  #     add_special_tokens=False - matching kvpress.
+  # -------------------------------------------------------------------------
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16                # bfloat16 is Qwen2.5's native dtype; see the
-                                # dtype note in longbench_qwen_full_cache.yaml
-  attn_implementation: eager                # MUST match cache.backend_package
+
+  # Qwen2.5's RELEASED dtype. Not a style choice: Qwen2-family activations
+  # overflow fp16 at long context, which surfaces as empty or repeated
+  # generations - i.e. as a bad *method* result. Llama-3.1 and Mistral-v0.2 are
+  # also bf16-native, so bfloat16 is the choice that makes the three columns most
+  # comparable, not least. Run every column at the same dtype; the loader warns
+  # when the configured dtype differs from the checkpoint's own.
+  dtype: bfloat16
+  attn_implementation: eager   # MUST match cache.backend_package
+
+  # --- YaRN context extension, 32K -> 128K ---------------------------------
+  # Mirrors the config.json the baseline runs use, so our rows and the baseline
+  # rows are the same model. utils/model_loading.py applies these to the
+  # AutoConfig BEFORE the weights load and every meta sidecar records them, so a
+  # scaled run can never be mistaken for an un-scaled one.
+  #
+  # Two things to know about this on the pinned transformers 4.47.1:
+  #   * _compute_yarn_parameters derives the correction range from
+  #     config.max_position_embeddings and IGNORES
+  #     original_max_position_embeddings (not in that version's accepted key set;
+  #     it also logs "Unrecognized keys"). So max_position_embeddings: 131072 is
+  #     load-bearing, not cosmetic. The key is kept because it is what every
+  #     other YaRN consumer reads and it records the intent.
+  #   * YaRN sets attention_scaling = 0.1*ln(factor)+1 = 1.1386 at factor 4.0,
+  #     which the rotary module folds into cos/sin. The two-tier read path
+  #     inverts RoPE analytically, so that scalar is divided back out in
+  #     modules/quant/effective.py; without it every int4 key would be 1.296x too
+  #     large. rope_type default/llama3 have attention_scaling 1.0, which is why
+  #     the Llama and Mistral columns never exercised this path.
+  #
+  # NOTE: static YaRN trades some short-context quality for the longer window,
+  # and every LongBench/GSM8K/RULER-4096 prompt fits inside the native 32K. It is
+  # here because the BASELINE is configured this way and matching it is what
+  # makes the columns comparable. To run at the native 32K instead, delete all
+  # four keys below and set longbench.max_length back to 31500 (the Mistral
+  # column's value).
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  # Declared by the checkpoint and disabled by it. Qwen2Config does
+  # `sliding_window = sliding_window if use_sliding_window else None`, so this
+  # pair resolves to None and banded attention stays OFF - which is what the
+  # windowed cache needs, since a band measured in cache SLOTS stops matching
+  # real token distance once the cache is compacted.
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
   backend: windowed
-  backend_package: eager                    # imports modules.windowed_eager_cache
-  cache_budget: 0.20
+  backend_package: eager
+  cache_budget: 0.20                        # fraction RETAINED; compression_ratio = 0.8
   window_size: 32
   num_sink_tokens: 4
   local_window_size: 0.25
@@ -54,9 +118,18 @@ longbench:
     - repobench-p
   include_chinese: false
   use_e_variants: false
-  max_length: 31500                         # matches the Qwen full-cache config; see it for why
+  # null = auto-fit to the model's own context window. With YaRN that window
+  # is 131072, so no LongBench prompt is ever truncated - byte-for-byte the
+  # same protocol as the Llama-3.1 column
+  # (configs/longbench_ours_flash_attn.yaml), which is the point.
+  #
+  # Do NOT omit this key: LongBenchConfig.max_length DEFAULTS to 7500, which
+  # silently middle-truncates every prompt to a quarter of what the other
+  # columns see and reads as a method result. The runner now logs the policy
+  # at run start and warns when a configured value discards context headroom.
+  max_length: null
   output_dir: outputs/longbench/qwen_ours_eager_compression_0.8
   seed: 42
-  resume: true                              # essential on Kaggle (9-hour limit)
+  resume: true
   skip_oom: true
-  aggressive_cache_clear: true              # essential on Kaggle T4
+  aggressive_cache_clear: true

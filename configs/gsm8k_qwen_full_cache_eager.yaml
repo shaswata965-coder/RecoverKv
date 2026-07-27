@@ -1,11 +1,11 @@
 # ============================================================================
-# GSM8K - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - flash-attn-2
+# GSM8K - Qwen2.5-7B-Instruct (YaRN 128K), Full Cache - eager
 # ============================================================================
 # Run this FIRST. A compressed number is only interpretable next to the
 # full-cache number from the IDENTICAL protocol - same model, same dtype,
 # same RoPE, same attention backend, same prompt budget.
 # scripts/run_gsm8k_e2e.sh gates on this accuracy (BASELINE_MIN).
-# Produces: outputs/gsm8k/qwen_full_cache_flash
+# Produces: outputs/gsm8k/qwen_full_cache_eager
 _base_: base.yaml
 
 run:
@@ -41,7 +41,7 @@ model:
   # comparable, not least. Run every column at the same dtype; the loader warns
   # when the configured dtype differs from the checkpoint's own.
   dtype: bfloat16
-  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+  attn_implementation: eager   # MUST match cache.backend_package
 
   # --- YaRN context extension, 32K -> 128K ---------------------------------
   # Mirrors the config.json the baseline runs use, so our rows and the baseline
@@ -92,7 +92,7 @@ telemetry:
 
 gsm8k:
   data_dir: data/gsm8k_cot
-  output_dir: outputs/gsm8k/qwen_full_cache_flash
+  output_dir: outputs/gsm8k/qwen_full_cache_eager
   results_dir: outputs/gsm8k
   num_samples: max          # override to e.g. 20 for a smoke run
   shard: 0
