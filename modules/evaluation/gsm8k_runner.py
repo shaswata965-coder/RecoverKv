@@ -35,6 +35,7 @@ import torch
 from data.gsm8k_loader import load_gsm8k_dataset, read_manifest
 from modules.evaluation.gsm8k_dataset import STOP_STRINGS
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
+from utils.generation import unmappable_token_ids
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -302,6 +303,14 @@ class GSM8KRunner:
                 "temperature": 1.0,
                 "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
             }
+            # Ids the model can emit but the tokenizer cannot map (Qwen2.5 pads
+            # its vocab to 152064 against a 151665-id tokenizer). They decode to
+            # '' AND make stop_strings crash — StopStringCriteria sizes its
+            # embedding by len(tokenizer). None for Llama/Mistral, which have no
+            # gap, so their generation is untouched.
+            suppress = unmappable_token_ids(model, tokenizer)
+            if suppress:
+                gen_kwargs["suppress_tokens"] = suppress
             if self._supports_stop_strings():
                 gen_kwargs["stop_strings"] = STOP_STRINGS
                 gen_kwargs["tokenizer"] = tokenizer

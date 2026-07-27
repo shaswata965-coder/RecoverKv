@@ -21,7 +21,8 @@ model:
   # templates every example, so every prompt takes the no-BOS path.
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16
+  dtype: float16                # bfloat16 is Qwen2.5's native dtype; see the
+                                # dtype note in longbench_qwen_full_cache.yaml
   attn_implementation: flash_attention_2   # MUST match cache.backend_package
 
 cache:

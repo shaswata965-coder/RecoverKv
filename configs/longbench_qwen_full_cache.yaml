@@ -31,6 +31,14 @@ model:
   # utils.get_prerope_query_states, which special-cases those and not Qwen2).
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
+  # Qwen2.5's own config declares bfloat16 — as do Llama-3.1 and Mistral-v0.2.
+  # float16 here matches the rest of the repo, and that symmetry is the point:
+  # a dtype that varies by column is indistinguishable from a method effect.
+  # On bf16-capable hardware (A100/H100) prefer
+  #   --override model.dtype=bfloat16
+  # applied to ALL THREE models together, never to Qwen alone. On T4/P100 there
+  # is no bf16 and float16 is the only option; watch for inf/nan on a bf16-native
+  # model at long context, which shows up as empty or repeated generations.
   dtype: float16
   attn_implementation: flash_attention_2
 
