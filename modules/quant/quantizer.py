@@ -33,6 +33,8 @@ v1) — shapes carry no batch axis. Keys/values come in token-major
 
 from __future__ import annotations
 
+import os
+import warnings
 from typing import Tuple
 
 import torch
@@ -42,24 +44,150 @@ _LEVELS = 15.0  # int4 asymmetric: codes in [0, 15]
 
 
 # ---------------------------------------------------------------------------
+# Grid storage dtype (design.md §2 — the scale/zero pair, NOT the int4 codes)
+# ---------------------------------------------------------------------------
+
+
+def grid_dtype_for(kv_dtype: torch.dtype) -> torch.dtype:
+    """The dtype the int4 ``(scale, zero)`` grid is stored in, for a given KV dtype.
+
+    **Must stay 2 bytes.** The budget resolver charges the grid at 2 bytes per
+    element (``modules/windowed_cache/config.py``, ``b_q``), and at int4 that
+    grid is the fixed overhead the 4-bit codes do not dominate — it is exactly
+    why ``b_fp/b_q`` lands at 2.6-3.5x rather than the naive 4x — so a wider
+    grid would silently change every compression ratio the method reports.
+
+    - ``float16`` KV → ``float16``. Byte-identical to the original pinned grid,
+      so the Llama-3.1 and Mistral-v0.2 fp16 columns produce bit-for-bit the
+      results they always did. Overflow is structurally impossible there anyway:
+      the inputs are fp16, so ``|zero| <= 65504`` and
+      ``scale = (mx - mn)/15 <= 8734``.
+    - **anything else → ``bfloat16``.** bf16 has fp32's exponent range in the
+      same 2 bytes, so *no* value the cache can hold — bf16 or fp32 — can
+      overflow it. That is the property being bought, and it is why this is a
+      structural fix rather than a wider guard: a bf16 KV cache CAN hold a key
+      past fp16's 65504, and casting the grid there produced ``inf`` and a
+      window of ``nan`` with nothing raising.
+
+    The trade is 3 mantissa bits (bf16's 8 vs fp16's 11) on the grid, against
+    int4's 16 quantization levels. The code error still dominates the grid error
+    by more than an order of magnitude — key rel-L2 ~0.078 against bf16's ~0.002
+    rounding — and the exactness invariant that matters — fit grid == read grid,
+    bit for bit, which is what makes a re-demotion an exact reactivation
+    (design §10) — is dtype-agnostic and preserved.
+    """
+    return torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Grid representability guard — now a should-never-fire assertion
+# ---------------------------------------------------------------------------
+#
+# With grid_dtype_for() above, neither overflow nor a zero-underflowed scale can
+# reach the divide: the grid dtype covers the cache dtype's whole range, and
+# _affine_quantize re-applies the degenerate rule after the cast. This check
+# stays as the thing that would notice if that reasoning ever stopped holding —
+# a new cache dtype, a caller passing grid_dtype explicitly, a change to the
+# fallback. It reports; it does not repair (the `where` above already did).
+#
+# Bounded rather than always-on because it is a device sync: unbounded it would
+# serialize the decode loop on GPU. It runs over the first evictions, which
+# quantize the whole prompt across every layer and carry the largest magnitudes
+# a run will ever see. STICKYKV_GRID_CHECKS=0 disables it; a larger value widens
+# the window.
+_GRID_CHECK_BUDGET = [None]
+_grid_warned = [False]
+
+
+def _grid_checks_remaining() -> int:
+    if _GRID_CHECK_BUDGET[0] is None:
+        try:
+            n = int(os.environ.get("STICKYKV_GRID_CHECKS", "64"))
+        except (TypeError, ValueError):
+            n = 64
+        _GRID_CHECK_BUDGET[0] = max(n, 0)
+    return _GRID_CHECK_BUDGET[0]
+
+
+def reset_grid_guard() -> None:
+    """Re-arm the guard (tests; a new process starts armed)."""
+    _GRID_CHECK_BUDGET[0] = None
+    _grid_warned[0] = False
+
+
+def _check_grid_representable(x, scale, zero, g_scale, g_zero, usable) -> None:
+    """Warn once if the grid dtype could not hold a value the cache can.
+
+    Skipped when the grid dtype is at least as wide as the input's exponent
+    range, which is the case :func:`grid_dtype_for` guarantees — so on every
+    shipped configuration this costs nothing and never fires. It exists for the
+    configurations that reasoning does not cover.
+    """
+    if _grid_warned[0]:
+        return
+    # fp16 grid + fp16 input: |zero| <= 65504 and scale <= 8734 by construction.
+    if g_scale.dtype == x.dtype:
+        return
+    # bf16 grid: same exponent range as fp32, so nothing the cache holds can
+    # overflow it and nothing narrower than its subnormals can reach the divide.
+    if g_scale.dtype == torch.bfloat16 and x.dtype in (
+        torch.bfloat16, torch.float32, torch.float16
+    ):
+        return
+    remaining = _grid_checks_remaining()
+    if remaining <= 0:
+        return
+    _GRID_CHECK_BUDGET[0] = remaining - 1
+
+    if not bool((~usable).any()):            # the sync, bounded to N calls
+        return
+    _grid_warned[0] = True
+    finite = torch.isfinite(scale) & torch.isfinite(zero)
+    biggest = float(torch.where(finite, zero.abs(), torch.zeros_like(zero)).amax())
+    warnings.warn(
+        f"int4 grid was not representable in {g_scale.dtype} while quantizing a "
+        f"{x.dtype} tensor (largest finite |zero| seen: {biggest:.1f}). Those "
+        f"groups fell back to the degenerate grid — they dequantize to their own "
+        f"minimum rather than to inf/nan, so the run is not corrupt, but those "
+        f"windows carry no information. Use modules.quant.quantizer.grid_dtype_for "
+        f"to pick the grid dtype; it returns bfloat16 for any non-fp16 cache "
+        f"dtype, which cannot overflow and costs the same 2 bytes.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core affine quant / dequant (grouped along one axis)
 # ---------------------------------------------------------------------------
 
 
-def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]:
+def _affine_quantize(
+    x: Tensor, group_dim: int, grid_dtype: torch.dtype = torch.float16
+) -> Tuple[Tensor, Tensor, Tensor]:
     """Affine asymmetric int4 quantize ``x`` grouped along ``group_dim``.
 
     The quant group is the slice along ``group_dim``: mx/mn are reduced over
     that axis so every group shares one ``(scale, zero)``.
+
+    ``grid_dtype`` is the storage dtype of that ``(scale, zero)`` pair — see
+    :func:`grid_dtype_for`. It must be a 2-byte float, because the budget
+    resolver charges the grid at 2 bytes per element and every reported
+    compression ratio follows from that.
+
+    Total by construction: no input can drive this to ``nan`` or to an undefined
+    ``uint8`` cast. Three ways it used to be possible, all closed below —
+    a grid value that overflows the storage dtype, a scale that underflows it to
+    zero (``0/0`` in the division), and a non-finite input.
 
     Returns
     -------
     codes : uint8 Tensor
         Same shape as ``x``; values in ``[0, 15]`` (unpacked, one code per
         element).
-    scale, zero : fp16 Tensor
+    scale, zero : ``grid_dtype`` Tensor
         Shape of ``x`` with ``group_dim`` reduced away (kept, not squeezed —
-        callers squeeze as needed). Pinned fp16 grid.
+        callers squeeze as needed).
     """
     x32 = x.to(torch.float32)
     mx = x32.amax(dim=group_dim, keepdim=True)
@@ -72,18 +200,41 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     scale = torch.where(degenerate, torch.ones_like(scale), scale)
     zero = mn
 
-    # Pin the grid in fp16, then quantize against the fp16 values (upcast for
-    # the arithmetic) so the fit grid == the read grid, bit for bit.
-    scale16 = scale.to(torch.float16)
-    zero16 = zero.to(torch.float16)
-    scale_grid = scale16.to(torch.float32)
-    zero_grid = zero16.to(torch.float32)
+    # Pin the grid in `grid_dtype`, then quantize against the STORED values
+    # (upcast for the arithmetic) so the fit grid == the read grid, bit for bit.
+    # That identity is what makes a re-demotion an exact reactivation (design
+    # §10), and it holds for any grid dtype.
+    g_scale = scale.to(grid_dtype)
+    g_zero = zero.to(grid_dtype)
+
+    # Re-apply the degenerate rule AFTER the cast. `mx == mn` catches a group
+    # that is exactly constant, but the cast can also produce an unusable scale:
+    # it underflows to 0 for a group whose spread is below grid_dtype's smallest
+    # subnormal, and to inf for one whose spread overflows it. Dividing by either
+    # yields inf or 0/0 = nan, and `nan.to(uint8)` is undefined — garbage codes
+    # that dequantize to plausible values with nothing raising. Falling back to
+    # the degenerate grid (scale 1, all codes 0, x̂ = zero) is the same answer
+    # the exactly-constant case already gets, and is exact for a group that
+    # narrow. Written as `where`, not a branch, so there is no host sync.
+    usable = torch.isfinite(g_scale) & (g_scale != 0)
+    g_scale = torch.where(usable, g_scale, torch.ones_like(g_scale))
+    g_zero = torch.where(torch.isfinite(g_zero), g_zero, torch.zeros_like(g_zero))
+    _check_grid_representable(x, scale, zero, g_scale, g_zero, usable)
+
+    scale_grid = g_scale.to(torch.float32)
+    zero_grid = g_zero.to(torch.float32)
 
     q = torch.round((x32 - zero_grid) / scale_grid)  # round-half-even
+    # A non-finite INPUT (the model itself diverged) would otherwise reach the
+    # uint8 cast as nan. Map it to a defined code instead of undefined behaviour:
+    # the fp tier still carries the nan, so the divergence stays visible where it
+    # actually happened. Identity on finite q, and ±inf already clamped to the
+    # same place below, so this does not move a single healthy value.
+    q = torch.nan_to_num(q, nan=0.0, posinf=_LEVELS, neginf=0.0)
     q = torch.clamp(q, 0.0, _LEVELS)                 # clamp BEFORE uint cast
     codes = q.to(torch.uint8)
 
-    return codes, scale16, zero16
+    return codes, g_scale, g_zero
 
 
 def _affine_dequantize(
@@ -140,7 +291,7 @@ def unpack_nibbles_last(packed: Tensor, n: int) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_key_window(k_win: Tensor, grid_dtype: torch.dtype = torch.float16) -> Tuple[Tensor, Tensor, Tensor]:
     """Quantize one window's keys.
 
     Parameters
@@ -163,7 +314,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         raise ValueError(f"key window must be even, got {window}")
 
     # Quant group = token axis (dim 1) ⇒ scale/zero per (head, channel).
-    codes, scale16, zero16 = _affine_quantize(k_win, group_dim=1)
+    codes, scale16, zero16 = _affine_quantize(k_win, group_dim=1, grid_dtype=grid_dtype)
     scale = scale16.squeeze(1)  # [H_kv, D]
     zero = zero16.squeeze(1)    # [H_kv, D]
 
@@ -173,7 +324,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     return packed, scale, zero
 
 
-def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_key_windows(k_wins: Tensor, grid_dtype: torch.dtype = torch.float16) -> Tuple[Tensor, Tensor, Tensor]:
     """Batched :func:`quantize_key_window` over a leading window axis.
 
     Bit-identical to calling the singular form per window: the quant group is
@@ -201,7 +352,7 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         raise ValueError(f"key window must be even, got {window}")
 
     # Quant group = token axis (dim 2 with the batch axis) ⇒ grid per (N, head, channel).
-    codes, scale16, zero16 = _affine_quantize(k_wins, group_dim=2)
+    codes, scale16, zero16 = _affine_quantize(k_wins, group_dim=2, grid_dtype=grid_dtype)
     scale = scale16.squeeze(2)  # [N, H_kv, D]
     zero = zero16.squeeze(2)    # [N, H_kv, D]
 
@@ -210,7 +361,7 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     return packed, scale, zero
 
 
-def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_value_windows(v_wins: Tensor, grid_dtype: torch.dtype = torch.float16) -> Tuple[Tensor, Tensor, Tensor]:
     """Batched :func:`quantize_value_window` over a leading window axis.
 
     Bit-identical to the singular form applied per window — see
@@ -235,7 +386,7 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         raise ValueError(f"value head_dim must be even, got {D}")
 
     # Quant group = channel axis ⇒ grid per (N, head, token).
-    codes, scale16, zero16 = _affine_quantize(v_wins, group_dim=3)
+    codes, scale16, zero16 = _affine_quantize(v_wins, group_dim=3, grid_dtype=grid_dtype)
     scale = scale16.squeeze(3)  # [N, H_kv, window]
     zero = zero16.squeeze(3)    # [N, H_kv, window]
 
@@ -298,7 +449,7 @@ def dequantize_key_windows(
 # ---------------------------------------------------------------------------
 
 
-def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_value_window(v_win: Tensor, grid_dtype: torch.dtype = torch.float16) -> Tuple[Tensor, Tensor, Tensor]:
     """Quantize one window's values.
 
     Parameters
@@ -320,7 +471,7 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         raise ValueError(f"value head_dim must be even, got {D}")
 
     # Quant group = channel axis (dim 2) ⇒ scale/zero per (head, token).
-    codes, scale16, zero16 = _affine_quantize(v_win, group_dim=2)
+    codes, scale16, zero16 = _affine_quantize(v_win, group_dim=2, grid_dtype=grid_dtype)
     scale = scale16.squeeze(2)  # [H_kv, window]
     zero = zero16.squeeze(2)    # [H_kv, window]
 
