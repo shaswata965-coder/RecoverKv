@@ -53,7 +53,7 @@
 #   cache_budget  0.20 / 0.10  — per-row memory; the 1:1 lever on max-B.
 #   quant_ratio   0.0  / 0.5   — how the evictable budget splits fp16 vs int4.
 #     The budget is enforced in BYTES and b_q already includes the int4 grid
-#     (config.py:293), so at a fixed budget q does NOT change per-row memory —
+#     (config.py resolve()), so at a fixed budget q does NOT change per-row memory —
 #     verified: b20_q00 = 106.6 MB/row, b20_q50 = 106.3 MB/row. What q buys is
 #     RETAINED TOKENS at equal bytes: 813 (q=0) -> 1413 (q=0.5), i.e. 1.74x the
 #     context for free. So expect q to move QUALITY (LongBench), not max-B. If
