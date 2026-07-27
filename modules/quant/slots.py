@@ -87,6 +87,7 @@ class QuantSlotTable:
         head_dim: int,
         num_kv_heads: int,
         device: torch.device,
+        grid_dtype: torch.dtype = torch.float16,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -96,11 +97,18 @@ class QuantSlotTable:
         self.num_kv_heads = H
 
         self.key_codes = torch.zeros((B, N, H, D, S // 4), dtype=torch.uint8, device=device)
-        self.key_scale = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
-        self.key_zero = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
+        # The (scale, zero) grid. `grid_dtype` MUST be a 2-byte float: the budget
+        # resolver charges it at 2 bytes/element and at int2 it is the dominant
+        # cost of a Q window, so a wider one would move every reported
+        # compression ratio. See modules.quant.quantizer.grid_dtype_for for why
+        # it follows the KV dtype (fp16 KV keeps fp16 and stays bit-identical;
+        # anything else takes bf16, which cannot overflow).
+        self.grid_dtype = grid_dtype
+        self.key_scale = torch.zeros((B, N, H, D), dtype=grid_dtype, device=device)
+        self.key_zero = torch.zeros((B, N, H, D), dtype=grid_dtype, device=device)
         self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
-        self.val_scale = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
-        self.val_zero = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
+        self.val_scale = torch.zeros((B, N, H, S), dtype=grid_dtype, device=device)
+        self.val_zero = torch.zeros((B, N, H, S), dtype=grid_dtype, device=device)
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)

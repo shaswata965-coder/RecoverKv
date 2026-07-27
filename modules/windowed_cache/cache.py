@@ -29,6 +29,7 @@ from .telemetry import NullTelemetry, Telemetry
 
 from modules.quant import (
     QuantizedStore,
+    grid_dtype_for,
     materialize_effective_kv,
     unrotate_key_window,
 )
@@ -119,6 +120,14 @@ class WindowedCache(_HFCacheBase):
                 QuantizedStore(
                     self.resolved.window_size, head_dim, num_kv_heads,
                     n_slots=n_slots,
+                    # The (scale, zero) grid follows the KV dtype. fp16 keeps the
+                    # historical fp16 grid bit-for-bit; a bf16 (or fp32) cache
+                    # takes a bf16 grid, which has fp32's exponent range in the
+                    # same 2 bytes and therefore cannot overflow. An fp16 grid
+                    # under a bf16 cache CAN: bf16 holds values past 65504, the
+                    # cast makes them inf, and the window dequantizes to nan with
+                    # nothing raising. Byte accounting is unchanged either way.
+                    grid_dtype=grid_dtype_for(kv_dtype),
                     # Provisional: `None` means auto, resolved from the real batch
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,

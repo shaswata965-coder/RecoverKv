@@ -58,6 +58,11 @@ class QuantizedStore:
     memoize_read : bool
         Cache :meth:`effective_q_tier`'s dequantized + RoPE'd result between
         evictions. See that method for the memory/bandwidth trade.
+    grid_dtype : torch.dtype
+        Storage dtype of the ``(scale, zero)`` grid. Must be a 2-byte float —
+        see :func:`modules.quant.quantizer.grid_dtype_for`, which derives it from
+        the cache's KV dtype. The default keeps the historical fp16 grid so a
+        direct construction is unchanged.
     """
 
     def __init__(
@@ -67,12 +72,17 @@ class QuantizedStore:
         num_kv_heads: int,
         n_slots: int,
         memoize_read: bool = True,
+        grid_dtype: torch.dtype = torch.float16,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
         self.memoize_read = memoize_read
+        # Single source of truth for the (scale, zero) storage dtype: it is
+        # handed BOTH to the slot table's buffers and to every quantize call, so
+        # the two cannot disagree and silently down-cast the grid on scatter.
+        self.grid_dtype = grid_dtype
 
         # Allocated on first use: the row count and device are not known until
         # the first forward pass reaches the cache.
@@ -105,6 +115,7 @@ class QuantizedStore:
                 head_dim=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
                 device=device,
+                grid_dtype=self.grid_dtype,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -198,8 +209,8 @@ class QuantizedStore:
         # singular op applied slice-wise — bit-identical, one launch per tier.
         k_flat = keys_pre_rope.reshape(B * n, H, S, D)
         v_flat = values.reshape(B * n, H, S, D)
-        k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
-        v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
+        k_codes, k_scale, k_zero = quantize_key_windows(k_flat, self.grid_dtype)
+        v_codes, v_scale, v_zero = quantize_value_windows(v_flat, self.grid_dtype)
 
         self.table.write(
             slot_idx, valid, wid,

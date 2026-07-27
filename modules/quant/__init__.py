@@ -30,6 +30,7 @@ from .quantizer import (
     dequantize_key_windows,
     dequantize_value_window,
     dequantize_value_windows,
+    grid_dtype_for,
     pack_crumbs_last,
     quantize_key_window,
     quantize_value_window,
@@ -37,6 +38,7 @@ from .quantizer import (
 )
 
 __all__ = [
+    "grid_dtype_for",
     "quantize_key_window",
     "dequantize_key_window",
     "dequantize_key_windows",
