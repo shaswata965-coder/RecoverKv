@@ -89,7 +89,10 @@ python main.py --config configs/eval_visualize.yaml
 Notes:
 - The knob is **`cache.quant_ratio`** (`configs/base.yaml:24`). `0.0` = pure fp16
   (byte-identical to the single-tier path); `> 0` splits the evictable budget so the
-  int4 Q tier holds ~4× the windows per byte. Set it in the yaml or via `--override`.
+  int4 Q tier holds more windows per byte. The factor is **not** the naive 4×: the
+  fp16 scale/zero grid is fixed overhead the 4-bit codes do not dominate, so it grows
+  with `window_size` as the grid amortizes — ~2.6× at `window_size` 8, ~3.5× at 32.
+  Set it in the yaml or via `--override`.
 - Step 3's config (`configs/eval_faithfulness.yaml`) points `base_npz_path` /
   `ours_npz_path` at the two outputs above.
 - **q = 0 sanity / back-compat:** run steps 2–3 with `--override cache.quant_ratio=0.0`

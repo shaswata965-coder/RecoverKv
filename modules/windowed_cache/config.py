@@ -101,9 +101,12 @@ class WindowedCacheConfig:
         Two-tier split ``q`` in ``[0, 1]`` (design.md §7).  **Default 0.0** —
         the Q (int4) tier is disabled and the cache is byte-identical to the
         single-tier fp16 path.  When ``q > 0``, the evictable window budget is
-        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int4 tier
-        (which holds ~4× the windows per byte).  Requires an even ``window_size``
-        (int4 nibble packing).
+        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int4 tier.
+        int4 quarters the codes vs fp16, but the fp16 scale/zero grid is fixed
+        overhead, so the honest gain is ~2.6× the windows per fp byte at
+        ``window_size = 8`` (see ``resolve``'s ``b_q``), not the naive 4×; it
+        grows with ``window_size`` as the grid amortizes (~3.5× at 32).
+        Requires an even ``window_size`` (int4 nibble packing).
     quant_memoize_read : bool, optional
         Cache the dequantized + RoPE'd Q tier between evictions, per layer.
         **Default ``None`` = auto: on at ``B == 1``, off above.**

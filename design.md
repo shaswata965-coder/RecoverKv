@@ -418,8 +418,9 @@ and local are already handled by the untouched `num_sink_tokens` / `local_tokens
   can never exceed the budget.
 
 *Example* (β = 0.25, q = 0.5): the evictable budget splits 50/50 by memory ⇒
-`N_q ≈ 4 · top_k_fp` ⇒ ~4× as many evictable windows kept in int4 as in fp, at the same
-byte cost.
+`N_q ≈ 2.6 · top_k_fp` ⇒ ~2.6× as many evictable windows kept in int4 as in fp, at the
+same byte cost (`window_size = 8`; the factor grows with `window_size` as the fixed
+fp16 scale/zero grid amortizes — the naive 4× counts only the codes).
 
 New config knobs: `β` (exists as `cache_budget`), `q` (default **0.0**), bit-width
 (fixed 4 in v1), group size (= `window_size`). Scale dtype is fixed fp16 (§2) — not a
