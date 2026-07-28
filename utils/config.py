@@ -380,7 +380,7 @@ class FaithfulnessConfig:
 
 
 # ---------------------------------------------------------------------------
-# Tier study config (six observation metrics over a five-run matrix)
+# Tier study config (seven observation metrics over a five-run matrix)
 # ---------------------------------------------------------------------------
 
 

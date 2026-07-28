@@ -1,5 +1,5 @@
 # ============================================================================
-# RecoveryKV — tier study (six observation metrics over a five-run matrix)
+# RecoveryKV — tier study (seven observation metrics over a five-run matrix)
 # ----------------------------------------------------------------------------
 # Post-processing only: no model load.  Reads five SEPARATELY RECORDED runs and
 # writes outputs/tier_study/{mN_*.{csv,json,npz}, all_metrics.{npz,json,md}}.

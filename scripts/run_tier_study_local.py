@@ -290,7 +290,7 @@ def run_study_stage(base_paths: Dict[int, Path], ours_paths: Dict[str, Path],
         "--trace-axis", trace_axis, "--bootstrap-samples", str(bootstrap),
         "--seed", str(seed),
     ]
-    log("=== TIER STUDY (combined M1-M6) ===")
+    log("=== TIER STUDY (combined M1-M7) ===")
     log("  " + " ".join(cmd))
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=REPO_ROOT)

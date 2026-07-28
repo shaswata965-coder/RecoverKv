@@ -22,7 +22,8 @@ window-level, promotion-capable cache:
       :func:`episode_lir` and :func:`binary_transition`.  ``episode_lir`` is
       the *episode*-based Global LIR: each maximal inactive run counts once,
       becomes eligible after ``m`` consecutive misses, and is rescued only if a
-      hit lands within the next ``H`` events.  This differs deliberately from
+      hit lands within the next ``H`` events — or anywhere later in the trace,
+      uncapped and uncensored, with ``H=None``.  This differs deliberately from
       ``sticky_metrics.lir_counts``, which counts every ``(event, window)``
       lookback pair and accepts a rescue arbitrarily far in the future — see
       the comparison table in ``modules/evaluation/qevict_observations.py``.
@@ -482,7 +483,7 @@ def infer_creation_events(selected: Array) -> Array:
 def episode_lir(
     selected: Array,
     inactivity: int,
-    horizon: int,
+    horizon: Optional[int],
     creation_events: Optional[Array] = None,
 ) -> Dict[str, object]:
     """Episode-based Global LIR: do *cold* windows regain importance?
@@ -493,6 +494,12 @@ def episode_lir(
     end of the trace are right-censored — dropped from numerator *and*
     denominator rather than counted as failures.
 
+    With ``horizon=None`` there is no cap: an episode is rescued iff a hit lands
+    *anywhere* later in the trace, and nothing is censored (there is no fixed
+    horizon left to run out of).  That is a different question — "was it **ever**
+    rescued" rather than "was it rescued in time" — and it is the honest
+    denominator when the point is how much a fixed ``H`` was undercounting.
+
     Contrast with :func:`utils.sticky_metrics.lir_counts`, which counts every
     ``(event, window)`` lookback pair (so one long inactive run contributes many
     eligible pairs) and accepts a rescue at *any* later event (so it has no
@@ -502,8 +509,15 @@ def episode_lir(
     ----------
     selected : np.ndarray ``[M, R, W]``
         Trinary selection matrix (``-1`` unobservable / ``0`` miss / ``1`` hit).
-    inactivity, horizon : int
-        ``m`` and ``H`` above; both must be positive.
+    inactivity : int
+        ``m`` above; must be positive.
+    horizon : int or None
+        ``H`` above; must be positive when given.  ``None`` means *uncapped* —
+        score every eligible episode against however much trace remains, with no
+        right-censoring and an unbounded ``time_to_revival``.  It is **not** the
+        same as passing a very large ``H``: a large finite ``H`` still censors
+        every episode whose window would overrun the trace end, so it shrinks the
+        denominator as ``H`` grows, while ``None`` keeps all of it.
     creation_events : np.ndarray, optional
         ``[W]`` or ``[M, W]``; defaults to :func:`infer_creation_events`.
 
@@ -521,7 +535,7 @@ def episode_lir(
         raise ValueError(f"selected must be [M, R, W]; got {x.shape}")
     if not np.all(np.isin(x, (-1, 0, 1))):
         raise ValueError("selected must contain only -1, 0, 1")
-    if inactivity <= 0 or horizon <= 0:
+    if inactivity <= 0 or (horizon is not None and horizon <= 0):
         raise ValueError("inactivity and horizon must be positive")
     M, R, W = x.shape
 
@@ -543,6 +557,9 @@ def episode_lir(
     #     eligible = run_len >= m  and  run_start + m - 1 + H < R
     #     rescued  = eligible and run_len <= m - 1 + H
     #     ttr      = run_len - m + 1
+    # H = None drops both horizon terms — eligibility keeps the run-length test
+    # only, and rescue becomes "a hit exists at all" (next_hit < R).  `ttr` is
+    # the same expression either way, just unbounded above.
     ev = np.arange(R, dtype=np.int32)
     window_ok = ~np.any((x < 0) & (ev[None, :, None] >= creation[:, None, :]),
                         axis=1)                                        # [M, W]
@@ -560,9 +577,13 @@ def episode_lir(
     run_start = r_idx.astype(np.int64)
     nh = next_hit[m_idx, r_idx, w_idx].astype(np.int64)
     run_len = nh - run_start
-    elig_event = run_start + inactivity - 1
-    is_eligible = (run_len >= inactivity) & (elig_event + horizon < R)
-    is_rescued = is_eligible & (run_len <= inactivity - 1 + horizon)
+    if horizon is None:
+        is_eligible = run_len >= inactivity
+        is_rescued = is_eligible & (nh < R)
+    else:
+        elig_event = run_start + inactivity - 1
+        is_eligible = (run_len >= inactivity) & (elig_event + horizon < R)
+        is_rescued = is_eligible & (run_len <= inactivity - 1 + horizon)
 
     keep = is_eligible
     order = np.lexsort((run_start[keep], w_idx[keep], m_idx[keep]))
