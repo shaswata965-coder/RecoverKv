@@ -11,6 +11,12 @@ standalone outputs:
     ``{"metadata": …, "metrics": [ …one ordered entry per module… ]}``.
 ``all_metrics.md``
     the markdown report, sections in the same order.
+``viz_bundle.npz`` + ``viz_bundle_manifest.json``
+    a compact, self-describing plotting bundle: every metric on its named axes
+    (layer, layer x head, layer x head x flush, trace x flush, bootstrap curve)
+    plus the coordinates to plot against, and nothing window-indexed — tens of
+    MB regardless of context length. The manifest lists every key with its
+    shape, dims and the caveats that apply to it.
 
 The matrix is loaded once for all six metrics, so the npz sha256s, the resolved
 geometry and the trace axis in every artifact describe the same load — a
@@ -37,7 +43,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -213,6 +219,145 @@ def write_combined(matrix, results: Sequence[Dict[str, Any]], out_dir: Path
     return {"npz": npz_path, "json": json_path, "md": md_path}
 
 
+# ---------------------------------------------------------------------------
+# Visualisation bundle
+# ---------------------------------------------------------------------------
+
+#: Array-name suffix -> (axis label, dims) for the bundle manifest.  Anything
+#: not matching one of these is carried through with dims "unknown" rather than
+#: dropped, so a new array in a metric module cannot silently vanish here.
+_AXIS_RULES: Sequence[Tuple[str, str, Tuple[str, ...]]] = (
+    ("_per_layer_head_step__", "layer x head x flush", ("layer", "head", "event")),
+    ("_per_layer_head__", "layer x head", ("layer", "head")),
+    ("_per_layer_from_heads__", "layer (head-mean)", ("layer",)),
+    ("_per_layer__", "layer", ("layer",)),
+    ("_per_trace__", "sample x layer (flattened)", ("trace",)),
+    ("_event__", "trace x flush", ("trace", "event")),
+    ("_curve_mean__", "flush (bootstrap mean)", ("event",)),
+    ("_curve_ci_lower__", "flush (bootstrap CI lo)", ("event",)),
+    ("_curve_ci_upper__", "flush (bootstrap CI hi)", ("event",)),
+    ("_series", "decode step", ("step",)),
+)
+
+#: Keys excluded from the bundle: window-indexed or otherwise large, and never
+#: needed to draw a figure.  Nothing here is smaller than O(W) per entry.
+_BUNDLE_DROP = ("trace_group",)
+
+
+def _classify(name: str) -> Tuple[str, Tuple[str, ...]]:
+    for suffix, label, dims in _AXIS_RULES:
+        if suffix in name:
+            return label, dims
+    return "unknown", ("unknown",)
+
+
+def write_viz_bundle(matrix, results: Sequence[Dict[str, Any]], out_dir: Path
+                     ) -> Dict[str, Path]:
+    """Write ``viz_bundle.npz`` + ``viz_bundle_manifest.json``.
+
+    A compact, self-describing subset of the six metrics' arrays, carrying every
+    computed value on its named axes plus the coordinates needed to plot it:
+
+    * ``coord__layer_ids`` ``[L]``, ``coord__head_ids`` ``[H]`` — which layers
+      and heads the run actually evaluated (``--layer-stride`` / ``--head-stride``
+      make these non-trivial).
+    * ``coord__event_steps__{cid}`` ``[R]`` — the **decode step** of each flush,
+      per condition.  These differ by design: ws=1 flushes every step, ws=32
+      every 32nd, so an ``[..., R]`` array is only plottable against its own
+      condition's coordinate.
+    * ``coord__num_samples`` / ``coord__num_layers`` — the factorisation of the
+      ``trace`` axis, which is ``(sample, layer)`` in C order, so a ``[M, R]``
+      array reshapes to ``[S, L, R]``.
+
+    Nothing window-indexed is included, so the bundle stays small (tens of MB)
+    regardless of context length — the run's own npzs hold the raw masses.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    arrays: Dict[str, np.ndarray] = {
+        "coord__layer_ids": matrix.layer_ids,
+        "coord__head_ids": matrix.head_ids,
+        "coord__num_samples": np.array([matrix.num_samples]),
+        "coord__num_layers": np.array([matrix.num_layers]),
+    }
+    for cid, view in matrix.conditions.items():
+        if view.num_events:
+            arrays[f"coord__event_steps__{cid}"] = view.event_steps
+
+    entries: List[Dict[str, Any]] = []
+    for res in results:
+        mid = res["metric_id"]
+        for key, arr in res["arrays"].items():
+            if key in _BUNDLE_DROP or key in ("layer_ids", "head_ids"):
+                continue
+            if key.startswith("event_steps__"):
+                continue                      # already emitted as a coordinate
+            a = np.asarray(arr)
+            if a.dtype == np.float64:
+                a = a.astype(np.float32)      # plotting never needs float64
+            name = f"{mid}__{key}"
+            arrays[name] = a
+            label, dims = _classify(key)
+            entries.append({
+                "key": name, "metric": mid, "metric_title": res["title"],
+                "question": res["question"], "array": key,
+                "axis": label, "dims": list(dims),
+                "shape": list(a.shape), "dtype": str(a.dtype),
+                "bytes": int(a.nbytes),
+            })
+
+    meta = {
+        **matrix.metadata_block(list(CONDITION_IDS)),
+        "schema_version": SCHEMA_VERSION,
+        "mode": "tier_study_viz_bundle",
+        "trace_axis_layout": (
+            "the `trace` dim is (sample, layer) in C order: an [M, ...] array "
+            "reshapes to [num_samples, num_layers, ...]"),
+        "caveats": {
+            "per_head_is_evaluation_not_decision": (
+                "compute_retain_window_indices ranks head-mean scores and emits "
+                "ONE retained set per layer, so every per-head array here scores "
+                "that shared set against each head's own ground-truth mass; "
+                "these are not per-head eviction decisions."),
+            "m2_raw_churn_head_invariant": (
+                "m2's per-(layer, head, flush) axis stores the MASS-WEIGHTED "
+                "churn; raw churn per head would be the layer value broadcast, "
+                "since the retained set is shared across heads."),
+            "m2_event_axis_is_r_minus_1": (
+                "churn is defined between consecutive flushes, so its event axis "
+                "has length R-1 and aligns with coord__event_steps__{cid}[1:]."),
+            "m6_series_axis_is_decode_steps": (
+                "m6's *_series and *_per_layer_head_step arrays from the "
+                "simulated policy are indexed by DECODE STEP (length T), not by "
+                "flush event."),
+            "per_head_step_mass_is_differenced": (
+                "the per-head step mass has no recorded source and is "
+                "differenced from the fp16 CUMULATIVE scores; by gen_len ~1000 "
+                "one fp16 ulp of the accumulation is comparable to a whole "
+                "per-step delta, so per-head M1/M6(b) degrade with gen_len. "
+                "Per-layer figures use the recorded fp32 step_window_scores and "
+                "are exact."),
+            "differenced_step_mass_negative_fraction":
+                matrix.diagnostics.get("differenced_step_mass_negative_fraction"),
+        },
+        "entries": entries,
+        "total_bytes": int(sum(a.nbytes for a in arrays.values())),
+    }
+
+    npz_path = out_dir / "viz_bundle.npz"
+    np.savez_compressed(
+        str(npz_path), **arrays,
+        metadata_json=np.array([json.dumps(_json_safe(meta))], dtype=object))
+    manifest_path = out_dir / "viz_bundle_manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe(meta), f, indent=2)
+
+    log.info("Viz bundle: %d array(s), %.1f MB uncompressed -> %s",
+             len(arrays), meta["total_bytes"] / 1e6, npz_path.name)
+    return {"npz": npz_path, "manifest": manifest_path}
+
+
 def run_study(
     paths: Dict[str, Any],
     out_dir: Path,
@@ -242,6 +387,7 @@ def run_study(
         for res in results:
             res["module"].write(matrix, res, out_dir)
     written = write_combined(matrix, results, out_dir)
+    written.update(write_viz_bundle(matrix, results, out_dir))
     return {"matrix": matrix, "results": results, "written": written}
 
 
@@ -312,6 +458,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         for res in results:
             res["module"].write(matrix, res, args.output_dir)
     written = write_combined(matrix, results, args.output_dir)
+    written.update(write_viz_bundle(matrix, results, args.output_dir))
     print(Path(written["md"]).read_text(encoding="utf-8"))
     print(f"\nSaved all outputs to: {Path(args.output_dir).resolve()}")
 

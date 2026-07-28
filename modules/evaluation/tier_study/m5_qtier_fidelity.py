@@ -52,6 +52,7 @@ from modules.evaluation.tier_study import (
     matrix_from_args,
     matrix_header_lines,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -199,10 +200,14 @@ def compute(
             log.info("%s: per-head Q-tier fidelity over %d head(s) x %d flushes",
                      cid, matrix.num_heads, view.num_events)
             ph = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+            phs = np.full((matrix.num_layers, matrix.num_heads,
+                           view.num_events), np.nan, dtype=np.float32)
             for jj, h in enumerate(matrix.head_ids):
                 cos_h, _, _ = fidelity_trajectory(matrix, cid, head=int(h))
                 ph[:, jj] = per_trace_to_layer(QM.nanmean(cos_h, axis=1), matrix)
+                phs[:, jj, :] = per_trace_to_layer_series(cos_h, matrix)
             arrays[f"cosine_per_layer_head__{cid}"] = ph
+            arrays[f"cosine_per_layer_head_step__{cid}"] = phs
             arrays[f"cosine_per_layer_from_heads__{cid}"] = QM.nanmean(ph, axis=1)
 
     arrays["layer_ids"] = matrix.layer_ids

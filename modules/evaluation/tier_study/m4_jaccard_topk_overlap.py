@@ -52,6 +52,7 @@ from modules.evaluation.tier_study import (
     matrix_header_lines,
     paired_row,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -204,11 +205,15 @@ def compute(
                      matrix.num_heads)
             name, alive = _alive_sets(view)[0]
             ph = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+            phs = np.full((matrix.num_layers, matrix.num_heads,
+                           view.num_events), np.nan, dtype=np.float32)
             for j, h in enumerate(matrix.head_ids):
                 s_h = matrix.mass_cum(cid, head=int(h))[:, view.event_steps, :]
                 jac_h, _ = overlap_trajectory(alive, s_h, view)
                 ph[:, j] = per_trace_to_layer(QM.nanmean(jac_h, axis=1), matrix)
+                phs[:, j, :] = per_trace_to_layer_series(jac_h, matrix)
             arrays[f"jaccard_per_layer_head__{cid}"] = ph
+            arrays[f"jaccard_per_layer_head_step__{cid}"] = phs
             arrays[f"jaccard_per_layer_from_heads__{cid}"] = QM.nanmean(ph, axis=1)
 
     # ── the claim: fp+Q sustains overlap that fp alone does not ──────────

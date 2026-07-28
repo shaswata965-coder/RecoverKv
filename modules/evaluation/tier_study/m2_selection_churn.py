@@ -68,6 +68,7 @@ from modules.evaluation.tier_study import (
     matrix_header_lines,
     paired_row,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -205,11 +206,22 @@ def compute(
             arrays[f"churn_per_layer_head__{cid}"] = np.repeat(
                 layer_churn[:, None], matrix.num_heads, axis=1)
             mw = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+            # Churn is defined between CONSECUTIVE flushes, so its event axis is
+            # R-1 long and indexed by event_steps[1:], not event_steps.
+            mws = np.full((matrix.num_layers, matrix.num_heads,
+                           max(view.num_events - 1, 0)), np.nan, dtype=np.float32)
             for j, h in enumerate(matrix.head_ids):
                 mass_ev = matrix.mass_cum(cid, head=int(h))[:, view.event_steps, :]
-                mw[:, j] = per_trace_to_layer(
-                    QM.nanmean(_mass_weighted_churn(sel, mass_ev), axis=1), matrix)
+                mwc = _mass_weighted_churn(sel, mass_ev)          # [M, R-1]
+                mw[:, j] = per_trace_to_layer(QM.nanmean(mwc, axis=1), matrix)
+                if mwc.shape[1]:
+                    mws[:, j, :] = per_trace_to_layer_series(mwc, matrix)
             arrays[f"churn_mass_weighted_per_layer_head__{cid}"] = mw
+            # The raw churn per (layer, head, flush) would be the layer value
+            # broadcast over heads (one shared retained set per layer), so the
+            # mass-weighted variant is the one carrying real per-head signal —
+            # it is what this axis stores.
+            arrays[f"churn_mass_weighted_per_layer_head_step__{cid}"] = mws
             arrays[f"churn_mass_weighted_per_layer__{cid}"] = QM.nanmean(mw, axis=1)
 
     # ── paired comparisons ───────────────────────────────────────────────

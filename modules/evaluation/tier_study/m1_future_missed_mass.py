@@ -64,6 +64,7 @@ from modules.evaluation.tier_study import (
     matrix_header_lines,
     paired_row,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -189,13 +190,17 @@ def compute(
             log.info("%s: per-head FMM over %d head(s) x %d flush point(s)",
                      cid, matrix.num_heads, view.num_events)
             ph = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+            phs = np.full((matrix.num_layers, matrix.num_heads,
+                           view.num_events), np.nan, dtype=np.float32)
             for j, h in enumerate(matrix.head_ids):
                 fmm_h = QM.future_missed_mass(
                     matrix.mass_step(cid, head=int(h)), view.acc_alive,
                     view.event_steps, horizon, creation_steps=view.creation,
                     require_full_horizon=True)
                 ph[:, j] = per_trace_to_layer(QM.nanmean(fmm_h, axis=1), matrix)
+                phs[:, j, :] = per_trace_to_layer_series(fmm_h, matrix)
             arrays[f"fmm_per_layer_head__{cid}"] = ph
+            arrays[f"fmm_per_layer_head_step__{cid}"] = phs
             arrays[f"fmm_per_layer_from_heads__{cid}"] = QM.nanmean(ph, axis=1)
 
     # ── paired comparisons over the shared trace axis ────────────────────

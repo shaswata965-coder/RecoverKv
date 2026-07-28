@@ -134,6 +134,8 @@ __all__ = [
     "SCHEMA_VERSION", "CONDITIONS", "ConditionSpec", "ConditionView", "RunMatrix",
     "load_run_matrix", "check_flush_cadence", "add_matrix_args", "matrix_from_args",
     "write_metric_outputs", "stack_tables", "matrix_header_lines",
+    "per_trace_to_layer", "per_trace_to_layer_series", "bootstrap_row",
+    "paired_row", "warn_vacuous",
     "TIER_FP", "TIER_Q", "TIER_LOCAL",
     "_pct", "_num", "_ci_pct", "_ci_num", "_write_csv", "_json_safe",
 ]
@@ -931,6 +933,24 @@ def _check_matrix_shape(views: Mapping[str, ConditionView], strict: bool) -> Non
 def per_trace_to_layer(values: np.ndarray, matrix: RunMatrix) -> np.ndarray:
     """``[M]`` per-trace values → ``[L]`` per-layer means over samples."""
     v = np.asarray(values, dtype=float).reshape(matrix.num_samples, matrix.num_layers)
+    return QM.nanmean(v, axis=0)
+
+
+def per_trace_to_layer_series(values: np.ndarray, matrix: RunMatrix) -> np.ndarray:
+    """``[M, R]`` per-trace series → ``[L, R]`` per-layer means over samples.
+
+    The event axis is *kept*, which is what separates this from
+    :func:`per_trace_to_layer`.  Stacking one of these per head is how the
+    metric modules build their ``[L, H, R]`` (layer x head x flush) arrays —
+    the axis a visualisation needs to show one head's trajectory over decode,
+    and the one every ``…_per_layer_head`` array throws away by averaging over
+    events first.
+    """
+    v = np.asarray(values, dtype=float)
+    if v.ndim != 2 or v.shape[0] != matrix.num_traces:
+        raise ValueError(
+            f"expected [M, R] with M={matrix.num_traces}; got {v.shape}")
+    v = v.reshape(matrix.num_samples, matrix.num_layers, v.shape[1])
     return QM.nanmean(v, axis=0)
 
 

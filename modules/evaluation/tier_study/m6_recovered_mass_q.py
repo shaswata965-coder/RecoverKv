@@ -62,6 +62,7 @@ from modules.evaluation.tier_study import (
     matrix_header_lines,
     paired_row,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -213,6 +214,7 @@ def compute(
                  matrix.num_heads, matrix.num_heads * matrix.num_traces * 2)
         rec = np.full((matrix.num_layers, matrix.num_heads), np.nan)
         cross_ph = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+        rec_s = cross_s = None
         for j, h in enumerate(matrix.head_ids):
             fp3, kept3 = simulate_missed(matrix, "R3", budget_k=r3.top_k_fp,
                                          n_q=r3.n_q, is_sticky=is_sticky,
@@ -222,8 +224,21 @@ def compute(
             rec[:, j] = per_trace_to_layer(QM.nanmean(fp3 - kept3, axis=1), matrix)
             cross_ph[:, j] = per_trace_to_layer(
                 QM.nanmean(fp2 - kept3, axis=1), matrix)
+            # simulate_missed returns a per-STEP series (length T), not a
+            # per-flush one — this axis is therefore decode steps, which is why
+            # the bundle pairs it with `step_index` rather than `event_steps`.
+            if rec_s is None:
+                n = fp3.shape[1]
+                rec_s = np.full((matrix.num_layers, matrix.num_heads, n),
+                                np.nan, dtype=np.float32)
+                cross_s = np.full_like(rec_s, np.nan)
+            rec_s[:, j, :] = per_trace_to_layer_series(fp3 - kept3, matrix)
+            cross_s[:, j, :] = per_trace_to_layer_series(fp2 - kept3, matrix)
         arrays[f"recovered_mass_q_per_layer_head__{pol_name}"] = rec
         arrays[f"recovered_vs_evict_only_per_layer_head__{pol_name}"] = cross_ph
+        if rec_s is not None:
+            arrays[f"recovered_mass_q_per_layer_head_step__{pol_name}"] = rec_s
+            arrays[f"recovered_vs_evict_only_per_layer_head_step__{pol_name}"] = cross_s
 
     # ── (b) measured FMM, fp-only vs fp+Q ────────────────────────────────
     variants = [
@@ -284,13 +299,17 @@ def compute(
         for cid, set_name, mask in variants:
             view = matrix.conditions[cid]
             ph = np.full((matrix.num_layers, matrix.num_heads), np.nan)
+            phs = np.full((matrix.num_layers, matrix.num_heads,
+                           view.num_events), np.nan, dtype=np.float32)
             for j, h in enumerate(matrix.head_ids):
                 fmm_h = QM.future_missed_mass(
                     matrix.mass_step(cid, head=int(h)), mask, view.event_steps,
                     horizon, creation_steps=view.creation,
                     require_full_horizon=True)
                 ph[:, j] = per_trace_to_layer(QM.nanmean(fmm_h, axis=1), matrix)
+                phs[:, j, :] = per_trace_to_layer_series(fmm_h, matrix)
             arrays[f"fmm_per_layer_head__{cid}__{set_name}"] = ph
+            arrays[f"fmm_per_layer_head_step__{cid}__{set_name}"] = phs
         if ("R2", "alive") in fmm_trace and ("R3", "alive") in fmm_trace:
             arrays["fmm_reduction_per_layer_head__R2_alive_vs_R3_alive"] = (
                 arrays["fmm_per_layer_head__R2__alive"]
