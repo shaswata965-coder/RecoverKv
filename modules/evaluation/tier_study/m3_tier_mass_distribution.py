@@ -66,6 +66,7 @@ from modules.evaluation.tier_study import (
     matrix_from_args,
     matrix_header_lines,
     per_trace_to_layer,
+    per_trace_to_layer_series,
     warn_vacuous,
     write_metric_outputs,
 )
@@ -186,7 +187,13 @@ def compute(
 
     for ci, cid in enumerate(present):
         view = matrix.conditions[cid]
-        series = bucket_event_masses(matrix.mass_cum(cid), view)
+        # Slice to the flush axis BEFORE bucketing: bucket_event_masses indexes
+        # its input by the event index r while taking the window geometry from
+        # the decode step t, so handing it the full [M, T, W] array ranks the
+        # mass at step r against the geometry at step t (for ws=8 that is steps
+        # 0..5 scored against flushes at 1, 9, 17, ...).
+        series = bucket_event_masses(
+            matrix.mass_cum(cid)[:, view.event_steps, :], view)
         if not np.isfinite(series["share_fp"]).any():
             warn_vacuous(cid, METRIC_TITLE,
                          "no flush has a non-empty evictable band (the whole "
@@ -262,13 +269,21 @@ def compute(
                      matrix.num_heads)
             ph = {k: np.full((matrix.num_layers, matrix.num_heads), np.nan)
                   for k in SERIES}
+            phs = {k: np.full((matrix.num_layers, matrix.num_heads,
+                               view.num_events), np.nan, dtype=np.float32)
+                   for k in SERIES}
             for j, h in enumerate(matrix.head_ids):
-                s_h = bucket_event_masses(matrix.mass_cum(cid, head=int(h)), view)
+                s_h = bucket_event_masses(
+                    matrix.mass_cum(cid, head=int(h))[:, view.event_steps, :],
+                    view)
                 for name in SERIES:
                     ph[name][:, j] = per_trace_to_layer(
                         QM.nanmean(s_h[name], axis=1), matrix)
+                    phs[name][:, j, :] = per_trace_to_layer_series(
+                        s_h[name], matrix)
             for name in SERIES:
                 arrays[f"{name}_per_layer_head__{cid}"] = ph[name]
+                arrays[f"{name}_per_layer_head_step__{cid}"] = phs[name]
 
     arrays["layer_ids"] = matrix.layer_ids
     arrays["head_ids"] = matrix.head_ids
