@@ -1,6 +1,6 @@
-"""Combined tier study — M1 … M6 over one five-run matrix, in order.
+"""Combined tier study — M1 … M7 over one five-run matrix, in order.
 
-Loads the run matrix once (``R0`` … ``R4``), runs the six metric modules in
+Loads the run matrix once (``R0`` … ``R4``), runs the seven metric modules in
 their numbered order, and writes the combined artifacts beside each module's own
 standalone outputs:
 
@@ -18,7 +18,7 @@ standalone outputs:
     MB regardless of context length. The manifest lists every key with its
     shape, dims and the caveats that apply to it.
 
-The matrix is loaded once for all six metrics, so the npz sha256s, the resolved
+The matrix is loaded once for all seven metrics, so the npz sha256s, the resolved
 geometry and the trace axis in every artifact describe the same load — a
 per-module run and a combined run of the same inputs produce the same numbers.
 
@@ -62,12 +62,13 @@ from modules.evaluation.tier_study import m3_tier_mass_distribution as m3
 from modules.evaluation.tier_study import m4_jaccard_topk_overlap as m4
 from modules.evaluation.tier_study import m5_qtier_fidelity as m5
 from modules.evaluation.tier_study import m6_recovered_mass_q as m6
+from modules.evaluation.tier_study import m7_global_lir as m7
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
 #: The numbered order every combined artifact preserves.
-MODULES = (m1, m2, m3, m4, m5, m6)
+MODULES = (m1, m2, m3, m4, m5, m6, m7)
 
 DEFAULTS: Dict[str, Any] = {
     "fmm_horizon": m1.DEFAULTS["horizon"],
@@ -100,7 +101,7 @@ def run_all(
     seed: int = 0,
     per_head: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Run M1 … M6 in order over one loaded matrix."""
+    """Run M1 … M7 in order over one loaded matrix."""
     results: List[Dict[str, Any]] = []
     for mod in MODULES:
         t0 = time.time()
@@ -126,12 +127,12 @@ def build_report(matrix, results: Sequence[Dict[str, Any]], meta: Dict[str, Any]
                  ) -> str:
     """The combined markdown report, sections in module order."""
     lines = [
-        "# RecoveryKV tier study — six observation metrics over five runs",
+        "# RecoveryKV tier study — seven observation metrics over five runs",
         "",
-        "Two questions, one run matrix: **why decide over a window** (M1, M2) "
-        "and **why three tiers** (M3–M6). Every condition below is a separate "
-        "recorded run — a flush cadence changes cache state divergently, so no "
-        "condition here is simulated from another.",
+        "Three questions, one run matrix: **why decide over a window** (M1, M2), "
+        "**why three tiers** (M3–M6) and **why promote** (M7). Every condition "
+        "below is a separate recorded run — a flush cadence changes cache state "
+        "divergently, so no condition here is simulated from another.",
         "",
         *matrix_header_lines(matrix, list(CONDITION_IDS)),
         "",
@@ -237,11 +238,28 @@ _AXIS_RULES: Sequence[Tuple[str, str, Tuple[str, ...]]] = (
     ("_curve_ci_lower__", "flush (bootstrap CI lo)", ("event",)),
     ("_curve_ci_upper__", "flush (bootstrap CI hi)", ("event",)),
     ("_series", "decode step", ("step",)),
+    # M7's axes.  Order matters: the more specific suffixes above already claim
+    # `lir_uncapped_per_layer__` / `_per_trace__`, and `lir_uncapped__` (double
+    # underscore) matches only the scalar itself.
+    ("_by_inactivity", "inactivity m", ("inactivity",)),
+    ("lir_inactivity_values", "inactivity m (coordinate)", ("inactivity",)),
+    ("transition_p01__", "transition lag", ("delta",)),
+    ("transition_p10__", "transition lag", ("delta",)),
+    ("transition_deltas", "transition lag (coordinate)", ("delta",)),
+    ("time_to_revival_uncapped__", "rescued episode (ragged)", ("episode",)),
+    ("lir_uncapped__", "global rate (scalar)", ()),
+    ("lir_uncapped_ci_lower__", "global rate CI lo (scalar)", ()),
+    ("lir_uncapped_ci_upper__", "global rate CI hi (scalar)", ()),
 )
 
 #: Keys excluded from the bundle: window-indexed or otherwise large, and never
 #: needed to draw a figure.  Nothing here is smaller than O(W) per entry.
 _BUNDLE_DROP = ("trace_group",)
+
+#: Prefixes excluded for the same reason.  ``event_steps__`` is re-emitted as a
+#: coordinate; ``creation_events__`` (M7) is ``[W]``, window-indexed, and the
+#: bundle promises nothing window-indexed.
+_BUNDLE_DROP_PREFIXES = ("event_steps__", "creation_events__")
 
 
 def _classify(name: str) -> Tuple[str, Tuple[str, ...]]:
@@ -255,7 +273,7 @@ def write_viz_bundle(matrix, results: Sequence[Dict[str, Any]], out_dir: Path
                      ) -> Dict[str, Path]:
     """Write ``viz_bundle.npz`` + ``viz_bundle_manifest.json``.
 
-    A compact, self-describing subset of the six metrics' arrays, carrying every
+    A compact, self-describing subset of the seven metrics' arrays, carrying every
     computed value on its named axes plus the coordinates needed to plot it:
 
     * ``coord__layer_ids`` ``[L]``, ``coord__head_ids`` ``[H]`` — which layers
@@ -291,8 +309,8 @@ def write_viz_bundle(matrix, results: Sequence[Dict[str, Any]], out_dir: Path
         for key, arr in res["arrays"].items():
             if key in _BUNDLE_DROP or key in ("layer_ids", "head_ids"):
                 continue
-            if key.startswith("event_steps__"):
-                continue                      # already emitted as a coordinate
+            if key.startswith(_BUNDLE_DROP_PREFIXES):
+                continue
             a = np.asarray(arr)
             if a.dtype == np.float64:
                 a = a.astype(np.float32)      # plotting never needs float64
@@ -327,6 +345,23 @@ def write_viz_bundle(matrix, results: Sequence[Dict[str, Any]], out_dir: Path
             "m2_event_axis_is_r_minus_1": (
                 "churn is defined between consecutive flushes, so its event axis "
                 "has length R-1 and aligns with coord__event_steps__{cid}[1:]."),
+            "m7_lir_has_no_horizon": (
+                "m7's revival rates are episode_lir(horizon=None): a promotion "
+                "counts however far out it lands and nothing is right-censored, "
+                "so there is no H axis to plot against and no fixed-H series in "
+                "this bundle. m7__lir_by_inactivity__* varies the INACTIVITY "
+                "threshold m (coordinate: m7__lir_inactivity_values), not a "
+                "horizon."),
+            "m7_time_to_revival_is_ragged": (
+                "m7__time_to_revival_uncapped__* has one entry per RESCUED "
+                "episode, so its length differs per (condition, selection) and "
+                "aligns with no coordinate in this bundle — it is a "
+                "distribution to histogram, not a series to plot. Values are "
+                "unbounded (no horizon clips them)."),
+            "m7_lir_head_invariant": (
+                "LIR is set membership over the retained set the policy shares "
+                "across heads, so m7 emits no per-head array at all; "
+                "m7__lir_uncapped_per_layer__* is its finest axis."),
             "m6_series_axis_is_decode_steps": (
                 "m6's *_series and *_per_layer_head_step arrays from the "
                 "simulated policy are indexed by DECODE STEP (length T), not by "
@@ -375,7 +410,7 @@ def run_study(
     module_outputs: bool = True,
     strict: bool = True,
 ) -> Dict[str, Any]:
-    """End-to-end: load the matrix, run M1 … M6, write everything."""
+    """End-to-end: load the matrix, run M1 … M7, write everything."""
     matrix = load_run_matrix(
         paths, required=CONDITION_IDS, trace_axis=trace_axis,
         max_samples=max_samples, layer_stride=layer_stride,
@@ -437,7 +472,7 @@ class TierStudyRunner:
 
 def main(argv: Optional[List[str]] = None) -> None:
     ap = argparse.ArgumentParser(
-        description="Combined RecoveryKV tier study (M1 … M6).")
+        description="Combined RecoveryKV tier study (M1 … M7).")
     add_matrix_args(ap, CONDITION_IDS)
     ap.add_argument("--fmm-horizon", type=int, default=DEFAULTS["fmm_horizon"],
                     help="H for M1 and M6(b).")

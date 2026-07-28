@@ -1,8 +1,8 @@
-"""Tier-study run matrix — five recorded runs behind six observation metrics.
+"""Tier-study run matrix — five recorded runs behind seven observation metrics.
 
 The QEvict suite (``modules/evaluation/qevict_observations.py``) asks whether the
 *design premise* holds inside **one** cache configuration.  This package asks the
-next question: **why this cache and not a simpler one?**  It answers with six
+next question: **why this cache and not a simpler one?**  It answers with seven
 metrics computed across a matrix of five *separately recorded* runs:
 
 ===== ============================ ================================================
@@ -16,7 +16,7 @@ metrics computed across a matrix of five *separately recorded* runs:
  R4    three-tier, ``ws = 32``      fp / Q(int4) / evict, coarser decisions
 ===== ============================ ================================================
 
-Two groups of metrics read it:
+Three groups of metrics read it:
 
   **Why a window (M1, M2)** — R0, R1, R3, R4.  Future Missed Mass and Selection
   Churn as the decision granularity coarsens.
@@ -24,6 +24,10 @@ Two groups of metrics read it:
   **Why three tiers (M3–M6)** — R0, R2, R3.  Tier mass distribution, alive-set
   Jaccard against the oracle, Q-tier numerical fidelity, and the mass the Q tier
   recovers relative to evicting it.
+
+  **Why promote (M7)** — R0, R3, R4.  Episode-level Global LIR: how often a
+  window that has gone cold regains importance at all, and how much of that
+  the real fp tier catches.
 
 Reading the ``ws = 1`` point
 ---------------------------

@@ -245,6 +245,58 @@ class TestEpisodeLIR:
         with pytest.raises(ValueError, match="-1, 0, 1"):
             QM.episode_lir(np.array([[[2]]]), 1, 1)
 
+    def test_uncapped_horizon_catches_a_late_rescue(self):
+        # One episode that goes cold for 30 events and is only then rescued —
+        # further out than any point of the `lir_horizon_values` sweep (max 16).
+        # This is the regression test for the finite-H undercount: every finite
+        # horizon either misses the rescue or censors the episode away, and only
+        # horizon=None reports it.
+        sel = np.zeros((1, 40, 1), dtype=np.int8)
+        sel[0, 0, 0] = 1                                # hot, then cold for 30
+        sel[0, 31, 0] = 1                               # rescued at event 31
+        sel[0, 32:, 0] = 1                              # stays hot to the end
+
+        uncapped = QM.episode_lir(sel, inactivity=2, horizon=None)
+        assert uncapped["eligible"] == 1 and uncapped["rescued"] == 1
+        assert uncapped["global_rate"] == pytest.approx(1.0)
+        # run_len = 30, ttr = 30 - 2 + 1 — unbounded, not clipped to any H.
+        assert uncapped["time_to_revival"].tolist() == [29]
+
+        # Large-but-finite H: room to spare in the trace, so the episode is
+        # still eligible — but the rescue lands outside H, so it counts as a
+        # failure and the rate collapses to 0.
+        far = QM.episode_lir(sel, inactivity=2, horizon=16)
+        assert far["eligible"] == 1 and far["rescued"] == 0
+        assert far["global_rate"] == pytest.approx(0.0)
+
+        # Small H, and a trace cut off inside that horizon: the episode is now
+        # right-censored out of numerator AND denominator, which is the other
+        # way a finite horizon loses it.  `horizon=None` still counts it — as an
+        # honest failure, since the rescue at 31 is no longer in the trace.
+        short = sel[:, :10, :]                          # elig at 2, 2 + 8 !< 10
+        censored = QM.episode_lir(short, inactivity=2, horizon=8)
+        assert censored["eligible"] == 0 and np.isnan(censored["global_rate"])
+        kept = QM.episode_lir(short, inactivity=2, horizon=None)
+        assert kept["eligible"] == 1 and kept["rescued"] == 0
+
+    def test_uncapped_horizon_keeps_episodes_a_finite_one_censors(self):
+        # Eligible at the very end: a finite horizon drops the episode entirely
+        # (test_right_censored_episode_is_dropped_entirely), while horizon=None
+        # keeps it and scores it as an honest failure — never rescued.
+        sel = np.array([[[1], [0], [0]]])
+        assert QM.episode_lir(sel, inactivity=2, horizon=4)["eligible"] == 0
+        res = QM.episode_lir(sel, inactivity=2, horizon=None)
+        assert res["eligible"] == 1 and res["rescued"] == 0
+        assert res["global_rate"] == pytest.approx(0.0)
+        assert res["time_to_revival"].tolist() == []
+
+    def test_uncapped_horizon_rejects_a_nonpositive_one(self):
+        sel = np.array([[[1], [0], [0], [1]]])
+        with pytest.raises(ValueError, match="must be positive"):
+            QM.episode_lir(sel, inactivity=2, horizon=0)
+        with pytest.raises(ValueError, match="must be positive"):
+            QM.episode_lir(sel, inactivity=0, horizon=None)
+
     def test_matches_the_reference_loop_implementation(self):
         """The closed-form enumeration must equal the naive scan, exactly.
 
