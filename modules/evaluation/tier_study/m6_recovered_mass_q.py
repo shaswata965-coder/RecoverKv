@@ -10,7 +10,7 @@ ws=8).  Two paired quantities, one simulated and one measured:
   cache with no middle tier throws away.
 * ``missed_mass_kept`` — mass on windows in **neither** tier: what the three-tier
   cache actually loses.
-* their difference is the mass int4 rescues.
+* their difference is the mass int2 rescues.
 
 The same simulation is also run at ``R2``'s capacity (``n_q = 0``, all the byte
 budget in fp16), which gives the honest **cross-run** recovery
@@ -27,9 +27,9 @@ sets and future attention (``qevict_metrics.future_missed_mass``, horizon ``H``)
 
 * ``R2.alive`` vs ``R3.alive`` — **byte-matched across runs** (the loader checks
   both runs declare the same ``cache_budget``; the resolver splits that one
-  budget between fp16 and int4);
+  budget between fp16 and int2);
 * ``R3.fp_only`` vs ``R3.alive`` — within one run, showing what crediting the
-  int4 tier adds at a fixed fp capacity.  This one is *not* byte-matched and is
+  int2 tier adds at a fixed fp capacity.  This one is *not* byte-matched and is
   labelled as such: a three-tier run's fp tier alone is a smaller cache.
 
 Per head
@@ -275,7 +275,7 @@ def compute(
     for i, (ref, cmp, matched, note) in enumerate((
         (("R2", "alive"), ("R3", "alive"), byte_matched,
          "byte-matched across runs: one cache_budget, spent all-fp16 vs split "
-         "fp16+int4"),
+         "fp16+int2"),
         (("R3", "fp_only"), ("R3", "alive"), False,
          "within-run at a fixed fp capacity — NOT byte-matched (a three-tier "
          "run's fp tier alone is a smaller cache)"),
@@ -350,7 +350,7 @@ def render(matrix, result: Dict[str, Any]) -> str:
         f"## {METRIC_TITLE} ({METRIC_QUESTION})",
         "",
         f"Capacities: `R2` keeps {d['R2_top_k_fp']} fp16 windows; `R3` keeps "
-        f"{d['R3_top_k_fp']} fp16 + {d['R3_N_q']} int4 "
+        f"{d['R3_top_k_fp']} fp16 + {d['R3_N_q']} int2 "
         f"(cache_budget {d['R2_cache_budget']} vs {d['R3_cache_budget']} — "
         f"{'byte-matched' if d['byte_matched'] else '**NOT** byte-matched'}).",
         "",

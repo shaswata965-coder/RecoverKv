@@ -12,8 +12,8 @@ metrics computed across a matrix of five *separately recorded* runs:
                                     scores are the real attention masses
  R1    evict-only, ``ws = 1``       token-level routing decisions, **no Q tier**
  R2    evict-only, ``ws = 8``       window-level routing decisions, **no Q tier**
- R3    three-tier, ``ws = 8``       fp / Q(int4) / evict
- R4    three-tier, ``ws = 32``      fp / Q(int4) / evict, coarser decisions
+ R3    three-tier, ``ws = 8``       fp / Q(int2) / evict
+ R4    three-tier, ``ws = 32``      fp / Q(int2) / evict, coarser decisions
 ===== ============================ ================================================
 
 Three groups of metrics read it:
@@ -32,10 +32,11 @@ Three groups of metrics read it:
 Reading the ``ws = 1`` point
 ---------------------------
 ``R1`` is **evict-only** while ``R3``/``R4`` are three-tier, so tiering
-co-varies with granularity at that point — the int4 packer needs an even
-``window_size`` (``WindowedCacheConfig.resolve``), so a three-tier ``ws = 1`` run
-cannot exist.  ``R1`` is therefore labelled the **token-level reference**, and
-the granularity-only contrast is ``R3`` vs ``R4`` (same tiering, ws 8 vs 32).
+co-varies with granularity at that point — the int2 crumb packer needs a
+``window_size`` divisible by 4 (``WindowedCacheConfig.resolve``), so a
+three-tier ``ws = 1`` run cannot exist.  ``R1`` is therefore labelled the
+**token-level reference**, and the granularity-only contrast is ``R3`` vs
+``R4`` (same tiering, ws 8 vs 32).
 Every table this package writes carries that distinction in a
 ``granularity_only`` column; no summary sentence attributes the R1-vs-R3 gap to
 granularity alone.
@@ -197,17 +198,18 @@ CONDITIONS: Dict[str, ConditionSpec] = {
         "never evicts; supplies the ground-truth attention masses"),
     "R1": ConditionSpec(
         "R1", "ours", "evict_only", 1, "evict-only ws=1 (token-level reference)",
-        "token-level decisions, no Q tier — int4 packing needs an even "
-        "window_size, so tiering co-varies with granularity here"),
+        "token-level decisions, no Q tier — int2 crumb packing needs a "
+        "window_size divisible by 4, so tiering co-varies with granularity "
+        "here"),
     "R2": ConditionSpec(
         "R2", "ours", "evict_only", 8, "evict-only ws=8",
         "window-level decisions, no Q tier — the two-tier ablation baseline"),
     "R3": ConditionSpec(
         "R3", "ours", "three_tier", 8, "three-tier ws=8",
-        "fp / Q(int4) / evict at the same granularity as R2"),
+        "fp / Q(int2) / evict at the same granularity as R2"),
     "R4": ConditionSpec(
         "R4", "ours", "three_tier", 32, "three-tier ws=32",
-        "fp / Q(int4) / evict at coarser granularity than R3"),
+        "fp / Q(int2) / evict at coarser granularity than R3"),
 }
 
 CONDITION_IDS: Tuple[str, ...] = tuple(CONDITIONS)
@@ -254,7 +256,7 @@ class ConditionView:
     valid_tw: np.ndarray                # [T, W] bool
     event_steps: np.ndarray             # [R] trace indices where eviction fired
     acc_fp: Optional[np.ndarray] = None      # [M, R, W] fp survivors + local tail
-    acc_q: Optional[np.ndarray] = None       # [M, R, W] int4 survivors
+    acc_q: Optional[np.ndarray] = None       # [M, R, W] int2 survivors
     acc_alive: Optional[np.ndarray] = None   # [M, R, W] fp | Q | local
     cadence_warnings: List[str] = field(default_factory=list)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
@@ -1088,10 +1090,10 @@ def matrix_header_lines(matrix: RunMatrix, cids: Sequence[str]) -> List[str]:
         "independent samples — read them as within-run variability, not "
         "population CIs.",
         "",
-        "`R1` (ws=1) is evict-only because int4 packing requires an even "
-        "`window_size`, so tiering co-varies with granularity at that point: it "
-        "is the **token-level reference**, and the granularity-only contrast is "
-        "`R3` vs `R4`.",
+        "`R1` (ws=1) is evict-only because int2 crumb packing requires a "
+        "`window_size` divisible by 4, so tiering co-varies with granularity "
+        "at that point: it is the **token-level reference**, and the "
+        "granularity-only contrast is `R3` vs `R4`.",
     ]
 
 

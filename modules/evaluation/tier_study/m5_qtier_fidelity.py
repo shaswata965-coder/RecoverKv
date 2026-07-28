@@ -2,13 +2,13 @@
 
 Reads ``R0`` (ground truth) and ``R3`` (three-tier ws=8).
 
-M4 credits the three-tier run for the windows its int4 tier still *holds*.  That
-credit is only worth anything if what int4 holds is numerically trustworthy, so
+M4 credits the three-tier run for the windows its int2 tier still *holds*.  That
+credit is only worth anything if what int2 holds is numerically trustworthy, so
 this metric takes the same windows and asks how faithful they are: per flush,
 per layer, per head, the cosine similarity between
 
 * the **Q tier's own** attention scores, as the compressed run measured them
-  through dequantized int4 K/V (``window_scores`` of the ours npz at the columns
+  through dequantized int2 K/V (``window_scores`` of the ours npz at the columns
   tagged ``tier == 1``), and
 * R0's true scores over that same window set (``all_window_ids`` maps survivor
   columns back onto the baseline's window axis).
@@ -143,7 +143,7 @@ def compute(
         view = matrix.conditions[cid]
         if view.n_q <= 0:
             warn_vacuous(cid, METRIC_TITLE,
-                         "the run has no Q tier (N_q=0), so there is no int4 "
+                         "the run has no Q tier (N_q=0), so there is no int2 "
                          "signal to score")
             rows.append({
                 "condition": cid, "label": view.label,
@@ -222,7 +222,7 @@ def compute(
         "runs_used": [c for c in RUNS if c in matrix.conditions],
         "knobs": knobs, "summary_table": rows, "arrays": arrays,
         "diagnostics": {
-            "cosine_contains": ("int4 quantization error AND the trajectory "
+            "cosine_contains": ("int2 quantization error AND the trajectory "
                                 "divergence caused by eviction — an upper bound "
                                 "on Q-tier damage, not pure quantization error"),
         },
@@ -235,7 +235,7 @@ def render(matrix, result: Dict[str, Any]) -> str:
     lines = [
         f"## {METRIC_TITLE} ({METRIC_QUESTION})",
         "",
-        "Cosine similarity between the int4 tier's own window scores and R0's "
+        "Cosine similarity between the int2 tier's own window scores and R0's "
         "true scores over the same windows — the numerical backing for the "
         "windows M4 credits to the Q tier.",
         "",
@@ -250,7 +250,7 @@ def render(matrix, result: Dict[str, Any]) -> str:
             f"{r['flushes']} | {r['flush_cells_without_q']} |")
     lines += [
         "",
-        "> A cosine below 1 mixes int4 quantization error with the trajectory "
+        "> A cosine below 1 mixes int2 quantization error with the trajectory "
         "divergence eviction itself causes (the compressed run's queries attend "
         "over a smaller cache). Read it as an **upper bound** on Q-tier damage.",
     ]

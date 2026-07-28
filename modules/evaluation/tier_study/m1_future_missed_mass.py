@@ -22,8 +22,8 @@ decision costs against the attention that *actually arrives* next::
 
 Granularity, honestly labelled
 ------------------------------
-``R1`` is evict-only (int4 packing needs an even ``window_size``), so the
-R1-vs-R3 gap mixes granularity with tiering.  It is reported as the
+``R1`` is evict-only (int2 crumb packing needs ``window_size % 4 == 0``), so
+the R1-vs-R3 gap mixes granularity with tiering.  It is reported as the
 *token-level reference* and flagged ``granularity_only = False``; the
 granularity-only contrast is ``R4 → R3`` (ws 32 → 8, tiering fixed).
 
@@ -100,7 +100,7 @@ def _accessible_sets(view) -> List[Tuple[str, np.ndarray]]:
     """The accessible-set variants worth scoring for one condition."""
     sets = [("alive", view.acc_alive)]
     if view.n_q > 0:
-        # fp-only is what the same run would have kept without an int4 tier at
+        # fp-only is what the same run would have kept without an int2 tier at
         # the SAME fp capacity — a within-run contrast, not a byte-matched one
         # (that is M6's job, against the real evict-only run).
         sets.append(("fp_only", view.acc_fp))

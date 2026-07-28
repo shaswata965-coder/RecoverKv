@@ -29,7 +29,7 @@ What it reads
 Both selections are trinary ``[M, R, W]`` ``int8`` matrices over
 ``(trace, event, window)``: ``-1`` outside the band at that event, ``0`` in the
 band and not selected, ``1`` selected.  ``int8`` is simply the narrowest integer
-NumPy offers — it is bookkeeping, unrelated to this branch's int4 K/V packing.
+NumPy offers — it is bookkeeping, unrelated to this branch's int2 K/V packing.
 
 No horizon
 ----------

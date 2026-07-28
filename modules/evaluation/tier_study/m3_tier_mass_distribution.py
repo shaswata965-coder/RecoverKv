@@ -7,13 +7,13 @@ At every flush the windows of that flush are ranked by ground-truth importance
 and cut into the three groups the run's own capacities define::
 
     rank 0 … k_fp-1              -> fp        (ultra-important, kept in fp16)
-    rank k_fp … k_fp+N_q-1       -> Q         (semi-important, kept in int4)
+    rank k_fp … k_fp+N_q-1       -> Q         (semi-important, kept in int2)
     rank k_fp+N_q … ew-1         -> evicted   (throwaway)
 
 ``k_fp`` / ``N_q`` come from the run's resolved config exactly as
 ``EvictionPolicy.tier_counts`` computes them (clamped to the evictable band), so
 ``R2`` — which has no Q tier — cuts the same ranking in *two*.  That contrast is
-the metric: the mass ``R3`` routes to int4 is precisely the mass ``R2`` throws
+the metric: the mass ``R3`` routes to int2 is precisely the mass ``R2`` throws
 away.
 
 Shares alone cannot make the argument, though: any monotone score has a "top
@@ -360,7 +360,7 @@ def render(matrix, result: Dict[str, Any]) -> str:
             "",
             "> The evict-only run's Q share is a **structural zero** — it has no "
             "middle tier by construction. That is the ablation being made, not a "
-            "measurement of an int4 tier that underperformed.",
+            "measurement of an int2 tier that underperformed.",
         ]
     return "\n".join(lines)
 

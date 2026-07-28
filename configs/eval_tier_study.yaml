@@ -8,7 +8,7 @@
 #                                    coarser conditions re-bucket it exactly)
 #   R1  parity_ours, ws 1, q = 0.0   evict-only — the TOKEN-LEVEL REFERENCE
 #   R2  parity_ours, ws 8, q = 0.0   evict-only
-#   R3  parity_ours, ws 8, q > 0     three-tier (fp / int4 Q / evict)
+#   R3  parity_ours, ws 8, q > 0     three-tier (fp / int2 Q / evict)
 #   R4  parity_ours, ws 32, q > 0    three-tier, coarser decisions
 #
 # Producing the matrix (see KAGGLE_RUNBOOK.md for the full flow): each ours run

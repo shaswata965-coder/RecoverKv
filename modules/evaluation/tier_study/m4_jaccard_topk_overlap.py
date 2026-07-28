@@ -221,9 +221,9 @@ def compute(
     comparisons = [
         ("R3", "fp_plus_q", "R2", "fp_only",
          "byte-matched across runs: same cache_budget, one run spends it all on "
-         "fp16, the other splits it fp16 + int4"),
+         "fp16, the other splits it fp16 + int2"),
         ("R3", "fp_plus_q", "R3", "fp_only",
-         "within-run: what crediting the int4 tier adds at the same fp capacity "
+         "within-run: what crediting the int2 tier adds at the same fp capacity "
          "(NOT byte-matched — the fp-only set of a three-tier run is a smaller "
          "budget)"),
     ]
