@@ -380,6 +380,37 @@ class FaithfulnessConfig:
 
 
 # ---------------------------------------------------------------------------
+# Tier study config (six observation metrics over a five-run matrix)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TierStudyConfig:
+    """Inputs for ``modules.evaluation.tier_study.combined`` (mode ``tier_study``).
+
+    Five *separately recorded* runs, one npz each — see the package docstring in
+    ``modules/evaluation/tier_study/__init__.py`` for why none of them can be
+    derived from another.  Every knob below defaults to the module default, so a
+    config only has to name the paths.
+    """
+
+    r0_npz: str = ""          # full-KV baseline (parity_base, finest window_size)
+    r1_npz: str = ""          # evict-only ws=1  (token-level reference)
+    r2_npz: str = ""          # evict-only ws=8
+    r3_npz: str = ""          # three-tier ws=8
+    r4_npz: str = ""          # three-tier ws=32
+    fmm_horizon: int = 32     # H for M1 and M6(b)
+    sticky_primary: bool = False   # M6: Fresh-K is primary by default
+    trace_axis: str = "sample_layer"
+    max_samples: Optional[int] = None
+    layer_stride: int = 1
+    head_stride: int = 1
+    per_head: bool = True
+    confidence: float = 0.95
+    bootstrap_samples: int = 2000
+
+
+# ---------------------------------------------------------------------------
 # Visualization config
 # ---------------------------------------------------------------------------
 
@@ -562,6 +593,7 @@ class ExperimentConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     perf: PerfConfig = field(default_factory=PerfConfig)
     faithfulness: FaithfulnessConfig = field(default_factory=FaithfulnessConfig)
+    tier_study: TierStudyConfig = field(default_factory=TierStudyConfig)
     visualize: VisualizeConfig = field(default_factory=VisualizeConfig)
     longbench: LongBenchConfig = field(default_factory=LongBenchConfig)
     ruler: RulerConfig = field(default_factory=RulerConfig)
@@ -615,6 +647,7 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         window=WindowConfig(**d.get("window", {})),
         perf=PerfConfig(**perf_kwargs),
         faithfulness=FaithfulnessConfig(**d.get("faithfulness", {})),
+        tier_study=TierStudyConfig(**d.get("tier_study", {})),
         visualize=VisualizeConfig(**vis_raw),
         longbench=LongBenchConfig(**lb_raw),
         ruler=RulerConfig(**ruler_raw),

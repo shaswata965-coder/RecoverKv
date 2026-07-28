@@ -1,0 +1,50 @@
+# ============================================================================
+# RecoveryKV — tier study (six observation metrics over a five-run matrix)
+# ----------------------------------------------------------------------------
+# Post-processing only: no model load.  Reads five SEPARATELY RECORDED runs and
+# writes outputs/tier_study/{mN_*.{csv,json,npz}, all_metrics.{npz,json,md}}.
+#
+#   R0  parity_base, window_size 1   full-KV ground truth (finest bucketing;
+#                                    coarser conditions re-bucket it exactly)
+#   R1  parity_ours, ws 1, q = 0.0   evict-only — the TOKEN-LEVEL REFERENCE
+#   R2  parity_ours, ws 8, q = 0.0   evict-only
+#   R3  parity_ours, ws 8, q > 0     three-tier (fp / int4 Q / evict)
+#   R4  parity_ours, ws 32, q > 0    three-tier, coarser decisions
+#
+# Producing the matrix (see KAGGLE_RUNBOOK.md for the full flow): each ours run
+# is teacher-forced from a base run and `validate_parity_pair` requires the base
+# npz to declare the SAME window_size, so record one base run per window size
+# (they are the same greedy decode — the loader verifies the forced-token
+# streams match) and point r0_npz at the ws=1 one.
+#
+# Knobs below are the module defaults, stated so the run is self-describing;
+# to sweep them call a module CLI directly, e.g.
+#
+#   python -m modules.evaluation.tier_study.m1_future_missed_mass \
+#       --r0-npz ... --r1-npz ... --r3-npz ... --r4-npz ... --fmm-horizon 64
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: tier_study
+  seed: 42
+
+tier_study:
+  r0_npz: outputs/parity_base_ws1_wikitext-103.npz
+  r1_npz: outputs/parity_ours_eager_ws1_evictonly_wikitext-103.npz
+  r2_npz: outputs/parity_ours_eager_ws8_evictonly_wikitext-103.npz
+  r3_npz: outputs/parity_ours_eager_ws8_threetier_wikitext-103.npz
+  r4_npz: outputs/parity_ours_eager_ws32_threetier_wikitext-103.npz
+
+  fmm_horizon: 32          # M1 / M6(b): decode steps of future attention scored
+  sticky_primary: false    # M6(a): Fresh-K is primary (matches the real policy)
+  trace_axis: sample_layer # bootstrap over (sample, layer) traces
+  per_head: true           # emit the per-(layer, head) arrays
+  layer_stride: 1          # raise to 4 on a memory-tight machine (Kaggle)
+  head_stride: 1           # raise to 4 to cut the per-head cost 4x
+  max_samples: null
+  confidence: 0.95
+  bootstrap_samples: 2000
+
+telemetry:
+  output_dir: outputs
