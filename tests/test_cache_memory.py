@@ -9,9 +9,19 @@ claim is ~3.9x. These pin the pair of ratios that keeps that legible.
 """
 from __future__ import annotations
 
-import pytest
+import time
 
-from utils.cache_memory import CacheMemoryReport, format_report
+import pytest
+import torch
+
+from utils.cache_memory import (
+    CacheMemoryReport,
+    MemoryProbe,
+    format_peak_report,
+    format_report,
+    host_peak_rss_bytes,
+    host_rss_bytes,
+)
 
 
 def _report(memo_bytes: int) -> CacheMemoryReport:
@@ -87,3 +97,179 @@ class TestMemoExclusiveRatios:
     def test_formatted_report_is_quiet_without_a_memo(self):
         text = format_report(_report(memo_bytes=0))
         assert "read memo is" not in text
+
+
+# ---------------------------------------------------------------------------
+# MemoryProbe — the attachable high-water recorder
+# ---------------------------------------------------------------------------
+
+
+class _Tiny(torch.nn.Module):
+    """A module whose forward allocates, so a peak exists to be recorded."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = torch.nn.Linear(32, 32)
+
+    def forward(self, x):
+        return self.lin(x).relu()
+
+
+class TestHostMemory:
+    def test_rss_is_available_without_psutil(self):
+        """psutil is NOT in environment.yml. A memory tool that reports nothing
+        on the default env is not a memory tool, so both fall back to the OS."""
+        assert host_rss_bytes() > 0
+        assert host_peak_rss_bytes() > 0
+
+    def test_peak_rss_is_at_least_current(self):
+        assert host_peak_rss_bytes() >= host_rss_bytes() * 0.5
+
+
+class TestMemoryProbe:
+    def test_context_manager_produces_a_report(self):
+        with MemoryProbe(label="unit", poll_interval_s=None) as probe:
+            torch.randn(256, 256)
+        r = probe.report()
+        assert r.label == "unit"
+        assert r.duration_s >= 0.0
+        assert r.samples >= 2                      # start + stop, at minimum
+        assert r.host_rss_peak > 0
+
+    def test_phases_are_recorded_in_order(self):
+        with MemoryProbe(poll_interval_s=None) as probe:
+            with probe.phase("prefill"):
+                torch.randn(512, 512)
+            with probe.phase("decode"):
+                torch.randn(64, 64)
+        r = probe.report()
+        assert [p.name for p in r.phases] == ["prefill", "decode"]
+        assert all(p.seconds >= 0.0 for p in r.phases)
+        assert all(p.samples >= 2 for p in r.phases)
+
+    def test_entering_a_phase_closes_the_previous_one(self):
+        """Phases do not nest — a forgotten exit must not swallow the next span."""
+        probe = MemoryProbe(poll_interval_s=None).start()
+        probe._begin_phase("a")
+        probe._begin_phase("b")
+        r = probe.stop().report()
+        assert [p.name for p in r.phases] == ["a", "b"]
+
+    def test_report_is_idempotent(self):
+        """The perf runner reports once per run and then again at save time."""
+        with MemoryProbe(poll_interval_s=None) as probe:
+            with probe.phase("only"):
+                pass
+        first = probe.report()
+        second = probe.report()
+        assert len(first.phases) == len(second.phases) == 1
+        assert first.duration_s == second.duration_s
+
+    def test_attach_samples_once_per_forward(self):
+        model = _Tiny()
+        probe = MemoryProbe(poll_interval_s=None).start()
+        probe.attach(model)
+        before = probe.report().samples
+        for _ in range(5):
+            model(torch.randn(4, 32))
+        after = probe.report().samples
+        assert after - before >= 5
+        probe.stop()
+        # Detached on stop: further forwards must not keep sampling.
+        settled = probe.report().samples
+        model(torch.randn(4, 32))
+        assert probe.report().samples == settled
+
+    def test_model_kwarg_attaches_and_detaches(self):
+        model = _Tiny()
+        with MemoryProbe(model=model, poll_interval_s=None) as probe:
+            model(torch.randn(4, 32))
+        assert probe.report().hooked is True
+        assert probe._hook is None, "hook outlived the probe's context"
+
+    def test_poller_samples_between_forwards(self):
+        """The poller is what catches a peak that no forward boundary brackets."""
+        with MemoryProbe(poll_interval_s=0.01) as probe:
+            time.sleep(0.15)
+        assert probe.report().samples > 2
+
+    def test_stop_is_idempotent(self):
+        probe = MemoryProbe(poll_interval_s=None).start()
+        probe.stop()
+        d1 = probe.report().duration_s
+        probe.stop()
+        assert probe.report().duration_s == d1
+
+    def test_to_dict_carries_the_peak_fields(self):
+        with MemoryProbe(poll_interval_s=None) as probe:
+            with probe.phase("prefill"):
+                pass
+        d = probe.to_dict()
+        for key in (
+            "torch_alloc_peak", "torch_reserved_peak", "device_used_peak",
+            "device_total", "host_rss_peak", "num_ooms", "num_alloc_retries",
+            "fragmentation_peak", "device_headroom", "device_utilization",
+            "peak_phase", "phases",
+        ):
+            assert key in d, f"{key} missing from the peak report dict"
+        assert d["phases"][0]["name"] == "prefill"
+
+    def test_cpu_report_has_no_device_figures(self):
+        """On CPU the GPU columns are absent rather than zero-and-misleading."""
+        with MemoryProbe(device=torch.device("cpu"), poll_interval_s=None) as probe:
+            pass
+        r = probe.report()
+        assert r.device_total == 0
+        assert r.device_utilization is None
+        text = format_peak_report(r)
+        assert "GPU device used" not in text
+        assert "host RSS" in text
+
+    def test_peak_phase_picks_the_larger_phase(self):
+        """Which phase holds the peak decides whether compression can raise
+        max-B at all, so it must not be guesswork."""
+        with MemoryProbe(poll_interval_s=None) as probe:
+            with probe.phase("prefill"):
+                pass
+            with probe.phase("decode"):
+                pass
+        r = probe.report()
+        r.phases[0].torch_alloc_peak = 900
+        r.phases[0].host_rss_peak = 900
+        r.phases[1].torch_alloc_peak = 100
+        r.phases[1].host_rss_peak = 100
+        assert r.peak_phase == "prefill"
+        # With a device measured, the ranking carries a max-B verdict...
+        r.device_total = 80 * 1024**3
+        r.phases[0].device_used_peak = 900
+        r.phases[1].device_used_peak = 100
+        assert "UN-EVICTED prompt" in format_peak_report(r)
+
+    def test_cpu_phase_ranking_does_not_claim_a_max_b_verdict(self):
+        """...but on CPU the only phase signal is RSS, which is dominated by the
+        weights and never falls. It ranks the phases honestly and means nothing
+        for batch capacity, so the verdict text must not appear."""
+        with MemoryProbe(device=torch.device("cpu"), poll_interval_s=None) as probe:
+            with probe.phase("prefill"):
+                pass
+            with probe.phase("decode"):
+                pass
+        text = format_peak_report(probe.report())
+        assert "NOT a max-B signal" in text
+        assert "UN-EVICTED prompt" not in text
+        assert "cache_budget maps ~1:1" not in text
+
+    def test_mid_run_report_does_not_close_an_open_phase(self):
+        """A progress report must not truncate the span it is reporting on."""
+        probe = MemoryProbe(poll_interval_s=None).start()
+        with probe.phase("decode"):
+            assert probe.report().phases == []      # not closed by reporting
+        assert [p.name for p in probe.report().phases] == ["decode"]
+        probe.stop()
+
+    def test_stop_closes_a_dangling_phase(self):
+        """A phase entered without its context manager still lands in the report."""
+        probe = MemoryProbe(poll_interval_s=None).start()
+        probe._begin_phase("prefill")
+        probe.stop()
+        assert [p.name for p in probe.report().phases] == ["prefill"]

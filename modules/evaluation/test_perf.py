@@ -113,6 +113,58 @@ class TestPerfRunner:
         wind_mem = np.nanmedian(data["peak_memory_mb"][1])
         assert wind_mem < base_mem
 
+    def test_max_b_reads_oom_not_skipped(self, tmp_path):
+        """A config skipped for a non-OOM reason is not evidence about what fits.
+
+        `skipped_mask` is the union of three unrelated outcomes — OOM, a missing
+        flash-attn, and a config/code error. eval_perf_batched.yaml defines max-B
+        as "the largest batch_size it did NOT skip", so reading the union would
+        report a smaller max-B than the method achieves every time a cell errors.
+        The runner records the three separately; this pins that.
+        """
+        names = ["fits", "oomed", "errored"]
+        skipped = np.array([False, True, True])
+        oom = np.array([False, True, False])
+        errored = np.array([False, False, True])
+        npz = tmp_path / "perf.npz"
+        np.savez_compressed(str(npz),
+            config_names=np.array(names, dtype=object),
+            attn_implementations=np.array(["flash_attention_2"]*3, dtype=object),
+            ttft_ms=np.ones((3,2)), throughput_tokps=np.ones((3,2)),
+            tpot_ms=np.ones((3,2)), e2e_latency_ms=np.ones((3,2)),
+            peak_memory_mb=np.ones((3,2)),
+            skipped_mask=skipped, oom_mask=oom, error_mask=errored,
+            skip_reason=np.array(["", "oom", "error: RuntimeError: boom"],
+                                 dtype=object),
+            metadata_json=np.array([json.dumps({"batch_size": 64})], dtype=object))
+        data = np.load(str(npz), allow_pickle=True)
+        assert data["skipped_mask"].sum() == 2
+        # Only the OOM says "this batch size does not fit".
+        assert data["oom_mask"].tolist() == [False, True, False]
+        assert data["error_mask"].tolist() == [False, False, True]
+        assert "RuntimeError" in str(data["skip_reason"][2])
+
+    def test_peak_detail_arrays_are_per_config_per_run(self, tmp_path):
+        """The peak fields the max-B decision needs, at the same shape as timings."""
+        n_configs, n_runs = 3, 2
+        arrs = {
+            k: np.random.rand(n_configs, n_runs) * 1000
+            for k in ("peak_memory_mb", "peak_reserved_mb", "peak_device_used_mb",
+                      "device_total_mb", "peak_prefill_mb", "peak_decode_mb",
+                      "peak_host_rss_mb", "alloc_retries")
+        }
+        npz = tmp_path / "perf.npz"
+        np.savez_compressed(str(npz),
+            config_names=np.array(["a", "b", "c"], dtype=object),
+            attn_implementations=np.array(["eager"]*3, dtype=object),
+            ttft_ms=np.ones((3,2)), throughput_tokps=np.ones((3,2)),
+            tpot_ms=np.ones((3,2)), e2e_latency_ms=np.ones((3,2)),
+            skipped_mask=np.zeros(3, dtype=bool),
+            metadata_json=np.array([json.dumps({})], dtype=object), **arrs)
+        data = np.load(str(npz), allow_pickle=True)
+        for key in arrs:
+            assert data[key].shape == (n_configs, n_runs), key
+
     def test_backends_not_compared_across_attention_impls(self, tmp_path):
         """Perf results contain attn_implementation per config."""
         npz = _make_perf_npz(tmp_path / "perf.npz")

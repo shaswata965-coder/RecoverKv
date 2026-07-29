@@ -1,6 +1,6 @@
 """cache_memory — drop-in memory accounting for the two-tier windowed KV cache.
 
-One file, two ways to use it.
+One file, three ways to use it.
 
 **As a probe inside any test / eval.** After a run has populated the cache
 (prefill + at least one eviction), hand the cache object to
@@ -22,6 +22,30 @@ It degrades gracefully: a plain ``DynamicCache`` / ``StaticCache`` is walked via
 its ``key_cache`` / ``value_cache`` lists, so the *same* call measures your
 baseline cache and the numbers line up apples-to-apples.
 
+**As a hook you attach to any run.** The accounting above is a *snapshot* of one
+instant, and the instant it can reach is after the run — which structurally
+cannot see the peak. Peak is what caps the batch size, and the peak of a
+windowed run does not happen at the end: it happens during prefill, before the
+first eviction compacts the prompt away (BATCHING_PLAN.md §5). :class:`MemoryProbe`
+is the high-water recorder for that::
+
+    from utils.cache_memory import MemoryProbe
+
+    with MemoryProbe(label="ours bs=64", model=model) as probe:
+        with probe.phase("prefill"):
+            out = model(input_ids=ids, past_key_values=pkv, use_cache=True)
+        with probe.phase("decode"):
+            ...                                    # the generation loop
+    print(probe.format())
+
+It records, per phase and overall: the torch allocator's peak allocated and peak
+reserved, the **device-level** peak (``mem_get_info`` — everything on the GPU,
+including the CUDA context, other processes, and allocator fragmentation, which
+is what an OOM actually trips on), peak host RSS, and the allocator's OOM /
+retry counters. Passing ``model=`` registers a forward hook so every forward
+pass samples; a background poller catches peaks between them. Both are optional
+and it degrades to a no-op-shaped report on CPU.
+
 **As a standalone script.** Run it to build a model, drive a real
 prefill + decode long enough to trigger eviction, and print the report::
 
@@ -38,7 +62,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +78,12 @@ __all__ = [
     "format_report",
     "report_cache_memory",
     "snapshot_device_memory",
+    "MemoryProbe",
+    "PeakMemoryReport",
+    "PhasePeak",
+    "format_peak_report",
+    "host_rss_bytes",
+    "host_peak_rss_bytes",
 ]
 
 _MB = 1024.0 * 1024.0
@@ -445,27 +478,550 @@ def _measure_hf_dense(
 # ---------------------------------------------------------------------------
 
 
+def host_rss_bytes() -> int:
+    """Current process RSS in bytes, or ``0`` if it cannot be determined.
+
+    ``psutil`` if present; otherwise the OS directly (Win32
+    ``GetProcessMemoryInfo`` / Linux ``statm``), because ``psutil`` is not in
+    ``environment.yml`` and a memory tool that reports nothing on the default
+    env is not a memory tool.
+    """
+    try:
+        import psutil  # optional
+
+        return int(psutil.Process().memory_info().rss)
+    except Exception:
+        pass
+    return _os_rss(peak=False)
+
+
+def host_peak_rss_bytes() -> int:
+    """**Peak** process RSS in bytes since start, or ``0`` if unavailable.
+
+    A true OS-maintained high-water mark (Win32 ``PeakWorkingSetSize`` /
+    ``getrusage(ru_maxrss)``) — no polling, and it cannot miss a spike between
+    samples the way a sampled maximum can.
+    """
+    return _os_rss(peak=True)
+
+
+def _os_rss(peak: bool) -> int:
+    """RSS (or peak RSS) straight from the OS. ``0`` when unsupported."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.windll.kernel32
+            # Explicit restype: the default (c_int) truncates the current-process
+            # pseudo-handle (0xFFFF...FFFF) to -1 and the call then fails.
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            get_info = ctypes.windll.psapi.GetProcessMemoryInfo
+            get_info.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD]
+            get_info.restype = wintypes.BOOL
+
+            counters = _PMC()
+            counters.cb = ctypes.sizeof(_PMC)
+            if not get_info(
+                kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                return 0
+            return int(
+                counters.PeakWorkingSetSize if peak else counters.WorkingSetSize
+            )
+        except Exception:
+            return 0
+    try:
+        if peak:
+            import resource
+
+            # ru_maxrss is KB on Linux, bytes on macOS.
+            kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return int(kb if sys.platform == "darwin" else kb * 1024)
+        with open("/proc/self/statm") as fh:
+            pages = int(fh.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        return 0
+
+
 def snapshot_device_memory(device: Optional[torch.device] = None) -> Dict[str, Any]:
     """CUDA allocator stats (if on GPU) and process RSS (best effort).
 
     The cache byte figures above are computed exactly and stand on their own;
-    this is the surrounding context — total process footprint, peak allocator
-    high-water mark — that a test set usually wants alongside them.
+    this is the surrounding context — total process footprint, allocator
+    high-water marks, and how close the **device as a whole** came to full —
+    that a test set usually wants alongside them.
+
+    Three different "GPU memory" numbers appear here and they are not
+    interchangeable:
+
+    * ``cuda_allocated``  — bytes in live tensors. What the model + cache
+      semantically occupy.
+    * ``cuda_reserved``   — bytes the caching allocator holds from the driver.
+      ``reserved - allocated`` is fragmentation: real, unusable, and it grows
+      with churn (this cache reallocates its fp buffer at the first eviction).
+    * ``cuda_device_used``— ``total - free`` from the driver. Adds the CUDA
+      context (~0.3-1 GB), NCCL buffers, and **other processes** on a shared
+      GPU. This is the number an OOM is actually decided against, and the one
+      the max-B ladder is really searching over.
     """
     out: Dict[str, Any] = {}
     is_cuda = device is not None and torch.device(device).type == "cuda"
     if is_cuda and torch.cuda.is_available():
-        idx = torch.device(device).index or 0
+        dev = torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
         out["cuda_allocated_mb"] = torch.cuda.memory_allocated(idx) / _MB
         out["cuda_reserved_mb"] = torch.cuda.memory_reserved(idx) / _MB
         out["cuda_max_allocated_mb"] = torch.cuda.max_memory_allocated(idx) / _MB
-    try:
-        import psutil  # optional
-
-        out["process_rss_mb"] = psutil.Process().memory_info().rss / _MB
-    except Exception:
-        pass
+        out["cuda_max_reserved_mb"] = torch.cuda.max_memory_reserved(idx) / _MB
+        try:
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            out["cuda_device_used_mb"] = (total_b - free_b) / _MB
+            out["cuda_device_total_mb"] = total_b / _MB
+        except Exception:
+            pass
+        try:
+            stats = torch.cuda.memory_stats(idx)
+            out["cuda_num_ooms"] = float(stats.get("num_ooms", 0))
+            out["cuda_alloc_retries"] = float(stats.get("num_alloc_retries", 0))
+        except Exception:
+            pass
+    rss = host_rss_bytes()
+    if rss:
+        out["process_rss_mb"] = rss / _MB
+    peak_rss = host_peak_rss_bytes()
+    if peak_rss:
+        out["process_peak_rss_mb"] = peak_rss / _MB
     return out
+
+
+# ---------------------------------------------------------------------------
+# MemoryProbe — the attachable high-water recorder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PhasePeak:
+    """High-water marks over one named span of a run."""
+
+    name: str
+    seconds: float
+    samples: int
+    torch_alloc_peak: int
+    torch_reserved_peak: int
+    device_used_peak: int
+    host_rss_peak: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PeakMemoryReport:
+    """What a run's memory actually *peaked* at, overall and per phase.
+
+    Every field is bytes unless the name says otherwise. ``device_*`` fields are
+    ``0`` on CPU.
+    """
+
+    label: Optional[str]
+    device: str
+    device_name: str
+    duration_s: float
+    samples: int
+    poll_interval_s: Optional[float]
+    hooked: bool
+
+    torch_alloc_peak: int
+    torch_alloc_end: int
+    torch_reserved_peak: int
+    torch_reserved_end: int
+    device_used_peak: int
+    device_used_end: int
+    device_total: int
+    host_rss_peak: int
+    host_rss_end: int
+    num_ooms: int
+    num_alloc_retries: int
+
+    phases: List[PhasePeak] = field(default_factory=list)
+
+    # -- derived -------------------------------------------------------------
+
+    @property
+    def fragmentation_peak(self) -> int:
+        """``reserved - allocated`` at peak: bytes the allocator holds but no
+        tensor is using. Grows with churn and counts against max-B exactly like
+        real tensors do."""
+        return max(self.torch_reserved_peak - self.torch_alloc_peak, 0)
+
+    @property
+    def device_headroom(self) -> int:
+        """Bytes still free on the device at its fullest. **This is the max-B
+        signal**: a config that peaks at 95% of the card will not survive the
+        next rung of the batch ladder, and a config that peaks at 40% is leaving
+        batch on the table."""
+        if not self.device_total:
+            return 0
+        return max(self.device_total - self.device_used_peak, 0)
+
+    @property
+    def device_utilization(self) -> Optional[float]:
+        """Peak device usage as a fraction of the card. ``None`` on CPU."""
+        if not self.device_total:
+            return None
+        return self.device_used_peak / self.device_total
+
+    @property
+    def peak_phase(self) -> Optional[str]:
+        """Which phase held the overall peak — prefill or decode.
+
+        Not cosmetic: if the peak is in **prefill**, per-row steady-state
+        compression cannot raise max-B (the un-evicted prompt binds) and the fix
+        is chunked prefill, not a smaller budget. If it is in **decode**, budget
+        and quant_ratio move max-B directly. BATCHING_PLAN.md §5 / the scenario-C
+        note in ``configs/eval_perf_batched.yaml``.
+        """
+        if not self.phases:
+            return None
+        key = (
+            (lambda p: p.device_used_peak)
+            if self.device_total
+            else (lambda p: max(p.torch_alloc_peak, p.host_rss_peak))
+        )
+        return max(self.phases, key=key).name
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["phases"] = [p.to_dict() for p in self.phases]
+        d["fragmentation_peak"] = self.fragmentation_peak
+        d["device_headroom"] = self.device_headroom
+        d["device_utilization"] = self.device_utilization
+        d["peak_phase"] = self.peak_phase
+        return d
+
+
+class MemoryProbe:
+    """Records memory high-water marks across a run. Attach it to anything.
+
+    Three collection paths, all optional and all additive:
+
+    1. **Allocator peaks** (CUDA) — ``max_memory_allocated`` /
+       ``max_memory_reserved``. Exact and free: the allocator maintains them, so
+       no sampling can miss a spike.
+    2. **A forward hook** on the model — one sample per forward pass. Cheap,
+       deterministic, and phase-aligned, which is what makes per-phase numbers
+       trustworthy on CPU where there is no allocator high-water mark.
+    3. **A background poller** — catches the device-level (``mem_get_info``) and
+       host-RSS peaks *between* forwards, which is where an allocator spike
+       inside one big prefill kernel sequence would otherwise hide.
+
+    ``reset_peak_memory_stats`` is the only way to get a *phase*-scoped
+    allocator peak, and it destroys the process-wide one — so this folds the
+    running peak into its own accumulator before every reset. The overall
+    numbers are therefore correct even though the phases each reset.
+
+    Parameters
+    ----------
+    label : str, optional
+        Free text carried into the report (e.g. ``"ours_b20_q50 bs=64"``).
+    device : torch.device, optional
+        Defaults to the current CUDA device, else CPU.
+    model : nn.Module, optional
+        Convenience for :meth:`attach` — registers the forward hook on enter and
+        removes it on exit.
+    poll_interval_s : float, optional
+        Background poller period. ``None`` disables it. Default 0.05 s.
+    """
+
+    def __init__(
+        self,
+        label: Optional[str] = None,
+        device: Optional[torch.device] = None,
+        model: Optional[torch.nn.Module] = None,
+        poll_interval_s: Optional[float] = 0.05,
+    ) -> None:
+        if device is None:
+            device = (
+                torch.device("cuda", torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+        self.device = torch.device(device)
+        self.label = label
+        self.poll_interval_s = poll_interval_s
+        self._model = model
+
+        self._is_cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        self._idx = (
+            (self.device.index if self.device.index is not None
+             else torch.cuda.current_device())
+            if self._is_cuda else None
+        )
+
+        # Running high-water marks. `_carried_*` hold what earlier phases
+        # reached, since reset_peak_memory_stats() wipes the allocator's own.
+        self._carried_alloc = 0
+        self._carried_reserved = 0
+        self._device_used_peak = 0
+        self._host_rss_peak = 0
+        self._samples = 0
+
+        self._phases: List[PhasePeak] = []
+        self._phase_open: Optional[tuple] = None
+        self._phase_device_start = 0
+        self._phase_host_start = 0
+        self._t0: Optional[float] = None
+        self._t1: Optional[float] = None
+        self._ooms_at_start = 0
+        self._retries_at_start = 0
+
+        self._hook = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # -- lifecycle -----------------------------------------------------------
+
+    def start(self) -> "MemoryProbe":
+        """Begin recording. Resets the allocator's peak counters."""
+        if self._is_cuda:
+            torch.cuda.synchronize(self._idx)
+            torch.cuda.reset_peak_memory_stats(self._idx)
+            stats = torch.cuda.memory_stats(self._idx)
+            self._ooms_at_start = int(stats.get("num_ooms", 0))
+            self._retries_at_start = int(stats.get("num_alloc_retries", 0))
+        self._t0 = time.perf_counter()
+        self.sample()
+        if self._model is not None:
+            self.attach(self._model)
+        if self.poll_interval_s:
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._poll, name="MemoryProbe", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def stop(self) -> "MemoryProbe":
+        """Stop recording. Idempotent."""
+        if self._t1 is not None:
+            return self
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self._end_phase()          # close a dangling phase, if any
+        self.detach()
+        if self._is_cuda:
+            torch.cuda.synchronize(self._idx)
+        self.sample()
+        self._t1 = time.perf_counter()
+        return self
+
+    def __enter__(self) -> "MemoryProbe":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- hook ----------------------------------------------------------------
+
+    def attach(self, module: torch.nn.Module):
+        """Register a forward hook that samples once per forward pass.
+
+        This is the "attach it to any run" path: it needs no cooperation from
+        the runner, no phase annotations, and no knowledge of the cache — hand
+        it the model and every step is sampled. Returns the hook handle
+        (also removed by :meth:`stop` / :meth:`detach`).
+        """
+        self.detach()
+
+        def _hook(_module, _inp, _out):
+            self.sample()
+
+        self._hook = module.register_forward_hook(_hook)
+        return self._hook
+
+    def detach(self) -> None:
+        """Remove the forward hook, if one is installed. Idempotent."""
+        if self._hook is not None:
+            self._hook.remove()
+            self._hook = None
+
+    # -- sampling ------------------------------------------------------------
+
+    def sample(self) -> None:
+        """Take one point sample. Cheap enough for a per-forward hook.
+
+        Deliberately does **not** synchronize: a sync inside a forward hook
+        would serialize the very decode loop the perf suite is timing. The
+        allocator peaks are exact regardless (they are updated at allocation,
+        not at sample time); only the device-level reading is a sampled
+        quantity, and the poller exists to keep that dense.
+        """
+        self._samples += 1
+        if self._is_cuda:
+            try:
+                free_b, total_b = torch.cuda.mem_get_info(self._idx)
+                self._device_used_peak = max(
+                    self._device_used_peak, total_b - free_b
+                )
+            except Exception:
+                pass
+        rss = host_rss_bytes()
+        if rss:
+            self._host_rss_peak = max(self._host_rss_peak, rss)
+
+    def _poll(self) -> None:
+        while not self._stop.wait(self.poll_interval_s):
+            self.sample()
+
+    # -- phases --------------------------------------------------------------
+
+    class _Phase:
+        def __init__(self, probe: "MemoryProbe", name: str) -> None:
+            self._probe, self._name = probe, name
+
+        def __enter__(self):
+            self._probe._begin_phase(self._name)
+            return self._probe
+
+        def __exit__(self, *exc):
+            self._probe._end_phase()
+
+    def phase(self, name: str) -> "MemoryProbe._Phase":
+        """Scope the next span as a named phase (``"prefill"``, ``"decode"``…).
+
+        Phases do not nest; entering one closes the previous.
+        """
+        return MemoryProbe._Phase(self, name)
+
+    def _begin_phase(self, name: str) -> None:
+        self._end_phase()
+        self._fold_allocator_peaks()
+        if self._is_cuda:
+            torch.cuda.synchronize(self._idx)
+            torch.cuda.reset_peak_memory_stats(self._idx)
+        self._phase_open = (name, time.perf_counter(), self._samples)
+        # Restart the sampled maxima at zero so the phase's numbers describe the
+        # phase, not everything before it. The run-wide maxima are preserved in
+        # _phase_*_start and folded back in _end_phase.
+        self._phase_device_start = self._device_used_peak
+        self._phase_host_start = self._host_rss_peak
+        self._device_used_peak = 0
+        self._host_rss_peak = 0
+        self.sample()
+
+    def _end_phase(self) -> None:
+        open_phase = getattr(self, "_phase_open", None)
+        if open_phase is None:
+            return
+        name, t_start, s_start = open_phase
+        self._phase_open = None
+        if self._is_cuda:
+            torch.cuda.synchronize(self._idx)
+        self.sample()
+        alloc_peak = self._allocator_peak()
+        reserved_peak = self._allocator_peak(reserved=True)
+        self._phases.append(
+            PhasePeak(
+                name=name,
+                seconds=time.perf_counter() - t_start,
+                samples=self._samples - s_start,
+                torch_alloc_peak=alloc_peak,
+                torch_reserved_peak=reserved_peak,
+                device_used_peak=self._device_used_peak,
+                host_rss_peak=self._host_rss_peak,
+            )
+        )
+        # Fold the phase's maxima back into the run-wide ones.
+        self._fold_allocator_peaks()
+        self._device_used_peak = max(
+            self._device_used_peak, self._phase_device_start
+        )
+        self._host_rss_peak = max(self._host_rss_peak, self._phase_host_start)
+
+    # -- peak bookkeeping ----------------------------------------------------
+
+    def _allocator_peak(self, reserved: bool = False) -> int:
+        if not self._is_cuda:
+            return 0
+        return int(
+            torch.cuda.max_memory_reserved(self._idx)
+            if reserved
+            else torch.cuda.max_memory_allocated(self._idx)
+        )
+
+    def _fold_allocator_peaks(self) -> None:
+        """Carry the allocator's current peaks over a pending reset."""
+        self._carried_alloc = max(self._carried_alloc, self._allocator_peak())
+        self._carried_reserved = max(
+            self._carried_reserved, self._allocator_peak(reserved=True)
+        )
+
+    # -- output --------------------------------------------------------------
+
+    def report(self) -> PeakMemoryReport:
+        """Freeze the recording into a :class:`PeakMemoryReport`.
+
+        Non-destructive and safe to call mid-run — it will not close an open
+        phase (:meth:`stop` does that), so a progress report cannot truncate the
+        span it is reporting on. An in-flight phase is simply not listed yet.
+        """
+        self._fold_allocator_peaks()
+        end = snapshot_device_memory(self.device)
+        total_b = int(end.get("cuda_device_total_mb", 0) * _MB)
+        used_end = int(end.get("cuda_device_used_mb", 0) * _MB)
+        ooms = int(end.get("cuda_num_ooms", 0)) - self._ooms_at_start
+        retries = int(end.get("cuda_alloc_retries", 0)) - self._retries_at_start
+        t1 = self._t1 if self._t1 is not None else time.perf_counter()
+        return PeakMemoryReport(
+            label=self.label,
+            device=str(self.device),
+            device_name=(
+                torch.cuda.get_device_name(self._idx) if self._is_cuda else "cpu"
+            ),
+            duration_s=t1 - (self._t0 if self._t0 is not None else t1),
+            samples=self._samples,
+            poll_interval_s=self.poll_interval_s,
+            hooked=self._model is not None,
+            torch_alloc_peak=self._carried_alloc,
+            torch_alloc_end=int(end.get("cuda_allocated_mb", 0) * _MB),
+            torch_reserved_peak=self._carried_reserved,
+            torch_reserved_end=int(end.get("cuda_reserved_mb", 0) * _MB),
+            device_used_peak=max(self._device_used_peak, used_end),
+            device_used_end=used_end,
+            device_total=total_b,
+            host_rss_peak=max(self._host_rss_peak, host_peak_rss_bytes()),
+            host_rss_end=host_rss_bytes(),
+            num_ooms=max(ooms, 0),
+            num_alloc_retries=max(retries, 0),
+            phases=list(self._phases),
+        )
+
+    def format(self) -> str:
+        """The report, rendered. Shorthand for ``format_peak_report(...)``."""
+        return format_peak_report(self.report())
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.report().to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -593,19 +1149,146 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
     return "\n".join(lines)
 
 
+def format_peak_report(report: PeakMemoryReport) -> str:
+    """Render a :class:`PeakMemoryReport` as a table."""
+    r = report
+    lines: List[str] = []
+    title = "Peak memory"
+    if r.label:
+        title += f" - {r.label}"
+    lines.append("=" * 72)
+    lines.append(title)
+    lines.append("=" * 72)
+    lines.append(
+        f"device={r.device} ({r.device_name})  elapsed={r.duration_s:.2f}s  "
+        f"samples={r.samples}"
+        + (f"  poll={r.poll_interval_s}s" if r.poll_interval_s else "")
+        + ("  hook=on" if r.hooked else "")
+    )
+    lines.append("-" * 72)
+    lines.append(f"{'':<26}{'peak':>20}{'at end':>22}")
+    lines.append(f"{'-'*26}{'-'*20:>20}{'-'*22:>22}")
+    lines.append(
+        f"{'torch allocated':<26}{_mb(r.torch_alloc_peak):>20}"
+        f"{_mb(r.torch_alloc_end):>22}"
+    )
+    lines.append(
+        f"{'torch reserved':<26}{_mb(r.torch_reserved_peak):>20}"
+        f"{_mb(r.torch_reserved_end):>22}"
+    )
+    if r.device_total:
+        lines.append(
+            f"{'GPU device used':<26}{_mb(r.device_used_peak):>20}"
+            f"{_mb(r.device_used_end):>22}"
+        )
+    lines.append(
+        f"{'host RSS':<26}{_mb(r.host_rss_peak):>20}{_mb(r.host_rss_end):>22}"
+    )
+    lines.append("-" * 72)
+
+    if r.device_total:
+        util = r.device_utilization or 0.0
+        lines.append(
+            f"GPU {_mb(r.device_used_peak)} / {_mb(r.device_total)} at peak "
+            f"({util*100:.1f}%)  headroom {_mb(r.device_headroom)}"
+        )
+        # The headroom line is the max-B verdict: this is the quantity the batch
+        # ladder is searching over, so say what it implies rather than making the
+        # reader divide.
+        if util >= 0.95:
+            lines.append(
+                "  -> at the ceiling: the next rung of the batch ladder will OOM."
+            )
+        elif util <= 0.60:
+            lines.append(
+                f"  -> {(1.0/util if util else 0):.1f}x headroom: batch size is NOT "
+                f"memory-bound here; raise it before quoting a max-B."
+            )
+    lines.append(
+        f"fragmentation at peak (reserved - allocated): "
+        f"{_mb(r.fragmentation_peak)}"
+    )
+    if r.num_ooms or r.num_alloc_retries:
+        lines.append(
+            f"allocator pressure: {r.num_ooms} OOM(s), "
+            f"{r.num_alloc_retries} retr(y/ies) - a retry means the allocator had "
+            f"to flush and re-request; the run survived but is at its limit."
+        )
+
+    if r.phases:
+        lines.append("-" * 72)
+        lines.append(
+            f"{'phase':<14}{'secs':>8}{'alloc peak':>16}{'GPU peak':>16}"
+            f"{'RSS peak':>16}"
+        )
+        for p in r.phases:
+            lines.append(
+                f"{p.name:<14}{p.seconds:>8.2f}"
+                f"{_mb(p.torch_alloc_peak):>16}"
+                f"{_mb(p.device_used_peak):>16}"
+                f"{_mb(p.host_rss_peak):>16}"
+            )
+        peak_phase = r.peak_phase
+        if peak_phase and not r.device_total:
+            # CPU: the only per-phase signal is host RSS, which is dominated by
+            # the weights and never falls back (the allocator keeps freed pages).
+            # It ranks the phases honestly but says nothing about what would cap
+            # a batch on a GPU, so state the limit instead of drawing a verdict.
+            lines.append(
+                f"peak phase: {peak_phase} (by host RSS - CPU run, so this is "
+                f"NOT a max-B signal)"
+            )
+        elif peak_phase:
+            lines.append(f"peak phase: {peak_phase}")
+            if peak_phase == "prefill":
+                lines.append(
+                    "  -> the UN-EVICTED prompt is the binding constraint, not the "
+                    "steady state."
+                )
+                lines.append(
+                    "     Lowering cache_budget / raising quant_ratio will not "
+                    "raise max-B at this shape;"
+                )
+                lines.append(
+                    "     only a shorter prompt, more decode, or chunked prefill "
+                    "will (BATCHING_PLAN.md 5)."
+                )
+            else:
+                lines.append(
+                    "  -> the steady state binds, so cache_budget maps ~1:1 onto "
+                    "max-B. This is the regime"
+                )
+                lines.append(
+                    "     where compression buys batch capacity."
+                )
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
 def report_cache_memory(
     cache: Any,
     label: Optional[str] = None,
     full_context_len: Optional[int] = None,
     as_json: bool = False,
     file=sys.stdout,
+    probe: Optional["MemoryProbe"] = None,
 ) -> CacheMemoryReport:
-    """Measure *cache*, print the report, and return it. The one-call entry point."""
+    """Measure *cache*, print the report, and return it. The one-call entry point.
+
+    Pass ``probe`` (a stopped :class:`MemoryProbe`) to print the run's peak
+    high-water marks under the cache's byte accounting — the resident footprint
+    and the peak are different questions and a batching decision needs both.
+    """
     report = measure_cache_memory(cache, full_context_len=full_context_len)
     if as_json:
-        print(json.dumps(report.to_dict(), indent=2), file=file)
+        out = report.to_dict()
+        if probe is not None:
+            out["peak"] = probe.to_dict()
+        print(json.dumps(out, indent=2), file=file)
     else:
         print(format_report(report, label=label), file=file)
+        if probe is not None:
+            print(format_peak_report(probe.report()), file=file)
     return report
 
 
@@ -681,15 +1364,22 @@ def _build_and_run(args: argparse.Namespace):
     # the tool show a *compacted* two-tier cache rather than a full one.
     gen_kwargs = {"output_attentions": True} if args.backend == "eager" else {}
     hooks = install_hooks(model, pkv, cfg)
+    label = (f"{args.model} q={args.quant_ratio} bs={B} "
+             f"prefill={args.prefill} gen={args.gen}")
+    probe = MemoryProbe(label=label, device=device,
+                        poll_interval_s=None if args.no_poll else args.poll)
     try:
-        with torch.no_grad():
-            out = model(input_ids=input_ids, past_key_values=pkv,
-                        use_cache=True, return_dict=True, **gen_kwargs)
-            next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            for _ in range(args.gen - 1):
-                out = model(input_ids=next_tok, past_key_values=out.past_key_values,
+        with torch.no_grad(), probe:
+            with probe.phase("prefill"):
+                out = model(input_ids=input_ids, past_key_values=pkv,
                             use_cache=True, return_dict=True, **gen_kwargs)
                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            with probe.phase("decode"):
+                for _ in range(args.gen - 1):
+                    out = model(input_ids=next_tok,
+                                past_key_values=out.past_key_values,
+                                use_cache=True, return_dict=True, **gen_kwargs)
+                    next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
     finally:
         if hooks is not None:
             hooks.remove()
@@ -697,10 +1387,10 @@ def _build_and_run(args: argparse.Namespace):
     full_ctx = args.prefill + args.gen
     report_cache_memory(
         pkv,
-        label=f"{args.model} q={args.quant_ratio} bs={B} "
-              f"prefill={args.prefill} gen={args.gen}",
+        label=label,
         full_context_len=full_ctx,
         as_json=args.json,
+        probe=probe,
     )
 
 
@@ -729,6 +1419,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         s.lower(), None), default=None,
         help="force read memo on/off; default None = auto (on at B=1)")
     p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    p.add_argument("--poll", type=float, default=0.05,
+                   help="MemoryProbe background poll interval, seconds")
+    p.add_argument("--no-poll", action="store_true",
+                   help="disable the background poller (allocator peaks only)")
     args = p.parse_args(argv)
 
     # allow integer --local

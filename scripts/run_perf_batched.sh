@@ -5,14 +5,27 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 # ============================================================================
-# Run Batched Performance Benchmarks
+# Run Batched Performance Benchmarks — the max-B search
 # ============================================================================
-# Scenario 1 — standard batch  : prefill=2048,  decode=256, batch=64
-# Scenario 2 — long context    : prefill=16384, decode=512, batch=4
+# Runs configs/eval_perf_batched.yaml: every config at every rung of a batch
+# ladder, with skip_if_oom: true. A config's max-B is the largest batch_size it
+# did NOT OOM at, and the headline is (max-B) x (decode tok/s per row). See that
+# file's header for the grid and BATCHING_PLAN.md §5 for why B=1 cannot show
+# this method working.
 #
-# Metrics: TPOT (ms/token), TTFT (s), throughput (token/s)
+# Scenarios in the shipped grid:
+#   A  prefill=512   gen=1024   B = 1, 8, 32, 128, 256, 512   long generation
+#   B  prefill=512   gen=4096   B = 1, 32, 128, 256           generation-dominated
+#   C  prefill=4096  gen=128    B = 1, 16, 32, 64             LongBench shape
+#
+# Override the ladder without editing the config, e.g. one scenario only:
+#   scripts/run_perf_batched.sh --override perf.num_measurement_runs=1
+#
+# Metrics: TPOT (ms/token), TTFT (s), throughput (token/s), and peak memory —
+# torch allocated / reserved, device-level (what an OOM trips on), and split by
+# prefill vs decode phase (utils/cache_memory.py::MemoryProbe).
 # Outputs: outputs/perf_batched/perf_prefill*_gen*_bs*.npz
-#          outputs/perf_batched/summary.txt
+#          outputs/perf_batched/summary.txt   <- includes the MAX-B SUMMARY table
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,9 +40,10 @@ mkdir -p "$OUT_DIR"
   pip freeze 2>/dev/null || true
 } > "$OUT_DIR/perf_batched.env"
 
-echo "=== StickyKV Batched Performance Benchmark ==="
-echo "Scenario 1: prefill=16384, decode=512, batch=4"
-echo "Scenario 2: prefill=2048,  decode=256, batch=64"
+echo "=== StickyKV Batched Performance Benchmark (max-B search) ==="
+echo "A: prefill=512  gen=1024  B=1,8,32,128,256,512"
+echo "B: prefill=512  gen=4096  B=1,32,128,256"
+echo "C: prefill=4096 gen=128   B=1,16,32,64"
 echo ""
 
 python "$PROJECT_ROOT/main.py" \
