@@ -11,9 +11,19 @@ Requires ``transformers <= 4.47.1`` (``utils.cache_factory`` enforces this at
 run time for the ours runs; this script just checks it up front so a bad env
 fails in seconds, not after the first base run).
 
-Defaults are sized for an 80 GB A100 with ~1 TB of host RAM:
-``prefill=4096, gen=1024, samples=20, budget=0.20, sink=5, local=128``
-(~497 GB peak host RAM).
+Defaults are sized for a CPU-feasible smoke run, not a reportable study:
+``prefill=512, gen=256, samples=2, budget=0.20, sink=5, local=32``
+(R0 npz ~0.8 GB, peak host RAM ~1.9 GB — see the sizing math below). Two
+samples is below KAGGLE_RUNBOOK.md's ">= 8 for anything reported" floor and
+exists to prove the pipeline runs end to end, not to produce numbers worth
+citing. For a real study, override toward the 80 GB A100 / ~1 TB host RAM
+sizing this module was originally written for::
+
+    python scripts/run_tier_study_local.py ... \\
+        --prefill 4096 --gen 1024 --samples 20 --local 128
+
+(~497 GB peak host RAM at that combination — see the table below before
+raising it further.)
 
 **Sizing — read this before raising --prefill/--gen/--samples.**
 R0 must be recorded at ``window_size=1``: R1 is the token-level arm of M1/M2,
@@ -34,19 +44,20 @@ fancy-indexes ``layer_ids`` (numpy always copies). On Llama 3.1 8B (32 layers,
     4096/2048        16      412 GB         953 GB    OOM
     4096/2048        12      309 GB         715 GB    tight
     4096/2048         8      206 GB         477 GB    OK
-    4096/1024        20      215 GB         497 GB    OK  <- default
+    4096/1024        20      215 GB         497 GB    OK  <- old default
     4096/1024        12      129 GB         298 GB    OK
     2048/1024        20      129 GB         298 GB    OK
     2048/1024         8       52 GB         119 GB    OK
+    512/256            2     0.8 GB         1.9 GB    OK  <- current default
 
 ``gen`` is the expensive axis — it multiplies both ``T`` and ``W`` — and it
 also bounds per-head fidelity (see ``--gen``). ``--layer-stride`` cuts the RAM
 but not the npz.
 
-The GPU side is *not* the binding constraint here: the base run's
-``output_attentions=True`` materialises ``[B, H, P, P]`` per layer, which is
-34 GB at prefill 4096 on top of ~16 GB of fp16 weights — 50 GB of an 80 GB
-A100. The ceiling there is prefill ~5120; host RAM binds long before.
+The GPU side is *not* the binding constraint at the larger sizes: the base
+run's ``output_attentions=True`` materialises ``[B, H, P, P]`` per layer,
+which is 34 GB at prefill 4096 on top of ~16 GB of fp16 weights — 50 GB of an
+80 GB A100. The ceiling there is prefill ~5120; host RAM binds long before.
 
 Usage
 -----
@@ -343,15 +354,17 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
                     help="Start at this stage, reusing files from earlier "
                          "stages already on disk (default: run everything).")
 
-    ap.add_argument("--prefill", type=int, default=4096,
+    ap.add_argument("--prefill", type=int, default=512,
                     help="Prompt length in tokens. NOTE: R0 is recorded at "
                          "window_size=1, so its npz grows as "
                          "S*T*L*H*(prefill+gen) — see the sizing table in the "
                          "module docstring BEFORE raising this. On an 80 GB "
                          "A100 the GPU-side ceiling (output_attentions, "
                          "[B,H,P,P] x L) is prefill ~5120; host RAM binds "
-                         "first.")
-    ap.add_argument("--gen", type=int, default=1024,
+                         "first. Default is a CPU-feasible smoke value, not "
+                         "a reportable one — see the module docstring for "
+                         "the 80 GB A100 override.")
+    ap.add_argument("--gen", type=int, default=256,
                     help="Decode length in tokens. Sets T = 1 + gen, so it "
                          "multiplies R0's size TWICE (via T and via W) — the "
                          "most expensive axis. It also bounds per-head "
@@ -362,23 +375,26 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
                          "recorded fp32 step_window_scores and stay exact at "
                          "any gen; per-HEAD M1/M2 degrade past ~512 and are "
                          "noise by 2048.")
-    ap.add_argument("--samples", type=int, default=20,
+    ap.add_argument("--samples", type=int, default=2,
                     help="num_samples (documents) — also the bootstrap axis. "
-                         "KAGGLE_RUNBOOK.md: >= 8 for anything reported. "
-                         "Pair with --trace-axis sample.")
+                         "KAGGLE_RUNBOOK.md: >= 8 for anything reported; the "
+                         "default of 2 is a smoke value below that floor. "
+                         "Pair with --trace-axis sample once you raise it.")
     ap.add_argument("--budget", type=float, default=0.20,
                     help="cache.cache_budget (fraction of prefill+gen).")
     ap.add_argument("--sink", type=int, default=5)
-    ap.add_argument("--local", type=int, default=128,
+    ap.add_argument("--local", type=int, default=32,
                     help="local_window_size in tokens — must be a multiple "
-                         "of every window_size used (1, 8, 32 -> 128 works).")
+                         "of every window_size used (1, 8, 32 -> 32 works).")
     ap.add_argument("--fmm-horizon", type=int, default=32,
                     help="H for M1/M6(b) — the repo-wide standard horizon "
                          "(qevict_observations and m1's own default both use "
-                         "32). At gen=1024, ws=32's last flush is at decode "
-                         "step 992, leaving 31 future steps: H=32 right-"
-                         "censors that ONE trailing flush (out of 32) rather "
-                         "than scoring it over a shorter, easier horizon.")
+                         "32). At the default gen=256, ws=32's last flush is "
+                         "at decode step 224, leaving 31 future steps: H=32 "
+                         "right-censors that ONE trailing flush (out of 8) "
+                         "rather than scoring it over a shorter, easier "
+                         "horizon. (At gen=1024 the same holds with 32 "
+                         "flushes, last at step 992.)")
     ap.add_argument("--trace-axis", choices=("sample_layer", "sample", "layer"),
                     default="sample",
                     help="Bootstrap axis. 'sample' (default) bootstraps over "
