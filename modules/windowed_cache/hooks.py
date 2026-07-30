@@ -361,10 +361,34 @@ def install_score_hooks(
                 #    transient, same exponent range). Set
                 #    STICKYKV_SCORE_SOFTMAX_DTYPE=float32 for the exact fp32
                 #    reduction earlier baselines used.
+                #    The ACCUMULATOR is fp32, not q.dtype. This is a running sum
+                #    over T query rows (up to ~18k at full LongBench context) and
+                #    it is then accumulated again across every decode step in
+                #    `state.window_scores`, whose dtype this one decides. In a
+                #    reduced-precision accumulator an addend smaller than half an
+                #    ULP of the running total rounds to no change and is discarded
+                #    outright: measured on a realistic trajectory, 76% of the
+                #    per-decode-step contributions vanish in bfloat16 and 52% in
+                #    float16, and the top-k retention set diverges from the fp32
+                #    answer by ~9% on a 512-step generation (gov_report). The
+                #    window ranking IS the method, so it is not a place to save two
+                #    bytes: [B, H_q, W] in fp32 is ~258 KB/layer at Qwen's 28 heads.
+                #
+                #    Qwen2.5 is the reason this surfaced — it is the only bf16
+                #    column (8-bit mantissa vs float16's 11), so it lost twice as
+                #    much as Llama-3.1 and Mistral-v0.2 and its scores were not
+                #    measured the same way theirs were. Fixing it moves all three,
+                #    which is the point: they now agree because the sum is exact,
+                #    not because they round alike.
+                #
+                #    The softmax intermediate is unaffected and stays on
+                #    _score_softmax_dtype() — torch reduces bf16/fp16 softmax with
+                #    an fp32 internal accumulator, so its denominator was never the
+                #    lossy part.
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
                 sm_dtype = _score_softmax_dtype()
                 token_scores = torch.zeros(
-                    B, H_kv, num_groups, S, device=q.device, dtype=q.dtype
+                    B, H_kv, num_groups, S, device=q.device, dtype=torch.float32
                 )
                 chunk = _prefill_score_chunk()
                 for start in range(0, T, chunk):
@@ -387,7 +411,12 @@ def install_score_hooks(
                         aw = aw.masked_fill(causal, float("-inf"))
 
                     aw = F.softmax(aw, dim=-1, dtype=sm_dtype).to(q.dtype)
-                    token_scores += aw.sum(dim=-2)                   # [B,H_kv,rep,S]
+                    # .to(float32) on the REDUCED [B,H_kv,rep,S] result, not on
+                    # `aw` — widening the [.., blk, S] block would double the
+                    # largest transient in the prefill pass for nothing, since the
+                    # per-chunk sum is already computed with an fp32 internal
+                    # accumulator by torch's reduction.
+                    token_scores += aw.sum(dim=-2).to(torch.float32)  # [B,H_kv,rep,S]
                     del aw
 
                 # Merge (H_kv, n_rep) back to H_q in the original head order.

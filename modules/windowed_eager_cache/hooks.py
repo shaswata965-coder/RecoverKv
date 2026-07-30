@@ -172,7 +172,17 @@ def install_score_hooks(
                 # attn_weights: [B, H_q, T, S] over the effective-K axis. Sum
                 # across the T (query) axis — every query row contributes (H2O
                 # cumulative, no obs_window) — to per-key received attention.
-                token_scores = attn_weights.sum(dim=-2)          # [B, H_q, S]
+                #
+                # fp32, mirroring modules/windowed_cache/hooks.py. This sum itself
+                # is fine in either dtype (torch reduces bf16/fp16 with an fp32
+                # internal accumulator), but its dtype is inherited by
+                # `state.window_scores`, which is then accumulated across every
+                # decode step by `scorer.accumulate`. That is the lossy one: in a
+                # reduced-precision accumulator a per-step contribution below half
+                # an ULP of the running total is discarded outright — 76% of them
+                # in bfloat16, 52% in float16. The window ranking is the method, so
+                # the running total is kept exact.
+                token_scores = attn_weights.sum(dim=-2, dtype=torch.float32)  # [B,H_q,S]
 
                 # At q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
                 # layout, so the key axis of attn_weights is unsorted too; undo

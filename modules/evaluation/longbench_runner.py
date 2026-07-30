@@ -707,27 +707,48 @@ class LongBenchRunner:
     #: to size the eager-attention warning below when truncation is off.
     _LONGEST_LONGBENCH_PROMPT = 20000
 
-    #: Warn when one attention matrix would exceed this. Deliberately generous:
-    #: the point is to catch "this cannot run at all", not to second-guess a
-    #: borderline fit on an 80 GB card.
+    #: Warn when the eager attention tensors would exceed this. Deliberately
+    #: generous: the point is to catch "this cannot run at all", not to
+    #: second-guess a borderline fit on an 80 GB card.
     _EAGER_ATTN_WARN_GB = 8.0
 
     def _warn_if_eager_attention_cannot_fit(self, prompt_tokens: int) -> None:
-        """Flag an eager run whose attention matrix cannot fit in any GPU.
+        """Flag an eager run whose attention tensors cannot fit in any GPU.
 
-        Eager attention materializes ``[B, H_q, T, T]``. That is quadratic in the
-        prompt, and LongBench prompts run to ~20k tokens: 22 GB for Qwen2.5-7B
-        (28 query heads) and 26 GB for Llama-3.1-8B (32) — per layer, per example,
-        on top of the weights. Flash-attention-2 never materializes it, which is
-        why only the eager column has this ceiling.
+        Eager attention materializes ``[B, H_q, T, T]``, quadratic in the prompt.
+        The part that decides whether the run is possible, though, is that the
+        eager backend needs ``output_attentions=True`` to score at all (see
+        ``_predict``) — and transformers does not hand that tensor back one layer
+        at a time. ``<Model>Model.forward`` accumulates every layer's into
+        ``all_self_attns`` and returns the whole tuple, so **all** ``num_layers``
+        matrices are resident simultaneously. The ceiling is therefore
+        ``num_layers x H_q x T^2 x 2`` bytes, not one layer's worth:
 
-        It matters because of how it fails. ``skip_oom: true`` (set in every
-        LongBench config) records an OOM'd example as ``pred=null``, and the
-        scorer counts a null as **0** rather than dropping it — correctly, since
-        dropping would inflate the mean. So an eager run that cannot fit does not
-        crash: it produces a complete, plausible, uniformly depressed score table.
-        The ``skipped=N`` column in the score log is the tell; this warning is so
-        the run is not started in the first place.
+        ==================  ==============  ==============
+        prompt tokens        one layer       all 28 layers
+        ==================  ==============  ==============
+        2 000                0.2 GB          6.3 GB
+        4 000                0.9 GB         25.1 GB
+        9 000                4.5 GB        127 GB
+        ==================  ==============  ==============
+
+        (Qwen2.5-7B, 28 query heads, 28 layers, fp16.) Most LongBench prompts are
+        past 4k, so the honest statement is that the eager backend cannot run this
+        suite untruncated on any card — which is exactly what this warning has to
+        say, and what the per-layer figure it used to report did not.
+
+        Flash-attention-2 never materializes any of it (its hook reconstructs the
+        scores from a chunked auxiliary SDPA), which is why only the eager column
+        has this ceiling.
+
+        Why it matters at all rather than just failing: ``skip_oom: true`` records
+        an OOM'd example as ``pred=null``, and the scorer counts a null as **0**
+        rather than dropping it — correctly, since dropping would inflate the mean.
+        So an eager run that cannot fit does not crash: it produces a complete,
+        plausible, uniformly depressed score table, with ``skipped=N`` in the score
+        log as the only tell. The Qwen "ours" configs now set ``skip_oom: false``
+        for that reason; this warning is so the run is not started in the first
+        place.
         """
         if self.cache_backend_package != "eager" and (
             getattr(self.config.model, "attn_implementation", None) != "eager"
@@ -737,24 +758,38 @@ class LongBenchRunner:
         heads = getattr(cfg, "num_attention_heads", None)
         if not heads or not prompt_tokens:
             return
+        # output_attentions=True retains one matrix PER LAYER, all at once. Default
+        # to 1 rather than skipping the check if the layer count can't be read: a
+        # per-layer figure understates the requirement but is still the right
+        # order of magnitude for "this will not fit".
+        layers = getattr(cfg, "num_hidden_layers", None) or 1
         import torch as _torch
 
         elem = _torch.tensor([], dtype=_torch.float16).element_size()
-        gb = heads * prompt_tokens * prompt_tokens * elem / 1e9
+        per_layer_gb = heads * prompt_tokens * prompt_tokens * elem / 1e9
+        gb = per_layer_gb * layers
         if gb < self._EAGER_ATTN_WARN_GB:
             return
+        # Invert gb(T) = layers * heads * T^2 * elem for the largest prompt that
+        # fits the warn budget, so the suggested max_length accounts for every
+        # layer too (it used to suggest a length sqrt(layers) too long).
+        fits = int(
+            (self._EAGER_ATTN_WARN_GB * 1e9 / (layers * heads * elem)) ** 0.5
+        )
         log.warning(
-            "EAGER backend at ~%d-token prompts materializes a %.0f GB attention "
-            "matrix (%d heads x T^2), per layer per example. This will OOM; with "
-            "skip_oom=true those examples are recorded as pred=null and SCORED AS "
-            "ZERO, so the run completes and returns a uniformly depressed table "
-            "rather than failing. Set longbench.max_length to something the card "
-            "can hold (a %.0f GB budget is ~%d tokens), or use the "
-            "flash_attention_2 backend, which never materializes it. If you are "
-            "comparing the eager and flash columns, they must use the SAME "
-            "max_length or they are not the same protocol.",
-            prompt_tokens, gb, heads, self._EAGER_ATTN_WARN_GB,
-            int((self._EAGER_ATTN_WARN_GB * 1e9 / (heads * elem)) ** 0.5),
+            "EAGER backend at ~%d-token prompts materializes %.0f GB of attention "
+            "weights (%d layers x %d heads x T^2 x 2B = %.1f GB per layer, and "
+            "output_attentions=True keeps ALL layers resident at once, not one at "
+            "a time). This will OOM. With skip_oom=true those examples are recorded "
+            "as pred=null and SCORED AS ZERO, so the run completes and returns a "
+            "uniformly depressed table rather than failing — set skip_oom: false so "
+            "it fails instead. Set longbench.max_length to something the card can "
+            "hold (a %.0f GB budget is ~%d tokens), or use the flash_attention_2 "
+            "backend, which never materializes it. If you are comparing the eager "
+            "and flash columns, they must use the SAME max_length or they are not "
+            "the same protocol.",
+            prompt_tokens, gb, layers, heads, per_layer_gb,
+            self._EAGER_ATTN_WARN_GB, fits,
         )
 
     def _note_auto_fit(self, dataset_name: str, original: int, budget: int) -> None:

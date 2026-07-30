@@ -130,6 +130,14 @@ longbench:
   max_length: null
   output_dir: outputs/longbench/qwen_ours_eager_compression_0.8
   seed: 42
-  resume: true
-  skip_oom: true
+  # false on BOTH — see configs/longbench_qwen_ours_flash_attn.yaml for the full
+  # reasoning. It matters MORE on this backend, not less: eager attention with
+  # output_attentions=True retains one [1, 28, T, T] matrix PER LAYER (the runner
+  # sets that flag for the eager backend, and transformers keeps every layer's in
+  # the output tuple), which is ~1.6 KB * T^2 across 28 layers — 6.3 GB at
+  # T = 2000 and 25 GB at T = 4000. Most LongBench prompts are past that. With
+  # skip_oom: true this column would return a table of zeros dressed up as a
+  # method result; with it false the run stops and says so.
+  resume: false
+  skip_oom: false
   aggressive_cache_clear: true

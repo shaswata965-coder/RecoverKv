@@ -128,6 +128,23 @@ longbench:
   max_length: null
   output_dir: outputs/longbench/qwen_ours_flash_attn_compression_0.8
   seed: 42
-  resume: true
-  skip_oom: true
+  # false on BOTH, matching configs/longbench_ours_flash_attn.yaml (Llama) and
+  # configs/longbench_mistral_ours_flash_attn.yaml — the point of this column is
+  # that it differs from those two only by model, and these two knobs were the
+  # only place it did not.
+  #
+  # skip_oom: true records an OOM'd example as pred=null, and the scorer counts a
+  # null as 0 while keeping it in the denominator (correctly — dropping it would
+  # inflate the mean). So an OOM does not fail the run: it returns a complete,
+  # plausible, uniformly depressed score table, and the only tell is `skipped=N`
+  # in the score log. The Llama and Mistral columns CRASH on that event, which is
+  # what makes their numbers trustworthy. Fail here too.
+  #
+  # resume: true skips any dataset whose jsonl already has > 0 lines, so a file
+  # truncated by a crashed run is silently accepted as finished and scored over
+  # however many examples happened to be written. Combined with skip_oom that is
+  # two independent ways for this column to report a number that is not a
+  # method result. Re-run a dataset from scratch or move its output aside.
+  resume: false
+  skip_oom: false
   aggressive_cache_clear: false
