@@ -1,80 +1,5 @@
 #!/usr/bin/env python
-"""Tier study, end to end, from a local WikiText-103 file and a local model dir.
-
-The HPC counterpart of the Kaggle tier-study notebook: same seven GPU runs
-(3 base + 4 ours), same ``modules.evaluation.tier_study.combined`` call, same
-output layout — just reading a local ``wiki.train.tokens`` and a local model
-directory instead of Kaggle input mounts, and driven from argparse instead of
-notebook cells.
-
-Requires ``transformers <= 4.47.1`` (``utils.cache_factory`` enforces this at
-run time for the ours runs; this script just checks it up front so a bad env
-fails in seconds, not after the first base run).
-
-Defaults are sized for a CPU-feasible smoke run, not a reportable study:
-``prefill=512, gen=256, samples=2, budget=0.20, sink=5, local=32``
-(R0 npz ~0.8 GB, peak host RAM ~1.9 GB — see the sizing math below). Two
-samples is below KAGGLE_RUNBOOK.md's ">= 8 for anything reported" floor and
-exists to prove the pipeline runs end to end, not to produce numbers worth
-citing. For a real study, override toward the 80 GB A100 / ~1 TB host RAM
-sizing this module was originally written for::
-
-    python scripts/run_tier_study_local.py ... \\
-        --prefill 4096 --gen 1024 --samples 20 --local 128
-
-(~497 GB peak host RAM at that combination — see the table below before
-raising it further.)
-
-**Sizing — read this before raising --prefill/--gen/--samples.**
-R0 must be recorded at ``window_size=1``: R1 is the token-level arm of M1/M2,
-and ``tier_study._build_view`` rejects a condition whose ``window_size`` is not
-a multiple of the baseline's, which pins the baseline to 1. At ws=1 the base
-npz's ``window_scores`` is ``[S, T, L, H_q, W]`` fp16 with ``W`` = the full
-post-sink sequence length, so it grows as ``S * (1+gen) * L * H_q *
-(prefill+gen)``.
-
-Two places allocate a second full copy, so budget **2x R0** plus the
-``[S*L, T, W]`` float64 mass arrays: ``BaseParityRunner`` holds the per-sample
-list *and* the ``np.stack`` output simultaneously, and ``load_run_matrix``
-fancy-indexes ``layer_ids`` (numpy always copies). On Llama 3.1 8B (32 layers,
-32 query heads)::
-
-    prefill/gen   samples    R0 npz     peak host RAM
-    4096/2048        20      515 GB        1191 GB    OOM even at 1 TB
-    4096/2048        16      412 GB         953 GB    OOM
-    4096/2048        12      309 GB         715 GB    tight
-    4096/2048         8      206 GB         477 GB    OK
-    4096/1024        20      215 GB         497 GB    OK  <- old default
-    4096/1024        12      129 GB         298 GB    OK
-    2048/1024        20      129 GB         298 GB    OK
-    2048/1024         8       52 GB         119 GB    OK
-    512/256            2     0.8 GB         1.9 GB    OK  <- current default
-
-``gen`` is the expensive axis — it multiplies both ``T`` and ``W`` — and it
-also bounds per-head fidelity (see ``--gen``). ``--layer-stride`` cuts the RAM
-but not the npz.
-
-The GPU side is *not* the binding constraint at the larger sizes: the base
-run's ``output_attentions=True`` materialises ``[B, H, P, P]`` per layer,
-which is 34 GB at prefill 4096 on top of ~16 GB of fp16 weights — 50 GB of an
-80 GB A100. The ceiling there is prefill ~5120; host RAM binds long before.
-
-Usage
------
-    python scripts/run_tier_study_local.py \\
-        --model-dir /path/to/Llama-3.1-8B-Instruct \\
-        --corpus-file /path/to/wikitext-103/wiki.train.tokens \\
-        --work-dir outputs/tier_study_run
-
-Resume after a partial run (skip GPU stages already done)::
-
-    python scripts/run_tier_study_local.py ... --stage study
-
-Stages: ``corpus`` (build the filtered jsonl) -> ``base`` (3 runs) ->
-``ours`` (4 runs) -> ``study`` (tier_study combined) -> ``zip``.
-``--stage X`` runs X and everything after it, reusing files already on disk
-for the stages before it.
-"""
+"""TODO: one-line module summary."""
 
 from __future__ import annotations
 
@@ -92,24 +17,18 @@ from typing import Dict, List, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGES = ("corpus", "base", "ours", "study", "zip")
 
-# ── condition matrix (mirrors modules/evaluation/tier_study/__init__.py) ────
 BASE_WINDOW_SIZES: Sequence[int] = (1, 8, 32)
-OURS_CONDITIONS: Sequence[tuple] = (   # (id, window_size, quant_ratio)
+OURS_CONDITIONS: Sequence[tuple] = (
     ("R1", 1, 0.0),
     ("R2", 8, 0.0),
-    ("R3", 8, 0.5),
-    ("R4", 32, 0.5),
+    ("R3", 8, 0.7),
+    ("R4", 32, 0.7),
 )
-R0_WINDOW_SIZE = 1   # the finest base run is R0 in the tier-study matrix
+R0_WINDOW_SIZE = 1
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Environment check
-# ---------------------------------------------------------------------------
 
 
 def check_transformers_version() -> None:
@@ -128,21 +47,8 @@ def check_transformers_version() -> None:
     log(f"transformers {v} OK (<= 4.47.1)")
 
 
-# ---------------------------------------------------------------------------
-# Stage: corpus — split wiki.train.tokens into a filtered jsonl
-# ---------------------------------------------------------------------------
-
-
 def build_corpus(corpus_file: Path, model_dir: Path, out_jsonl: Path,
                  prefill: int, samples: int) -> Path:
-    """Split raw WikiText-103 into articles and keep only the long ones.
-
-    Same level-1-heading split ``data/corpus_loader.py`` uses for the built-in
-    HF loader. A single ``.txt`` handed to ``CorpusLoader`` directly would be
-    treated as ONE article (see ``_load_local_file``), so this pre-splits into
-    a ``.jsonl`` (one article per line) that the local-corpus path reads
-    correctly.
-    """
     if out_jsonl.exists():
         log(f"corpus already built: {out_jsonl} (delete it to rebuild)")
         return out_jsonl
@@ -156,7 +62,7 @@ def build_corpus(corpus_file: Path, model_dir: Path, out_jsonl: Path,
     log(f"split into {len(articles)} articles")
 
     tok = AutoTokenizer.from_pretrained(str(model_dir))
-    min_len = prefill + 8   # a little headroom past prefill for generation
+    min_len = prefill + 8
     long_enough = [
         a for a in articles
         if len(tok(a, add_special_tokens=True).input_ids) >= min_len
@@ -175,11 +81,6 @@ def build_corpus(corpus_file: Path, model_dir: Path, out_jsonl: Path,
             f.write(json.dumps({"text": a}) + "\n")
     log(f"corpus -> {out_jsonl}")
     return out_jsonl
-
-
-# ---------------------------------------------------------------------------
-# Stage: geometry preflight
-# ---------------------------------------------------------------------------
 
 
 def print_geometry(model_dir: Path, prefill: int, gen: int, budget: float,
@@ -203,11 +104,6 @@ def print_geometry(model_dir: Path, prefill: int, gen: int, budget: float,
         print(f"{rid:<4}{ws:>4}{q:>5}{r.top_k_windows:>7}{r.top_k_fp:>5}"
               f"{r.N_q:>5}{alive:>11}{alive * ws:>11}")
     print()
-
-
-# ---------------------------------------------------------------------------
-# Stage: base / ours runs
-# ---------------------------------------------------------------------------
 
 
 def run_main(config: str, overrides: Dict[str, object], tag: str) -> None:
@@ -261,7 +157,8 @@ def run_base_stage(model_dir: Path, corpus: Path, work_dir: Path,
 
 
 def run_ours_stage(model_dir: Path, corpus: Path, work_dir: Path,
-                   base_paths: Dict[int, Path], **geom_kwargs) -> Dict[str, Path]:
+                   base_paths: Dict[int, Path], quant_promotion: bool = True,
+                   **geom_kwargs) -> Dict[str, Path]:
     ours_paths = {rid: work_dir / f"parity_ours_{rid}.npz"
                  for rid, _, _ in OURS_CONDITIONS}
     for rid, ws, q in OURS_CONDITIONS:
@@ -274,18 +171,15 @@ def run_ours_stage(model_dir: Path, corpus: Path, work_dir: Path,
             geom_overrides(
                 model_dir, corpus, ws, output_dir=work_dir,
                 **{"cache.quant_ratio": q, "cache.backend_package": "eager",
+                   "cache.quant_promotion": quant_promotion,
                    "base_run_npz": str(base_paths[ws]),
                    "output_path": str(path)},
                 **geom_kwargs,
             ),
-            f"OURS {rid}: ws={ws} quant_ratio={q}",
+            f"OURS {rid}: ws={ws} quant_ratio={q} "
+            f"promotion={'on' if quant_promotion else 'STICKY-OFF'}",
         )
     return ours_paths
-
-
-# ---------------------------------------------------------------------------
-# Stage: tier study
-# ---------------------------------------------------------------------------
 
 
 def run_study_stage(base_paths: Dict[int, Path], ours_paths: Dict[str, Path],
@@ -311,11 +205,6 @@ def run_study_stage(base_paths: Dict[int, Path], ours_paths: Dict[str, Path],
     return out_dir
 
 
-# ---------------------------------------------------------------------------
-# Stage: zip exactly what this script generated
-# ---------------------------------------------------------------------------
-
-
 def zip_outputs(work_dir: Path, base_paths: Dict[int, Path],
                 ours_paths: Dict[str, Path], study_dir: Path) -> Path:
     candidates = [*base_paths.values(), *ours_paths.values(),
@@ -334,11 +223,6 @@ def zip_outputs(work_dir: Path, base_paths: Dict[int, Path],
         print(f"  {f.relative_to(work_dir)}  ({f.stat().st_size / 1e6:.1f} MB)")
     log(f"-> {zip_path}  ({zip_path.stat().st_size / 1e6:.1f} MB total)")
     return zip_path
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_args(argv: List[str] = None) -> argparse.Namespace:
@@ -377,7 +261,7 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
                          "noise by 2048.")
     ap.add_argument("--samples", type=int, default=2,
                     help="num_samples (documents) — also the bootstrap axis. "
-                         "KAGGLE_RUNBOOK.md: >= 8 for anything reported; the "
+                         "docs/evaluation.md: >= 8 for anything reported; the "
                          "default of 2 is a smoke value below that floor. "
                          "Pair with --trace-axis sample once you raise it.")
     ap.add_argument("--budget", type=float, default=0.20,
@@ -386,6 +270,13 @@ def parse_args(argv: List[str] = None) -> argparse.Namespace:
     ap.add_argument("--local", type=int, default=32,
                     help="local_window_size in tokens — must be a multiple "
                          "of every window_size used (1, 8, 32 -> 32 works).")
+    ap.add_argument("--no-quant-promotion", action="store_true",
+                    help="sticky Q: a window demoted to int2 never buys back "
+                         "an fp16 seat — it stays int2 until evicted outright. "
+                         "Applies uniformly to every OURS_CONDITIONS run with "
+                         "quant_ratio > 0 (R3, R4); R1/R2 are unaffected "
+                         "since they never populate the Q tier. Default is "
+                         "the promoting policy (this flag off).")
     ap.add_argument("--fmm-horizon", type=int, default=32,
                     help="H for M1/M6(b) — the repo-wide standard horizon "
                          "(qevict_observations and m1's own default both use "
@@ -447,7 +338,9 @@ def main(argv: List[str] = None) -> None:
                 raise SystemExit(f"--stage {args.stage} needs {p} (base run) "
                                  "first — run an earlier stage.")
         ours_paths = run_ours_stage(args.model_dir, corpus_path, work_dir,
-                                    base_paths, **geom_kwargs)
+                                    base_paths,
+                                    quant_promotion=not args.no_quant_promotion,
+                                    **geom_kwargs)
 
     study_dir = work_dir / "tier_study"
     if do("study"):
