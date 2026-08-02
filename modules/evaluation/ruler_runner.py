@@ -1,28 +1,3 @@
-"""RULER evaluation runner — one runner, both backends, any subset of tasks.
-
-Mirrors ``LongBenchRunner`` exactly for model loading, windowed-cache setup,
-and the generation loop; only the data source and prompt construction differ,
-following DefensiveKV's RULER protocol
-(``kv_cache/DefensiveKV/kvpress/pipeline.py`` + ``evaluation/evaluate.py``):
-- RULER (vendored locally as ``datasets.save_to_disk`` arrow splits per
-  context length, see ``data/ruler_loader.py``)
-- Llama-3.1-8B-Instruct fp16, chat-templated prompt, greedy decoding
-- Per-example ``max_new_tokens`` from the dataset (no fixed generation cap)
-
-Prompt construction mirrors ``kvpress.pipeline.KVPressTextGenerationPipeline
-.preprocess``: apply the chat template to a single user turn containing
-``context + question``, then append ``answer_prefix`` verbatim after the
-generation-prompt header.
-
-Backend routing via ``utils/cache_factory.py`` (same as LongBenchRunner).
-
-Optional per-example memory accounting via ``utils/cache_memory.py``
-(``ruler.capture_memory: true``): after each generate call, before the cache
-is torn down, the cache's exact byte breakdown (fp16 tier, int4 Q tier,
-bookkeeping; retained tokens vs. observed context) is captured and written to
-``<task>.memory.jsonl`` (one record per example) plus a
-``<task>.memory_summary.json`` aggregate (mean/min/max across examples).
-"""
 
 from __future__ import annotations
 
@@ -44,12 +19,6 @@ log = get_logger(__name__)
 
 
 class RulerRunner:
-    """End-to-end RULER prediction runner.
-
-    One runner handles all (or a configured subset of) the RULER tasks for a
-    single context-length split, on either cache backend (flash_attn /
-    eager), routed via the factory in ``utils/cache_factory.py``.
-    """
 
     def __init__(self, config) -> None:
         self._assert_tracking_off(config)
@@ -95,7 +64,6 @@ class RulerRunner:
 
     @staticmethod
     def _assert_tracking_off(config) -> None:
-        """Guard: track_scores must be False for RULER runs (see LongBenchRunner)."""
         track = getattr(getattr(config, "telemetry", None), "track_scores", False)
         if track:
             raise ValueError(
@@ -107,7 +75,6 @@ class RulerRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         cfg = self.config
@@ -145,10 +112,6 @@ class RulerRunner:
         return model, tokenizer
 
     def run(self) -> None:
-        """Run predictions on all configured RULER tasks."""
-        # Fail fast on an unsupported transformers version: the windowed
-        # cache's RoPE handling assumes monotonic cache_position
-        # (transformers <= 4.47), see utils.cache_factory.
         if self.is_windowed:
             from utils.cache_factory import assert_transformers_version_supported
 
@@ -168,7 +131,6 @@ class RulerRunner:
 
         resume = getattr(self.ruler, "resume", False)
 
-        # Group examples by task, preserving on-disk order within each task.
         by_task: Dict[str, List[Dict[str, Any]]] = {}
         for ex in examples:
             by_task.setdefault(ex["task"], []).append(ex)
@@ -204,7 +166,6 @@ class RulerRunner:
     def _run_task(
         self, task_name: str, task_examples: List[Dict[str, Any]], output_dir: Path
     ) -> None:
-        """Run predictions on a single RULER task."""
         log.info("=== Task: %s ===", task_name)
 
         ns = getattr(self.ruler, "num_samples", "max")
@@ -290,23 +251,12 @@ class RulerRunner:
     def _predict(
         self, ex: Dict[str, Any], capture_memory: bool = False
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        """Generate a prediction for a single RULER example.
-
-        Follows kvpress.pipeline.KVPressTextGenerationPipeline exactly: the
-        final string is
-        ``chat_template(context + question, add_generation_prompt=True) + answer_prefix``.
-
-        Returns ``(pred, memory_report_dict_or_None)``.
-        """
         cfg = self.config
         model = self.model
         tokenizer = self.tokenizer
 
         max_gen_len = int(ex["max_new_tokens"])
 
-        # 1. Build the chat-templated prompt (RULER always uses the chat
-        #    template — none of its task names are in DefensiveKV's
-        #    no-template exception set, unlike some LongBench datasets).
         messages = [{"role": "user", "content": ex["context"] + ex["question"]}]
         try:
             prompt = tokenizer.apply_chat_template(
@@ -320,32 +270,20 @@ class RulerRunner:
             )
         prompt = prompt + ex["answer_prefix"]
 
-        # 2. Tokenize (no truncation — RULER splits are sized to fit the
-        #    model's context window at generation time; DefensiveKV doesn't
-        #    pre-truncate RULER either).
-        #    encode_prompt, not tokenizer(): the templated string above already
-        #    carries the BOS, and tokenizer()'s add_special_tokens default would
-        #    add a second — shifting every position and spending a protected
-        #    sink slot on a duplicate. kvpress tokenizes without re-adding
-        #    specials; this matches it.
         inputs = encode_prompt(tokenizer, prompt, truncation=False,
                                return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
-        # Explicit mask: pad_token == eos_token on Llama, so transformers warns
-        # on every example otherwise. All-ones at batch size 1.
         attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
         self._warn_if_over_context(context_length, max_gen_len)
 
-        # 3. Set up cache
         cache = None
         hooks = None
 
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
 
-        # 4. Generate
         try:
             gen_kwargs = {
                 "attention_mask": attention_mask,
@@ -369,9 +307,6 @@ class RulerRunner:
             if hooks is not None:
                 hooks.remove()
 
-        # 5. Capture memory BEFORE the cache is torn down. The actual
-        #    generated length (may stop early on EOS) is the honest
-        #    full-context baseline, not the requested max_gen_len.
         mem_dict = None
         if capture_memory and cache is not None:
             from utils.cache_memory import measure_cache_memory
@@ -384,24 +319,18 @@ class RulerRunner:
             mem_dict["task"] = ex["task"]
             self._last_report = report
 
-        # 6. Decode only new tokens
         pred = tokenizer.decode(
             output[0][context_length:], skip_special_tokens=True
         )
 
-        # 7. Memory hygiene
         self._cleanup_memory(cache)
 
         return pred, mem_dict
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
-        """Create windowed cache and install hooks (identical to LongBenchRunner)."""
         cfg = self.config
         model = self.model
 
-        # RULER reads window params from cfg.cache.*; parity runners read
-        # from cfg.window.*. Warn loudly if the two configs disagree so a user
-        # who copied a parity template doesn't silently get cache defaults.
         self._warn_on_cache_window_disagreement()
 
         budget = cfg.cache.cache_budget if cfg.cache.cache_budget is not None else 0.20
@@ -413,6 +342,7 @@ class RulerRunner:
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            quant_promotion=getattr(cfg.cache, "quant_promotion", True),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -453,7 +383,6 @@ class RulerRunner:
         return cache, hooks
 
     def _warn_if_over_context(self, context_length: int, max_gen_len: int) -> None:
-        """Warn (once) if prompt + generation exceeds the model's context window."""
         model_max = getattr(getattr(self.model, "config", None),
                             "max_position_embeddings", None)
         if not model_max:
@@ -469,7 +398,6 @@ class RulerRunner:
             self._over_context_warned = True
 
     def _cleanup_memory(self, cache=None) -> None:
-        """Memory hygiene between examples."""
         if cache is not None:
             del cache
         aggressive = getattr(self.ruler, "aggressive_cache_clear", False)
@@ -478,14 +406,6 @@ class RulerRunner:
             gc.collect()
 
     def _write_memory(self, task_name: str, output_dir: Path) -> None:
-        """Write per-example memory records + an aggregate summary.
-
-        ``<task>.memory.jsonl`` — one ``CacheMemoryReport.to_dict()`` per
-        example. ``<task>.memory_summary.json`` — mean/min/max of the
-        headline byte totals and the compression ratios across examples, so a
-        window_size / cache_budget / quant_ratio sweep can be compared at a
-        glance without re-parsing every jsonl line.
-        """
         reports = self._memory_reports
         mem_path = output_dir / f"{task_name}.memory.jsonl"
         with open(mem_path, "w", encoding="utf-8") as f:
@@ -512,12 +432,6 @@ class RulerRunner:
             "bookkeeping_live": _stats("bookkeeping_live"),
             "reduction_vs_full": _stats("reduction_vs_full"),
             "compression_vs_fp16": _stats("compression_vs_fp16"),
-            # The summary is what anyone actually reads — the jsonl is for
-            # re-analysis — so it must carry BOTH compression framings, not just
-            # the memo-inclusive one. At B = 1 (where the memo defaults ON) the
-            # memo is the largest line item and drags compression_vs_fp16 below
-            # 1.0, i.e. the summary alone would report the two-tier cache as
-            # bigger than fp16. See utils/cache_memory.py.
             "memo_bytes": _stats("memo_bytes"),
             "total_live_excl_memo": _stats("total_live_excl_memo"),
             "reduction_vs_full_excl_memo": _stats("reduction_vs_full_excl_memo"),
@@ -544,7 +458,6 @@ class RulerRunner:
         eps: float,
         output_dir: Path,
     ) -> None:
-        """Write per-task metadata sidecar JSON (mirrors LongBenchRunner)."""
         cfg = self.config
         env = capture_environment()
 
@@ -590,7 +503,6 @@ class RulerRunner:
             json.dump(meta, f, indent=2, default=str)
 
     def _warn_on_cache_window_disagreement(self) -> None:
-        """Warn if cfg.cache.* and cfg.window.* disagree on shared fields."""
         cfg = self.config
         pairs = [
             ("window_size", cfg.cache.window_size, cfg.window.window_size),
@@ -607,7 +519,6 @@ class RulerRunner:
                 )
 
     def _get_tokenizer_sha(self) -> str:
-        """Get tokenizer SHA for reproducibility."""
         if self.tokenizer is None:
             return "unknown"
         try:

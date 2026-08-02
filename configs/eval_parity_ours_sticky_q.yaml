@@ -1,0 +1,55 @@
+# ============================================================================
+# StickyKV — Parity Ours, STICKY Q (no promotion) — Kaggle-runnable
+#
+# Identical to eval_parity_ours_eager.yaml except cache.quant_promotion: false.
+# Demotion to int2 is one-way: a window that reaches the Q tier stays there
+# until it is evicted outright, and never buys back an fp16 seat. Emitted
+# arrays and metrics are the same schema as the promoting run, so the two npz
+# files drop straight into the same tier-study comparison.
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: parity_ours
+  seed: 42
+
+base_run_npz: outputs/parity_base_wikitext-103.npz
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: eager        # MUST pair with cache.backend_package: eager
+
+cache:
+  backend: windowed
+  backend_package: eager            # imports modules.windowed_eager_cache
+  cache_budget: 0.25
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+  quant_ratio: 0.5                  # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
+  quant_promotion: false            # sticky Q: int2 is a one-way door
+
+data:
+  dataset: wikitext-103
+  article_id: 0
+  prefill_len: 2048
+  gen_len: 1024
+
+parity:
+  dataset: wikitext-103
+  num_articles: 50
+  article_index: 0
+  min_article_tokens: 4096
+  prefill_len: 2048
+  gen_len: 1024
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+
+telemetry:
+  track_scores: true
+  output_dir: outputs

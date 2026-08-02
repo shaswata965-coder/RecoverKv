@@ -1,26 +1,3 @@
-"""GSM8K evaluation runner — chain-of-thought, greedy, one runner for all budgets.
-
-Mirrors ``RulerRunner``: same cache-backend routing, same chat-template protocol,
-same meta sidecar discipline. GSM8K-specific parts are the stop strings (so a
-512-token budget costs ~150 tokens of wall-clock) and the *compression
-diagnostic* described below.
-
-The compression diagnostic
---------------------------
-GSM8K prompts are short — roughly 120-180 tokens. A cache budget is sized against
-``prefill_len + max_new_tokens``, so on a 150-token prompt with a 512-token
-generation budget, ``cache_budget=0.80`` resolves to ~530 retained tokens: more
-than the sequence ever reaches. **The cache never evicts, and the run is
-byte-identical to the full-cache baseline.** That is not a bug, but silently
-reporting it as "accuracy at 80% budget" would be. So for every run this runner
-resolves the policy against the real per-example prefill length and records:
-
-* ``n_examples_no_eviction`` — examples where the budget exceeded the sequence
-* ``mean_retained_tokens`` / ``mean_sequence_tokens``
-
-and logs a loud warning when the first exceeds 10% of the run. Read it before
-you read the accuracy.
-"""
 
 from __future__ import annotations
 
@@ -43,7 +20,6 @@ log = get_logger(__name__)
 
 
 class GSM8KRunner:
-    """End-to-end GSM8K prediction runner (mode ``gsm8k``)."""
 
     def __init__(self, config) -> None:
         self._assert_tracking_off(config)
@@ -84,14 +60,10 @@ class GSM8KRunner:
         self._over_context_warned = False
         self._stop_strings_supported: Optional[bool] = None
 
-        # Compression diagnostic accumulators
         self._n_no_eviction = 0
         self._retained_tokens: List[int] = []
         self._sequence_tokens: List[int] = []
 
-    # ------------------------------------------------------------------
-    # setup
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _assert_tracking_off(config) -> None:
@@ -135,9 +107,6 @@ class GSM8KRunner:
         model.eval()
         return model, tokenizer
 
-    # ------------------------------------------------------------------
-    # run
-    # ------------------------------------------------------------------
 
     def run(self) -> None:
         if self.is_windowed:
@@ -219,18 +188,12 @@ class GSM8KRunner:
         )
         log.info("Predictions written to %s", out_path)
 
-    # ------------------------------------------------------------------
-    # predict
-    # ------------------------------------------------------------------
 
     def _predict(self, ex: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """Generate one GSM8K answer. Returns ``(pred, per_example_stats)``."""
         model, tokenizer = self.model, self.tokenizer
         override = getattr(self.gs, "max_new_tokens", None)
         max_gen_len = int(override) if override else int(ex["max_new_tokens"])
 
-        # 1. Chat template over context + question, then answer_prefix.
-        #    Identical protocol to RulerRunner / kvpress pipeline.
         messages = [{"role": "user", "content": ex["context"] + ex["question"]}]
         try:
             prompt = tokenizer.apply_chat_template(
@@ -244,21 +207,12 @@ class GSM8KRunner:
             )
         prompt = prompt + ex.get("answer_prefix", "")
 
-        # encode_prompt, not tokenizer(): the templated string above already
-        # carries the BOS, and tokenizer()'s add_special_tokens default would
-        # add a second — shifting every position and spending a protected sink
-        # slot on a duplicate.
         inputs = encode_prompt(tokenizer, prompt, truncation=False,
                                return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
-        # Pass the mask explicitly: pad_token == eos_token for Llama, so
-        # transformers cannot infer it and warns on every example. At batch
-        # size 1 the mask is all-ones and the result is unchanged, but leaving
-        # it implicit buries real warnings under thousands of spurious ones.
         attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
-        # 2. Cache
         cache = hooks = None
         resolved = None
         if self.is_windowed:
@@ -266,7 +220,6 @@ class GSM8KRunner:
                 input_ids, max_gen_len
             )
 
-        # 3. Generate — pure greedy, matching the LongBench/RULER protocol.
         try:
             gen_kwargs: Dict[str, Any] = {
                 "attention_mask": attention_mask,
@@ -295,8 +248,6 @@ class GSM8KRunner:
             output[0][context_length:], skip_special_tokens=True
         )
 
-        # 4. Per-example stats — these are what make a run auditable after the
-        #    fact without re-running it.
         seq_tokens = context_length + n_generated
         stats: Dict[str, Any] = {
             "prompt_tokens": context_length,
@@ -317,7 +268,6 @@ class GSM8KRunner:
         return pred, stats
 
     def _supports_stop_strings(self) -> bool:
-        """Whether this transformers version accepts ``generate(stop_strings=...)``."""
         if self._stop_strings_supported is None:
             try:
                 from transformers import GenerationConfig
@@ -337,7 +287,6 @@ class GSM8KRunner:
         return self._stop_strings_supported
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
-        """Create windowed cache + hooks. Returns ``(cache, hooks, resolved)``."""
         cfg = self.config
         model = self.model
 
@@ -350,6 +299,7 @@ class GSM8KRunner:
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            quant_promotion=getattr(cfg.cache, "quant_promotion", True),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -405,9 +355,6 @@ class GSM8KRunner:
             torch.cuda.empty_cache()
             gc.collect()
 
-    # ------------------------------------------------------------------
-    # diagnostics + meta
-    # ------------------------------------------------------------------
 
     def _compression_summary(self, n_examples: int) -> Dict[str, Any]:
         if not self._sequence_tokens:
@@ -428,7 +375,6 @@ class GSM8KRunner:
         }
 
     def _report_compression_diagnostic(self, n_examples: int) -> None:
-        """Print, and warn about, how much compression actually happened."""
         if not self.is_windowed:
             log.info("Full-cache baseline: no compression applied.")
             return
@@ -477,8 +423,6 @@ class GSM8KRunner:
             "run_name": output_dir.name,
             "num_examples": n_examples,
             "num_oom": n_oom,
-            # Dataset identity — the scorer refuses to compare runs whose
-            # dataset_sha disagree.
             "dataset_dir": str(getattr(self.gs, "data_dir", "data/gsm8k_cot")),
             "dataset_sha": manifest["dataset_sha"],
             "prompt_style": manifest["prompt_style"],
@@ -487,7 +431,6 @@ class GSM8KRunner:
             "shard": getattr(self.gs, "shard", 0),
             "num_shards": getattr(self.gs, "num_shards", 1),
             "num_samples_requested": getattr(self.gs, "num_samples", "max"),
-            # Model / cache
             "model_name": cfg.model.name,
             "model_revision": getattr(cfg.model, "revision", None),
             "tokenizer_sha": self._get_tokenizer_sha(),

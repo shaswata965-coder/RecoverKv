@@ -1,62 +1,3 @@
-"""cache_memory — drop-in memory accounting for the two-tier windowed KV cache.
-
-One file, three ways to use it.
-
-**As a probe inside any test / eval.** After a run has populated the cache
-(prefill + at least one eviction), hand the cache object to
-:func:`report_cache_memory`::
-
-    from utils.cache_memory import report_cache_memory
-    ...
-    out = model.generate(..., past_key_values=pkv)
-    report_cache_memory(pkv, label="qasper bs=4 q=0.5")
-
-It prints an exact byte breakdown — fp16 tier, int2 Q tier (codes + grid),
-read memo, and bookkeeping — split into what is *semantically retained* (live)
-vs. what is *reserved in memory* (allocated), plus the two compression ratios
-the method exists to move: against an fp16 cache at the **same retention** (the
-quantization win) and against a dense fp16 cache over the **full observed
-context** (eviction + quantization together). It also snapshots CUDA / RSS.
-
-It degrades gracefully: a plain ``DynamicCache`` / ``StaticCache`` is walked via
-its ``key_cache`` / ``value_cache`` lists, so the *same* call measures your
-baseline cache and the numbers line up apples-to-apples.
-
-**As a hook you attach to any run.** The accounting above is a *snapshot* of one
-instant, and the instant it can reach is after the run — which structurally
-cannot see the peak. Peak is what caps the batch size, and the peak of a
-windowed run does not happen at the end: it happens during prefill, before the
-first eviction compacts the prompt away (BATCHING_PLAN.md §5). :class:`MemoryProbe`
-is the high-water recorder for that::
-
-    from utils.cache_memory import MemoryProbe
-
-    with MemoryProbe(label="ours bs=64", model=model) as probe:
-        with probe.phase("prefill"):
-            out = model(input_ids=ids, past_key_values=pkv, use_cache=True)
-        with probe.phase("decode"):
-            ...                                    # the generation loop
-    print(probe.format())
-
-It records, per phase and overall: the torch allocator's peak allocated and peak
-reserved, the **device-level** peak (``mem_get_info`` — everything on the GPU,
-including the CUDA context, other processes, and allocator fragmentation, which
-is what an OOM actually trips on), peak host RSS, and the allocator's OOM /
-retry counters. Passing ``model=`` registers a forward hook so every forward
-pass samples; a background poller catches peaks between them. Both are optional
-and it degrades to a no-op-shaped report on CPU.
-
-**As a standalone script.** Run it to build a model, drive a real
-prefill + decode long enough to trigger eviction, and print the report::
-
-    python -m utils.cache_memory --model meta-llama/Llama-3.1-8B \
-        --backend eager --prefill 512 --gen 256 --batch-size 4 \
-        --quant-ratio 0.5 --cache-budget 0.5
-
-Introspection reads the cache's own tensors (``_states`` / ``_stores`` /
-``resolved``), so it needs no GPU and adds no allocation of its own — the byte
-figures are computed, not sampled, and are correct on CPU or CUDA alike.
-"""
 
 from __future__ import annotations
 
@@ -89,115 +30,64 @@ __all__ = [
 _MB = 1024.0 * 1024.0
 
 
-# ---------------------------------------------------------------------------
-# small helpers
-# ---------------------------------------------------------------------------
-
-
 def _nbytes(t: Optional[Tensor]) -> int:
-    """Bytes a tensor's storage carries (``0`` for ``None``)."""
     if t is None:
         return 0
     return t.numel() * t.element_size()
 
 
 def _per_row_slot_bytes(t: Tensor) -> int:
-    """Bytes one (row, slot) lane of a ``[B, N, ...]`` table tensor occupies.
-
-    Used to charge the Q tier by *active* windows rather than by the full
-    (dormant + free + margin) slot table — the live footprint, not the reserved
-    one.
-    """
     if t.dim() < 2:
         return 0
     lane = t[0, 0]
     return lane.numel() * t.element_size()
 
 
-# ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class CacheMemoryReport:
-    """Byte accounting for one cache instance, summed over all layers and rows.
 
-    ``*_live`` fields are the **semantically retained** content — the KV the
-    cache currently represents. ``*_alloc`` fields are what is **reserved in
-    memory** right now, which is larger when the fp buffer still holds the
-    prefill-sized allocation, or when the Q slot table carries dormant / free
-    slots (see ``state.py`` / ``slots.py``). Token counts are per row, taken
-    from layer 0 (identical across layers at steady state); byte totals are
-    summed exactly over every layer.
-    """
-
-    kind: str                       # "windowed" | "dynamic" | "static" | "unknown"
+    kind: str
     num_layers: int
     batch_size: int
     device: str
     kv_dtype: str
     window_size: int
 
-    # per-row token / window counts (layer 0, representative)
     fp_live_tokens: int
     fp_alloc_tokens: int
     q_active_windows: int
     q_active_tokens: int
     q_slots: int
-    retained_tokens: int            # T_fp + T_q per row (effective seq length)
-    observed_context_len: int       # max absolute position + 1 (full context seen)
+    retained_tokens: int
+    observed_context_len: int
 
-    # byte totals — all layers, all rows
     fp_content_live: int
     fp_content_alloc: int
     q_content_live: int
     q_content_alloc: int
-    bookkeeping_live: int           # positions + window scores + window ids + slot meta
+    bookkeeping_live: int
     bookkeeping_alloc: int
     memo_bytes: int
 
     total_live: int
     total_alloc: int
 
-    # analytic baselines (all layers, all rows, fp16-equivalent)
-    fp16_equiv_retained: int        # same retained tokens, but all fp16 dense
-    dense_full_context: int         # full observed context, all fp16 dense
+    fp16_equiv_retained: int
+    dense_full_context: int
 
     resolved: Dict[str, Any] = field(default_factory=dict)
     device_mem: Dict[str, Any] = field(default_factory=dict)
     per_layer: List[Dict[str, Any]] = field(default_factory=list)
 
-    # -- derived ratios ------------------------------------------------------
 
     @property
     def compression_vs_fp16(self) -> Optional[float]:
-        """fp16-at-same-retention ÷ actual live. The quantization win in isolation."""
         return self.fp16_equiv_retained / self.total_live if self.total_live else None
 
     @property
     def reduction_vs_full(self) -> Optional[float]:
-        """Dense fp16 over the full observed context ÷ actual live.
-
-        Eviction and quantization together, against the cache you would have
-        kept had you never evicted or quantized.
-        """
         return self.dense_full_context / self.total_live if self.total_live else None
 
-    # -- the same two ratios with the read memo taken out --------------------
-    #
-    # The memo is a *derived* fp16 copy of the Q tier, not cache state: dropping
-    # it costs recomputation, never correctness or a token. It is also charged
-    # per row and, at B = 1 (where the auto rule turns it ON), it is by far the
-    # largest line item — measured on a RULER example it was 16.3 of 21.4 MB,
-    # which drags `compression_vs_fp16` to 0.91x, i.e. the report says the
-    # two-tier cache is BIGGER than fp16.
-    #
-    # Both framings are honest and neither is the whole story, so publish the
-    # pair rather than picking one: `*_excl_memo` is the cache-state figure a
-    # compression claim should quote, `compression_vs_fp16` is the resident
-    # footprint you actually pay at that batch size. For a headline memory
-    # table, run the capture with quant_memoize_read: false and the two agree.
 
     @property
     def total_live_excl_memo(self) -> int:
@@ -223,28 +113,10 @@ class CacheMemoryReport:
         return d
 
 
-# ---------------------------------------------------------------------------
-# measurement
-# ---------------------------------------------------------------------------
-
-
 def measure_cache_memory(
     cache: Any,
     full_context_len: Optional[int] = None,
 ) -> CacheMemoryReport:
-    """Introspect a cache instance and return a :class:`CacheMemoryReport`.
-
-    Parameters
-    ----------
-    cache
-        A ``WindowedCache`` (either backend), or any HF cache exposing
-        ``key_cache`` / ``value_cache`` lists (``DynamicCache``, ``StaticCache``).
-    full_context_len
-        Override for the full-context baseline (prefill + tokens generated). If
-        ``None``, it is inferred from the largest absolute position the cache
-        still holds — reliable, because the newest (local) tokens are never
-        evicted.
-    """
     if hasattr(cache, "_states"):
         return _measure_windowed(cache, full_context_len)
     if hasattr(cache, "key_cache"):
@@ -263,7 +135,6 @@ def _measure_windowed(
     resolved = cache.resolved
     ws = resolved.window_size
 
-    # locate the first populated layer to read shapes / dtype / device from
     ref = next((s for s in states if s.key_states is not None), None)
     if ref is None:
         raise ValueError(
@@ -273,17 +144,16 @@ def _measure_windowed(
     kv_dtype = ref.key_states.dtype
     elsize = ref.key_states.element_size()
     device = str(ref.key_states.device)
-    dense_bytes_per_token = H_kv * D * elsize * 2  # K + V, per row per layer
+    dense_bytes_per_token = H_kv * D * elsize * 2
 
     fp_content_live = fp_content_alloc = 0
     q_content_live = q_content_alloc = 0
     book_live = book_alloc = 0
     memo_bytes = 0
-    retained_per_row_sum = 0        # Σ_layers (T_fp + T_q)  — for the fp16 baseline
+    retained_per_row_sum = 0
     observed_ctx = 0
     per_layer: List[Dict[str, Any]] = []
 
-    # representative per-row counts from layer 0
     fp_live_tokens = ref.key_states.shape[2]
     fp_alloc_tokens = ref.buffer_capacity
     q_active_windows = 0
@@ -293,13 +163,11 @@ def _measure_windowed(
         if state.key_states is None:
             continue
 
-        # -- fp16 tier: live views vs. reserved buffers --
         k_live = _nbytes(state.key_states) + _nbytes(state.value_states)
         k_alloc = _nbytes(state._key_buf) + _nbytes(state._val_buf)
         fp_content_live += k_live
         fp_content_alloc += k_alloc
 
-        # -- bookkeeping: positions, window scores, window ids --
         b_live = (
             _nbytes(state.position_ids)
             + _nbytes(state.window_scores)
@@ -315,7 +183,6 @@ def _measure_windowed(
         t_q = 0
         n_active = 0
 
-        # -- int2 Q tier --
         store = stores[li] if li < len(stores) else None
         table = getattr(store, "table", None) if store is not None else None
         if table is not None:
@@ -331,7 +198,6 @@ def _measure_windowed(
             )
             meta_tensors = (table.slot_pos, table.slot_wid, table.slot_active)
 
-            # allocated = the whole table; live = only the active windows
             q_content_alloc += sum(_nbytes(t) for t in kv_tensors)
             per_slot_kv = sum(_per_row_slot_bytes(t) for t in kv_tensors)
             q_content_live += per_slot_kv * B * n_active
@@ -340,7 +206,6 @@ def _measure_windowed(
             per_slot_meta = sum(_per_row_slot_bytes(t) for t in meta_tensors)
             b_live += per_slot_meta * B * n_active
 
-            # read memo: whole Q tier dequantized to fp16, if enabled + warm
             rc = getattr(store, "_read_cache", None)
             if rc is not None:
                 keys, vals, pos_flat = rc[1]
@@ -352,8 +217,6 @@ def _measure_windowed(
         retained_row = t_fp + t_q
         retained_per_row_sum += retained_row
 
-        # full-context estimate: newest tokens are never evicted, so the largest
-        # surviving absolute position + 1 is the true context length.
         if state.position_ids is not None and state.position_ids.numel():
             observed_ctx = max(observed_ctx, int(state.position_ids.max().item()) + 1)
 
@@ -369,7 +232,6 @@ def _measure_windowed(
     total_live = fp_content_live + q_content_live + book_live + memo_bytes
     total_alloc = fp_content_alloc + q_content_alloc + book_alloc + memo_bytes
 
-    # analytic fp16 baselines (K+V dense, all layers, all rows)
     fp16_equiv = retained_per_row_sum * B * dense_bytes_per_token
     if full_context_len is not None:
         observed_ctx = max(observed_ctx, int(full_context_len))
@@ -420,7 +282,6 @@ def _measure_windowed(
 def _measure_hf_dense(
     cache: Any, full_context_len: Optional[int]
 ) -> CacheMemoryReport:
-    """Walk a ``DynamicCache`` / ``StaticCache`` for an apples-to-apples baseline."""
     keys = [k for k in cache.key_cache if k is not None and k.numel()]
     vals = [v for v in cache.value_cache if v is not None and v.numel()]
     if not keys:
@@ -433,8 +294,6 @@ def _measure_hf_dense(
 
     content = sum(_nbytes(k) for k in keys) + sum(_nbytes(v) for v in vals)
     n_layers = len(keys)
-    # StaticCache preallocates to max; its "live" length is a prefix. DynamicCache
-    # is exact. Either way, alloc == what the tensors carry; live == what's used.
     seq_len = T
     observed_ctx = int(full_context_len) if full_context_len is not None else seq_len
     retained_sum = seq_len * n_layers
@@ -473,21 +332,9 @@ def _measure_hf_dense(
     )
 
 
-# ---------------------------------------------------------------------------
-# device / process snapshot
-# ---------------------------------------------------------------------------
-
-
 def host_rss_bytes() -> int:
-    """Current process RSS in bytes, or ``0`` if it cannot be determined.
-
-    ``psutil`` if present; otherwise the OS directly (Win32
-    ``GetProcessMemoryInfo`` / Linux ``statm``), because ``psutil`` is not in
-    ``environment.yml`` and a memory tool that reports nothing on the default
-    env is not a memory tool.
-    """
     try:
-        import psutil  # optional
+        import psutil
 
         return int(psutil.Process().memory_info().rss)
     except Exception:
@@ -496,17 +343,10 @@ def host_rss_bytes() -> int:
 
 
 def host_peak_rss_bytes() -> int:
-    """**Peak** process RSS in bytes since start, or ``0`` if unavailable.
-
-    A true OS-maintained high-water mark (Win32 ``PeakWorkingSetSize`` /
-    ``getrusage(ru_maxrss)``) — no polling, and it cannot miss a spike between
-    samples the way a sampled maximum can.
-    """
     return _os_rss(peak=True)
 
 
 def _os_rss(peak: bool) -> int:
-    """RSS (or peak RSS) straight from the OS. ``0`` when unsupported."""
     if sys.platform == "win32":
         try:
             import ctypes
@@ -527,8 +367,6 @@ def _os_rss(peak: bool) -> int:
                 ]
 
             kernel32 = ctypes.windll.kernel32
-            # Explicit restype: the default (c_int) truncates the current-process
-            # pseudo-handle (0xFFFF...FFFF) to -1 and the call then fails.
             kernel32.GetCurrentProcess.restype = ctypes.c_void_p
             get_info = ctypes.windll.psapi.GetProcessMemoryInfo
             get_info.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD]
@@ -551,7 +389,6 @@ def _os_rss(peak: bool) -> int:
         if peak:
             import resource
 
-            # ru_maxrss is KB on Linux, bytes on macOS.
             kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             return int(kb if sys.platform == "darwin" else kb * 1024)
         with open("/proc/self/statm") as fh:
@@ -562,26 +399,6 @@ def _os_rss(peak: bool) -> int:
 
 
 def snapshot_device_memory(device: Optional[torch.device] = None) -> Dict[str, Any]:
-    """CUDA allocator stats (if on GPU) and process RSS (best effort).
-
-    The cache byte figures above are computed exactly and stand on their own;
-    this is the surrounding context — total process footprint, allocator
-    high-water marks, and how close the **device as a whole** came to full —
-    that a test set usually wants alongside them.
-
-    Three different "GPU memory" numbers appear here and they are not
-    interchangeable:
-
-    * ``cuda_allocated``  — bytes in live tensors. What the model + cache
-      semantically occupy.
-    * ``cuda_reserved``   — bytes the caching allocator holds from the driver.
-      ``reserved - allocated`` is fragmentation: real, unusable, and it grows
-      with churn (this cache reallocates its fp buffer at the first eviction).
-    * ``cuda_device_used``— ``total - free`` from the driver. Adds the CUDA
-      context (~0.3-1 GB), NCCL buffers, and **other processes** on a shared
-      GPU. This is the number an OOM is actually decided against, and the one
-      the max-B ladder is really searching over.
-    """
     out: Dict[str, Any] = {}
     is_cuda = device is not None and torch.device(device).type == "cuda"
     if is_cuda and torch.cuda.is_available():
@@ -612,14 +429,8 @@ def snapshot_device_memory(device: Optional[torch.device] = None) -> Dict[str, A
     return out
 
 
-# ---------------------------------------------------------------------------
-# MemoryProbe — the attachable high-water recorder
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class PhasePeak:
-    """High-water marks over one named span of a run."""
 
     name: str
     seconds: float
@@ -635,11 +446,6 @@ class PhasePeak:
 
 @dataclass
 class PeakMemoryReport:
-    """What a run's memory actually *peaked* at, overall and per phase.
-
-    Every field is bytes unless the name says otherwise. ``device_*`` fields are
-    ``0`` on CPU.
-    """
 
     label: Optional[str]
     device: str
@@ -663,42 +469,25 @@ class PeakMemoryReport:
 
     phases: List[PhasePeak] = field(default_factory=list)
 
-    # -- derived -------------------------------------------------------------
 
     @property
     def fragmentation_peak(self) -> int:
-        """``reserved - allocated`` at peak: bytes the allocator holds but no
-        tensor is using. Grows with churn and counts against max-B exactly like
-        real tensors do."""
         return max(self.torch_reserved_peak - self.torch_alloc_peak, 0)
 
     @property
     def device_headroom(self) -> int:
-        """Bytes still free on the device at its fullest. **This is the max-B
-        signal**: a config that peaks at 95% of the card will not survive the
-        next rung of the batch ladder, and a config that peaks at 40% is leaving
-        batch on the table."""
         if not self.device_total:
             return 0
         return max(self.device_total - self.device_used_peak, 0)
 
     @property
     def device_utilization(self) -> Optional[float]:
-        """Peak device usage as a fraction of the card. ``None`` on CPU."""
         if not self.device_total:
             return None
         return self.device_used_peak / self.device_total
 
     @property
     def peak_phase(self) -> Optional[str]:
-        """Which phase held the overall peak — prefill or decode.
-
-        Not cosmetic: if the peak is in **prefill**, per-row steady-state
-        compression cannot raise max-B (the un-evicted prompt binds) and the fix
-        is chunked prefill, not a smaller budget. If it is in **decode**, budget
-        and quant_ratio move max-B directly. BATCHING_PLAN.md §5 / the scenario-C
-        note in ``configs/eval_perf_batched.yaml``.
-        """
         if not self.phases:
             return None
         key = (
@@ -719,37 +508,6 @@ class PeakMemoryReport:
 
 
 class MemoryProbe:
-    """Records memory high-water marks across a run. Attach it to anything.
-
-    Three collection paths, all optional and all additive:
-
-    1. **Allocator peaks** (CUDA) — ``max_memory_allocated`` /
-       ``max_memory_reserved``. Exact and free: the allocator maintains them, so
-       no sampling can miss a spike.
-    2. **A forward hook** on the model — one sample per forward pass. Cheap,
-       deterministic, and phase-aligned, which is what makes per-phase numbers
-       trustworthy on CPU where there is no allocator high-water mark.
-    3. **A background poller** — catches the device-level (``mem_get_info``) and
-       host-RSS peaks *between* forwards, which is where an allocator spike
-       inside one big prefill kernel sequence would otherwise hide.
-
-    ``reset_peak_memory_stats`` is the only way to get a *phase*-scoped
-    allocator peak, and it destroys the process-wide one — so this folds the
-    running peak into its own accumulator before every reset. The overall
-    numbers are therefore correct even though the phases each reset.
-
-    Parameters
-    ----------
-    label : str, optional
-        Free text carried into the report (e.g. ``"ours_b20_q50 bs=64"``).
-    device : torch.device, optional
-        Defaults to the current CUDA device, else CPU.
-    model : nn.Module, optional
-        Convenience for :meth:`attach` — registers the forward hook on enter and
-        removes it on exit.
-    poll_interval_s : float, optional
-        Background poller period. ``None`` disables it. Default 0.05 s.
-    """
 
     def __init__(
         self,
@@ -776,8 +534,6 @@ class MemoryProbe:
             if self._is_cuda else None
         )
 
-        # Running high-water marks. `_carried_*` hold what earlier phases
-        # reached, since reset_peak_memory_stats() wipes the allocator's own.
         self._carried_alloc = 0
         self._carried_reserved = 0
         self._device_used_peak = 0
@@ -797,10 +553,8 @@ class MemoryProbe:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    # -- lifecycle -----------------------------------------------------------
 
     def start(self) -> "MemoryProbe":
-        """Begin recording. Resets the allocator's peak counters."""
         if self._is_cuda:
             torch.cuda.synchronize(self._idx)
             torch.cuda.reset_peak_memory_stats(self._idx)
@@ -820,14 +574,13 @@ class MemoryProbe:
         return self
 
     def stop(self) -> "MemoryProbe":
-        """Stop recording. Idempotent."""
         if self._t1 is not None:
             return self
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
-        self._end_phase()          # close a dangling phase, if any
+        self._end_phase()
         self.detach()
         if self._is_cuda:
             torch.cuda.synchronize(self._idx)
@@ -841,16 +594,8 @@ class MemoryProbe:
     def __exit__(self, *exc) -> None:
         self.stop()
 
-    # -- hook ----------------------------------------------------------------
 
     def attach(self, module: torch.nn.Module):
-        """Register a forward hook that samples once per forward pass.
-
-        This is the "attach it to any run" path: it needs no cooperation from
-        the runner, no phase annotations, and no knowledge of the cache — hand
-        it the model and every step is sampled. Returns the hook handle
-        (also removed by :meth:`stop` / :meth:`detach`).
-        """
         self.detach()
 
         def _hook(_module, _inp, _out):
@@ -860,22 +605,12 @@ class MemoryProbe:
         return self._hook
 
     def detach(self) -> None:
-        """Remove the forward hook, if one is installed. Idempotent."""
         if self._hook is not None:
             self._hook.remove()
             self._hook = None
 
-    # -- sampling ------------------------------------------------------------
 
     def sample(self) -> None:
-        """Take one point sample. Cheap enough for a per-forward hook.
-
-        Deliberately does **not** synchronize: a sync inside a forward hook
-        would serialize the very decode loop the perf suite is timing. The
-        allocator peaks are exact regardless (they are updated at allocation,
-        not at sample time); only the device-level reading is a sampled
-        quantity, and the poller exists to keep that dense.
-        """
         self._samples += 1
         if self._is_cuda:
             try:
@@ -893,7 +628,6 @@ class MemoryProbe:
         while not self._stop.wait(self.poll_interval_s):
             self.sample()
 
-    # -- phases --------------------------------------------------------------
 
     class _Phase:
         def __init__(self, probe: "MemoryProbe", name: str) -> None:
@@ -907,10 +641,6 @@ class MemoryProbe:
             self._probe._end_phase()
 
     def phase(self, name: str) -> "MemoryProbe._Phase":
-        """Scope the next span as a named phase (``"prefill"``, ``"decode"``…).
-
-        Phases do not nest; entering one closes the previous.
-        """
         return MemoryProbe._Phase(self, name)
 
     def _begin_phase(self, name: str) -> None:
@@ -920,9 +650,6 @@ class MemoryProbe:
             torch.cuda.synchronize(self._idx)
             torch.cuda.reset_peak_memory_stats(self._idx)
         self._phase_open = (name, time.perf_counter(), self._samples)
-        # Restart the sampled maxima at zero so the phase's numbers describe the
-        # phase, not everything before it. The run-wide maxima are preserved in
-        # _phase_*_start and folded back in _end_phase.
         self._phase_device_start = self._device_used_peak
         self._phase_host_start = self._host_rss_peak
         self._device_used_peak = 0
@@ -951,14 +678,12 @@ class MemoryProbe:
                 host_rss_peak=self._host_rss_peak,
             )
         )
-        # Fold the phase's maxima back into the run-wide ones.
         self._fold_allocator_peaks()
         self._device_used_peak = max(
             self._device_used_peak, self._phase_device_start
         )
         self._host_rss_peak = max(self._host_rss_peak, self._phase_host_start)
 
-    # -- peak bookkeeping ----------------------------------------------------
 
     def _allocator_peak(self, reserved: bool = False) -> int:
         if not self._is_cuda:
@@ -970,21 +695,13 @@ class MemoryProbe:
         )
 
     def _fold_allocator_peaks(self) -> None:
-        """Carry the allocator's current peaks over a pending reset."""
         self._carried_alloc = max(self._carried_alloc, self._allocator_peak())
         self._carried_reserved = max(
             self._carried_reserved, self._allocator_peak(reserved=True)
         )
 
-    # -- output --------------------------------------------------------------
 
     def report(self) -> PeakMemoryReport:
-        """Freeze the recording into a :class:`PeakMemoryReport`.
-
-        Non-destructive and safe to call mid-run — it will not close an open
-        phase (:meth:`stop` does that), so a progress report cannot truncate the
-        span it is reporting on. An in-flight phase is simply not listed yet.
-        """
         self._fold_allocator_peaks()
         end = snapshot_device_memory(self.device)
         total_b = int(end.get("cuda_device_total_mb", 0) * _MB)
@@ -1017,21 +734,13 @@ class MemoryProbe:
         )
 
     def format(self) -> str:
-        """The report, rendered. Shorthand for ``format_peak_report(...)``."""
         return format_peak_report(self.report())
 
     def to_dict(self) -> Dict[str, Any]:
         return self.report().to_dict()
 
 
-# ---------------------------------------------------------------------------
-# formatting
-# ---------------------------------------------------------------------------
-
-
 def _mb(n: int) -> str:
-    """Human-readable bytes: scales B / KB / MB / GB so small configs don't
-    all collapse to ``0.00 MB`` and 8B-model caches don't overflow the column."""
     n = float(n)
     for unit, scale in (("GB", _MB * 1024), ("MB", _MB), ("KB", 1024.0)):
         if n >= scale:
@@ -1085,7 +794,6 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
     )
     lines.append("-" * 72)
 
-    # token accounting (per row)
     lines.append(
         f"retained/row: T_fp={r.fp_live_tokens} + T_q={r.q_active_tokens} "
         f"({r.q_active_windows} win x ws={r.window_size}) = {r.retained_tokens} tok"
@@ -1097,7 +805,6 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
         )
     lines.append(f"observed context: {r.observed_context_len} tok/row")
 
-    # baselines
     c1 = r.compression_vs_fp16
     c2 = r.reduction_vs_full
     lines.append("-" * 72)
@@ -1110,10 +817,6 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
         f"{c2:.2f}x smaller" if c2 else "vs full context: n/a"
     )
     if r.memo_bytes:
-        # Say it out loud: at B = 1 the memo is usually the biggest line item,
-        # and both ratios above are computed WITH it. Quoting only the first
-        # number here would understate the method; quoting only the second
-        # would hide what the run actually occupies. Print both.
         c1x = r.compression_vs_fp16_excl_memo
         c2x = r.reduction_vs_full_excl_memo
         share = 100.0 * r.memo_bytes / r.total_live if r.total_live else 0.0
@@ -1150,7 +853,6 @@ def format_report(report: CacheMemoryReport, label: Optional[str] = None) -> str
 
 
 def format_peak_report(report: PeakMemoryReport) -> str:
-    """Render a :class:`PeakMemoryReport` as a table."""
     r = report
     lines: List[str] = []
     title = "Peak memory"
@@ -1192,9 +894,6 @@ def format_peak_report(report: PeakMemoryReport) -> str:
             f"GPU {_mb(r.device_used_peak)} / {_mb(r.device_total)} at peak "
             f"({util*100:.1f}%)  headroom {_mb(r.device_headroom)}"
         )
-        # The headroom line is the max-B verdict: this is the quantity the batch
-        # ladder is searching over, so say what it implies rather than making the
-        # reader divide.
         if util >= 0.95:
             lines.append(
                 "  -> at the ceiling: the next rung of the batch ladder will OOM."
@@ -1230,10 +929,6 @@ def format_peak_report(report: PeakMemoryReport) -> str:
             )
         peak_phase = r.peak_phase
         if peak_phase and not r.device_total:
-            # CPU: the only per-phase signal is host RSS, which is dominated by
-            # the weights and never falls back (the allocator keeps freed pages).
-            # It ranks the phases honestly but says nothing about what would cap
-            # a batch on a GPU, so state the limit instead of drawing a verdict.
             lines.append(
                 f"peak phase: {peak_phase} (by host RSS - CPU run, so this is "
                 f"NOT a max-B signal)"
@@ -1251,7 +946,7 @@ def format_peak_report(report: PeakMemoryReport) -> str:
                 )
                 lines.append(
                     "     only a shorter prompt, more decode, or chunked prefill "
-                    "will (BATCHING_PLAN.md 5)."
+                    "will."
                 )
             else:
                 lines.append(
@@ -1273,12 +968,6 @@ def report_cache_memory(
     file=sys.stdout,
     probe: Optional["MemoryProbe"] = None,
 ) -> CacheMemoryReport:
-    """Measure *cache*, print the report, and return it. The one-call entry point.
-
-    Pass ``probe`` (a stopped :class:`MemoryProbe`) to print the run's peak
-    high-water marks under the cache's byte accounting — the resident footprint
-    and the peak are different questions and a batching decision needs both.
-    """
     report = measure_cache_memory(cache, full_context_len=full_context_len)
     if as_json:
         out = report.to_dict()
@@ -1290,11 +979,6 @@ def report_cache_memory(
         if probe is not None:
             print(format_peak_report(probe.report()), file=file)
     return report
-
-
-# ---------------------------------------------------------------------------
-# standalone CLI — build a model, drive prefill + decode, print the report
-# ---------------------------------------------------------------------------
 
 
 def _build_and_run(args: argparse.Namespace):
@@ -1326,9 +1010,6 @@ def _build_and_run(args: argparse.Namespace):
 
     device = model.device
     B = max(1, args.batch_size)
-    # Bound token ids by the model's real vocab so this works for tiny test
-    # models as well as production ones. The content is irrelevant — memory
-    # accounting depends on shapes, not values.
     vocab = int(getattr(model.config, "vocab_size", 30000))
     input_ids = torch.randint(0, vocab, (B, args.prefill), device=device)
 
@@ -1339,6 +1020,7 @@ def _build_and_run(args: argparse.Namespace):
         cache_budget=args.cache_budget,
         quant_ratio=args.quant_ratio,
         quant_memoize_read=args.memoize,
+        quant_promotion=not args.no_quant_promotion,
     )
 
     rope = None
@@ -1357,11 +1039,6 @@ def _build_and_run(args: argparse.Namespace):
         kv_dtype=torch_dtype, rope_module=rope,
         num_layers=model.config.num_hidden_layers, max_tokens=args.gen,
     )
-    # The eager scorer reads attn_weights from the forward output, so it needs
-    # output_attentions=True; flash_attn derives scores from its own softmax
-    # stats and must NOT be given it (see the runners). Without scores flowing,
-    # eviction never fires and the Q tier stays empty — so this is what makes
-    # the tool show a *compacted* two-tier cache rather than a full one.
     gen_kwargs = {"output_attentions": True} if args.backend == "eager" else {}
     hooks = install_hooks(model, pkv, cfg)
     label = (f"{args.model} q={args.quant_ratio} bs={B} "
@@ -1418,6 +1095,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     p.add_argument("--memoize", type=lambda s: {"true": True, "false": False}.get(
         s.lower(), None), default=None,
         help="force read memo on/off; default None = auto (on at B=1)")
+    p.add_argument("--no-quant-promotion", action="store_true",
+                   help="sticky Q: a demoted window never returns to fp, it "
+                        "stays int2 until it is evicted")
     p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     p.add_argument("--poll", type=float, default=0.05,
                    help="MemoryProbe background poll interval, seconds")
@@ -1425,7 +1105,6 @@ def main(argv: Optional[List[str]] = None) -> None:
                    help="disable the background poller (allocator peaks only)")
     args = p.parse_args(argv)
 
-    # allow integer --local
     if args.local is not None and float(args.local).is_integer() and args.local > 1:
         args.local = int(args.local)
 

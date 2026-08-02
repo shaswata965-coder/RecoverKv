@@ -1,14 +1,3 @@
-"""LongBench evaluation runner — one runner, both backends, all 16 datasets.
-
-Follows DefensiveKV's exact protocol:
-- LongBench v1 (THUDM/LongBench), 16 English datasets
-- Llama-3.1-8B-Instruct (128K) fp16, full context (no pre-truncation)
-- Greedy decoding, per-dataset max gen length
-- Optional middle truncation (longbench.max_length) for short-context models
-- Output jsonl schema matches THUDM/LongBench/pred.py exactly
-
-Backend routing via ``utils/cache_factory.py``.
-"""
 
 from __future__ import annotations
 
@@ -35,22 +24,7 @@ log = get_logger(__name__)
 
 
 class LongBenchRunner:
-    """End-to-end LongBench prediction runner.
 
-    One runner handles all 16 datasets and both cache backends
-    (flash_attn / eager), routed via the factory in ``utils/cache_factory.py``.
-    """
-
-    # Few-shot in-context-learning datasets whose prompt body IS a series of
-    # worked examples ("input\nanswer\n\ninput\nanswer\n...").  THUDM/LongBench
-    # pred.py (and DefensiveKV) deliberately do NOT wrap these in the chat
-    # template — doing so flips an instruct model out of "continue the format"
-    # mode into chat-assistant mode, so it emits a meta-preamble ("Here are the
-    # summaries:", "Here is the completed code:") instead of imitating the
-    # examples, destroying the score on exact-/edit-match metrics.
-    #   THUDM/LongBench/pred.py:
-    #     if dataset not in ["trec","triviaqa","samsum","lsht","lcc","repobench-p"]:
-    #         prompt = build_chat(...)
     NO_CHAT_TEMPLATE_DATASETS = frozenset(
         {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
     )
@@ -59,14 +33,12 @@ class LongBenchRunner:
         self._assert_tracking_off(config)
         self.config = config
 
-        # Extract longbench-specific config
         self.lb = getattr(config, "longbench", None)
         if self.lb is None:
             raise ValueError(
                 "Config must have a 'longbench' section for LongBench mode."
             )
 
-        # Determine cache type
         cache_backend = getattr(config.cache, "backend", "dynamic")
         cache_package = getattr(config.cache, "backend_package", None)
 
@@ -93,14 +65,12 @@ class LongBenchRunner:
             self.cache_backend_package = None
             self.is_windowed = False
 
-        # Load vendored configs (DO NOT reimplement)
         configs_dir = Path("data/longbench_configs")
         with open(configs_dir / "dataset2prompt.json", "r", encoding="utf-8") as f:
             self.dataset2prompt = json.load(f)
         with open(configs_dir / "dataset2maxlen.json", "r", encoding="utf-8") as f:
             self.dataset2maxlen = json.load(f)
 
-        # Compute SHA-256 of vendored files for reproducibility
         self._vendored_shas = {
             "longbench_dataset2prompt_sha": sha256_file(
                 configs_dir / "dataset2prompt.json"
@@ -120,7 +90,6 @@ class LongBenchRunner:
 
     @staticmethod
     def _compute_metrics_sha() -> str:
-        """SHA-256 of the vendored metrics module."""
         metrics_path = Path("modules/evaluation/longbench_metrics.py")
         if metrics_path.exists():
             return sha256_file(metrics_path)
@@ -128,14 +97,6 @@ class LongBenchRunner:
 
     @staticmethod
     def _assert_tracking_off(config) -> None:
-        """Guard: track_scores must be False for LongBench runs.
-
-        Telemetry buffers grow linearly with
-        ``num_layers × H_q × num_windows × num_steps``; on long-context tasks
-        (~7.5k tokens prompt, up to 512 tokens generation), that's gigabytes
-        of CPU-resident tensors per example.  Distorts throughput numbers and
-        risks OOM.
-        """
         track = getattr(getattr(config, "telemetry", None), "track_scores", False)
         if track:
             raise ValueError(
@@ -147,7 +108,6 @@ class LongBenchRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         cfg = self.config
@@ -185,16 +145,12 @@ class LongBenchRunner:
         return model, tokenizer
 
     def run(self) -> None:
-        """Run predictions on all configured datasets."""
-        # Fail fast on an unsupported transformers version: the windowed cache's
-        # RoPE handling assumes monotonic cache_position (transformers <= 4.47).
         if self.is_windowed:
             from utils.cache_factory import assert_transformers_version_supported
 
             assert_transformers_version_supported()
             self._warn_on_cache_window_disagreement()
 
-        # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
         self._warn_if_chat_gate_looks_wrong()
 
@@ -218,7 +174,6 @@ class LongBenchRunner:
         for dataset_name in datasets:
             jsonl_path = output_dir / f"{dataset_name}.jsonl"
 
-            # Resume support: skip if output already exists with data
             if resume and jsonl_path.exists():
                 existing_lines = len(
                     jsonl_path.read_text(encoding="utf-8").strip().splitlines()
@@ -236,14 +191,12 @@ class LongBenchRunner:
         log.info("LongBench run complete. Outputs in %s", output_dir)
 
     def _run_dataset(self, name: str, output_dir: Path) -> None:
-        """Run predictions on a single dataset."""
         log.info("=== Dataset: %s ===", name)
 
         use_e = getattr(self.lb, "use_e_variants", False)
         examples = load_longbench_dataset(name, use_e_variant=use_e)
         examples_list = list(examples)
 
-        # Cap to num_samples per dataset. "max" (default) keeps the full split.
         ns = getattr(self.lb, "num_samples", "max")
         if isinstance(ns, int) and ns >= 0:
             total = len(examples_list)
@@ -283,7 +236,6 @@ class LongBenchRunner:
                     else:
                         raise
 
-                # Output schema matches THUDM/LongBench/pred.py exactly
                 record = {
                     "pred": pred,
                     "answers": ex["answers"],
@@ -312,7 +264,6 @@ class LongBenchRunner:
             eps,
         )
 
-        # Write metadata sidecar
         self._write_meta(name, n_examples, max_gen_len, run_start, run_end, eps, output_dir)
 
     def _predict(
@@ -322,45 +273,24 @@ class LongBenchRunner:
         max_gen_len: int,
         dataset_name: str,
     ) -> str:
-        """Generate a prediction for a single example.
-
-        Follows THUDM/LongBench/pred.py + kvpress protocol exactly.
-        """
         cfg = self.config
         model = self.model
         tokenizer = self.tokenizer
 
-        # 1. Format prompt from template
         prompt = prompt_template.format(
             context=ex["context"], input=ex.get("input", "")
         )
 
-        # 2. Tokenize and (optionally) middle-truncate.
-        #    max_length None / 0 / negative  -> NO truncation (full-context run;
-        #    matches DefensiveKV, which uses Llama-3.1-8B's 128K window and does
-        #    not pre-truncate). A positive value reproduces official
-        #    THUDM/LongBench middle-truncation for short-context models.
         max_length = getattr(self.lb, "max_length", None)
         tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
 
         if max_length and max_length > 0 and len(tokenized) > max_length:
             half = max_length // 2
-            # Middle truncation — byte-for-byte identical to THUDM/LongBench
-            # pred.py and DefensiveKV: decode the head and tail halves
-            # SEPARATELY and string-concatenate. (Concatenating token ids and
-            # decoding once produces a different prompt at the head/tail seam,
-            # so it must not be used if results are to match the published
-            # numbers.) The prompt is re-tokenized below regardless.
             prompt = tokenizer.decode(
                 tokenized[:half], skip_special_tokens=True
             ) + tokenizer.decode(tokenized[-half:], skip_special_tokens=True)
 
-        # 3. Apply chat template for LLaMA-3-8B-Instruct.
-        #    Skipped for the few-shot ICL datasets (matches THUDM/LongBench +
-        #    DefensiveKV) — wrapping their worked-example prompts in a chat
-        #    turn breaks few-shot continuation. See NO_CHAT_TEMPLATE_DATASETS.
         if self._should_apply_chat_template(cfg.model.name, dataset_name):
-            # Use the tokenizer's built-in chat template
             messages = [{"role": "user", "content": prompt}]
             try:
                 prompt = tokenizer.apply_chat_template(
@@ -369,48 +299,26 @@ class LongBenchRunner:
                     add_generation_prompt=True,
                 )
             except Exception:
-                # Fallback: manual LLaMA-3 template
                 prompt = (
                     f"<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
                     f"{prompt}<|eot_id|>"
                     f"<|start_header_id|>assistant<|end_header_id|>\n\n"
                 )
 
-        # 4. Tokenize final prompt.
-        #    encode_prompt, not tokenizer(): apply_chat_template returns a string
-        #    that ALREADY carries <|begin_of_text|>, and tokenizer()'s
-        #    add_special_tokens default would prepend a second one — shifting
-        #    every position and spending a protected sink slot on a duplicate
-        #    BOS. It decides per prompt, so the few-shot datasets that skip the
-        #    template (NO_CHAT_TEMPLATE_DATASETS) still get their BOS from the
-        #    tokenizer. THUDM/LongBench and DefensiveKV tokenize the templated
-        #    string without re-adding specials; this matches them.
         inputs = encode_prompt(tokenizer, prompt, truncation=False,
                                return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
-        # Pass the mask explicitly: pad_token == eos_token on Llama, so
-        # transformers cannot infer it and warns on every example. All-ones at
-        # batch size 1, so the result is unchanged — but leaving it implicit
-        # buries real warnings under thousands of spurious ones.
         attention_mask = inputs.attention_mask.to(model.device)
         context_length = input_ids.shape[-1]
 
-        # Guard: a prompt longer than the model's positional range yields
-        # out-of-distribution RoPE positions (garbage / errors). Surface it
-        # loudly instead of silently scoring noise — almost always means
-        # truncation was disabled (max_length null) on a SHORT-context model.
-        # Llama-3.1-8B (128K) fits every LongBench prompt; the original
-        # Llama-3-8B (8K) does not.
         self._warn_if_over_context(context_length, max_gen_len)
 
-        # 5. Set up cache
         cache = None
         hooks = None
 
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
 
-        # 6. Generate
         try:
             gen_kwargs = {
                 "attention_mask": attention_mask,
@@ -422,22 +330,16 @@ class LongBenchRunner:
                 or tokenizer.eos_token_id,
             }
 
-            # THUDM/LongBench + DefensiveKV use PURE greedy with NO repetition
-            # penalty. Only pass one if the user explicitly opted in to a
-            # non-1.0 value; otherwise the default must stay absent so results
-            # match the published protocol exactly.
             rep_pen = getattr(self.lb, "repetition_penalty", 1.0)
             if rep_pen is not None and rep_pen != 1.0:
                 gen_kwargs["repetition_penalty"] = rep_pen
 
-            # output_attentions only for eager backend
             if self.cache_backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
 
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache
 
-            # samsum special handling: stop at newline
             if dataset_name == "samsum":
                 newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
                 gen_kwargs["eos_token_id"] = [
@@ -450,25 +352,20 @@ class LongBenchRunner:
                 output = model.generate(input_ids, **gen_kwargs)
 
         finally:
-            # 7. Clean up hooks (no leakage between examples)
             if hooks is not None:
                 hooks.remove()
 
-        # 8. Decode only new tokens
         pred = tokenizer.decode(
             output[0][context_length:], skip_special_tokens=True
         )
 
-        # 9. Post-processing (dataset-specific, matches THUDM pred.py)
         pred = self._post_process(pred, dataset_name)
 
-        # 10. Memory hygiene
         self._cleanup_memory(cache)
 
         return pred
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
-        """Create windowed cache and install hooks."""
         cfg = self.config
         model = self.model
 
@@ -480,21 +377,11 @@ class LongBenchRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
-            # Same failure mode as first_eviction_step below: omitted, and the
-            # YAML knob is silently inert. LongBench generates one example at a
-            # time, so the auto rule (memo on at B == 1) hides it — a config
-            # asking for it OFF got it ON anyway.
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
-            # Without this the knob was inert here: LongBench fell through to
-            # WindowedCacheConfig's default whatever the YAML said, while the
-            # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
-            # the prompt is compressed before the second decode token, which is
-            # the operating point the prompt-compression baselines
-            # (SnapKV/AdaKV/DefensiveKV) are measured at.
+            quant_promotion=getattr(cfg.cache, "quant_promotion", True),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
-        # Get RoPE module
         rope = None
         for name, mod in model.named_modules():
             if "rotary" in name.lower() or "rope" in name.lower():
@@ -532,13 +419,6 @@ class LongBenchRunner:
         return cache, hooks
 
     def _warn_if_over_context(self, context_length: int, max_gen_len: int) -> None:
-        """Warn (once) if prompt + generation exceeds the model's context window.
-
-        A prompt beyond ``max_position_embeddings`` produces out-of-distribution
-        RoPE positions: the run won't crash but scores become noise. The usual
-        cause is disabling truncation (``max_length: null``) on a short-context
-        model. Warn rather than raise so a long run isn't aborted by one example.
-        """
         model_max = getattr(getattr(self.model, "config", None),
                             "max_position_embeddings", None)
         if not model_max:
@@ -557,37 +437,11 @@ class LongBenchRunner:
 
     @classmethod
     def _should_apply_chat_template(cls, model_name: str, dataset_name: str) -> bool:
-        """Whether to wrap the prompt in the model's chat template.
-
-        True only for instruct/chat models AND non-few-shot datasets. The
-        few-shot ICL datasets (NO_CHAT_TEMPLATE_DATASETS) must stay raw so the
-        model continues the worked-example format instead of switching into
-        chat-assistant mode. Matches THUDM/LongBench + DefensiveKV.
-
-        The instruct/chat test is on the model *name*, which is how THUDM does
-        it — but see :meth:`_warn_if_chat_gate_looks_wrong`: a local checkpoint
-        directory whose name does not happen to contain "instruct" or "chat"
-        silently loses the template on all 10 templated datasets.
-        """
         name = model_name.lower()
         is_chat_model = "instruct" in name or "chat" in name
         return is_chat_model and dataset_name not in cls.NO_CHAT_TEMPLATE_DATASETS
 
     def _warn_if_chat_gate_looks_wrong(self) -> None:
-        """Flag a model-name heuristic that disagrees with the tokenizer.
-
-        ``_should_apply_chat_template`` decides from the *name*, so pointing
-        ``model.name`` at a local directory — ``/scratch/ckpt/final``,
-        ``llama31_8b_it`` — turns the template off for every dataset without a
-        word of complaint. Every prompt then goes in raw, an instruct model is
-        queried out of distribution, and the scores are wrong in a way that
-        looks like a method result.
-
-        The tokenizer knows the truth (a base model carries no chat template),
-        so cross-check the two and say so when they disagree. This warns rather
-        than overrides: the name heuristic is what the reference implementations
-        use, and silently diverging from them would be its own problem.
-        """
         tok = self.tokenizer
         if tok is None:
             return
@@ -615,21 +469,11 @@ class LongBenchRunner:
 
     @staticmethod
     def _post_process(pred: str, dataset_name: str) -> str:
-        """Dataset-specific post-processing (matches THUDM pred.py).
-
-        - samsum: first line only
-        - code datasets: preserve whitespace
-        - all others: return as-is
-        """
         if dataset_name == "samsum":
-            # Take first line only (prevents illegal repeating output)
             pred = pred.split("\n")[0].strip()
-        # Code datasets: preserve all whitespace (no stripping)
-        # All others: return as-is (metric functions handle normalization)
         return pred
 
     def _cleanup_memory(self, cache=None) -> None:
-        """Memory hygiene between examples."""
         if cache is not None:
             del cache
         aggressive = getattr(self.lb, "aggressive_cache_clear", False)
@@ -647,25 +491,15 @@ class LongBenchRunner:
         eps: float,
         output_dir: Path,
     ) -> None:
-        """Write per-dataset metadata sidecar JSON."""
         cfg = self.config
         env = capture_environment()
 
         budget = cfg.cache.cache_budget
         compression_ratio = round(1.0 - budget, 2) if budget else None
 
-        # Resolve local_window_size if possible
         lws = cfg.cache.local_window_size
         if isinstance(lws, float) and budget:
             import math
-            # Mirror WindowedCacheConfig.resolve: a float local_window_size is a
-            # fraction of the cache BUDGET (not the full context), resolved here
-            # at the max_length upper bound (the runtime resolves against each
-            # example's own prefill length).
-            # When truncation is disabled (max_length null), fall back to the
-            # model's context window for this informational estimate; the
-            # runtime policy resolves local_window_size against each example's
-            # real prefill length regardless.
             max_len = getattr(self.lb, "max_length", None)
             if not max_len:
                 max_len = getattr(
@@ -698,15 +532,9 @@ class LongBenchRunner:
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
-            # The tier split IS the method on this branch, so a sidecar without
-            # it cannot attribute a finished run to an operating point. The
-            # RULER and GSM8K sidecars have always recorded it; this one did not.
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
             "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
             "local_window_size": lws,
-            # NOTE: resolved against `max_length` (upper bound), not the
-            # per-example truncated prefill; the actual policy resolves
-            # against each example's own prefill length at runtime.
             "local_window_size_resolved_at_max_length": lws_resolved,
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
@@ -731,13 +559,6 @@ class LongBenchRunner:
             json.dump(meta, f, indent=2, default=str)
 
     def _warn_on_cache_window_disagreement(self) -> None:
-        """Warn if cfg.cache.* and cfg.window.* disagree on shared fields.
-
-        LongBench reads window parameters from cfg.cache (CacheConfig), but
-        parity runners read from cfg.window (WindowConfig). The two dataclasses
-        have different defaults, so a user who only sets cfg.window.* while
-        switching to LongBench would silently inherit CacheConfig's defaults.
-        """
         cfg = self.config
         pairs = [
             ("window_size", cfg.cache.window_size, cfg.window.window_size),
@@ -754,7 +575,6 @@ class LongBenchRunner:
                 )
 
     def _get_tokenizer_sha(self) -> str:
-        """Get tokenizer SHA for reproducibility."""
         if self.tokenizer is None:
             return "unknown"
         try:

@@ -1,9 +1,3 @@
-"""PerfRunner — wall-clock benchmarks (Suite C).
-
-TTFT, throughput (tok/s), TPOT, peak memory across the backend x budget
-factorial. Supports eager (Kaggle-safe) and flash_attn (Ampere+) backends.
-Gracefully skips configs that OOM or require unavailable flash-attn.
-"""
 from __future__ import annotations
 import json, time, gc
 from pathlib import Path
@@ -19,13 +13,6 @@ log = get_logger(__name__)
 
 
 def _phase_mb(phase) -> float:
-    """A phase's peak in MB — device-level if we have it, else torch allocated.
-
-    ``PhasePeak`` carries both; the device figure is what an OOM is decided on,
-    so prefer it. On CPU neither exists and this is ``nan``, not ``0``: the phase
-    did have a footprint (host RSS, in the probe's own report), and writing a 0
-    into a GPU-peak column would read as "used nothing".
-    """
     if phase is None:
         return float("nan")
     peak = phase.device_used_peak or phase.torch_alloc_peak
@@ -39,7 +26,6 @@ def _flash_attn_available() -> bool:
         return False
 
 class PerfRunner:
-    """Suite C — TTFT, throughput, TPOT benchmarks."""
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
 
@@ -51,12 +37,9 @@ class PerfRunner:
         if not flash_ok:
             log.info("flash-attn not available — flash configs will be skipped")
         env = capture_environment()
-        # Try to lock GPU clocks
         clocks_locked = False
         if pc.enable_clock_locking:
             clocks_locked = self._try_lock_clocks()
-        # Build (prefill_len, gen_len) grid. Explicit `grid:` wins; otherwise
-        # fall back to legacy `prefill_lengths` x scalar `gen_len`.
         if pc.grid:
             cells = [
                 (int(g["prefill_len"]), int(g["gen_len"]),
@@ -85,11 +68,6 @@ class PerfRunner:
         tpot = np.full((n_configs, n_runs), np.nan)
         e2e_latency = np.full((n_configs, n_runs), np.nan)
         peak_mem = np.full((n_configs, n_runs), np.nan)
-        # Peak detail, per (config, run). `peak_mem` above stays exactly what it
-        # was (torch max_memory_allocated) so old npz readers keep working; these
-        # add what a max-B decision actually needs — see utils/cache_memory.py's
-        # snapshot_device_memory for why allocated / reserved / device-used are
-        # three different numbers and only the last one decides an OOM.
         peak_reserved = np.full((n_configs, n_runs), np.nan)
         peak_device = np.full((n_configs, n_runs), np.nan)
         device_total = np.full((n_configs, n_runs), np.nan)
@@ -97,11 +75,6 @@ class PerfRunner:
         peak_decode = np.full((n_configs, n_runs), np.nan)
         peak_host_rss = np.full((n_configs, n_runs), np.nan)
         alloc_retries = np.full((n_configs, n_runs), np.nan)
-        # A config is "skipped" for three very different reasons and max-B is
-        # DEFINED by the mask (eval_perf_batched.yaml: "a config's max-B is the
-        # largest batch_size it did NOT skip"). Conflating an OOM with a config
-        # error silently reports a smaller max-B than the method achieves, so
-        # record which happened. `skipped` stays the union, for compatibility.
         skipped = np.zeros(n_configs, dtype=bool)
         oom = np.zeros(n_configs, dtype=bool)
         errored = np.zeros(n_configs, dtype=bool)
@@ -112,7 +85,6 @@ class PerfRunner:
             name = c.get("name", f"config_{ci}")
             names.append(name)
             attn_impls.append(c.get("attn_implementation", "eager"))
-            # Check flash requirement
             if c.get("requires_flash_attn", False) and not flash_ok:
                 if pc.skip_if_flash_attn_unavailable:
                     log.info("Skipping %s (flash-attn unavailable)", name)
@@ -148,8 +120,6 @@ class PerfRunner:
                 else:
                     raise
             except Exception as e:
-                # NOT an OOM: a config / env / code error. It says nothing about
-                # whether this batch size fits, so it must not be read as one.
                 log.warning("Error on %s: %s: %s — skipping (NOT an OOM)",
                             name, type(e).__name__, e)
                 skipped[ci] = True
@@ -185,8 +155,6 @@ class PerfRunner:
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")
         model.eval()
-        # Create input. batch_size>1 measures batched throughput; the windowed
-        # cache evicts each row independently (equal-length inputs, no padding).
         batch_size = max(1, int(batch_size))
         data_source = c.get("data_source") or getattr(pc, "data_source", None)
         if data_source:
@@ -197,14 +165,9 @@ class PerfRunner:
             input_ids = torch.randint(
                 100, 30000, (batch_size, prefill_len), device=model.device
             )
-        # Setup cache
         cache_backend = c.get("cache_backend", "dynamic")
         cache_pkg = c.get("cache_package")
         budget = c.get("cache_budget")
-        # Windowed-cache setup: resolve classes + RoPE once, but DO NOT install
-        # hooks here. Each warmup/measurement iteration creates a fresh cache,
-        # so hooks must be (re)installed on the cache the model actually
-        # receives, then removed before the next iteration.
         WC = WCC = install_hooks = None
         cc = None
         rope = None
@@ -213,24 +176,14 @@ class PerfRunner:
                 assert_transformers_version_supported,
                 get_cache_classes,
             )
-            # Fail fast: the windowed cache's RoPE handling assumes monotonic
-            # cache_position (transformers <= 4.47).
             assert_transformers_version_supported()
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
             w = cfg.window
-            # quant_ratio is per-config (like cache_budget), falling back to the
-            # shared cache.quant_ratio; 0.0 keeps the pure-fp16 path (design.md §7).
             quant_ratio = c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0))
-            # None (default) = auto: memoize the dequantized Q tier at B=1, not
-            # above. The default is set by the memory bound (the memo costs
-            # ~149 MB/row against ~131 MB/row of actual KV, halving max-B); what
-            # it trades that for — ~8x fewer Q-tier dequants per step — is a
-            # wall-clock question only this suite can answer. Set it explicitly
-            # to measure both sides. See BATCHING_PLAN.md §5.
             memoize = c.get("quant_memoize_read",
                             getattr(cfg.cache, "quant_memoize_read", None))
-            # Decode step of the first eviction (independent of window_size);
-            # per-config override falling back to the shared cache setting.
+            promotion = c.get("quant_promotion",
+                              getattr(cfg.cache, "quant_promotion", True))
             first_eviction_step = c.get(
                 "first_eviction_step", getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT)
             )
@@ -240,8 +193,8 @@ class PerfRunner:
                       rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                       quant_ratio=quant_ratio,
                       quant_memoize_read=memoize,
+                      quant_promotion=promotion,
                       first_eviction_step=first_eviction_step)
-            # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():
                     rope = mod; break
@@ -257,14 +210,6 @@ class PerfRunner:
                 )
 
         def _make_windowed_cache():
-            # max_tokens sizes the budget against the FULL expected sequence
-            # (prefill + generation) per design.md §7, which is what
-            # ours_parity_runner and longbench_runner both pass. This used to
-            # pass 0 on the premise that perf was "prefill-only, no generation" —
-            # but the measurement loop below generates gen_len tokens, so the
-            # budget came out sized on the prompt alone. At gen_len >> prefill
-            # that is a different (much smaller) cache than the quality suites
-            # measure, so their numbers would not correspond.
             return WC(config=cc, prefill_len=prefill_len,
                       model_config=model.config, kv_dtype=torch_dtype,
                       rope_module=rope,
@@ -274,7 +219,6 @@ class PerfRunner:
         gen_kwargs = {}
         if attn_impl == "eager" and c.get("install_hooks_for_measurement"):
             gen_kwargs["output_attentions"] = True
-        # Warmup
         for _ in range(pc.num_warmup_runs):
             hooks = None
             try:
@@ -292,19 +236,9 @@ class PerfRunner:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        # Measurement runs
         measurements = []
         for ri in range(pc.num_measurement_runs):
             hooks = None
-            # One probe per measurement run. It records the peak the run reaches
-            # — which is NOT the footprint at the end, and is what caps the batch
-            # size (BATCHING_PLAN.md §5). Phases split prefill from decode
-            # because which one holds the peak decides whether compression can
-            # raise max-B at this shape at all. The poller is off: a background
-            # thread sampling mem_get_info during a wall-clock benchmark is exactly
-            # the kind of interference this suite must not have. The forward hook
-            # is likewise off; the per-phase boundaries below are enough, and the
-            # allocator's own peak counters are exact regardless of sampling.
             probe = MemoryProbe(
                 label=f"{c.get('name', 'config')} bs={batch_size} "
                       f"prefill={prefill_len} gen={gen_len}",
@@ -316,8 +250,6 @@ class PerfRunner:
                     torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
                 probe.start()
-                # TTFT — synchronize BEFORE t0 so prior async work doesn't taint
-                # the measurement and the sync's own latency isn't timed.
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 with torch.no_grad(), probe.phase("prefill"):
@@ -331,7 +263,6 @@ class PerfRunner:
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 ttft_ms = (t1 - t0) * 1000
-                # Generate tokens for TPOT
                 pkv = out.past_key_values
                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -347,16 +278,12 @@ class PerfRunner:
                 gen_time = t3 - t2
                 tpot_ms = (gen_time / max(gen_len - 1, 1)) * 1000
                 e2e_latency_ms = (t3 - t0) * 1000
-                # End-to-end throughput includes prefill (TTFT) + decode time; this
-                # mirrors the legacy field name but is NOT decode-only. Counts all
-                # batch_size rows (B=1 ⇒ identical to the legacy value).
                 throughput_tokps = (batch_size * gen_len) / max(gen_time + (t1-t0), 1e-9)
                 peak = probe.stop().report()
                 phase_peak = {p.name: p for p in peak.phases}
                 measurements.append({
                     "ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
                     "tpot_ms": tpot_ms, "e2e_latency_ms": e2e_latency_ms,
-                    # Unchanged field, unchanged meaning: torch allocated peak.
                     "peak_memory_mb": peak.torch_alloc_peak / (1024 * 1024),
                     "peak_reserved_mb": peak.torch_reserved_peak / (1024 * 1024),
                     "peak_device_used_mb": peak.device_used_peak / (1024 * 1024),
@@ -374,7 +301,6 @@ class PerfRunner:
                     hooks.remove()
             gc.collect()
             if torch.cuda.is_available(): torch.cuda.empty_cache()
-        # Cleanup
         del model
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
@@ -400,13 +326,9 @@ class PerfRunner:
             e2e_latency_ms=result["e2e_latency"],
             peak_memory_mb=result["peak_mem"],
             skipped_mask=result["skipped"],
-            # Why a config was skipped. `skipped_mask` is the union of all three
-            # and stays first-class for old readers; max-B must be read off
-            # `oom_mask` alone (see _run_prefill).
             oom_mask=result["oom"],
             error_mask=result["errored"],
             skip_reason=np.array(result["skip_reason"], dtype=object),
-            # Peak detail per (config, run), all MB.
             peak_reserved_mb=result["peak_reserved"],
             peak_device_used_mb=result["peak_device"],
             device_total_mb=result["device_total"],
@@ -440,7 +362,7 @@ class PerfRunner:
             )
         rng = random.Random(seed)
         selected = rng.sample(chunks, batch_size)
-        return torch.cat(selected, dim=0)  # [batch_size, prefill_len]
+        return torch.cat(selected, dim=0)
 
     def _try_lock_clocks(self) -> bool:
         import subprocess
