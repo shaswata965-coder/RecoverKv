@@ -48,6 +48,11 @@ def _get_attn_classes() -> Tuple:
     return tuple(classes)
 
 
+# Guards the one-per-process "which scoring path" banner (install runs per
+# sample in the runners, so an unguarded print would spam thousands of lines).
+_PATH_ANNOUNCED = [False]
+
+
 # ---------------------------------------------------------------------------
 # HookHandles — idempotent removal
 # ---------------------------------------------------------------------------
@@ -115,6 +120,16 @@ def install_score_hooks(
 
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
+
+    # Explicit, once-per-process banner: the eager path reads HF's attention
+    # weights directly, so there is no Triton kernel involved here.
+    if not _PATH_ANNOUNCED[0]:
+        _PATH_ANNOUNCED[0] = True
+        print(
+            "[StickyKV] score path: EAGER (attention weights read directly; "
+            "no Triton kernel)",
+            flush=True,
+        )
 
     warned_once = [False]
 

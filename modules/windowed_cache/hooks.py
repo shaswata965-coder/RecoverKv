@@ -36,7 +36,7 @@ import torch.nn as nn
 import os
 
 from . import flash_lse
-from .score_kernel import compute_token_scores
+from .score_kernel import compute_token_scores, describe_prefill_backend
 from .scorer import (
     compute_window_scores,
     reduce_token_scores_to_windows,
@@ -170,6 +170,10 @@ class HookHandles:
 # install_score_hooks
 # ---------------------------------------------------------------------------
 
+# Guards the one-per-process "which scoring path" banner (install runs per
+# sample in the runners, so an unguarded print would spam thousands of lines).
+_PATH_ANNOUNCED = [False]
+
 
 def install_score_hooks(
     model: nn.Module,
@@ -234,6 +238,18 @@ def install_score_hooks(
             handles._cleanups.append(_lse_handle.restore)
         else:
             lse_capture = False  # flash-attn unavailable; fall back to recompute
+
+    # Explicit, once-per-process banner: which scoring path is active. The
+    # Triton-vs-reference line is confirmed at runtime by the score kernel on its
+    # first call; this states the prediction plus the L-reuse status up front.
+    if not _PATH_ANNOUNCED[0]:
+        _PATH_ANNOUNCED[0] = True
+        print(
+            "[StickyKV] score path: FLASH (flash_attention_2) | prefill scoring "
+            f"-> {describe_prefill_backend(torch.cuda.is_available())} | "
+            f"L-reuse: {'ON' if lse_capture else 'off'}",
+            flush=True,
+        )
 
     # Discover attention modules and assign layer indices in module order.
     layer_idx_map: Dict[int, int] = {}

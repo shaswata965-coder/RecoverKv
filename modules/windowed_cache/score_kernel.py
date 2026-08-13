@@ -83,6 +83,59 @@ def _backend() -> str:
     return os.environ.get("STICKYKV_SCORE_KERNEL", "auto").strip().lower()
 
 
+# --- One-time, explicit terminal announcement of the chosen scoring path ------
+# So a run never *silently* falls back to the reference (e.g. triton missing on
+# the GPU box): the actual choice is printed once per process.
+
+_ANNOUNCED = {"done": False}
+
+
+def _prefill_backend(backend: str, cuda: bool):
+    """Resolve what PREFILL scoring will use: ('triton'|'torch', reason)."""
+    if backend in ("triton", "auto") and _HAS_TRITON and cuda:
+        return "triton", ""
+    if backend == "torch":
+        reason = "backend forced to 'torch'"
+    elif not _HAS_TRITON:
+        reason = "triton not installed"
+    elif not cuda:
+        reason = "not running on CUDA"
+    else:
+        reason = "unavailable"
+    return "torch", reason
+
+
+def describe_prefill_backend(cuda: bool) -> str:
+    """Human string for the prefill scoring backend, given CUDA availability."""
+    backend = _backend()
+    kind, reason = _prefill_backend(backend, cuda)
+    if kind == "triton":
+        return f"TRITON fused kernel (backend={backend})"
+    return f"PyTorch reference (backend={backend}; {reason})"
+
+
+def _announce_backend_once(q: Tensor) -> None:
+    """Print, once per process, whether the Triton path was actually chosen."""
+    if _ANNOUNCED["done"]:
+        return
+    _ANNOUNCED["done"] = True
+    cuda = bool(getattr(q, "is_cuda", False))
+    backend = _backend()
+    kind, reason = _prefill_backend(backend, cuda)
+    if kind == "triton":
+        print(
+            "[StickyKV] score kernel: TRITON path ACTIVE for prefill scoring "
+            f"[OK] (backend={backend})",
+            flush=True,
+        )
+    else:
+        print(
+            "[StickyKV] score kernel: PyTorch reference path; TRITON NOT used "
+            f"(backend={backend}; {reason})",
+            flush=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # GQA helper — score at KV-head granularity without expanding K
 # ---------------------------------------------------------------------------
@@ -412,6 +465,7 @@ def compute_token_scores(
     """
     backend = _backend()
     T = q.shape[2]
+    _announce_backend_once(q)
 
     use_triton = (
         backend in ("triton", "auto")
