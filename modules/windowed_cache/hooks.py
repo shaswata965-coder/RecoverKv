@@ -32,10 +32,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import os
 
+from . import flash_lse
+from .score_kernel import compute_token_scores
 from .scorer import (
     compute_window_scores,
     reduce_token_scores_to_windows,
@@ -58,6 +59,19 @@ def _prefill_score_chunk() -> int:
         return v if v > 0 else 1024
     except (TypeError, ValueError):
         return 1024
+
+
+def _lse_from_forward() -> bool:
+    """Whether to reuse flash's ``softmax_lse`` instead of recomputing ``L``.
+
+    Off by default (``STICKYKV_SCORE_LSE_FROM_FORWARD`` unset). When on, the
+    flash forward is monkeypatched (:mod:`flash_lse`) to hand out the softmax
+    normaliser it already computes, so the Triton score path skips its ``L``
+    recompute pass. Only meaningful with ``STICKYKV_SCORE_KERNEL=triton``/``auto``
+    (the Triton path is the only consumer of ``lse``); harmless otherwise.
+    """
+    v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def _score_softmax_dtype() -> torch.dtype:
@@ -125,18 +139,30 @@ def _extract_arg(
 
 @dataclass
 class HookHandles:
-    """Manages installed forward hooks with idempotent ``remove()``."""
+    """Manages installed forward hooks with idempotent ``remove()``.
+
+    ``_cleanups`` holds zero-arg callables run at removal — used to restore the
+    optional flash ``softmax_lse`` monkeypatch (:mod:`flash_lse`) so the process
+    is left exactly as we found it.
+    """
 
     _hook_handles: List[Any] = field(default_factory=list)
+    _cleanups: List[Any] = field(default_factory=list)
     _removed: bool = False
 
     def remove(self) -> None:
-        """Remove all hooks.  Idempotent."""
+        """Remove all hooks and run cleanups.  Idempotent."""
         if self._removed:
             return
         for handle in self._hook_handles:
             handle.remove()
         self._hook_handles.clear()
+        for cleanup in self._cleanups:
+            try:
+                cleanup()
+            except Exception:
+                pass
+        self._cleanups.clear()
         self._removed = True
 
 
@@ -195,6 +221,20 @@ def install_score_hooks(
     window_size = getattr(config, "window_size", 8)
     num_sink = getattr(config, "num_sink_tokens", 4)
 
+    # Optionally reuse flash's own softmax normaliser L instead of recomputing
+    # it. This monkeypatches the process-global flash_attn_func (the only
+    # interception point in transformers 4.47.1 — no attention-function registry
+    # exists there) to hand out `softmax_lse`, without changing the attention
+    # output. enable() returns None if flash-attn isn't installed, in which case
+    # capture is silently disabled and the score path recomputes L as before.
+    lse_capture = _lse_from_forward()
+    if lse_capture:
+        _lse_handle = flash_lse.enable()
+        if _lse_handle is not None:
+            handles._cleanups.append(_lse_handle.restore)
+        else:
+            lse_capture = False  # flash-attn unavailable; fall back to recompute
+
     # Discover attention modules and assign layer indices in module order.
     layer_idx_map: Dict[int, int] = {}
     layer_idx = 0
@@ -232,6 +272,18 @@ def install_score_hooks(
                 make_qproj_stash_hook(this_layer_idx)
             )
             handles._hook_handles.append(q_handle)
+
+        # Clear the flash-lse stash at the START of each attention forward, so a
+        # captured L can never leak from one layer to the next: the wrapper only
+        # re-fills it if THIS layer runs the non-varlen flash_attn_func. A layer
+        # that took the padded (varlen) path leaves it None → score hook falls
+        # back to recomputing L. (All layers share the same [B,H_q,T] shape, so a
+        # shape check alone would not catch staleness — this pre-hook does.)
+        if lse_capture:
+            pre_handle = module.register_forward_pre_hook(
+                lambda _m, _a: flash_lse.clear()
+            )
+            handles._hook_handles.append(pre_handle)
 
         def make_hook(lidx: int):
             def score_hook(module, args, kwargs, output):
@@ -298,65 +350,47 @@ def install_score_hooks(
                 q, _ = apply_rotary_pos_emb(q, q, cos, sin)
                 q = q.to(k_current.dtype)
 
-                T = q.shape[2]
-                S = k_current.shape[2]
-
-                # 2. Score at KV-head granularity WITHOUT expanding K.
-                #    repeat_kv materializes a num_groups×-larger [B, H_q, S, D]
-                #    key copy (its expand+reshape forces a real copy) that is
-                #    only averaged back to a per-window mean downstream. Instead,
-                #    view the query heads as (H_kv, n_rep) and let the S-dim
-                #    matmul broadcast over n_rep against the un-expanded keys —
-                #    identical per-head scores, no num_groups× key copy.
-                B = q.shape[0]
-                H_q = q.shape[1]
-                num_groups = getattr(module, "num_key_value_groups", 1)
-                H_kv = H_q // num_groups
-                q5 = q.reshape(B, H_kv, num_groups, T, head_dim)  # [B,H_kv,rep,T,D]
-                k_t = k_current.transpose(-2, -1).unsqueeze(2)    # [B,H_kv,1,D,S]
-
-                # 3. Auxiliary attention scoring, CHUNKED over the query rows.
-                #    The score we need is softmax(q·kᵀ).sum(over query rows) — a
-                #    sum, so we accumulate it in query-row blocks and never
-                #    materialize the full [B, H_q, T, S] matrix. Peak memory is
-                #    O(chunk · S) instead of O(T · S).
-                #
-                #    Numerics: the softmax intermediate runs in
-                #    _score_softmax_dtype() (bf16 by default — half the fp32
-                #    transient, same exponent range). Set
-                #    STICKYKV_SCORE_SOFTMAX_DTYPE=float32 for the exact fp32
-                #    reduction earlier baselines used.
+                # 2-3. Per-key received attention:
+                #      softmax(scale·q·kᵀ).sum(over query rows) → token_scores
+                #      [B, H_q, S]. Delegated to score_kernel.compute_token_scores,
+                #      which picks a backend from STICKYKV_SCORE_KERNEL:
+                #        • torch  (default) — the chunked softmax loop that used to
+                #          live inline here, byte-for-byte (bf16 softmax, GQA via
+                #          broadcast, no repeat_kv). Zero behaviour change.
+                #        • triton / auto    — the fused FlashAttention-2-*backward*-
+                #          style kernel: exact softmax exp(scale·q·kᵀ − L) per key,
+                #          looped key-outer so each key block writes a disjoint
+                #          slice (no atomics), fully-masked causal tiles skipped.
+                #      Both return the same [B, H_q, S]. The window size never
+                #      enters the score pass — it stays a downstream reshape in
+                #      scorer.reduce_* below, so it can change freely per run.
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
-                sm_dtype = _score_softmax_dtype()
-                token_scores = torch.zeros(
-                    B, H_kv, num_groups, S, device=q.device, dtype=q.dtype
-                )
-                chunk = _prefill_score_chunk()
-                for start in range(0, T, chunk):
-                    end = min(start + chunk, T)
-                    q_blk = q5[:, :, :, start:end, :]                # [B,H_kv,rep,blk,D]
-                    aw = torch.matmul(q_blk, k_t) * scaling          # [B,H_kv,rep,blk,S]
 
-                    # Causal mask for this block: the global query row (start+r)
-                    # sits at absolute position S-T+start+r and may attend to
-                    # keys 0..S-T+start+r. Generation (T==1) needs no mask.
-                    # The [blk, S] mask broadcasts over the leading head dims.
-                    if T > 1:
-                        blk = end - start
-                        causal = torch.triu(
-                            torch.ones(
-                                blk, S, device=aw.device, dtype=torch.bool
-                            ),
-                            diagonal=S - T + start + 1,
-                        )
-                        aw = aw.masked_fill(causal, float("-inf"))
+                # Reuse flash's softmax normaliser L when it was captured this
+                # forward (STICKYKV_SCORE_LSE_FROM_FORWARD + Triton backend). It
+                # is only valid when the keys the score pass sees equal the keys
+                # flash saw: pure prefill (T > 1) with no post-eviction reorder
+                # (score_meta is None ⟹ k_current is the plain fp store). The
+                # padded (varlen) flash path leaves the stash empty; the shape
+                # check then rejects it and compute_token_scores recomputes L.
+                lse = None
+                if lse_capture and q.shape[2] > 1 and score_meta is None:
+                    cand = flash_lse.pop()
+                    if (
+                        isinstance(cand, torch.Tensor)
+                        and tuple(cand.shape) == (q.shape[0], q.shape[1], q.shape[2])
+                    ):
+                        lse = cand.to(device=q.device)
 
-                    aw = F.softmax(aw, dim=-1, dtype=sm_dtype).to(q.dtype)
-                    token_scores += aw.sum(dim=-2)                   # [B,H_kv,rep,S]
-                    del aw
-
-                # Merge (H_kv, n_rep) back to H_q in the original head order.
-                token_scores = token_scores.reshape(B, H_q, S)
+                token_scores = compute_token_scores(
+                    q,
+                    k_current,
+                    scaling,
+                    lse=lse,
+                    chunk=_prefill_score_chunk(),
+                    softmax_dtype=_score_softmax_dtype(),
+                    out_dtype=q.dtype,
+                )                                                    # [B, H_q, S]
 
                 # 4. Reduce to per-window scores and hand off to the cache. At
                 #    q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
