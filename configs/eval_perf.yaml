@@ -18,6 +18,14 @@ window:
   local_window_size: 256
 
 perf:
+  # NOTE on the windowed_eager_* rows below. Until the output_attentions gate was
+  # fixed in perf_runner.py, these cells ran with scoring DISABLED (the eager hook
+  # needs output_attentions=True to see attn_weights) and so timed sink+local
+  # eviction, not this project's scored eviction. They are correct now, and
+  # correspondingly slower and far more memory-hungry: output_attentions
+  # materializes [B, H, L, L], which is ~4 GB per layer in fp16 at prefill 8192.
+  # Any windowed_eager number recorded before that fix is not comparable to one
+  # recorded after it, and eager rows are never comparable to flash rows.
   configs:
     # --- eager backend (always available; Kaggle-safe) ---
     - name: baseline_eager

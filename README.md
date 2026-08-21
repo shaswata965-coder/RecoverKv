@@ -94,6 +94,7 @@ python main.py --config configs/eval_parity_ours_flash.yaml
 |                  | `parity_ours`     | `eval_parity_ours_*.yaml`      | Windowed-cache generation (both backends)         |
 | **Faithfulness B**| `faithfulness`   | `eval_faithfulness.yaml`       | Compares base vs ours npz outputs                 |
 | **Perf C**       | `perf`           | `eval_perf.yaml`               | Throughput/latency benchmarks                     |
+|                  | `perf`           | `eval_efficiency.yaml`         | Same, under the published comparison protocol     |
 | **LongBench D**  | `longbench`      | `longbench_*.yaml`             | Downstream benchmark (16 English datasets)        |
 | **Visualization**| `visualize`      | `eval_visualize.yaml`          | Plots from telemetry npz files                    |
 

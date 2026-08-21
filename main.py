@@ -61,7 +61,18 @@ def _import_runner(mode: str):
 
 
 def _parse_value(val: str):
-    """Try to parse a CLI override value as int, float, bool, or string."""
+    """Try to parse a CLI override value as list, int, float, bool, or string.
+
+    Lists use an explicit bracket syntax -- ``[4096,8192]``, ``[]`` -- rather than
+    bare commas, so a value that legitimately contains a comma (a prompt string,
+    say) is never silently split into a list.
+    """
+    val = val.strip()
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_value(item) for item in inner.split(",")]
     if val.lower() == "true":
         return True
     if val.lower() == "false":
@@ -95,7 +106,8 @@ def main() -> None:
         type=str,
         nargs="*",
         default=[],
-        help="Key=value overrides (e.g. run.seed=123 data.prefill_len=200).",
+        help=("Key=value overrides (e.g. run.seed=123 data.prefill_len=200). "
+              "Lists use brackets: perf.prefill_lengths=[4096,8192], perf.grid=[]."),
     )
     args = parser.parse_args()
 

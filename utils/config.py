@@ -357,6 +357,15 @@ class PerfConfig:
     prefill_lengths: List[int] = field(default_factory=lambda: [2048, 4096])
     gen_len: int = 256
     batch_size: int = 1            # sequences per forward; >1 measures batched throughput
+    # Sweep axes. When `grid` is empty the cells are the CARTESIAN PRODUCT of
+    # prefill_lengths x gen_lengths x batch_sizes, so a shape sweep can be driven
+    # entirely from the CLI without writing a grid by hand:
+    #   --override perf.grid=[] perf.prefill_lengths=[4096,8192] \
+    #              perf.gen_lengths=[128,1024] perf.batch_sizes=[1,4]
+    # Empty falls back to the scalar `gen_len` / `batch_size`, so every existing
+    # config keeps its current cells.
+    gen_lengths: List[int] = field(default_factory=list)
+    batch_sizes: List[int] = field(default_factory=list)
     num_warmup_runs: int = 2
     num_measurement_runs: int = 10
     allow_shared_gpu: bool = True
@@ -364,6 +373,109 @@ class PerfConfig:
     skip_if_flash_attn_unavailable: bool = True
     enable_clock_locking: bool = False
     data_source: Optional[str] = None  # LongBench dataset name (e.g. "2wikimqa"); None = synthetic
+
+    # -- Standardized-protocol knobs (KVPress / AdaKV / DefensiveKV family) --
+    # These exist so a run can be made *comparable* to the efficiency tables
+    # published by the prompt-compression line of work, whose shared harness is
+    # kvpress' ``efficiency_evaluate.py``. Defaults reproduce this suite's own
+    # historical behaviour exactly; ``configs/eval_efficiency.yaml`` flips them.
+
+    #: Provenance label recorded in the npz metadata and used to pick a printer.
+    #: ``native`` = this suite's own shape; ``standard`` = the measurement
+    #: conditions published efficiency tables use. Purely descriptive — it never
+    #: overrides the knobs below, and it selects NO third-party code path: what
+    #: runs is always this project's own cache.
+    protocol: str = "native"
+
+    #: How the benchmark prompt is built.
+    #:   ``auto``            - ``dataset`` if ``data_source`` is set, else ``random_tokens``
+    #:   ``random_tokens``   - uniform token ids in [100, 30000) (this suite's original)
+    #:   ``repeat_sentence`` - ``repeat_sentence`` tiled and truncated to exactly
+    #:                         ``prefill_len`` tokens; what the kvpress family uses
+    #:   ``dataset``         - real text chunks from ``data_source``
+    prompt_mode: str = "auto"
+    repeat_sentence: str = "The quick brown fox jumps over the lazy dog."
+
+    #: What the fractional ``cache_budget`` is a fraction OF.
+    #:   ``prefill_plus_gen`` - ``ratio * (prefill_len + gen_len)`` (design.md §7)
+    #:   ``context``          - ``ratio * prefill_len``, i.e. the kvpress family's
+    #:                          ``compression_ratio = 1 - budget / context_length``
+    budget_basis: str = "prefill_plus_gen"
+
+    #: Whether the prefill forward materializes logits for every prompt position.
+    #:   ``full``      - [B, L, V] (original behaviour; matches the published harness)
+    #:   ``last_only`` - [B, 1, V] via transformers' ``num_logits_to_keep``
+    #: At L=32k, V=128k the full tensor is ~8 GB fp16 (~17 GB once Llama upcasts
+    #: to fp32) — several times the whole KV cache — and it is method-independent,
+    #: so it swamps exactly the difference a memory table is trying to show.
+    prefill_logits: str = "full"
+
+    # -- GPU-state hygiene: keep the machine from writing itself into the score --
+
+    #: Decode steps to run in each warmup round. ``None`` = auto: enough to cross
+    #: the first eviction (``first_eviction_step + 2``), clamped to what the cell
+    #: generates. ``0`` restores the old prefill-only warmup.
+    #:
+    #: Prefill-only warmup leaves the whole decode path cold, so one-time costs
+    #: land in measurement run 0 instead of in the warmup where they belong:
+    #: allocator growth, cuBLAS handle setup, and — since the fused score kernel
+    #: landed — Triton JIT compilation and autotuning of the eviction kernel.
+    #: That kernel fires on the FIRST COMPACTION, i.e. decode step 0, which a
+    #: prefill-only warmup never reaches. Its compile time then shows up as
+    #: "our compaction is slow".
+    warmup_decode_steps: Optional[int] = None
+
+    #: Seconds to idle between measurement runs (and after warmup). A benchmark
+    #: loop with no gap runs the GPU hot: clocks drop as the part heats, so run 9
+    #: is measured on a slower GPU than run 0 and the trend is read as method
+    #: variance. Pairs with ``enable_clock_locking``; the idle still helps when
+    #: locking is unavailable (locking needs elevated permissions on most boxes).
+    cooldown_s: float = 0.0
+
+    #: Seconds to wait after locking clocks, before the first measurement, for
+    #: the requested clock to actually take effect.
+    clock_settle_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        for fname, allowed in (
+            ("prompt_mode", {"auto", "random_tokens", "repeat_sentence", "dataset"}),
+            ("budget_basis", {"prefill_plus_gen", "context"}),
+            ("prefill_logits", {"full", "last_only"}),
+        ):
+            val = getattr(self, fname)
+            if val not in allowed:
+                raise ConfigValidationError(
+                    f"perf.{fname} must be one of {sorted(allowed)}, got {val!r}"
+                )
+        if self.prompt_mode == "dataset" and not self.data_source:
+            raise ConfigValidationError(
+                "perf.prompt_mode='dataset' requires perf.data_source to name a "
+                "LongBench dataset"
+            )
+        if not self.repeat_sentence:
+            raise ConfigValidationError("perf.repeat_sentence must be non-empty")
+        for fname in ("prefill_lengths", "gen_lengths", "batch_sizes"):
+            vals = getattr(self, fname)
+            if not isinstance(vals, (list, tuple)):
+                raise ConfigValidationError(
+                    f"perf.{fname} must be a list, got {type(vals).__name__}. "
+                    f"From the CLI use bracket syntax: perf.{fname}=[1,4]"
+                )
+            for v in vals:
+                if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                    raise ConfigValidationError(
+                        f"perf.{fname} entries must be ints >= 1, got {v!r}")
+        if self.warmup_decode_steps is not None and self.warmup_decode_steps < 0:
+            raise ConfigValidationError(
+                f"perf.warmup_decode_steps must be >= 0 or None (auto), got "
+                f"{self.warmup_decode_steps}"
+            )
+        for fname in ("cooldown_s", "clock_settle_s"):
+            val = getattr(self, fname)
+            if not isinstance(val, (int, float)) or isinstance(val, bool) or val < 0:
+                raise ConfigValidationError(
+                    f"perf.{fname} must be a non-negative number, got {val!r}"
+                )
 
 
 # ---------------------------------------------------------------------------

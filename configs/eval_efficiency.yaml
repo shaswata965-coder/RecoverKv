@@ -1,0 +1,262 @@
+# ============================================================================
+# StickyKV — Efficiency, measured under the published comparison protocol
+# ============================================================================
+# WE DO NOT USE kvpress. Nothing here imports it, and no third-party press runs.
+# What is measured is this project's own windowed two-tier cache. What is
+# BORROWED is only the measurement *conditions* — prompt shape, budget
+# denominator, round counts, step counts.
+#
+# PROVENANCE, STATED EXACTLY — do not overclaim this.
+# The conditions below are read from ONE reference implementation that we have
+# actually inspected: `evaluation/efficiency_evaluate.py` in the DefensiveKV
+# release (ICLR 2026, arXiv 2510.13334), which is a fork of NVIDIA's kvpress.
+# Its PRESS_DICT can drive SnapKV, AdaKV, CriticalKV and DefensiveKV, so that one
+# harness *can* measure all of them under these conditions.
+#
+# What is NOT established: that the published SnapKV / AdaKV / CriticalKV numbers
+# were produced this way. Those papers do not document a protocol in this detail
+# — Ada-KV (arXiv 2407.11550) reports "peak memory usage and decoding latency" at
+# a fixed 1024 budget without stating context length, batch size, warmup rounds,
+# dtype, or prompt construction. So matching these conditions makes our numbers
+# reproducible and comparable TO A RE-RUN, not automatically to a printed table.
+# That is precisely why the runner exposes `cache_backend: external`: a baseline
+# you re-run under your own protocol is a controlled comparison, a number lifted
+# from a paper is not. No method implementation ships here -- point
+# `method_factory` at whichever one you want to measure.
+#
+# Conditions matched (to that reference implementation):
+#   prompt          a sentence tiled and truncated to exactly context_length
+#                   -> perf.prompt_mode: repeat_sentence
+#   context lengths 24k / 32k / 40k
+#   budget          ratio of the PROMPT, not prompt+generation  (their
+#                   compression_ratio = 1 - budget/context_length), ratio 0.5
+#                   -> perf.budget_basis: context, cache_budget: 0.50
+#   decode steps    exactly 100 forwards after the prefill
+#                   -> gen_len: 101 (this runner does gen_len - 1 decode steps)
+#   rounds          5 warmup, 10 measured
+#   dtype / attn    bfloat16 + flash_attention_2 ; batch 1
+#
+# Conditions deliberately NOT matched (their harness's defects, not its protocol):
+#   * it never calls reset_peak_memory_stats(), so its max_memory_allocated is
+#     the peak since process start, monotonic across rounds AND across its
+#     context-length loop. Averaging 10 rounds of a monotonic max is that max.
+#   * it times CUDA work with time.time(); we use perf_counter() with an explicit
+#     synchronize on both sides.
+#   * it reports a mean; we keep all rounds so the printer can show median+spread.
+#   * its OOM handler cannot tell an OOM from a config error; we mask them apart.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS CONFIG CAN AND CANNOT SHOW FOR OUR METHOD — read before quoting it.
+#
+# 1. At B=1, KV compression CANNOT produce a decode speedup, and that is physics,
+#    not a result. Decode reads every model weight once per step (16.06 GB for
+#    Llama-3.1-8B fp16 = a ~10.3 ms/token floor on an A100) and that floor is
+#    independent of cache size. Batching is the only lever that amortizes the
+#    weight read, and B is capped by KV memory — which is what we compress.
+#    The protocol is B=1, so expect our decoding_latency to be at best a tie.
+#    THE THROUGHPUT CLAIM LIVES IN eval_perf_batched.yaml (tokens/s at max-B),
+#    not here. BATCHING_PLAN.md §5.
+#
+# 2. Peak memory here is dominated by the UNCOMPRESSED PROMPT. We cannot compact
+#    during prefill (the score hook is a forward_hook, so no scores exist until
+#    the prefill returns), so peak = max(prefill_len + 1, budget) and at these
+#    shapes (24k-40k prompt, 100 generated tokens) the prompt always wins. A
+#    whole-run peak therefore shows ~no saving. Read `peak_decode_steady_mb`,
+#    which is the phase AFTER step 0 compacted — that is the compressed cache,
+#    and it is the number the memory claim rests on.
+#
+# 3. Consequently this config's honest headline is: same latency, same peak,
+#    much smaller steady-state cache — which is exactly the precondition for the
+#    max-B result in eval_perf_batched.yaml.
+#
+# ONE THING NO CONFIG CAN EQUALISE: their press compresses INSIDE the prefill
+# forward, so compression is charged to their prefill_latency. Ours compacts on
+# decode step 0. Read `prefill_plus_compress_ms` against their prefill_latency and
+# `tpot_steady_ms` against their decoding_latency; scripts/print_efficiency.py
+# prints that pairing. Reading our raw ttft_ms/tpot_ms against their columns
+# flatters the first and penalises the second.
+#
+# MODEL. That reference implementation's driver script uses
+# Mistral-7B-Instruct-v0.3 / Llama-3.1-8B-Instruct. Absolute numbers only compare
+# against the SAME model, so match it before putting columns side by side.
+#
+# ---------------------------------------------------------------------------
+# SWEEPING SHAPES WITHOUT EDITING THIS FILE
+#
+#   scripts/run_efficiency.sh --prefill 4096,8192 --decode 128,1024 --batch 1,4
+#   scripts/run_efficiency.sh --window 8,32 --prefill 8192 --decode 100
+#
+# Any shape flag switches the runner off the `grid:` below and onto the cartesian
+# product of perf.prefill_lengths x perf.gen_lengths x perf.batch_sizes.
+# `--decode` is DECODE STEPS (what every published table counts); the script adds
+# the +1 for gen_len, because the prefill emits the first token and getting that
+# backwards is the standing off-by-one in this comparison.
+# `--window` runs once per value into its own subdirectory, since window_size is
+# config-level and npz filenames key only on prefill/gen/batch.
+# window_size / num_sink_tokens / local_window_size are also per-config keys, so a
+# single run can compare window geometries row by row.
+#
+# ---------------------------------------------------------------------------
+# PREFILLING FROM YOUR OWN TEXT
+#
+#   scripts/run_efficiency.sh --dataset ./mycorpus/ --prefill 4096 --decode 256
+#
+# perf.prompt_mode: dataset + perf.data_source, where data_source is usually A
+# PATH: a file or a directory, any suffix (.txt, .md, .jsonl, .json, or none).
+# Directories are walked recursively in sorted order. It also accepts the
+# built-in corpora (wikitext-103, pg19) and the 21 LongBench names; prefix with
+# `longbench:` / `corpus:` to force the interpretation. An existing path always
+# wins over a name, so a local directory can never be shadowed by a dataset that
+# happens to share its name.
+#
+# THE SHAPE IS FIXED BY THE CONFIG, NOT BY THE CORPUS. Each batch row gets
+# exactly prefill_len tokens cut from the text, and generation runs exactly
+# gen_len - 1 decode steps however long the corpus is. Text is tokenized
+# incrementally with an early stop -- necessary, because the corpus may be far
+# larger than the few rows a cell needs. Rows are equal-length chunks, so a
+# batched timing has no padding in it.
+#
+# This is a DEVIATION from the comparison protocol, which prefills a tiled
+# synthetic sentence. Use a real corpus to characterise the method on realistic
+# text; do not put the result beside a published table that used the synthetic
+# prompt. The npz records prompt_mode and data_source either way.
+#
+# Does the corpus change the timing? For a full-cache baseline, essentially no --
+# latency follows tensor shapes. For an eviction method it can, because the
+# scores it ranks by are a function of the attention distribution, and real text
+# and uniform random token ids do not produce the same one. That is the reason
+# random_tokens is not the default here.
+#
+# ---------------------------------------------------------------------------
+# MEASURING A METHOD THAT IS NOT OURS
+#
+# The measurement core is method-agnostic: it builds a cache, runs one prefill and
+# N decode steps, and records phases. It never inspects what the cache does, so a
+# pressed, unpressed, quantized or evicted method all measure the same way. Point
+# a row at any of them:
+#
+#   - name: some_baseline
+#     cache_backend: external
+#     method_factory: "their_pkg.their_module:build"
+#     method_kwargs: { ... }
+#     cache_budget: 0.50        # the runner resolves this to budget_tokens and
+#                               # hands it over, so the baseline is held to OUR
+#                               # budget under OUR budget_basis, not its defaults
+#     compaction: prefill       # where its one-off compaction lands (see below)
+#
+# `compaction` is the ONE method property the core needs, and only because the
+# same physical work belongs in a different column per design:
+#   prefill       compacted inside the prefill forward (press-style) -> already
+#                 inside TTFT, so nothing is added to the prefill column
+#   decode_step0  compacted on the first decode step, because the scores it needs
+#                 do not exist until the prefill returns (this project) -> the
+#                 prefill column is TTFT + step 0
+#   none          nothing compacted (full cache, or quantize-only)
+# It is inferred per backend when omitted. Getting it wrong overstates a
+# press-style or full-cache row's prefill by an entire decode step.
+# ============================================================================
+_base_: base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: bfloat16
+
+window:
+  # This branch's canonical operating point (mirrors eval_perf_batched.yaml).
+  # window_size must be a multiple of 4 for quant_ratio > 0 (int2 crumb packing);
+  # local_window_size as an int must be a multiple of window_size.
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 64
+
+cache:
+  first_eviction_step: 0     # compact the prompt on decode step 0
+
+perf:
+  protocol: standard         # provenance label only; selects no third-party code
+  prompt_mode: repeat_sentence
+  repeat_sentence: "The quick brown fox jumps over the lazy dog."
+  budget_basis: context      # budget = cache_budget * prefill_len
+  prefill_logits: last_only
+
+  # WHY prefill_logits: last_only. Letting the prefill materialize logits for
+  # every position gives [1, 40960, 128256] = 10.5 GB in fp16, ~21 GB once Llama
+  # upcasts to fp32 — against a full Llama-3-8B KV cache at 40k of ~5.4 GB. It is
+  # identical for every method, so it adds a large constant to every row of a
+  # memory table and compresses the very differences the table exists to show.
+  # Set `full` only to reproduce the upstream harness's absolute GB figures.
+
+  # -- GPU state hygiene: keep the machine out of the score --------------------
+  # warmup_decode_steps: null (auto) runs enough decode steps to cross the first
+  # compaction, so the Triton eviction kernel JIT-compiles and autotunes during
+  # WARMUP rather than inside measurement run 0. cooldown_s idles between runs so
+  # the part is not progressively clocking down across the 10 rounds.
+  warmup_decode_steps: null
+  cooldown_s: 3.0
+  enable_clock_locking: true   # needs elevated permissions; falls back with a warning
+  clock_settle_s: 5.0
+
+  configs:
+    # flash_attention_2 ONLY. The eager backend cannot run this protocol at all:
+    # its score hook reads attn_weights, which requires output_attentions=True,
+    # which materializes [B, H, L, L] — at L=24576 that is ~38 GB per layer in
+    # fp16 before anything else. The flash package reconstructs scores from the
+    # LSE and has no such term. For an eager smoke run use a small-context config
+    # (configs/eval_perf_cpu_e2e.yaml), and never put eager and flash timings in
+    # the same column.
+    - name: fullkv
+      cache_backend: dynamic
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+
+    - name: ours_b50            # single-tier fp16 eviction
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.0
+      requires_flash_attn: true
+
+    - name: ours_b50_q50        # the two-tier fp16 + int2 method
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.5
+      requires_flash_attn: true
+
+    - name: ours_b50_q50_nomemo
+      # Same method with the dequantized-Q-tier memo OFF. At B=1 the memo
+      # defaults ON, and it trades ~149 MB/row of extra memory for ~8x fewer
+      # Q-tier dequants per step. Only this suite can price that trade, so both
+      # sides have to be in the table. BATCHING_PLAN.md §5.
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.5
+      quant_memoize_read: false
+      requires_flash_attn: true
+
+  # 24k / 32k / 40k at gen_len 101 = exactly 100 decode forwards, matching the
+  # upstream loop. 8k is commented out upstream; add
+  # { prefill_len: 8192, gen_len: 101, batch_size: 1 } for a shorter point.
+  grid:
+    - { prefill_len: 24576, gen_len: 101, batch_size: 1 }
+    - { prefill_len: 32768, gen_len: 101, batch_size: 1 }
+    - { prefill_len: 40960, gen_len: 101, batch_size: 1 }
+
+  num_warmup_runs: 5
+  num_measurement_runs: 10
+  allow_shared_gpu: true
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+telemetry:
+  track_scores: false        # scoring telemetry would distort the timings
+  output_dir: outputs/efficiency
