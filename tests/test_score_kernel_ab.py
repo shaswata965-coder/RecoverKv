@@ -52,6 +52,7 @@ import torch
 # under pytest the rootdir is already importable so this is a no-op.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from modules.windowed_cache import flash_lse
 from modules.windowed_cache.score_kernel import (
     _HAS_TRITON,
     _token_scores_triton,
@@ -63,6 +64,16 @@ from modules.windowed_cache.score_kernel import (
 CUDA = torch.cuda.is_available()
 GPU = _HAS_TRITON and CUDA
 gpu_only = pytest.mark.skipif(not GPU, reason="needs CUDA + triton")
+
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+    _HAS_FLASH = True
+except Exception:
+    _HAS_FLASH = False
+
+flash_only = pytest.mark.skipif(
+    not (GPU and _HAS_FLASH), reason="needs CUDA + triton + flash_attn"
+)
 
 if _HAS_TRITON:
     import triton
@@ -415,6 +426,93 @@ def test_E_lse_scale_must_match():
     bad = token_scores_from_lse(q, k, scaling, lse_bad)
     assert not torch.allclose(bad, ref, atol=1e-2), \
         "scale-mismatched L did NOT diverge — the guard test is ineffective"
+
+
+# ===========================================================================
+# Section F — flash softmax_lse parity (GPU + flash_attn). THE remaining link.
+#
+# The kernel is proven correct GIVEN a correct L. The one thing the suite has
+# not exercised end-to-end is L sourced from flash's own forward, which is what
+# STICKYKV_SCORE_LSE_FROM_FORWARD=1 turns on. If flash's softmax_lse disagrees
+# with compute_lse — different scale, log base, causal alignment, GQA order, or
+# a padded seqlen — the kernel is fed a bad L and scores corrupt while every
+# test above stays green. Given the kernel is now exonerated, this is the prime
+# suspect for the 2wikimqa collapse, so it gets its own direct test.
+# ===========================================================================
+
+# flash pads softmax_lse's seqlen up to a multiple of 128 on some builds. T is
+# chosen a multiple of 128 so the [B,H,T] shape check passes and reuse actually
+# engages — the exact case where a value mismatch would corrupt (a padded shape
+# is instead rejected by the hook and safely recomputed).
+_FLASH_SHAPE = dict(B=1, T=512, H_q=32, H_kv=8, D=128)
+
+
+def _flash_qkv():
+    p = _FLASH_SHAPE
+    dt = torch.bfloat16
+    q = torch.randn(p["B"], p["T"], p["H_q"], p["D"], device="cuda", dtype=dt)
+    k = torch.randn(p["B"], p["T"], p["H_kv"], p["D"], device="cuda", dtype=dt)
+    v = torch.randn(p["B"], p["T"], p["H_kv"], p["D"], device="cuda", dtype=dt)
+    return q, k, v
+
+
+@flash_only
+def test_F_raw_flash_lse_convention():
+    """flash's own softmax_lse == compute_lse (scale / log-base / causal / GQA).
+
+    Calls flash_attn_func directly (bypassing the monkeypatch) to isolate the
+    CONVENTION question from the capture plumbing. flash layout is [B,T,H,D];
+    ours is [B,H,T,D].
+    """
+    p = _FLASH_SHAPE
+    scaling = p["D"] ** -0.5
+    q_f, k_f, v_f = _flash_qkv()
+    ours = compute_lse(q_f.transpose(1, 2), k_f.transpose(1, 2), scaling)  # [B,H_q,T]
+
+    out = _flash_attn_func(q_f, k_f, v_f, causal=True, softmax_scale=scaling,
+                           return_attn_probs=True)
+    assert isinstance(out, tuple) and len(out) >= 2, \
+        "this flash build did not return softmax_lse with return_attn_probs"
+    lse = out[1]
+    # A padded/other shape would be REJECTED by the hook (safe recompute), so
+    # treat that as 'reuse never engages', not corruption.
+    assert tuple(lse.shape) == (p["B"], p["H_q"], p["T"]), (
+        f"flash softmax_lse shape {tuple(lse.shape)} != {(p['B'], p['H_q'], p['T'])}: "
+        "the hook would reject this and recompute L (safe, but LSE-reuse is inert)."
+    )
+    torch.testing.assert_close(lse.float(), ours, atol=1e-2, rtol=1e-2,
+                               msg="flash softmax_lse disagrees with compute_lse")
+
+
+@flash_only
+def test_F_captured_lse_matches_recompute():
+    """End-to-end: wrapper-captured L == compute_lse for the same q,k.
+
+    Exercises the exact path STICKYKV_SCORE_LSE_FROM_FORWARD turns on: the
+    patched transformers symbol -> flash_lse.pop().
+    """
+    import transformers.modeling_flash_attention_utils as fa_utils
+
+    p = _FLASH_SHAPE
+    scaling = p["D"] ** -0.5
+    q_f, k_f, v_f = _flash_qkv()
+    ours = compute_lse(q_f.transpose(1, 2), k_f.transpose(1, 2), scaling)
+
+    handle = flash_lse.enable()
+    assert handle is not None, "flash_lse.enable() found no flash_attn_func to patch"
+    try:
+        flash_lse.clear()
+        _ = fa_utils.flash_attn_func(q_f, k_f, v_f, causal=True, softmax_scale=scaling)
+        cap = flash_lse.pop()
+    finally:
+        handle.restore()
+
+    if cap is None:
+        pytest.skip("capture returned None (flash rejected return_attn_probs or "
+                    "padded the shape) — the hook safely recomputes L, no corruption")
+    assert tuple(cap.shape) == (p["B"], p["H_q"], p["T"])
+    torch.testing.assert_close(cap.float(), ours, atol=1e-2, rtol=1e-2,
+                               msg="captured flash L disagrees with compute_lse")
 
 
 # ===========================================================================
