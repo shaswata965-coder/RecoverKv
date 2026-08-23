@@ -76,7 +76,7 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     v_fp = v_flash.transpose(1, 2)
 
     out, token_scores = fused_two_tier_decode(
-        q_hd, k_fp, v_fp, ctx["k_q"], ctx["v_q"], ctx["scaling"]
+        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"]
     )                                                  # out [B,H_q,D], scores [B,H_q,S]
 
     order, q_token_len = ctx["score_meta"]

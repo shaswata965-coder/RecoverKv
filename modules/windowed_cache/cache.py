@@ -443,20 +443,38 @@ class WindowedCache(_HFCacheBase):
             if (self._fused_decode_active and not is_prefill
                     and store is not None and store.num_active_windows > 0):
                 from modules.quant.effective import compute_score_meta
+                from .decode_kernel import rope_cos_sin_halves
                 from . import flash_decode
-                k_q, v_q, q_pos = store.effective_q_tier(
-                    self.rope_module, state.key_states.dtype
-                )
+                # Gather the active Q windows' RAW int2 fields (no dequant — the
+                # kernel unpacks + dequants + RoPEs in registers), plus the RoPE
+                # halves (position-only, cheap) and the score-scatter map.
+                n = store.num_active_windows
+                B = state.key_states.shape[0]
+                ws = self.resolved.window_size
+                idx = store.table.active_order(n)                     # [B, n] slots
+                kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
+                kc = kc.reshape(B, n, *kc.shape[1:])
+                ks = ks.reshape(B, n, *ks.shape[1:])
+                kz = kz.reshape(B, n, *kz.shape[1:])
+                vc = vc.reshape(B, n, *vc.shape[1:])
+                vs = vs.reshape(B, n, *vs.shape[1:])
+                vz = vz.reshape(B, n, *vz.shape[1:])
+                qpos_flat = qpos.reshape(B, n * ws)
+                cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
                 score_meta = compute_score_meta(
-                    state.position_ids, q_pos,
-                    self.resolved.num_sink_tokens, self.resolved.window_size,
+                    state.position_ids, qpos_flat,
+                    self.resolved.num_sink_tokens, ws,
                 )
                 flash_decode.set_pending({
                     "layer_idx": layer_idx,
-                    "k_q": k_q, "v_q": v_q,
+                    "qtier": {
+                        "k_codes": kc, "k_scale": ks, "k_zero": kz,
+                        "v_codes": vc, "v_scale": vs, "v_zero": vz,
+                        "cos": cos_h, "sin": sin_h, "window_size": ws,
+                    },
                     "score_meta": score_meta,
                     "num_sink": self.resolved.num_sink_tokens,
-                    "window_size": self.resolved.window_size,
+                    "window_size": ws,
                     "scaling": self._attn_scaling,
                     "cache": self,
                 })

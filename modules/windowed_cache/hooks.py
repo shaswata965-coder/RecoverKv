@@ -73,15 +73,22 @@ def _prefill_score_chunk() -> int:
 def _lse_from_forward() -> bool:
     """Whether to reuse flash's ``softmax_lse`` instead of recomputing ``L``.
 
-    Off by default (``STICKYKV_SCORE_LSE_FROM_FORWARD`` unset). When on, the
-    flash forward is monkeypatched (:mod:`flash_lse`) to hand out the softmax
-    normaliser it already computes, so the Triton score path skips its ``L``
-    recompute pass (:func:`score_kernel.compute_lse`, whose chunked logit block
-    is the one transient the kernel path would otherwise still materialise).
-    Prefill scoring always runs the Triton kernel now, so ``lse`` reuse is always
-    consumed when captured; harmless if flash-attn is unavailable.
+    **On by default.** The flash forward is monkeypatched (:mod:`flash_lse`) to
+    hand out the softmax normaliser it already computes, so the Triton score path
+    skips its ``L`` recompute pass (:func:`score_kernel.compute_lse`) — and that
+    recompute is the ``[B, H, chunk, S]`` fp32 transient (~17 GB at prefill=4096,
+    batch=32) that OOMs the very shapes this method targets. Reusing L eliminates
+    it: the fused key-outer kernel never materialises the score matrix. This is
+    THE prefill-memory fix, so it is the default rather than an opt-in.
+
+    Degrades safely: :func:`flash_lse.enable` returns None if flash-attn is
+    absent, and the wrapper latches off if the installed build rejects
+    ``return_attn_probs`` — in either case the score path falls back to
+    recomputing L (and its transient) exactly as before. Set
+    ``STICKYKV_SCORE_LSE_FROM_FORWARD=0`` to force that recompute (e.g. for parity
+    against the pre-reuse numbers).
     """
-    v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "0").strip().lower()
+    v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "1").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 

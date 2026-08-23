@@ -80,7 +80,7 @@ def test_dispatcher_is_triton_or_error_on_cpu():
     k = torch.randn(1, 2, 5, 8)
     v = torch.randn(1, 2, 5, 8)
     with pytest.raises(RuntimeError, match="requires the Triton kernel"):
-        fused_two_tier_decode(q, k, v, None, None, 8 ** -0.5)
+        fused_two_tier_decode(q, k, v, None, 8 ** -0.5)   # qtier=None (empty Q)
 
 
 def test_fused_decode_enabled_default_and_off(monkeypatch):
@@ -106,10 +106,15 @@ def test_gate_is_noop_when_fused_disabled(monkeypatch):
 
 
 # NOTE: the Triton kernel (_two_tier_decode_kernel) has no CPU test by construction
-# — it requires CUDA. On a GPU box, validate it against the reference:
+# — it requires CUDA. On a GPU box, validate it against the reference by building
+# the effective K/V the *materialize* path would (so the int2 dequant+RoPE inside
+# the kernel is checked against the already-tested primitives):
 #
-#     k_eff = torch.cat([k_fp, k_q], dim=2); v_eff = torch.cat([v_fp, v_q], dim=2)
+#     from modules.quant.effective import materialize_effective_kv
+#     k_eff, v_eff, _ = materialize_effective_kv(k_fp, v_fp, fp_pos, store,
+#                                                num_sink, ws, rope)
 #     out_ref, sc_ref = two_tier_decode_reference(q, k_eff, v_eff, scaling)
-#     out, sc = fused_two_tier_decode(q, k_fp, v_fp, k_q, v_q, scaling)
+#     # qtier = the gathered int2 fields + rope halves the cache builds in update()
+#     out, sc = fused_two_tier_decode(q, k_fp, v_fp, qtier, scaling)
 #     assert torch.allclose(out, out_ref, atol=1e-2, rtol=1e-2)
-#     assert torch.allclose(sc,  sc_ref,  atol=1e-2, rtol=1e-2)
+#     assert torch.allclose(sc,  sc_ref,  atol=1e-2, rtol=1e-2)  # scores are [sink‖body‖Q] order
