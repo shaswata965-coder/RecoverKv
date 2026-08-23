@@ -108,6 +108,28 @@ def describe_prefill_backend(cuda: bool) -> str:
     return f"WILL ERROR: prefill needs the Triton kernel on CUDA ({reason})"
 
 
+def prefill_kernel_available(cuda: bool) -> bool:
+    """True iff the prefill score Triton kernel can actually launch."""
+    return bool(_HAS_TRITON and cuda)
+
+
+def assert_prefill_kernel_available(cuda: bool) -> None:
+    """Raise unless the prefill score kernel can launch (flash-backend gate).
+
+    The prefill score path is already Triton-or-raise at its first call
+    (:func:`compute_token_scores`); this surfaces the same failure at flash-hook
+    install so choosing the flash backend fails loudly at setup on a box that
+    cannot launch the kernel, rather than only on the first prefill.
+    """
+    if not prefill_kernel_available(cuda):
+        kind, reason = _prefill_backend(cuda)
+        raise RuntimeError(
+            "The flash backend requires the prefill score Triton kernel on CUDA, "
+            f"and it cannot launch ({reason}). There is no PyTorch prefill "
+            "fallback. Install triton and run on GPU, or use the eager backend."
+        )
+
+
 def _announce_backend_once(q: Tensor) -> None:
     """Print, once per process, whether prefill scoring can use the Triton path."""
     if _ANNOUNCED["done"]:

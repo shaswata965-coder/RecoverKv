@@ -35,8 +35,17 @@ import torch.nn as nn
 
 import os
 
-from . import flash_lse
-from .score_kernel import compute_token_scores, describe_prefill_backend
+from . import flash_lse, flash_decode
+from .decode_kernel import (
+    assert_decode_kernel_available,
+    describe_decode_backend,
+    fused_decode_enabled,
+)
+from .score_kernel import (
+    assert_prefill_kernel_available,
+    compute_token_scores,
+    describe_prefill_backend,
+)
 from .scorer import (
     compute_window_scores,
     reduce_token_scores_to_windows,
@@ -241,14 +250,29 @@ def install_score_hooks(
         else:
             lse_capture = False  # flash-attn unavailable; fall back to recompute
 
-    # Explicit, once-per-process banner: which scoring path is active. The
-    # Triton-vs-reference line is confirmed at runtime by the score kernel on its
-    # first call; this states the prediction plus the L-reuse status up front.
+    # Fused two-tier decode (decode_kernel + flash_decode). Choosing the flash
+    # backend commits to the Triton path for BOTH the prefill score kernel and the
+    # decode kernel, so gate at install: a CUDA box that cannot launch them fails
+    # HERE, not mid-run. Only activated on CUDA — the eager/CPU path uses the
+    # materialize read path (and a CPU flash run already raises at the first
+    # prefill), so hook-install unit tests on CPU are unaffected.
+    _cuda = torch.cuda.is_available()
+    fused_active = fused_decode_enabled() and _cuda
+    if fused_active:
+        assert_prefill_kernel_available(True)
+        assert_decode_kernel_available(True)
+        _dec_handle = flash_decode.enable()
+        if _dec_handle is not None:
+            handles._cleanups.append(_dec_handle.restore)
+        setattr(cache, "_fused_decode_active", True)
+
+    # Explicit, once-per-process banner: which scoring/attention path is active.
     if not _PATH_ANNOUNCED[0]:
         _PATH_ANNOUNCED[0] = True
         print(
             "[StickyKV] score path: FLASH (flash_attention_2) | prefill scoring "
-            f"-> {describe_prefill_backend(torch.cuda.is_available())} | "
+            f"-> {describe_prefill_backend(_cuda)} | "
+            f"decode -> {describe_decode_backend(_cuda)} | "
             f"L-reuse: {'ON' if lse_capture else 'off'}",
             flush=True,
         )
@@ -303,6 +327,16 @@ def install_score_hooks(
             )
             handles._hook_handles.append(pre_handle)
 
+        # Clear any pending fused-decode context at the START of each layer's
+        # forward. update() re-arms it for this layer right before the flash call,
+        # so this only guards against a context leaking from a layer that (against
+        # expectation) never reached flash_attn_func.
+        if fused_active:
+            dec_pre = module.register_forward_pre_hook(
+                lambda _m, _a: flash_decode.clear()
+            )
+            handles._hook_handles.append(dec_pre)
+
         def make_hook(lidx: int):
             def score_hook(module, args, kwargs, output):
                 hidden_states = _extract_arg(args, kwargs, "hidden_states", 0)
@@ -320,6 +354,19 @@ def install_score_hooks(
                         )
                         warned_once[0] = True
                     return
+
+                # Fused decode already produced this step's scores. On a q>0 decode
+                # step with a non-empty Q tier (exactly update()'s fused condition),
+                # the flash_decode kernel wrote window_scores, so the auxiliary
+                # score pass must NOT run — it would need the effective K, which the
+                # fused path deliberately never builds. Prefill (T>1) and empty-Q
+                # decode steps fall through and score as before.
+                if (fused_active and getattr(cache, "_fused_decode_active", False)
+                        and hidden_states.shape[1] == 1
+                        and getattr(cache, "_q", 0.0) > 0.0):
+                    st = cache._stores[lidx]
+                    if st is not None and st.num_active_windows > 0:
+                        return
 
                 # Keys: already RoPE-applied and appended by cache.update()
                 # earlier in this same forward pass. At q > 0 the raw fp store

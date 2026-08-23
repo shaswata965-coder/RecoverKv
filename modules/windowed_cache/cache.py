@@ -118,7 +118,17 @@ class WindowedCache(_HFCacheBase):
                 )
                 for _ in range(num_layers)
             ]
+            # Softmax scale for the fused decode kernel (Llama/Qwen: head_dim**-0.5).
+            self._attn_scaling: float = head_dim ** -0.5
+        else:
+            self._attn_scaling = 1.0
         self._memoization_resolved = False
+
+        # Fused two-tier decode (decode_kernel + flash_decode). Off until the flash
+        # score hook activates it (CUDA + triton + STICKYKV_FUSED_DECODE on); the
+        # eager backend and CPU tests never activate it, so they keep the
+        # materialize read path. See update()'s q>0 return.
+        self._fused_decode_active: bool = False
 
         # Per-layer state and policy. The fp store is preallocated so append()
         # never re-cats the whole store (BATCHING_PLAN.md §5: at max batch that
@@ -423,6 +433,39 @@ class WindowedCache(_HFCacheBase):
         #    attention (and the eager scorer) see both tiers; at q == 0 this is
         #    the live fp store, byte-identical to the single-tier cache.
         if self._q > 0.0:
+            store = self._stores[layer_idx]
+            # Fused decode path: on a real decode step with a non-empty Q tier and
+            # the flash kernel active, hand the Q tier + scatter map to the
+            # flash_attn_func patch and return the FP TIER for it to attend over —
+            # no fp16 concat, and the kernel emits the eviction score. Everything
+            # else (prefill, empty Q tier, eager backend, fused disabled) falls
+            # through to the materialize path below, unchanged.
+            if (self._fused_decode_active and not is_prefill
+                    and store is not None and store.num_active_windows > 0):
+                from modules.quant.effective import compute_score_meta
+                from . import flash_decode
+                k_q, v_q, q_pos = store.effective_q_tier(
+                    self.rope_module, state.key_states.dtype
+                )
+                score_meta = compute_score_meta(
+                    state.position_ids, q_pos,
+                    self.resolved.num_sink_tokens, self.resolved.window_size,
+                )
+                flash_decode.set_pending({
+                    "layer_idx": layer_idx,
+                    "k_q": k_q, "v_q": v_q,
+                    "score_meta": score_meta,
+                    "num_sink": self.resolved.num_sink_tokens,
+                    "window_size": self.resolved.window_size,
+                    "scaling": self._attn_scaling,
+                    "cache": self,
+                })
+                # The patch writes window_scores; the score forward-hook skips this
+                # step. Clear the materialize stashes so no stale effective-K leaks.
+                self._last_effective_k[layer_idx] = None
+                self._last_score_meta[layer_idx] = None
+                return state.key_states, state.value_states
+
             eff_k, eff_v, score_meta = self._materialize(layer_idx)
             # Hand the effective K + its score-scatter map to the score hook
             # (fix #2) so it need not rebuild them. Overwritten each step; the

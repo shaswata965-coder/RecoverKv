@@ -261,6 +261,37 @@ def window_id_of(position: int, num_sink: int, window_size: int) -> int:
     return (int(position) - num_sink) // window_size
 
 
+def compute_score_meta(
+    fp_positions: Tensor,
+    q_pos_flat: Tensor,
+    num_sink: int,
+    window_size: int,
+) -> Tuple[Tensor, int]:
+    """The ``(order, q_token_len)`` scatter map the two-tier scorer needs.
+
+    The physical effective-K order is ``[sink ‖ fp body ‖ Q]``; the running
+    ``window_scores`` live in ascending merged-window-id order. ``order`` is the
+    ``argsort`` of the physical per-window ids, so
+    :func:`scorer.reduce_two_tier_scores` can scatter each tier's per-window sum
+    back to merged-id order. Extracted so both the materialize path **and** the
+    fused-decode path (which builds no effective tensor) produce identical meta.
+
+    Parameters
+    ----------
+    fp_positions : ``[B, T_fp]`` original absolute positions of the fp store
+        (sink prefix included; sliced off here).
+    q_pos_flat : ``[B, n_q * ws]`` original absolute positions of the Q tier,
+        window-major ascending (from :meth:`QuantizedStore.effective_q_tier`).
+    """
+    ws = window_size
+    body_pos = fp_positions[:, num_sink:]
+    body_win_ids = (body_pos[:, ::ws].to(torch.long) - num_sink) // ws   # [B, n_body]
+    q_win_ids = (q_pos_flat[:, ::ws].to(torch.long) - num_sink) // ws    # [B, n_q]
+    phys_win_ids = torch.cat([body_win_ids, q_win_ids], dim=1)          # [B, W]
+    order = torch.argsort(phys_win_ids, dim=1)                          # [B, W]
+    return order, q_pos_flat.shape[1]
+
+
 def materialize_effective_kv(
     fp_keys: Tensor,
     fp_values: Tensor,
@@ -354,9 +385,7 @@ def materialize_effective_kv(
     # tier's per-window score back in ascending-merged-id order — the order
     # ``state.window_scores`` / ``original_window_ids`` are kept in. A stable
     # sort is not required (window ids are unique) but costs nothing.
-    ws = window_size
-    body_win_ids = (body_pos[:, ::ws].to(torch.long) - num_sink) // ws   # [B, n_body]
-    q_win_ids = (q_pos_flat[:, ::ws].to(torch.long) - num_sink) // ws    # [B, n_q]
-    phys_win_ids = torch.cat([body_win_ids, q_win_ids], dim=1)           # [B, W]
-    order = torch.argsort(phys_win_ids, dim=1)                           # [B, W]
-    return eff_k, eff_v, (order, q_pos_flat.shape[1])
+    order, q_token_len = compute_score_meta(
+        fp_positions, q_pos_flat, num_sink, window_size
+    )
+    return eff_k, eff_v, (order, q_token_len)
