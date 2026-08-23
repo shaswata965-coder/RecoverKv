@@ -37,8 +37,9 @@ What's in this file
 -------------------
 * :func:`compute_token_scores` — the public entry point / dispatcher.
 * :func:`token_scores_torch` — pure-PyTorch reference. **Byte-identical to the
-  old inline hook loop** when called with its defaults, so switching the hook to
-  it changes nothing until you opt into the kernel. Runs on CPU.
+  old inline hook loop** when called with its defaults. Now used only for the
+  DECODE pass (``T == 1``) and as the CPU test oracle — it is no longer a prefill
+  fallback (see below). Runs on CPU.
 * :func:`token_scores_from_lse` — the Design-B ``exp(S − L)`` formulation in
   PyTorch. Mathematically equal to :func:`token_scores_torch`; it exists to
   prove the kernel's math on CPU and to serve as the kernel's test oracle.
@@ -46,12 +47,16 @@ What's in this file
   kernel. GPU-only; **must be validated on a GPU against the reference** (this
   repo's dev box is CPU-only, so it ships unvalidated by construction).
 
-Backend selection is via ``STICKYKV_SCORE_KERNEL`` (see :func:`_backend`).
+Prefill scoring (``T > 1``) is **Triton-only**: :func:`compute_token_scores`
+runs the fused kernel or RAISES — there is no PyTorch prefill fallback, because
+that path materialises a ``[B, H_q, chunk, S]`` probability block (~8.6 GB fp16
+at prefill=4096, batch=32) that OOMs the batched long-context shapes this method
+exists to serve, and a silent degrade to it is worse than a hard failure. Decode
+(``T == 1``) uses the PyTorch path (no grid to tile — design §6).
 """
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -69,20 +74,6 @@ except Exception:  # ImportError, or a broken triton build
     _HAS_TRITON = False
 
 
-def _backend() -> str:
-    """Which score backend to use, from ``STICKYKV_SCORE_KERNEL``.
-
-    * ``auto`` (default) — the fused Triton kernel when triton **and** CUDA are
-      available and the pass is a real prefill (``T > 1``); otherwise fall back
-      to ``torch``. So GPU flash runs go through the kernel automatically, while
-      CPU / eager runs (and this dev box) transparently use the reference — which
-      is byte-identical to the historic inline loop, so those are unchanged.
-    * ``torch`` — force the PyTorch reference everywhere (parity / A-B baseline).
-    * ``triton`` — force the fused GPU kernel (errors if triton/CUDA missing).
-    """
-    return os.environ.get("STICKYKV_SCORE_KERNEL", "auto").strip().lower()
-
-
 # --- One-time, explicit terminal announcement of the chosen scoring path ------
 # So a run never *silently* falls back to the reference (e.g. triton missing on
 # the GPU box): the actual choice is printed once per process.
@@ -90,48 +81,49 @@ def _backend() -> str:
 _ANNOUNCED = {"done": False}
 
 
-def _prefill_backend(backend: str, cuda: bool):
-    """Resolve what PREFILL scoring will use: ('triton'|'torch', reason)."""
-    if backend in ("triton", "auto") and _HAS_TRITON and cuda:
+def _prefill_backend(cuda: bool):
+    """Resolve what PREFILL scoring will do: ``('triton', '')`` or ``('error', reason)``.
+
+    Prefill scoring is Triton-only by contract (see :func:`compute_token_scores`):
+    the PyTorch reconstruction materialises a ``[B, H_q, chunk, S]`` probability
+    block that OOMs the batched long-context shapes this method targets, so when
+    the kernel is unavailable the prefill path RAISES rather than degrading. This
+    reports which case it is so the one-time banner can warn up front instead of
+    the run only discovering it at the first prefill.
+    """
+    if _HAS_TRITON and cuda:
         return "triton", ""
-    if backend == "torch":
-        reason = "backend forced to 'torch'"
-    elif not _HAS_TRITON:
-        reason = "triton not installed"
-    elif not cuda:
-        reason = "not running on CUDA"
-    else:
-        reason = "unavailable"
-    return "torch", reason
+    if not _HAS_TRITON:
+        return "error", "triton not installed"
+    if not cuda:
+        return "error", "not running on CUDA"
+    return "error", "unavailable"
 
 
 def describe_prefill_backend(cuda: bool) -> str:
     """Human string for the prefill scoring backend, given CUDA availability."""
-    backend = _backend()
-    kind, reason = _prefill_backend(backend, cuda)
+    kind, reason = _prefill_backend(cuda)
     if kind == "triton":
-        return f"TRITON fused kernel (backend={backend})"
-    return f"PyTorch reference (backend={backend}; {reason})"
+        return "TRITON fused kernel (required)"
+    return f"WILL ERROR: prefill needs the Triton kernel on CUDA ({reason})"
 
 
 def _announce_backend_once(q: Tensor) -> None:
-    """Print, once per process, whether the Triton path was actually chosen."""
+    """Print, once per process, whether prefill scoring can use the Triton path."""
     if _ANNOUNCED["done"]:
         return
     _ANNOUNCED["done"] = True
     cuda = bool(getattr(q, "is_cuda", False))
-    backend = _backend()
-    kind, reason = _prefill_backend(backend, cuda)
+    kind, reason = _prefill_backend(cuda)
     if kind == "triton":
         print(
-            "[StickyKV] score kernel: TRITON path ACTIVE for prefill scoring "
-            f"[OK] (backend={backend})",
+            "[StickyKV] score kernel: TRITON path ACTIVE for prefill scoring [OK]",
             flush=True,
         )
     else:
         print(
-            "[StickyKV] score kernel: PyTorch reference path; TRITON NOT used "
-            f"(backend={backend}; {reason})",
+            "[StickyKV] score kernel: TRITON UNAVAILABLE "
+            f"({reason}) — prefill scoring will RAISE (no PyTorch fallback)",
             flush=True,
         )
 
@@ -439,9 +431,10 @@ def compute_token_scores(
 ) -> Tensor:
     """Per-key received attention ``[B, H_q, S]`` — the score the policy needs.
 
-    Backend chosen by ``STICKYKV_SCORE_KERNEL`` (see :func:`_backend`). Decode
-    passes (``T == 1``) always use the PyTorch path — there is no grid to tile,
-    so the kernel would only add launch overhead (design §6).
+    Prefill passes (``T > 1``) run the fused Triton kernel or RAISE — there is no
+    PyTorch prefill fallback (it OOMs the batched long-context shapes this method
+    targets). Decode passes (``T == 1``) always use the PyTorch path — there is no
+    grid to tile, so the kernel would only add launch overhead (design §6).
 
     Parameters
     ----------
@@ -463,32 +456,41 @@ def compute_token_scores(
     ``[B, H_q, S]`` — hand straight to ``scorer.reduce_*``. Window size never
     enters this function.
     """
-    backend = _backend()
     T = q.shape[2]
     _announce_backend_once(q)
 
-    use_triton = (
-        backend in ("triton", "auto")
-        and T > 1
-        and _HAS_TRITON
-        and q.is_cuda
-    )
-    if backend == "triton" and not use_triton and T > 1:
-        # Explicit request but unavailable — fail loudly rather than silently
-        # running a different (slower) path in a perf-sensitive eval.
-        raise RuntimeError(
-            "STICKYKV_SCORE_KERNEL=triton but triton/CUDA is unavailable "
-            f"(has_triton={_HAS_TRITON}, is_cuda={q.is_cuda})."
-        )
-
-    if use_triton:
+    # -- Prefill (T > 1): Triton-only, by contract. --------------------------
+    # No PyTorch fallback: token_scores_torch would materialise a
+    # [B, H_q, chunk, S] probability block (~8.6 GB fp16 at prefill=4096, bs=32,
+    # chunk=1024) that OOMs the very batched long-context shapes this method
+    # targets. A silent degrade to that path is worse than a hard failure, so
+    # when the kernel is unavailable we RAISE instead of running it.
+    if T > 1:
+        if not (_HAS_TRITON and q.is_cuda):
+            raise RuntimeError(
+                "Prefill score computation requires the Triton kernel on CUDA; "
+                "the PyTorch prefill fallback has been removed "
+                f"(has_triton={_HAS_TRITON}, "
+                f"is_cuda={bool(getattr(q, 'is_cuda', False))}). The reference "
+                "path materialises a [B, H_q, chunk, S] score matrix that OOMs "
+                "batched long-context prefills. Install triton and run on GPU; "
+                "for CPU/eager smoke tests use the eager backend, which reads "
+                "attn_weights directly and never calls this path."
+            )
         if lse is None:
+            # L was not handed down from the forward
+            # (STICKYKV_SCORE_LSE_FROM_FORWARD off): recompute it. NOTE this
+            # still materialises a chunked logit block; feed `lse` from flash's
+            # softmax_lse to make Stage B a single extra q·kᵀ pass with no such
+            # transient.
             lse = compute_lse(q, k, scaling, chunk=chunk)
         return _token_scores_triton(
             q, k, scaling, lse, out_dtype=out_dtype or torch.float32
         )
 
-    # PyTorch path. Byte-identical to the old hook loop at its defaults.
+    # -- Decode (T == 1): PyTorch path. --------------------------------------
+    # There is no grid to tile for a single query row, so the kernel would only
+    # add launch overhead (design §6). Byte-identical to the historic hook loop.
     scores = token_scores_torch(
         q, k, scaling, chunk=chunk, softmax_dtype=softmax_dtype
     )

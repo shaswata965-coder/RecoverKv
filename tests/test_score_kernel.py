@@ -14,7 +14,8 @@ What is asserted:
      == ``token_scores_torch`` — for prefill (offset 0), past+current (offset > 0),
      and decode (T == 1).
   3. ``compute_lse`` equals a full-matrix ``logsumexp``.
-  4. The dispatcher's default (torch) backend matches ``token_scores_torch``.
+  4. The dispatcher routes by pass: prefill (T > 1) is Triton-only and RAISES on
+     CPU (no silent PyTorch fallback); decode (T == 1) matches ``token_scores_torch``.
 """
 
 from __future__ import annotations
@@ -159,11 +160,28 @@ def test_compute_lse_matches_logsumexp(name, B, H_q, H_kv, T, S):
     assert torch.allclose(got, ref, atol=1e-5, rtol=1e-4), name
 
 
-def test_dispatcher_default_is_torch_path():
-    """Default backend is 'auto'; on CPU it falls back to the exact reference."""
-    q, k = _make(2, 8, 2, 20, 20, seed=5)
+def test_dispatcher_prefill_requires_triton_on_cpu():
+    """Prefill (T > 1) is Triton-only: on CPU it RAISES, never silently falls back.
+
+    This is the contract that stops a GPU box with triton missing from silently
+    running the [B, H_q, chunk, S] PyTorch reconstruction that OOMs batched
+    long-context prefills. CPU has no CUDA, so the dispatcher must refuse.
+    """
+    q, k = _make(2, 8, 2, 20, 20, seed=5)          # T = 20 > 1 → prefill
     scaling = q.shape[-1] ** -0.5
-    got = compute_token_scores(q, k, scaling, softmax_dtype=torch.float32, out_dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="requires the Triton kernel"):
+        compute_token_scores(
+            q, k, scaling, softmax_dtype=torch.float32, out_dtype=torch.float32
+        )
+
+
+def test_dispatcher_decode_uses_torch_path():
+    """Decode (T == 1) still uses the exact PyTorch reference (no kernel grid)."""
+    q, k = _make(2, 8, 2, 1, 20, seed=5)           # T = 1 → decode
+    scaling = q.shape[-1] ** -0.5
+    got = compute_token_scores(
+        q, k, scaling, softmax_dtype=torch.float32, out_dtype=torch.float32
+    )
     ref = token_scores_torch(q, k, scaling, softmax_dtype=torch.float32)
     assert torch.allclose(got, ref, atol=1e-6)
 

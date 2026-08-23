@@ -67,8 +67,10 @@ def _lse_from_forward() -> bool:
     Off by default (``STICKYKV_SCORE_LSE_FROM_FORWARD`` unset). When on, the
     flash forward is monkeypatched (:mod:`flash_lse`) to hand out the softmax
     normaliser it already computes, so the Triton score path skips its ``L``
-    recompute pass. Only meaningful with ``STICKYKV_SCORE_KERNEL=triton``/``auto``
-    (the Triton path is the only consumer of ``lse``); harmless otherwise.
+    recompute pass (:func:`score_kernel.compute_lse`, whose chunked logit block
+    is the one transient the kernel path would otherwise still materialise).
+    Prefill scoring always runs the Triton kernel now, so ``lse`` reuse is always
+    consumed when captured; harmless if flash-attn is unavailable.
     """
     v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "0").strip().lower()
     return v in ("1", "true", "yes", "on")
@@ -369,14 +371,17 @@ def install_score_hooks(
                 # 2-3. Per-key received attention:
                 #      softmax(scale·q·kᵀ).sum(over query rows) → token_scores
                 #      [B, H_q, S]. Delegated to score_kernel.compute_token_scores,
-                #      which picks a backend from STICKYKV_SCORE_KERNEL:
-                #        • torch  (default) — the chunked softmax loop that used to
-                #          live inline here, byte-for-byte (bf16 softmax, GQA via
-                #          broadcast, no repeat_kv). Zero behaviour change.
-                #        • triton / auto    — the fused FlashAttention-2-*backward*-
-                #          style kernel: exact softmax exp(scale·q·kᵀ − L) per key,
-                #          looped key-outer so each key block writes a disjoint
-                #          slice (no atomics), fully-masked causal tiles skipped.
+                #      which routes by pass, not by an env knob:
+                #        • prefill (T > 1) — the fused FlashAttention-2-*backward*-
+                #          style Triton kernel: exact softmax exp(scale·q·kᵀ − L)
+                #          per key, looped key-outer so each key block writes a
+                #          disjoint slice (no atomics), fully-masked causal tiles
+                #          skipped. Triton-ONLY — it RAISES if triton/CUDA is
+                #          unavailable (the PyTorch prefill fallback OOMs at these
+                #          shapes and has been removed).
+                #        • decode (T == 1) — the chunked bf16 softmax loop
+                #          (token_scores_torch); no grid to tile, so the kernel
+                #          would only add launch overhead (design §6).
                 #      Both return the same [B, H_q, S]. The window size never
                 #      enters the score pass — it stays a downstream reshape in
                 #      scorer.reduce_* below, so it can change freely per run.
