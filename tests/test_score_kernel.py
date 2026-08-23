@@ -186,6 +186,28 @@ def test_dispatcher_decode_uses_torch_path():
     assert torch.allclose(got, ref, atol=1e-6)
 
 
+def test_token_scores_decode_matches_torch_at_T1():
+    """The T==1 fast path is byte-identical to the general reference at T==1.
+
+    Also for GQA (rep>1) and MHA (rep==1), so the size-1-query fold matches the
+    accumulator path's head layout.
+    """
+    from modules.windowed_cache.score_kernel import token_scores_decode
+
+    for B, H_q, H_kv in [(2, 8, 2), (1, 4, 4), (3, 16, 4)]:
+        q, k = _make(B, H_q, H_kv, 1, 24, seed=7)      # T = 1 → decode
+        scaling = q.shape[-1] ** -0.5
+        fast = token_scores_decode(q, k, scaling, softmax_dtype=torch.float32)
+        ref = token_scores_torch(q, k, scaling, softmax_dtype=torch.float32)
+        assert torch.allclose(fast, ref, atol=1e-6), (B, H_q, H_kv)
+
+    # It is a T==1 path only — a prefill shape must be rejected, not silently
+    # mis-scored (the general path handles T>1).
+    q2, k2 = _make(1, 4, 2, 5, 20, seed=7)
+    with pytest.raises(ValueError, match="T==1"):
+        token_scores_decode(q2, k2, q2.shape[-1] ** -0.5)
+
+
 # NOTE: the Triton kernel (_token_scores_triton) has no CPU test by construction —
 # it requires CUDA. On a GPU box, assert it against token_scores_from_lse:
 #

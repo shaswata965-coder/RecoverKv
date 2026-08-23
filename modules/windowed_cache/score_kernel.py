@@ -215,6 +215,31 @@ def token_scores_torch(
     return out.reshape(B, H_q, S)
 
 
+def token_scores_decode(
+    q: Tensor,
+    k: Tensor,
+    scaling: float,
+    *,
+    softmax_dtype: torch.dtype = torch.bfloat16,
+) -> Tensor:
+    """Per-key received attention for a single decode query (``T == 1``).
+
+    The ``T == 1`` special case of :func:`token_scores_torch`: one query row, so
+    there is no causal mask and the "sum over query rows" is the identity. This
+    drops the ``torch.zeros`` accumulator and the chunk loop that the general path
+    carries — **byte-identical** to ``token_scores_torch(q, k, ...)`` at ``T == 1``
+    (a size-1 sum over the query axis changes nothing), just without the per-step
+    allocation. It fires on every generated token, every layer, so the saved
+    allocator traffic is not nothing at batch.
+    """
+    q5, kt, B, H_q, H_kv, rep, T, S, D = _as_grouped(q, k)
+    if T != 1:
+        raise ValueError(f"token_scores_decode is the T==1 path only, got T={T}")
+    aw = torch.matmul(q5, kt) * scaling                # [B, H_kv, rep, 1, S]
+    p = F.softmax(aw, dim=-1, dtype=softmax_dtype).to(q.dtype)
+    return p.reshape(B, H_q, S)                        # size-1 query axis folds away
+
+
 # ---------------------------------------------------------------------------
 # Design-B formulation in PyTorch — the exp(S − L) math, and its L source
 # ---------------------------------------------------------------------------
@@ -488,12 +513,11 @@ def compute_token_scores(
             q, k, scaling, lse, out_dtype=out_dtype or torch.float32
         )
 
-    # -- Decode (T == 1): PyTorch path. --------------------------------------
+    # -- Decode (T == 1): PyTorch fast path. ---------------------------------
     # There is no grid to tile for a single query row, so the kernel would only
-    # add launch overhead (design §6). Byte-identical to the historic hook loop.
-    scores = token_scores_torch(
-        q, k, scaling, chunk=chunk, softmax_dtype=softmax_dtype
-    )
+    # add launch overhead (design §6). token_scores_decode is the T==1 special
+    # case of token_scores_torch — byte-identical, minus the accumulator + loop.
+    scores = token_scores_decode(q, k, scaling, softmax_dtype=softmax_dtype)
     if out_dtype is not None and scores.dtype != out_dtype:
         scores = scores.to(out_dtype)
     return scores

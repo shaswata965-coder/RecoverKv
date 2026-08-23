@@ -106,23 +106,56 @@ def _dequant_rotate_flat(
 
 
 _COMPILED_READ_FN = None
+_READ_ANNOUNCED = {"done": False}
+
+
+def _announce_read_path_once(compiled: bool) -> None:
+    """Print, once per process, which decode read path is live."""
+    if _READ_ANNOUNCED["done"]:
+        return
+    _READ_ANNOUNCED["done"] = True
+    if compiled:
+        print(
+            "[StickyKV] decode read path: COMPILED fused dequant->RoPE kernel "
+            "ACTIVE [OK] (STICKYKV_COMPILE_READ=1)",
+            flush=True,
+        )
+    else:
+        print(
+            "[StickyKV] decode read path: eager dequant->RoPE chain "
+            "(STICKYKV_COMPILE_READ off)",
+            flush=True,
+        )
 
 
 def _read_fn():
-    """Return the (optionally compiled) fused dequant→RoPE callable.
+    """Return the fused dequant→RoPE callable, honouring kernel-or-error.
 
-    Compiles once, lazily, with ``dynamic=True`` so the varying active-window
-    count ``n`` does not force a recompile every eviction. Falls back to eager if
-    compilation is unavailable or raises.
+    With ``STICKYKV_COMPILE_READ`` off (default) the eager op-for-op chain runs —
+    the CPU/reference path, byte-identical, always available. With it ON the fused
+    (compiled) kernel is REQUIRED: if ``torch.compile`` fails there is **no** silent
+    fallback to the ~20-launch eager chain, because that is the decode analog of
+    the prefill PyTorch fallback we removed — slower, and invisible in the numbers.
+    Compiles once, lazily, ``dynamic=True`` so the varying active-window count ``n``
+    does not recompile every eviction.
     """
     global _COMPILED_READ_FN
     if not _compile_read_enabled():
+        _announce_read_path_once(compiled=False)
         return _dequant_rotate_flat
     if _COMPILED_READ_FN is None:
         try:
             _COMPILED_READ_FN = torch.compile(_dequant_rotate_flat, dynamic=True)
-        except Exception:  # pragma: no cover - environment-dependent
-            _COMPILED_READ_FN = _dequant_rotate_flat
+        except Exception as e:
+            raise RuntimeError(
+                "STICKYKV_COMPILE_READ is set but torch.compile of the fused "
+                f"decode read path failed ({type(e).__name__}: {e}). The fused "
+                "read kernel is required when enabled — there is no silent "
+                "fallback to the eager dequant->RoPE chain (kernel-or-error, as "
+                "on the prefill score path). Unset STICKYKV_COMPILE_READ to run "
+                "the eager reference."
+            ) from e
+    _announce_read_path_once(compiled=True)
     return _COMPILED_READ_FN
 
 
@@ -152,16 +185,15 @@ def dequant_rotate_q_keys(
     cos, sin = _rope_cos_sin(rope_module, ref, pos_flat)
     apply_rotary = _apply_rotary()
     fn = _read_fn()
-    try:
-        return fn(
-            k_codes, k_scale, k_zero, window, cos, sin,
-            out_dtype, B, n, H, D, apply_rotary,
-        )
-    except Exception:  # pragma: no cover - compiled-path fallback
-        return _dequant_rotate_flat(
-            k_codes, k_scale, k_zero, window, cos, sin,
-            out_dtype, B, n, H, D, apply_rotary,
-        )
+    # No silent fallback: with COMPILE_READ off, fn IS the eager chain; with it on,
+    # fn is the compiled kernel and any failure propagates (kernel-or-error, see
+    # _read_fn). The eager and compiled paths are the same op sequence, so a
+    # runtime failure in the compiled one is a real failure — not a reason to
+    # quietly run the slow path under the fast path's name.
+    return fn(
+        k_codes, k_scale, k_zero, window, cos, sin,
+        out_dtype, B, n, H, D, apply_rotary,
+    )
 
 
 def _rope_cos_sin(

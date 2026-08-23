@@ -54,7 +54,7 @@ all flipped together by ``configs/eval_efficiency.yaml``):
 None of this changes what a ``native``-protocol run measures.
 """
 from __future__ import annotations
-import json, math, pathlib, time, gc
+import json, math, os, pathlib, time, gc
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -705,6 +705,15 @@ class PerfRunner:
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
             # cache_position (transformers <= 4.47).
             assert_transformers_version_supported()
+            # Realize the fused decode read path on GPU. The compiled dequant->RoPE
+            # kernel (STICKYKV_COMPILE_READ) is the intended decode fast path but is
+            # opt-in — torch.compile buys nothing on the CPU dev box. Enable it here
+            # for CUDA windowed runs so decode is measured on the fused kernel, not
+            # the ~20-launch eager chain; setdefault semantics so an explicit env
+            # (including a deliberate "0") always wins.
+            if torch.cuda.is_available() and os.environ.get("STICKYKV_COMPILE_READ") is None:
+                os.environ["STICKYKV_COMPILE_READ"] = "1"
+                log.info("enabled STICKYKV_COMPILE_READ=1 for CUDA windowed decode")
             # Fair measurement: reject a backend/attn mismatch up front, exactly
             # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
             # it, cache_package='eager' paired with flash attention (or vice
