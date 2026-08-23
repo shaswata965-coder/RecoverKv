@@ -355,7 +355,6 @@ def materialize_effective_kv(
     sink_v = fp_values[:, :, :num_sink]
     body_k = fp_keys[:, :, num_sink:]
     body_v = fp_values[:, :, num_sink:]
-    body_pos = fp_positions[:, num_sink:]
 
     # Q windows: dequantized + RoPE'd at their frozen original positions.
     # RoPE is per-token pointwise, so rotating all N_q windows in ONE call

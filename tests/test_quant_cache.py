@@ -176,6 +176,90 @@ def test_q0_store_is_none():
 
 
 # ---------------------------------------------------------------------------
+# Fused decode kernel glue (design §11 Phase 2) — the CPU-checkable half of the
+# int2-in-register decode kernel: everything but the Triton launch itself.
+# ---------------------------------------------------------------------------
+
+
+def test_two_half_rope_matches_primitive():
+    """The decode kernel's two-half RoPE reconstructs rotate_key_window exactly.
+
+    The kernel avoids a rotate-half gather by loading the two head-dim halves and
+    applying ``k_lo*c − k_hi*s`` / ``k_hi*c + k_lo*s`` with the cos/sin FIRST
+    halves. That must equal the read path's ``apply_rotary_pos_emb``
+    (rotate_key_window) the fp store and effective_q_tier use — otherwise the
+    fused decode attends mis-rotated Q keys.
+    """
+    from modules.windowed_cache.decode_kernel import rope_cos_sin_halves
+
+    torch.manual_seed(0)
+    H, T, D = 2, 6, 4
+    rope = _RealRoPE(D)
+    k_pre = torch.randn(H, T, D)
+    pos = torch.arange(T, dtype=torch.long)
+
+    k_ref = rotate_key_window(k_pre, pos, rope)                 # [H, T, D] full RoPE
+    cos_h, sin_h = rope_cos_sin_halves(rope, pos)              # [1, T, D//2]
+    half = D // 2
+    c, s = cos_h[0], sin_h[0]                                   # [T, half]
+    k_lo, k_hi = k_pre[..., :half], k_pre[..., half:]
+    k_two_half = torch.cat([k_lo * c - k_hi * s, k_hi * c + k_lo * s], dim=-1)
+    assert torch.allclose(k_two_half, k_ref, atol=1e-5)
+
+
+def test_fused_ctx_dequant_matches_effective_q_tier():
+    """The int2 fields the fused path gathers, dequantized + two-half RoPE'd as the
+    kernel does, equal ``effective_q_tier`` — so fused decode attends the SAME Q
+    keys/values as the materialize path. This proves the whole int2-in-register
+    read except the Triton launch (validated on a GPU against the reference).
+    """
+    from modules.windowed_cache.decode_kernel import rope_cos_sin_halves
+    from modules.quant.quantizer import (
+        dequantize_key_windows,
+        dequantize_value_windows,
+    )
+
+    cache = _make_cache(quant_ratio=0.5, ws=4, num_sink=0)
+    H, D, ws, B = 2, 4, 4, 1
+    _seed_prefill_state(cache, n_win=4, ws=ws)
+    st = cache._states[0]
+    st.window_scores = torch.zeros(1, 2, 4)
+    st.window_scores[0, :, 0] = 100.0
+    st.window_scores[0, :, 1] = 50.0
+    st.window_scores[0, :, 2] = 10.0
+    st.original_window_ids = torch.tensor([[0, 1, 2, 3]])
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
+    cache._evict_two_tier(0, step=2)
+    store = cache._stores[0]
+    n = store.num_active_windows
+    assert n >= 1
+
+    # Read-path reference: dequant + RoPE via the tested primitives.
+    k_ref, v_ref, _ = store.effective_q_tier(cache.rope_module, torch.float32)  # [B,H,n*ws,D]
+
+    # Mirror cache.update()'s fused-branch gather (raw int2, no dequant).
+    idx = store.table.active_order(n)
+    kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)      # flat [B*n, ...]
+    qpos_flat = qpos.reshape(B, n * ws)
+    cos_h, sin_h = rope_cos_sin_halves(cache.rope_module, qpos_flat)  # [B, n*ws, half]
+
+    # Kernel-style key reconstruction: int2 dequant (pre-RoPE) -> two-half RoPE.
+    k_pre = dequantize_key_windows(kc, ks, kz, ws, out_dtype=torch.float32)  # [B*n,H,ws,D]
+    k_pre = k_pre.reshape(B, n, H, ws, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * ws, D)
+    half = D // 2
+    c, s = cos_h[:, None], sin_h[:, None]                       # [B,1,n*ws,half]
+    k_lo, k_hi = k_pre[..., :half], k_pre[..., half:]
+    k_roped = torch.cat([k_lo * c - k_hi * s, k_hi * c + k_lo * s], dim=-1)
+    assert torch.allclose(k_roped, k_ref, atol=1e-4)
+
+    # Values: int2 dequant, no RoPE, window-major -> [B,H,n*ws,D].
+    v_pre = dequantize_value_windows(vc, vs, vz, D, out_dtype=torch.float32)  # [B*n,H,ws,D]
+    v_deq = v_pre.reshape(B, n, H, ws, D).permute(0, 2, 1, 3, 4).reshape(B, H, n * ws, D)
+    assert torch.allclose(v_deq, v_ref, atol=1e-4)
+
+
+# ---------------------------------------------------------------------------
 # Slot table + fp-rebuild invariants (Phase 1)
 # ---------------------------------------------------------------------------
 
