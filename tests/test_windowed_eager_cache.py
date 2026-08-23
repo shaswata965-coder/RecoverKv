@@ -394,19 +394,46 @@ class TestEagerHooks:
         assert scores.shape == (B, H_q, 2)  # (S - 4) = 16 / 8 = 2 windows
 
     # Replaces 21 (test_score_hook_does_not_disable_flash_attn)
-    def test_eager_hook_handles_none_attn_weights_gracefully(self):
-        """Hook should warn (not crash) when attn_weights is None."""
-        # The eager hook checks if attn_weights is None and warns
-        # We test the HookHandles + warning behavior
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            # Simulate: the hook would issue RuntimeWarning
-            warnings.warn(
-                "attn_weights is None",
-                RuntimeWarning,
-            )
-            assert len(w) == 1
-            assert "attn_weights" in str(w[0].message)
+    def test_eager_score_raises_when_attn_weights_absent(self):
+        """Eager scoring RAISES when attn_weights are absent (no silent degrade).
+
+        Reading HF's materialized attention weights IS the eager scoring path, so
+        their absence is an unrecoverable failure, not a warn-and-skip — mirroring
+        the flash backend's Triton-or-raise contract. Was previously a silent
+        warn+return that timed eviction degraded to sink+local under the config's
+        name.
+        """
+        from modules.windowed_eager_cache.hooks import score_from_attn_weights
+
+        class _Cache:
+            def __init__(self):
+                self.cache_kwargs = {0: {}}
+                self._last_score_meta = None
+
+        hs = torch.randn(1, 20, 16)
+        # output_attentions off → attn_weights is None
+        with pytest.raises(RuntimeError, match="attn_weights are absent"):
+            score_from_attn_weights((hs, None), _Cache(), 0, 4, 8)
+        # not even a 2-tuple (e.g. a bare hidden_states return)
+        with pytest.raises(RuntimeError, match="attn_weights are absent"):
+            score_from_attn_weights((hs,), _Cache(), 0, 4, 8)
+
+    def test_eager_score_reduces_when_attn_weights_present(self):
+        """With attn_weights present, per-window scores land in cache_kwargs."""
+        from modules.windowed_eager_cache.hooks import score_from_attn_weights
+
+        class _Cache:
+            def __init__(self):
+                self.cache_kwargs = {0: {}}
+                self._last_score_meta = None
+
+        B, H_q, T, S = 1, 8, 20, 20
+        cache = _Cache()
+        score_from_attn_weights(
+            (torch.randn(B, T, 16), torch.rand(B, H_q, T, S)), cache, 0, 4, 8
+        )
+        scores = cache.cache_kwargs[0]["window_scores"]
+        assert scores.shape == (B, H_q, (S - 4) // 8)  # (20 - 4) / 8 = 2 windows
 
     # New eager-specific test
     def test_eager_requires_output_attentions_pairing(self):

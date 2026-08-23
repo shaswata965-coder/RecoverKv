@@ -7,7 +7,10 @@ reads it directly — no monkey-patch, no captured q/k, no auxiliary pass.
 
 Runner contract: the runner **must** pass ``output_attentions=True`` to
 ``model.generate(...)`` / ``model.forward(...)``.  Without it, HF returns
-``None`` for attn_weights and the hook warns once and skips.
+``None`` for attn_weights and the hook **raises** — reading those weights IS the
+eager scoring path, so their absence is an unrecoverable failure, not a
+warn-and-skip (it would otherwise time eviction degraded to sink+local under the
+config's name). This mirrors the flash backend's Triton-or-raise contract.
 
 Scoring policy: H2O-style cumulative.  Every query row in the current
 forward pass contributes to the per-key score; the cache's ``update()``
@@ -46,6 +49,58 @@ def _get_attn_classes() -> Tuple:
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
     return tuple(classes)
+
+
+def score_from_attn_weights(output, cache, layer_idx, num_sink, window_size):
+    """Reduce an eager attention module's output to per-window scores, or RAISE.
+
+    Reading HF's materialized ``attn_weights`` **is** the eager backend's scoring
+    path. If they are absent — the module did not run eager attention, or
+    ``output_attentions=True`` was not passed — there is nothing to score, and a
+    silent skip would time a DIFFERENT method (eviction degraded to sink+local)
+    under this config's name. So this RAISES instead of degrading, mirroring the
+    flash backend's Triton-or-raise contract (score_kernel.compute_token_scores).
+
+    Lives at module scope (not inside the hook closure) so the fail-hard contract
+    is unit-testable without a real attention module.
+    """
+    if not isinstance(output, tuple) or len(output) < 2 or output[1] is None:
+        raise RuntimeError(
+            "Eager score hook: attn_weights are absent from the attention "
+            "output. The eager backend scores by reading HF's materialized "
+            "attention weights, which requires attn_implementation='eager' AND "
+            "output_attentions=True on every forward. Without them scoring is "
+            "impossible and eviction would silently degrade to sink+local, so "
+            "this fails rather than mis-measure the method. Pair the eager cache "
+            "package with eager attention (validate_backend_attn_pairing) and "
+            "pass output_attentions=True."
+        )
+
+    # attn_weights: [B, H_q, T, S] over the effective-K axis. Sum across the T
+    # (query) axis — every query row contributes (H2O cumulative, no obs_window)
+    # — to per-key received attention.
+    token_scores = output[1].sum(dim=-2)                 # [B, H_q, S]
+
+    # At q > 0 the effective K is the unsorted [sink ‖ body ‖ Q] layout, so the
+    # key axis of attn_weights is unsorted too; undo it on the score axis with
+    # the scatter map update() stashed this pass (bit-identical to the old sorted
+    # reduce). Otherwise it is a single ascending-id run and the plain contiguous
+    # reduce applies.
+    meta_stash = getattr(cache, "_last_score_meta", None)
+    score_meta = meta_stash[layer_idx] if meta_stash is not None else None
+    if score_meta is not None:
+        order, q_token_len = score_meta
+        scores = reduce_two_tier_scores(
+            token_scores, num_sink, window_size, q_token_len, order
+        )
+        meta_stash[layer_idx] = None
+    else:
+        scores = reduce_token_scores_to_windows(
+            token_scores, num_sink, window_size
+        )
+
+    # Push into cache_kwargs; cache.update() accumulates across steps.
+    cache.cache_kwargs[layer_idx]["window_scores"] = scores
 
 
 # Guards the one-per-process "which scoring path" banner (install runs per
@@ -131,8 +186,6 @@ def install_score_hooks(
             flush=True,
         )
 
-    warned_once = [False]
-
     # Discover attention modules
     layer_idx_map: Dict[int, int] = {}
     layer_idx = 0
@@ -149,59 +202,14 @@ def install_score_hooks(
 
         def make_hook(lidx):
             def score_hook(module, input, output):
-                # output = (hidden_states, attn_weights, past_key_value)
-                # when output_attentions=True
-                if not isinstance(output, tuple) or len(output) < 2:
-                    if not warned_once[0]:
-                        warnings.warn(
-                            "Eager hook: output is not a tuple with attn_weights. "
-                            "Ensure output_attentions=True is passed to model.forward().",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                        warned_once[0] = True
-                    return
-
-                attn_weights = output[1]
-
-                if attn_weights is None:
-                    if not warned_once[0]:
-                        warnings.warn(
-                            "Eager hook: attn_weights is None. "
-                            "Ensure output_attentions=True is passed to model.generate(). "
-                            "Without attention weights, scoring is disabled and eviction "
-                            "degrades to sink+local only.",
-                            RuntimeWarning,
-                            stacklevel=2,
-                        )
-                        warned_once[0] = True
-                    return
-
-                # attn_weights: [B, H_q, T, S] over the effective-K axis. Sum
-                # across the T (query) axis — every query row contributes (H2O
-                # cumulative, no obs_window) — to per-key received attention.
-                token_scores = attn_weights.sum(dim=-2)          # [B, H_q, S]
-
-                # At q > 0 the effective K is the unsorted [sink ‖ body ‖ Q]
-                # layout, so the key axis of attn_weights is unsorted too; undo
-                # it on the score axis with the scatter map update() stashed this
-                # pass (bit-identical to the old sorted reduce). Otherwise it is a
-                # single ascending-id run and the plain contiguous reduce applies.
-                meta_stash = getattr(cache, "_last_score_meta", None)
-                score_meta = meta_stash[lidx] if meta_stash is not None else None
-                if score_meta is not None:
-                    order, q_token_len = score_meta
-                    scores = reduce_two_tier_scores(
-                        token_scores, num_sink, window_size, q_token_len, order
-                    )
-                    meta_stash[lidx] = None
-                else:
-                    scores = reduce_token_scores_to_windows(
-                        token_scores, num_sink, window_size
-                    )
-
-                # Push into cache_kwargs; cache.update() accumulates across steps.
-                cache.cache_kwargs[lidx]["window_scores"] = scores
+                # output = (hidden_states, attn_weights, past_key_value) when
+                # output_attentions=True. Reducing to per-window scores — and
+                # RAISING if the weights are absent (eager-or-fail, mirroring the
+                # flash Triton-or-raise contract) — lives in the module-level
+                # helper so it is unit-testable without a real attention module.
+                score_from_attn_weights(
+                    output, cache, lidx, num_sink, window_size
+                )
 
             return score_hook
 

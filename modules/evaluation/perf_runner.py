@@ -700,10 +700,19 @@ class PerfRunner:
             from utils.cache_factory import (
                 assert_transformers_version_supported,
                 get_cache_classes,
+                validate_backend_attn_pairing,
             )
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
             # cache_position (transformers <= 4.47).
             assert_transformers_version_supported()
+            # Fair measurement: reject a backend/attn mismatch up front, exactly
+            # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
+            # it, cache_package='eager' paired with flash attention (or vice
+            # versa) would install a score hook that never gets its inputs and
+            # silently time the degraded sink+local method under this config's
+            # name — the one measurement-integrity hole Suite C had. Raises
+            # ConfigValidationError, caught per-config as `errored` (not `oom`).
+            validate_backend_attn_pairing(cache_pkg, attn_impl)
             WC, WCC, install_hooks = get_cache_classes(cache_pkg)
             # Window geometry is per-config-overridable, like cache_budget and
             # quant_ratio, so one run can sweep window_size across rows instead
