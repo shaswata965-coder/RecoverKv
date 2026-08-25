@@ -1,0 +1,919 @@
+<title>Decode Throughput Benchmarks</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Libre+Franklin:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --bg: #f4f5f3;
+    --surface: #ffffff;
+    --surface-alt: #eceeea;
+    --surface-strong: #e2e5de;
+    --ink: #1c211d;
+    --ink-soft: #565f57;
+    --ink-faint: #8b938a;
+    --rule: #d7dbd3;
+    --rule-strong: #b9c0b4;
+    --accent-a: #2f6f5e;
+    --accent-a-soft: #e3efea;
+    --accent-b: #a2622b;
+    --accent-b-soft: #f4e9dc;
+    --accent-c: #3d5a8a;
+    --accent-c-soft: #e4eaf5;
+    --accent-d: #7a4f9c;
+    --accent-d-soft: #ece2f3;
+    --accent-e: #b0473f;
+    --accent-e-soft: #f6e2e0;
+    --accent-f: #1f7a8c;
+    --accent-f-soft: #e0eef0;
+    --accent-g: #74782b;
+    --accent-g-soft: #eef0dc;
+    --accent-h: #3a4f80;
+    --accent-h-soft: #e2e6f2;
+    --danger: #a3402f;
+    --danger-soft: #f6e4df;
+    --focus: #2f6f5e;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14170f;
+      --surface: #1b1f18;
+      --surface-alt: #21261e;
+      --surface-strong: #262c22;
+      --ink: #eceee7;
+      --ink-soft: #a7ada0;
+      --ink-faint: #767d70;
+      --rule: #333a2e;
+      --rule-strong: #454e3d;
+      --accent-a: #74c2a9;
+      --accent-a-soft: #1e3229;
+      --accent-b: #d9a25f;
+      --accent-b-soft: #34291a;
+      --accent-c: #86a6dd;
+      --accent-c-soft: #202940;
+      --accent-d: #c39bdf;
+      --accent-d-soft: #2f2338;
+      --accent-e: #e08e85;
+      --accent-e-soft: #3a231f;
+      --accent-f: #6ec3d4;
+      --accent-f-soft: #1a2f33;
+      --accent-g: #c3c96e;
+      --accent-g-soft: #2c2e18;
+      --accent-h: #97aae0;
+      --accent-h-soft: #202538;
+      --danger: #dd8871;
+      --danger-soft: #3a251f;
+      --focus: #74c2a9;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #14170f;
+    --surface: #1b1f18;
+    --surface-alt: #21261e;
+    --surface-strong: #262c22;
+    --ink: #eceee7;
+    --ink-soft: #a7ada0;
+    --ink-faint: #767d70;
+    --rule: #333a2e;
+    --rule-strong: #454e3d;
+    --accent-a: #74c2a9;
+    --accent-a-soft: #1e3229;
+    --accent-b: #d9a25f;
+    --accent-b-soft: #34291a;
+    --accent-c: #86a6dd;
+    --accent-c-soft: #202940;
+    --accent-d: #c39bdf;
+    --accent-d-soft: #2f2338;
+    --accent-e: #e08e85;
+    --accent-e-soft: #3a231f;
+    --accent-f: #6ec3d4;
+    --accent-f-soft: #1a2f33;
+    --accent-g: #c3c96e;
+    --accent-g-soft: #2c2e18;
+    --accent-h: #97aae0;
+    --accent-h-soft: #202538;
+    --danger: #dd8871;
+    --danger-soft: #3a251f;
+    --focus: #74c2a9;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Libre Franklin", system-ui, sans-serif;
+    padding: 56px 24px 72px;
+    display: flex;
+    justify-content: center;
+  }
+
+  main {
+    width: 100%;
+    max-width: 980px;
+  }
+
+  header {
+    margin-bottom: 34px;
+  }
+
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+    color: var(--accent-a);
+    margin: 0 0 10px;
+  }
+
+  h1 {
+    font-size: clamp(28px, 4vw, 36px);
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    line-height: 1.1;
+    margin: 0 0 12px;
+    text-wrap: balance;
+  }
+
+  .dek {
+    font-size: 15.5px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    max-width: 68ch;
+    margin: 0 0 16px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 18px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .legend li {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+  }
+
+  .legend .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+  }
+  .dot-snapkv { background: var(--accent-a); }
+  .dot-streaming { background: var(--accent-b); }
+  .dot-eager { background: var(--accent-c); }
+  .dot-flash { background: var(--accent-d); }
+  .dot-defensivekv { background: var(--accent-e); }
+  .dot-qevict { background: var(--accent-f); }
+  .dot-kivi2 { background: var(--accent-g); }
+  .dot-kivi4 { background: var(--accent-h); }
+
+  .table-shell {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 760px;
+  }
+
+  caption {
+    caption-side: top;
+    text-align: left;
+    padding: 18px 22px 4px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  thead th {
+    text-align: right;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding: 14px 22px 12px;
+    border-bottom: 1px solid var(--rule-strong);
+    white-space: nowrap;
+  }
+
+  thead th:first-child,
+  thead th:nth-child(2) {
+    text-align: left;
+  }
+
+  tbody td {
+    padding: 13px 22px;
+    font-size: 14.5px;
+    text-align: right;
+    border-bottom: 1px solid var(--rule);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  tbody tr:last-child td {
+    border-bottom: none;
+  }
+
+  tbody td:first-child,
+  tbody td:nth-child(2) {
+    text-align: left;
+  }
+
+  /* batch super-group divider */
+  tr.batch-row th {
+    text-align: left;
+    padding: 12px 22px;
+    background: var(--surface-strong);
+    border-top: 1px solid var(--rule-strong);
+    border-bottom: 1px solid var(--rule-strong);
+  }
+
+  tr.batch-row:first-child th {
+    border-top: none;
+  }
+
+  .batch-label {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--ink);
+  }
+
+  .batch-label .n {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    color: var(--accent-a);
+    margin-right: 3px;
+  }
+
+  .batch-sub {
+    font-size: 11.5px;
+    font-weight: 500;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--ink-faint);
+    margin-left: 10px;
+  }
+
+  /* shape sub-group divider (within a batch block) */
+  tr.shape-row td {
+    padding: 8px 22px 8px 40px;
+    background: color-mix(in srgb, var(--surface-alt) 70%, transparent);
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .shape-row-label {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+
+  .shape-row-label .val {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12.5px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--ink-soft);
+  }
+
+  tbody tr.data-row:nth-of-type(even) {
+    background: color-mix(in srgb, var(--surface-alt) 45%, transparent);
+  }
+
+  .method-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12.5px;
+    font-weight: 500;
+    padding: 4px 10px 4px 8px;
+    border-radius: 999px;
+  }
+
+  .method-badge::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+  }
+
+  .method-snapkv {
+    color: var(--accent-a);
+    background: var(--accent-a-soft);
+  }
+  .method-snapkv::before { background: var(--accent-a); }
+
+  .method-streaming {
+    color: var(--accent-b);
+    background: var(--accent-b-soft);
+  }
+  .method-streaming::before { background: var(--accent-b); }
+
+  .method-eager {
+    color: var(--accent-c);
+    background: var(--accent-c-soft);
+  }
+  .method-eager::before { background: var(--accent-c); }
+
+  .method-flash {
+    color: var(--accent-d);
+    background: var(--accent-d-soft);
+  }
+  .method-flash::before { background: var(--accent-d); }
+
+  .method-defensivekv {
+    color: var(--accent-e);
+    background: var(--accent-e-soft);
+  }
+  .method-defensivekv::before { background: var(--accent-e); }
+
+  .method-qevict {
+    color: var(--accent-f);
+    background: var(--accent-f-soft);
+  }
+  .method-qevict::before { background: var(--accent-f); }
+
+  .method-kivi2 {
+    color: var(--accent-g);
+    background: var(--accent-g-soft);
+  }
+  .method-kivi2::before { background: var(--accent-g); }
+
+  .method-kivi4 {
+    color: var(--accent-h);
+    background: var(--accent-h-soft);
+  }
+  .method-kivi4::before { background: var(--accent-h); }
+
+  .oom {
+    display: inline-block;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--danger);
+    background: var(--danger-soft);
+    padding: 2px 8px;
+    border-radius: 5px;
+  }
+
+  .dash {
+    color: var(--ink-faint);
+  }
+
+  .shape {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 13px;
+    color: var(--ink-soft);
+  }
+
+  .metric-primary {
+    color: var(--ink);
+    font-weight: 600;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+  }
+
+  .metric {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    color: var(--ink-soft);
+  }
+
+  .mem-flag {
+    color: var(--ink-faint);
+    font-size: 11px;
+    font-family: "Libre Franklin", sans-serif;
+    margin-left: 3px;
+    vertical-align: 1px;
+  }
+
+  .mem-extra {
+    display: block;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 11px;
+    color: var(--ink-faint);
+    margin-top: 2px;
+  }
+
+  tfoot td {
+    padding: 13px 22px 16px;
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--ink-faint);
+    border-top: 1px solid var(--rule);
+  }
+
+  footer.note {
+    margin-top: 18px;
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    max-width: 68ch;
+    line-height: 1.6;
+  }
+
+  footer.note p {
+    margin: 0 0 6px;
+  }
+  footer.note p:last-child {
+    margin-bottom: 0;
+  }
+
+  @media (max-width: 560px) {
+    body { padding: 36px 14px 56px; }
+    thead th, tbody td, tr.batch-row th { padding: 12px 14px; }
+  }
+</style>
+
+<main>
+  <header>
+    <p class="eyebrow">Decode-phase evaluation &middot; batched inference</p>
+    <h1>KV-cache strategies, side by side across shape and batch size</h1>
+    <p class="dek">
+      SnapKV, StreamingLLM, DefensiveKV, QEvict, and KIVI (eviction and quantization) against
+      eager and flash-attention FullKV (no eviction), grouped by batch size, then by
+      prefill/decode shape &mdash; within each shape, methods are ranked fastest to slowest
+      by throughput.
+    </p>
+    <ul class="legend">
+      <li><span class="dot dot-snapkv"></span>SnapKV</li>
+      <li><span class="dot dot-streaming"></span>StreamingLLM</li>
+      <li><span class="dot dot-eager"></span>FullKV &middot; eager</li>
+      <li><span class="dot dot-flash"></span>FullKV &middot; flash</li>
+      <li><span class="dot dot-defensivekv"></span>DefensiveKV</li>
+      <li><span class="dot dot-qevict"></span>QEvict</li>
+      <li><span class="dot dot-kivi2"></span>KIVI &middot; int2</li>
+      <li><span class="dot dot-kivi4"></span>KIVI &middot; int4</li>
+    </ul>
+  </header>
+
+  <div class="table-shell">
+    <div class="table-scroll">
+      <table>
+        <caption>All methods &middot; grouped by batch, then shape, ranked by throughput</caption>
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th>Shape (prefill / decode)</th>
+            <th>TTFT (s)</th>
+            <th>TPOT (s)</th>
+            <th>Throughput (tok/s)</th>
+            <th>Peak mem (GB)</th>
+          </tr>
+        </thead>
+        <tbody>
+
+          <!-- ===== BATCH = 1 ===== -->
+          <tr class="batch-row">
+            <th colspan="6"><span class="batch-label"><span class="n">Batch 1</span>&mdash; single-sequence decode<span class="batch-sub">FullKV (eager/flash) plus eviction &amp; quantization methods</span></span></th>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">1048 / 1048</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-defensivekv">DefensiveKV</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.174</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.8</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.099</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.1</td>
+            <td class="metric">63.28<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.138</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.0</td>
+            <td class="metric">59.75<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.100</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">40.2</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.110</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">40.0</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.104</td>
+            <td class="metric">0.043</td>
+            <td class="metric-primary">23.3</td>
+            <td class="metric">15.77</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.105</td>
+            <td class="metric">0.043</td>
+            <td class="metric-primary">23.0</td>
+            <td class="metric">15.76</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">0.443</td>
+            <td class="metric">0.1031</td>
+            <td class="metric-primary">9.7</td>
+            <td class="metric">15.26<span class="mem-extra">steady 15.95</span></td>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">2048 / 512</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-defensivekv">DefensiveKV</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.258</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.9</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.286</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.3</td>
+            <td class="metric">59.75<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.173</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.2</td>
+            <td class="metric">63.28<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.174</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">40.3</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.187</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">39.9</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.183</td>
+            <td class="metric">0.043</td>
+            <td class="metric-primary">23.3</td>
+            <td class="metric">16.53</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.184</td>
+            <td class="metric">0.044</td>
+            <td class="metric-primary">22.9</td>
+            <td class="metric">16.50</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">0.531</td>
+            <td class="metric">0.1017</td>
+            <td class="metric-primary">9.8</td>
+            <td class="metric">15.53<span class="mem-extra">steady 16.38</span></td>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">4096 / 256</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-defensivekv">DefensiveKV</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.430</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.8</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.744</td>
+            <td class="metric">0.024</td>
+            <td class="metric-primary">41.5</td>
+            <td class="metric">59.75<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.335</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">40.7</td>
+            <td class="metric">63.28<span class="mem-flag">&dagger;</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.333</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">39.9</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.339</td>
+            <td class="metric">0.025</td>
+            <td class="metric-primary">39.5</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.367</td>
+            <td class="metric">0.043</td>
+            <td class="metric-primary">23.0</td>
+            <td class="metric">18.10</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.360</td>
+            <td class="metric">0.044</td>
+            <td class="metric-primary">22.9</td>
+            <td class="metric">18.03</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">0.724</td>
+            <td class="metric">0.1047</td>
+            <td class="metric-primary">9.6</td>
+            <td class="metric">16.06<span class="mem-extra">steady 17.03</span></td>
+          </tr>
+
+          <!-- ===== BATCH = 32 ===== -->
+          <tr class="batch-row">
+            <th colspan="6"><span class="batch-label"><span class="n">Batch 32</span>&mdash; up to seven methods tested<span class="batch-sub">SnapKV &amp; StreamingLLM only at 4096/256 and 2048/512; QEvict and KIVI skip 256/1024; both KIVI variants OOM at 4096/256</span></span></th>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">256 / 1024</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">256 / 1024</td>
+            <td class="metric">0.605</td>
+            <td class="metric">0.030</td>
+            <td class="metric-primary">1059.3</td>
+            <td class="metric">20.04</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">256 / 1024</td>
+            <td class="metric">0.672</td>
+            <td class="metric">0.062</td>
+            <td class="metric-primary">512.6</td>
+            <td class="metric">20.60</td>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">1048 / 1048</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">2.505</td>
+            <td class="metric">0.043</td>
+            <td class="metric-primary">743.4</td>
+            <td class="metric">63.28</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">2.766</td>
+            <td class="metric">0.044</td>
+            <td class="metric-primary">723.2</td>
+            <td class="metric">40.29</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">2.754</td>
+            <td class="metric">0.046</td>
+            <td class="metric-primary">693.9</td>
+            <td class="metric">40.76</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">3.766</td>
+            <td class="metric">0.107</td>
+            <td class="metric-primary">298.3</td>
+            <td class="metric">59.75</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">2.954</td>
+            <td class="metric">0.1082</td>
+            <td class="metric-primary">296.1</td>
+            <td class="metric">23.79<span class="mem-extra">steady 26.96</span></td>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">2048 / 512</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">5.016</td>
+            <td class="metric">0.028</td>
+            <td class="metric-primary">1128.9</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">4.870</td>
+            <td class="metric">0.028</td>
+            <td class="metric-primary">1127.7</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">5.531</td>
+            <td class="metric">0.049</td>
+            <td class="metric-primary">647.4</td>
+            <td class="metric">64.15</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">5.518</td>
+            <td class="metric">0.054</td>
+            <td class="metric-primary">588.5</td>
+            <td class="metric">65.12</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">4.911</td>
+            <td class="metric">0.055</td>
+            <td class="metric-primary">582.3</td>
+            <td class="metric">63.28</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="metric">5.750</td>
+            <td class="metric">0.1142</td>
+            <td class="metric-primary">280.2</td>
+            <td class="metric">32.13<span class="mem-extra">steady 38.52</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">2048 / 512</td>
+            <td class="oom">OOM</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">4096 / 256</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">10.309</td>
+            <td class="metric">0.033</td>
+            <td class="metric-primary">973.6</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">10.480</td>
+            <td class="metric">0.033</td>
+            <td class="metric-primary">972.0</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-flash">Flash</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">10.783</td>
+            <td class="metric">0.086</td>
+            <td class="metric-primary">370.8</td>
+            <td class="metric">63.28</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-qevict">QEvict</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="metric">11.857</td>
+            <td class="metric">0.1768</td>
+            <td class="metric-primary">181.0</td>
+            <td class="metric">49.20<span class="mem-extra">steady 61.24</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-eager">Eager</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="oom">OOM</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi2">KIVI &middot; int2</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="oom">OOM</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-kivi4">KIVI &middot; int4</span></td>
+            <td class="shape">4096 / 256</td>
+            <td class="oom">OOM</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+            <td class="dash">&ndash;</td>
+          </tr>
+
+          <!-- ===== BATCH = 64 ===== -->
+          <tr class="batch-row">
+            <th colspan="6"><span class="batch-label"><span class="n">Batch 64</span>&mdash; eviction methods only<span class="batch-sub">no FullKV run at this batch size</span></span></th>
+          </tr>
+
+          <tr class="shape-row"><td colspan="6"><span class="shape-row-label">Prefill / decode <span class="val">1048 / 1048</span></span></td></tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-snapkv">SnapKV</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">5.113</td>
+            <td class="metric">0.040</td>
+            <td class="metric-primary">1590.4</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+          <tr class="data-row">
+            <td><span class="method-badge method-streaming">StreamingLLM</span></td>
+            <td class="shape">1048 / 1048</td>
+            <td class="metric">4.944</td>
+            <td class="metric">0.040</td>
+            <td class="metric-primary">1586.8</td>
+            <td class="metric">50.48<span class="mem-flag">*</span></td>
+          </tr>
+
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="6">Shape is prefill tokens / decode tokens; batch size is shown by the group header above each block. Within a shape, rows run fastest to slowest by throughput. OOM rows ran out of memory before producing timing data.</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </div>
+
+  <footer class="note">
+    <p>* SnapKV and StreamingLLM peak-memory reads are flat at 50.48&nbsp;GB across every one of
+    their runs because CUDA's peak-allocation counter was not reset between cells &mdash; the
+    figure is the high-water mark of the whole sweep, not this row's run in isolation.</p>
+    <p>&dagger; The batch-1 FullKV peak-memory figures match the batch-32 high-water mark from
+    earlier in the same sweep, for the same reason &mdash; inherited, not measured fresh per row.</p>
+    <p>SnapKV, StreamingLLM, and DefensiveKV at batch&nbsp;1 come from a separate sweep that
+    didn't record peak-memory allocation, hence the dashes.</p>
+    <p>QEvict's memory column shows two figures: the run's peak allocated GB, and (below it)
+    the steady-state KV cache footprint in GB once decode stabilizes.</p>
+  </footer>
+</main>
