@@ -834,6 +834,130 @@ def test_flash_eager_two_tier_parity(B):
 
 
 # ---------------------------------------------------------------------------
+# Fused hand-off memoization — the per-layer/per-step launch-overhead fix.
+# The claim under test is EQUIVALENCE, not speed: what the memo hands back must
+# be what a recompute would have produced, tensor for tensor.
+# ---------------------------------------------------------------------------
+
+
+def _fresh_fused_ctx(cache, layer_idx=0):
+    """Rebuild the fused hand-off from scratch — the pre-memo code path, verbatim."""
+    from modules.windowed_cache.decode_kernel import rope_cos_sin_halves
+    from modules.quant.effective import compute_score_meta
+
+    state = cache._states[layer_idx]
+    store = cache._stores[layer_idx]
+    n = store.num_active_windows
+    B = state.key_states.shape[0]
+    ws = cache.resolved.window_size
+    idx = store.table.active_order(n)
+    kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
+    qtier = {
+        "k_codes": kc.reshape(B, n, *kc.shape[1:]),
+        "k_scale": ks.reshape(B, n, *ks.shape[1:]),
+        "k_zero": kz.reshape(B, n, *kz.shape[1:]),
+        "v_codes": vc.reshape(B, n, *vc.shape[1:]),
+        "v_scale": vs.reshape(B, n, *vs.shape[1:]),
+        "v_zero": vz.reshape(B, n, *vz.shape[1:]),
+    }
+    qpos_flat = qpos.reshape(B, n * ws)
+    qtier["cos"], qtier["sin"] = rope_cos_sin_halves(cache.rope_module, qpos_flat)
+    meta = compute_score_meta(
+        state.position_ids, qpos_flat, cache.resolved.num_sink_tokens, ws
+    )
+    return qtier, meta
+
+
+def _seeded_fused_cache(ws=4):
+    """A layer-0 cache past its first two-tier eviction, armed for fused decode."""
+    cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=0)
+    _seed_prefill_state(cache, n_win=4, ws=ws)
+    st = cache._states[0]
+    st.window_scores = torch.zeros(1, 2, 4)
+    st.window_scores[0, :, 0] = 100.0
+    st.window_scores[0, :, 1] = 50.0
+    st.window_scores[0, :, 2] = 10.0
+    st.original_window_ids = torch.tensor([[0, 1, 2, 3]])
+    pol = cache._policies[0]
+    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
+    cache._evict_two_tier(0, step=2)
+    cache._prefill_done[0] = True
+    cache._fused_decode_active = True
+    return cache
+
+
+def _drive_decode_step(cache, pos):
+    """One decode update(); returns the ctx the fused path armed (and disarms it)."""
+    from modules.windowed_cache import flash_decode
+
+    k = torch.randn(1, 2, 1, 4)
+    cache.update(k, k.clone(), 0,
+                 cache_kwargs={"cache_position": torch.tensor([pos])})
+    ctx = flash_decode._PENDING["ctx"]
+    # Stand in for the wrapper consuming it (the Triton launch is GPU-only).
+    flash_decode._PENDING["ctx"] = None
+    return ctx
+
+
+def test_memoized_fused_ctx_equals_a_fresh_rebuild_every_step():
+    """Every memoized hand-off is tensor-for-tensor what a rebuild would produce.
+
+    This is the whole safety argument for hoisting the gather / RoPE / argsort out
+    of the per-layer-per-step path: design §10 freezes Q entries between evictions,
+    so the memo can only return the same values — never merely equivalent ones.
+    """
+    cache = _seeded_fused_cache(ws=4)
+    compared = 0
+    for step, pos in enumerate(range(16, 21)):
+        ctx = _drive_decode_step(cache, pos)
+        if ctx is None:                       # Q tier emptied — nothing to compare
+            continue
+        compared += 1
+        want_q, want_meta = _fresh_fused_ctx(cache)
+        for field, got in ctx["qtier"].items():
+            if field == "window_size":
+                continue
+            assert torch.equal(got, want_q[field]), f"step {step}: {field} diverged"
+        assert torch.equal(ctx["score_meta"][0], want_meta[0]), f"step {step}: order"
+        assert ctx["score_meta"][1] == want_meta[1], f"step {step}: q_token_len"
+    # Guard against the loop quietly going vacuous if the fixture drifts.
+    assert compared >= 4, f"only {compared} fused steps exercised"
+
+
+def test_fused_ctx_is_reused_between_evictions_and_dropped_by_one():
+    """The memo actually hits (same object) and an eviction actually drops it.
+
+    Without the first half the fix does nothing; without the second it would serve
+    a stale Q tier after the active set moves.
+    """
+    cache = _seeded_fused_cache(ws=4)
+    first = _drive_decode_step(cache, 16)
+    assert first is not None
+    second = _drive_decode_step(cache, 17)
+    # Same epoch -> the identical dict, not a rebuilt copy.
+    assert second["qtier"] is first["qtier"]
+
+    cache._evict_two_tier(0, step=4)
+    after = _drive_decode_step(cache, 18)
+    if after is not None:
+        assert after["qtier"] is not first["qtier"]
+        want_q, _ = _fresh_fused_ctx(cache)
+        assert torch.equal(after["qtier"]["k_codes"], want_q["k_codes"])
+
+
+def test_store_version_bump_invalidates_the_memo():
+    """Any Q-store mutation invalidates, not just the eviction entry point."""
+    cache = _seeded_fused_cache(ws=4)
+    first = _drive_decode_step(cache, 16)
+    assert first is not None
+    cache._stores[0]._invalidate()            # what every store mutator calls
+    again = _drive_decode_step(cache, 17)
+    assert again["qtier"] is not first["qtier"]
+    want_q, _ = _fresh_fused_ctx(cache)
+    assert torch.equal(again["qtier"]["k_codes"], want_q["k_codes"])
+
+
+# ---------------------------------------------------------------------------
 # Triton-or-error, proven at RUNTIME (not just at hook install).
 # ---------------------------------------------------------------------------
 

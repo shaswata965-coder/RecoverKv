@@ -130,6 +130,12 @@ class WindowedCache(_HFCacheBase):
         # materialize read path. See update()'s q>0 return.
         self._fused_decode_active: bool = False
 
+        # Per-layer memo for the fused hand-off (Q-tier gather + RoPE halves +
+        # score-scatter map). Keyed on `store.version` and the fp body's window
+        # count, so it can only ever hand back what a recompute would produce;
+        # _evict_two_tier drops it outright as a second line of defence.
+        self._fused_ctx: List[Optional[Dict[str, Any]]] = [None] * num_layers
+
         # Per-layer state and policy. The fp store is preallocated so append()
         # never re-cats the whole store (BATCHING_PLAN.md §5: at max batch that
         # copy is ~4x the weight traffic and the largest single term in the step).
@@ -442,36 +448,20 @@ class WindowedCache(_HFCacheBase):
             # through to the materialize path below, unchanged.
             if (self._fused_decode_active and not is_prefill
                     and store is not None and store.num_active_windows > 0):
-                from modules.quant.effective import compute_score_meta
-                from .decode_kernel import rope_cos_sin_halves
                 from . import flash_decode
-                # Gather the active Q windows' RAW int2 fields (no dequant — the
-                # kernel unpacks + dequants + RoPEs in registers), plus the RoPE
-                # halves (position-only, cheap) and the score-scatter map.
                 n = store.num_active_windows
                 B = state.key_states.shape[0]
                 ws = self.resolved.window_size
-                idx = store.table.active_order(n)                     # [B, n] slots
-                kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
-                kc = kc.reshape(B, n, *kc.shape[1:])
-                ks = ks.reshape(B, n, *ks.shape[1:])
-                kz = kz.reshape(B, n, *kz.shape[1:])
-                vc = vc.reshape(B, n, *vc.shape[1:])
-                vs = vs.reshape(B, n, *vs.shape[1:])
-                vz = vz.reshape(B, n, *vz.shape[1:])
-                qpos_flat = qpos.reshape(B, n * ws)
-                cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
-                score_meta = compute_score_meta(
-                    state.position_ids, qpos_flat,
-                    self.resolved.num_sink_tokens, ws,
-                )
+                # Both hand-offs are MEMOIZED (see _fused_qtier / _fused_meta):
+                # everything the kernel needs except this step's query is frozen
+                # between evictions, so rebuilding it per layer per step was pure
+                # launch overhead. Identical tensors either way — same values, not
+                # merely equivalent ones.
+                qtier = self._fused_qtier(layer_idx, store, B, n, ws)
+                score_meta = self._fused_meta(layer_idx, state, ws)
                 flash_decode.set_pending({
                     "layer_idx": layer_idx,
-                    "qtier": {
-                        "k_codes": kc, "k_scale": ks, "k_zero": kz,
-                        "v_codes": vc, "v_scale": vs, "v_zero": vz,
-                        "cos": cos_h, "sin": sin_h, "window_size": ws,
-                    },
+                    "qtier": qtier,
                     "score_meta": score_meta,
                     "num_sink": self.resolved.num_sink_tokens,
                     "window_size": ws,
@@ -492,6 +482,94 @@ class WindowedCache(_HFCacheBase):
             self._last_score_meta[layer_idx] = score_meta
             return eff_k, eff_v
         return state.key_states, state.value_states
+
+    # -----------------------------------------------------------------
+    # Fused-decode hand-off, memoized (design §10 — entries are write-once)
+    # -----------------------------------------------------------------
+
+    def _fused_qtier(self, layer_idx: int, store, B: int, n: int, ws: int) -> Dict:
+        """The kernel's Q-tier context — gathered int2 fields + RoPE halves.
+
+        **Rebuilt only when the Q tier changes.** design §10 makes every entry
+        write-once and moves the active set only at eviction, so between
+        evictions the gathered codes/scales/zeros, the frozen positions, and the
+        ``cos``/``sin`` those positions produce are all constant — the same
+        memoization contract ``QuantizedStore.effective_q_tier`` already uses for
+        the materialize path, keyed on the same ``store.version`` (bumped by
+        every mutator: retain_only / reactivate_many / demote_many / promote_many).
+
+        Rebuilding it per layer per step was ~21 kernel launches of pure repeat
+        work — 8 for the gather, 10 for the rotary module, 3 for the ``argsort``
+        that orders the slots. Measured over one eviction cycle, memoizing takes a
+        non-eviction ``update()`` from 30 launches to 5; at 32 layers that is ~800
+        fewer launches per generated token, and at these shapes decode is bound by
+        launch count, not by the kernel those launches feed.
+
+        The returned tensors are read-only to the kernel and to
+        :mod:`flash_decode`, so handing out the same objects across steps is safe.
+        """
+        slot = self._fused_ctx[layer_idx]
+        key = (store.version, n, B)
+        if slot is not None and slot["qkey"] == key:
+            return slot["qtier"]
+
+        from .decode_kernel import rope_cos_sin_halves
+
+        # Gather the active Q windows' RAW int2 fields (no dequant — the kernel
+        # unpacks + dequants + RoPEs in registers), plus the RoPE halves
+        # (position-only) the kernel applies in registers.
+        idx = store.table.active_order(n)                     # [B, n] slots
+        kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
+        kc = kc.reshape(B, n, *kc.shape[1:])
+        ks = ks.reshape(B, n, *ks.shape[1:])
+        kz = kz.reshape(B, n, *kz.shape[1:])
+        vc = vc.reshape(B, n, *vc.shape[1:])
+        vs = vs.reshape(B, n, *vs.shape[1:])
+        vz = vz.reshape(B, n, *vz.shape[1:])
+        qpos_flat = qpos.reshape(B, n * ws)
+        cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
+        qtier = {
+            "k_codes": kc, "k_scale": ks, "k_zero": kz,
+            "v_codes": vc, "v_scale": vs, "v_zero": vz,
+            "cos": cos_h, "sin": sin_h, "window_size": ws,
+        }
+        # A new Q tier invalidates the scatter map built against the old one.
+        self._fused_ctx[layer_idx] = {
+            "qkey": key, "qtier": qtier, "qpos": qpos_flat,
+            "mkey": None, "score_meta": None,
+        }
+        return qtier
+
+    def _fused_meta(self, layer_idx: int, state, ws: int):
+        """The ``(order, q_token_len)`` scatter map — memoized per window epoch.
+
+        :func:`~modules.quant.effective.compute_score_meta` reads the fp body's
+        positions at a ``ws`` stride, so its result depends on the fp store only
+        through **how many whole windows the body spans**, not through its exact
+        token count. Between evictions ``position_ids`` is append-only (it is a
+        ``_pos_buf[:, :length]`` view), so a body of the same window count is the
+        same values at the same strided indices — and the ``argsort`` over
+        per-row-unique window ids has no ties, so the permutation is unique and
+        the cached one is the one a recompute would produce.
+
+        Net: rebuilt once per ``ws`` decode steps instead of every step, per layer.
+        """
+        slot = self._fused_ctx[layer_idx]
+        num_sink = self.resolved.num_sink_tokens
+        n_body = max(state.position_ids.shape[1] - num_sink, 0)
+        n_body_win = -(-n_body // ws)            # ceil — windows the body spans
+        key = (slot["qkey"], n_body_win)
+        if slot["mkey"] == key:
+            return slot["score_meta"]
+
+        from modules.quant.effective import compute_score_meta
+
+        meta = compute_score_meta(
+            state.position_ids, slot["qpos"], num_sink, ws,
+        )
+        slot["mkey"] = key
+        slot["score_meta"] = meta
+        return meta
 
     # -----------------------------------------------------------------
     # Two-tier read path + eviction (design §5, §8) — q > 0, B = 1
@@ -581,6 +659,12 @@ class WindowedCache(_HFCacheBase):
         B, H_kv, T_fp, D = state.key_states.shape
         T_body = T_fp - num_sink
         W = state.window_scores.shape[2]
+        # Eviction rewrites the Q tier AND compacts the fp store's positions, so
+        # every memoized fused hand-off for this layer is stale. store.version
+        # already covers the Q half (retain_only below bumps it); this also covers
+        # the fp half without relying on that ordering.
+        self._fused_ctx[layer_idx] = None
+
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
