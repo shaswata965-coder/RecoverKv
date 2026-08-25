@@ -15,7 +15,9 @@ on a real decode step whose Q tier is non-empty. Any call with no pending contex
 — prefill, ``q==0``, an empty Q tier, or a non-fused run — passes straight
 through to the original ``flash_attn_func`` (which may itself be the
 :mod:`flash_lse` wrapper). A forward-pre-hook clears the slot at the start of
-every layer so a context can never leak between layers.
+every layer, and an armed-but-unconsumed slot at that point means the kernel did
+not run for the previous layer — a hard :class:`FusedDecodeNotReached`, never a
+silent skip (see its docstring for why silence would be worse than failing).
 
 Layout: ``flash_attn_func`` is called with ``[B, S, H, D]`` (seqlen-major), so the
 wrapper transposes q/k/v to the heads-major ``[B, H, S, D]`` the kernel and cache
@@ -44,15 +46,86 @@ from .scorer import reduce_two_tier_scores
 # one slot is enough; a forward-pre-hook clears it per layer against leaks.
 _PENDING: dict = {"ctx": None}
 
+#: Proof-of-execution counters. ``armed`` counts cache.update() hand-offs,
+#: ``fired`` counts wrapper invocations that actually ran the kernel. They must
+#: stay equal; :func:`clear` raises the moment they diverge.
+_STATS: dict = {"armed": 0, "fired": 0}
+
+
+def stats() -> dict:
+    """``{"armed": n, "fired": m}`` — hand-offs vs. actual kernel runs."""
+    return dict(_STATS)
+
+
+def reset_stats() -> None:
+    """Zero the counters (per-run harnesses; tests)."""
+    _STATS["armed"] = 0
+    _STATS["fired"] = 0
+
+
+class FusedDecodeNotReached(RuntimeError):
+    """The kernel was armed for a layer and the wrapper never ran it.
+
+    Being able to *launch* the Triton kernel (what ``assert_decode_kernel_available``
+    checks at hook install) is not the same as the model actually *routing*
+    through it. The known way to arm-without-firing is transformers taking the
+    **varlen** flash path (``flash_attn_varlen_func``, chosen when a padding
+    ``attention_mask`` survives ``_update_causal_mask``): the module-global
+    ``flash_attn_func`` this patch owns is then never called, the model silently
+    attends over the FP TIER ALONE — the Q tier dropped — and the score hook
+    still skips its own pass, so no ``window_scores`` are written either.
+
+    That is silently wrong output *and* a decode timed against a method it is not
+    running, which is precisely what the Triton-or-error contract exists to
+    prevent. So it is a hard error, raised on the next layer's pre-hook — i.e.
+    within one layer of the first offending step.
+    """
+
 
 def set_pending(ctx: dict) -> None:
     """Arm the next ``flash_attn_func`` call to run the fused decode kernel."""
+    if _PENDING["ctx"] is not None:
+        stale = _PENDING["ctx"]
+        _PENDING["ctx"] = None
+        raise FusedDecodeNotReached(
+            "fused decode was armed for layer "
+            f"{stale.get('layer_idx')} and never ran (armed="
+            f"{_STATS['armed']}, fired={_STATS['fired']}) before layer "
+            f"{ctx.get('layer_idx')} armed again. "
+            + _DIAGNOSIS
+        )
     _PENDING["ctx"] = ctx
+    _STATS["armed"] += 1
 
 
 def clear() -> None:
-    """Empty the pending slot. Call in a forward-pre-hook per layer."""
+    """Empty the pending slot. Call in a forward-pre-hook per layer.
+
+    Raises :class:`FusedDecodeNotReached` if the slot still holds a context: the
+    previous layer handed the Q tier over and ``flash_attn_func`` was never
+    called, so the fused kernel did not run for that layer.
+    """
+    ctx = _PENDING["ctx"]
+    if ctx is None:
+        return
     _PENDING["ctx"] = None
+    raise FusedDecodeNotReached(
+        f"fused decode was armed for layer {ctx.get('layer_idx')} and the "
+        f"kernel never ran (armed={_STATS['armed']}, fired={_STATS['fired']}). "
+        + _DIAGNOSIS
+    )
+
+
+_DIAGNOSIS = (
+    "transformers called something other than the module-global "
+    "`flash_attn_func` this patch wraps — almost certainly "
+    "`flash_attn_varlen_func`, which `_flash_attention_forward` selects when a "
+    "padding attention_mask reaches it. The fused path cannot serve that call, "
+    "and letting it through would attend over the fp tier alone (Q tier "
+    "dropped) with no eviction scores written. Use equal-length prompts (no "
+    "padding), or set STICKYKV_FUSED_DECODE=0 to run the Phase-1 materialize "
+    "path, which is correct under varlen."
+)
 
 
 def _flash_utils_module():
@@ -94,6 +167,7 @@ def _make_wrapper(orig):
         if ctx is None:
             return orig(*args, **kwargs)               # prefill / empty-Q / non-fused
         _PENDING["ctx"] = None
+        _STATS["fired"] += 1
         # flash_attn_func(q, k, v, ...) — positional (see GPU-verify note above).
         q, k, v = args[0], args[1], args[2]
         return _run_fused(ctx, q, k, v)

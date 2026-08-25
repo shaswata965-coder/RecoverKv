@@ -831,3 +831,64 @@ def test_flash_eager_two_tier_parity(B):
         fa, ea = flash._stores[0].active_ids(), eager._stores[0].active_ids()
         assert (fa is None and ea is None) or torch.equal(fa, ea)
         assert flash.get_seq_length(0) == eager.get_seq_length(0)
+
+
+# ---------------------------------------------------------------------------
+# Triton-or-error, proven at RUNTIME (not just at hook install).
+# ---------------------------------------------------------------------------
+
+
+class TestFusedDecodeProofOfExecution:
+    """Arming the kernel and never running it is a hard error, never a silent skip.
+
+    ``assert_decode_kernel_available`` only proves triton *imports* on a CUDA box.
+    It cannot see whether transformers actually routed through the patched
+    ``flash_attn_func`` — and the varlen path silently does not, dropping the Q
+    tier from attention and writing no eviction scores. These lock the gap shut.
+    """
+
+    def setup_method(self):
+        from modules.windowed_cache import flash_decode
+        flash_decode._PENDING["ctx"] = None
+        flash_decode.reset_stats()
+
+    def teardown_method(self):
+        from modules.windowed_cache import flash_decode
+        flash_decode._PENDING["ctx"] = None
+        flash_decode.reset_stats()
+
+    def test_clear_raises_when_the_kernel_never_ran(self):
+        from modules.windowed_cache import flash_decode
+
+        flash_decode.set_pending({"layer_idx": 7})
+        with pytest.raises(flash_decode.FusedDecodeNotReached) as e:
+            flash_decode.clear()          # next layer's pre-hook
+        assert "layer 7" in str(e.value)
+        assert "varlen" in str(e.value)   # the actual cause, named
+
+    def test_arming_twice_without_a_run_raises(self):
+        from modules.windowed_cache import flash_decode
+
+        flash_decode.set_pending({"layer_idx": 0})
+        with pytest.raises(flash_decode.FusedDecodeNotReached):
+            flash_decode.set_pending({"layer_idx": 1})
+
+    def test_a_consumed_hand_off_is_silent_and_counted(self):
+        from modules.windowed_cache import flash_decode
+
+        for lidx in range(3):
+            flash_decode.clear()                       # pre-hook: nothing pending
+            flash_decode.set_pending({"layer_idx": lidx})
+            flash_decode._PENDING["ctx"] = None        # wrapper consumes
+            flash_decode._STATS["fired"] += 1
+        flash_decode.clear()
+        assert flash_decode.stats() == {"armed": 3, "fired": 3}
+
+    def test_wrapper_passes_through_and_counts_only_fused_calls(self):
+        from modules.windowed_cache import flash_decode
+
+        calls = []
+        wrapper = flash_decode._make_wrapper(lambda *a, **k: calls.append(a) or "orig")
+        assert wrapper(1, 2, 3) == "orig"              # no ctx -> original flash
+        assert flash_decode.stats()["fired"] == 0
+        assert len(calls) == 1

@@ -223,21 +223,41 @@ def install_score_hooks(
         Call ``.remove()`` to uninstall all hooks.
     """
     handles = HookHandles()
+
+    # Committed to the Triton path? Choosing the flash backend on CUDA commits to
+    # the Triton PREFILL score kernel unconditionally — compute_token_scores has
+    # no PyTorch fallback at T > 1 — so every degrade-to-silence branch below
+    # becomes a hard error instead: a run that quietly scores nothing times
+    # sink+local eviction under this method's name, which is the exact failure
+    # the Triton-or-error contract exists to make impossible.
+    #
+    # Note this is deliberately NOT gated on fused_decode_enabled(): turning the
+    # decode kernel off (STICKYKV_FUSED_DECODE=0) opts out of the *decode* kernel
+    # only, and prefill scoring still has to run on Triton.
+    #
+    # Off CUDA (CPU hook-install unit tests) the warn-and-degrade behaviour is
+    # kept — nothing there could have launched a kernel in the first place.
+    _cuda = torch.cuda.is_available()
+    _committed = _cuda
+
     attn_classes = _get_attn_classes()
     if not attn_classes:
-        warnings.warn(
-            "No LlamaAttention or Qwen2Attention found — no hooks installed.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        msg = "No LlamaAttention or Qwen2Attention found — no hooks installed."
+        if _committed:
+            raise RuntimeError(
+                msg + " The flash backend is committed to the Triton score/decode "
+                "kernels, which only the hooked attention modules can reach, so "
+                "this would score nothing at all. Check the model class."
+            )
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
         return handles
     if apply_rotary_pos_emb is None or repeat_kv is None:
-        warnings.warn(
-            "transformers RoPE/GQA helpers unavailable — flash score hooks "
-            "not installed; eviction would degrade to sink+local only.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        msg = ("transformers RoPE/GQA helpers unavailable — flash score hooks "
+               "not installed; eviction would degrade to sink+local only.")
+        if _committed:
+            raise RuntimeError(msg + " Refusing to run: see the Triton-or-error "
+                               "contract in score_kernel/decode_kernel.")
+        warnings.warn(msg, RuntimeWarning, stacklevel=2)
         return handles
 
     window_size = getattr(config, "window_size", 8)
@@ -263,7 +283,6 @@ def install_score_hooks(
     # HERE, not mid-run. Only activated on CUDA — the eager/CPU path uses the
     # materialize read path (and a CPU flash run already raises at the first
     # prefill), so hook-install unit tests on CPU are unaffected.
-    _cuda = torch.cuda.is_available()
     fused_active = fused_decode_enabled() and _cuda
     if fused_active:
         assert_prefill_kernel_available(True)
@@ -351,14 +370,17 @@ def install_score_hooks(
                     args, kwargs, "position_embeddings", 1
                 )
                 if hidden_states is None or position_embeddings is None:
-                    if not warned_once[0]:
-                        warnings.warn(
-                            "Flash hook: hidden_states / position_embeddings "
-                            "not found in the attention call — scoring "
-                            "disabled, eviction degrades to sink+local only.",
-                            RuntimeWarning,
-                            stacklevel=2,
+                    msg = ("Flash hook: hidden_states / position_embeddings "
+                           "not found in the attention call — scoring "
+                           "disabled, eviction degrades to sink+local only.")
+                    if _committed:
+                        raise RuntimeError(
+                            msg + " Refusing to continue: the Triton score kernel "
+                            "cannot run without them, and a silently unscored run "
+                            "times sink+local under this method's name."
                         )
+                    if not warned_once[0]:
+                        warnings.warn(msg, RuntimeWarning, stacklevel=2)
                         warned_once[0] = True
                     return
 
@@ -383,6 +405,13 @@ def install_score_hooks(
                 score_meta = None
                 if getattr(cache, "_q", 0.0) > 0.0:
                     if cache._states[lidx].key_states is None:
+                        if _committed:
+                            raise RuntimeError(
+                                f"Flash hook (layer {lidx}): the fp store is empty "
+                                "at a scoring pass, so the Triton score kernel has "
+                                "no keys to score. update() should have appended "
+                                "them earlier in this same forward."
+                            )
                         return
                     # Reuse the effective K + score-scatter map that
                     # cache.update() already built for this layer this pass (fix
@@ -403,6 +432,12 @@ def install_score_hooks(
                 else:
                     k_current = cache._states[lidx].key_states  # [B, H_kv, S, D]
                 if k_current is None:
+                    if _committed:
+                        raise RuntimeError(
+                            f"Flash hook (layer {lidx}): no effective K to score. "
+                            "The Triton prefill score kernel cannot run, and "
+                            "skipping would leave this layer unscored."
+                        )
                     return
 
                 # 1. Post-RoPE query from the layer's own inputs. Reuse the
