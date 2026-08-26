@@ -35,7 +35,7 @@ import torch.nn as nn
 
 import os
 
-from . import flash_lse, flash_decode
+from . import flash_lse, flash_decode, flashinfer_lse
 from .decode_kernel import (
     assert_decode_kernel_available,
     describe_decode_backend,
@@ -90,6 +90,60 @@ def _lse_from_forward() -> bool:
     """
     v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "1").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def _lse_backend() -> str:
+    """Which L-source to install: ``flashinfer`` | ``flash`` | ``auto``.
+
+    ``STICKYKV_LSE_BACKEND`` selects it (default ``auto``):
+
+    * ``flash``      — the fragile ``flash_attn_func(return_attn_probs=True)``
+                       capture (:mod:`flash_lse`). Historic default.
+    * ``flashinfer`` — FlashInfer's prefill kernel, which returns ``L`` as a
+                       first-class output (:mod:`flashinfer_lse`) *and* runs the
+                       prefill attention faster. REQUIRED when named: raises at
+                       install if flashinfer is not importable, rather than
+                       silently degrading (kernel-or-error).
+    * ``auto``       — prefer ``flashinfer`` when it imports, else ``flash``.
+    """
+    return os.environ.get("STICKYKV_LSE_BACKEND", "auto").strip().lower()
+
+
+def _install_lse_source(handles: "HookHandles") -> Tuple[bool, str]:
+    """Install the selected L-source. Returns ``(capture_on, label)``.
+
+    ``label`` is for the banner: ``flashinfer`` / ``flash`` / ``off``. A named
+    ``flashinfer`` that cannot import is a hard error (kernel-or-error); ``auto``
+    falls back to ``flash`` and then to recompute.
+    """
+    if not _lse_from_forward():
+        return False, "off (STICKYKV_SCORE_LSE_FROM_FORWARD=0)"
+
+    backend = _lse_backend()
+    if backend == "flashinfer":
+        h = flashinfer_lse.enable()
+        if h is None:
+            raise RuntimeError(
+                "STICKYKV_LSE_BACKEND=flashinfer but FlashInfer (or transformers' "
+                "flash utils) is not importable. Install flashinfer on the CUDA "
+                "box, or use STICKYKV_LSE_BACKEND=flash / auto. This is "
+                "kernel-or-error: a named backend never silently degrades."
+            )
+        handles._cleanups.append(h.restore)
+        return True, "flashinfer"
+
+    if backend == "auto" and flashinfer_lse.available():
+        h = flashinfer_lse.enable()
+        if h is not None:
+            handles._cleanups.append(h.restore)
+            return True, "flashinfer"
+
+    # backend == "flash", or auto without flashinfer: the flash_lse capture.
+    h = flash_lse.enable()
+    if h is not None:
+        handles._cleanups.append(h.restore)
+        return True, "flash"
+    return False, "off (flash-attn unavailable; recomputing L)"
 
 
 def _score_softmax_dtype() -> torch.dtype:
@@ -269,13 +323,10 @@ def install_score_hooks(
     # exists there) to hand out `softmax_lse`, without changing the attention
     # output. enable() returns None if flash-attn isn't installed, in which case
     # capture is silently disabled and the score path recomputes L as before.
-    lse_capture = _lse_from_forward()
-    if lse_capture:
-        _lse_handle = flash_lse.enable()
-        if _lse_handle is not None:
-            handles._cleanups.append(_lse_handle.restore)
-        else:
-            lse_capture = False  # flash-attn unavailable; fall back to recompute
+    lse_capture, lse_label = _install_lse_source(handles)
+    # The module whose clear()/pop() the per-layer hooks below must call — the
+    # FlashInfer path and the flash-attn capture keep independent stashes.
+    lse_mod = flashinfer_lse if lse_label == "flashinfer" else flash_lse
 
     # Fused two-tier decode (decode_kernel + flash_decode). Choosing the flash
     # backend commits to the Triton path for BOTH the prefill score kernel and the
@@ -299,7 +350,7 @@ def install_score_hooks(
             "[StickyKV] score path: FLASH (flash_attention_2) | prefill scoring "
             f"-> {describe_prefill_backend(_cuda)} | "
             f"decode -> {describe_decode_backend(_cuda)} | "
-            f"L-reuse: {'ON' if lse_capture else 'off'}",
+            f"L-reuse: {lse_label if lse_capture else 'off'}",
             flush=True,
         )
 
@@ -349,7 +400,7 @@ def install_score_hooks(
         # shape check alone would not catch staleness — this pre-hook does.)
         if lse_capture:
             pre_handle = module.register_forward_pre_hook(
-                lambda _m, _a: flash_lse.clear()
+                lambda _m, _a: lse_mod.clear()
             )
             handles._hook_handles.append(pre_handle)
 
@@ -485,7 +536,7 @@ def install_score_hooks(
                 # check then rejects it and compute_token_scores recomputes L.
                 lse = None
                 if lse_capture and q.shape[2] > 1 and score_meta is None:
-                    cand = flash_lse.pop()
+                    cand = lse_mod.pop()
                     if (
                         isinstance(cand, torch.Tensor)
                         and tuple(cand.shape) == (q.shape[0], q.shape[1], q.shape[2])

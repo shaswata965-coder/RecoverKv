@@ -267,6 +267,24 @@ def token_scores_decode(
 # ---------------------------------------------------------------------------
 
 
+# Diagnostic: how many times compute_lse ran (i.e. L was NOT reused from the
+# forward). On a healthy L-reuse run this stays 0 through the whole prefill; a
+# nonzero count per layer means every prefill layer paid a second O(N^2) pass —
+# the prefill-TTFT pathology. Read via lse_recompute_count(); zero it with
+# reset_lse_recompute_count() at the start of a measured run.
+_LSE_RECOMPUTE_COUNT = [0]
+
+
+def lse_recompute_count() -> int:
+    """Times :func:`compute_lse` ran since the last reset (L-reuse misses)."""
+    return _LSE_RECOMPUTE_COUNT[0]
+
+
+def reset_lse_recompute_count() -> None:
+    """Zero the compute_lse counter (call before a measured prefill)."""
+    _LSE_RECOMPUTE_COUNT[0] = 0
+
+
 def compute_lse(
     q: Tensor,
     k: Tensor,
@@ -286,6 +304,7 @@ def compute_lse(
     provides ``L`` self-contained so the kernel is usable and testable in
     isolation. See ``SCORE_KERNEL_PLAN.md`` §4 / Flag 2.
     """
+    _LSE_RECOMPUTE_COUNT[0] += 1
     q5, kt, B, H_q, H_kv, rep, T, S, D = _as_grouped(q, k)
     offset = S - T
     lse = torch.empty(B, H_kv, rep, T, device=q.device, dtype=torch.float32)
