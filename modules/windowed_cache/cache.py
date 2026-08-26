@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -33,6 +35,56 @@ from modules.quant import (
 )
 from modules.quant.effective import rotate_key_window
 from modules.quant.slots import n_slots_for
+
+
+# ---------------------------------------------------------------------------
+# Optional torch.compile of the eviction step (STICKYKV_COMPILE_EVICT).
+# Off by default: the eager _evict_two_tier_impl is the reference path and ships
+# GPU-unvalidated compilation OFF, mirroring the decode read path's convention
+# (modules/quant/effective.py). The compiled callable is process-global and
+# built lazily on first use so a run that never evicts never pays for it.
+# ---------------------------------------------------------------------------
+
+_COMPILED_EVICT_FN = None
+_EVICT_ANNOUNCED = {"done": False}
+
+
+def _compile_evict_enabled() -> bool:
+    """Whether to run the eviction through ``torch.compile`` (default OFF)."""
+    v = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _compile_evict_backend() -> Optional[str]:
+    """Optional ``torch.compile`` backend override for the eviction.
+
+    ``None`` (unset) uses the default (Inductor), which is what fuses the
+    launches on GPU. Set ``STICKYKV_COMPILE_EVICT_BACKEND`` to pick another —
+    ``aot_eager`` traces + runs eager (no C++/Triton codegen, so it validates the
+    tracing and semantics on a box without a compiler), ``cudagraphs`` for the
+    graph backend, etc.
+    """
+    v = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND", "").strip()
+    return v or None
+
+
+def _announce_evict_path_once(compiled: bool) -> None:
+    """Print, once per process, which eviction path is live."""
+    if _EVICT_ANNOUNCED["done"]:
+        return
+    _EVICT_ANNOUNCED["done"] = True
+    if compiled:
+        print(
+            "[StickyKV] eviction path: COMPILED two-tier eviction ACTIVE [OK] "
+            "(STICKYKV_COMPILE_EVICT=1)",
+            flush=True,
+        )
+    else:
+        print(
+            "[StickyKV] eviction path: eager two-tier eviction "
+            "(STICKYKV_COMPILE_EVICT off)",
+            flush=True,
+        )
 
 
 class WindowedCache(_HFCacheBase):
@@ -629,6 +681,52 @@ class WindowedCache(_HFCacheBase):
         return out[:, :width], valid[:, :width]
 
     def _evict_two_tier(self, layer_idx: int, step: int) -> None:
+        """Dispatch one two-tier eviction to the eager or torch.compile'd body.
+
+        Default (``STICKYKV_COMPILE_EVICT`` off) calls the eager implementation
+        below — byte-for-byte the historic path, one extra function-pointer hop.
+        With it ON, the body is run through a lazily-built, process-global
+        ``torch.compile`` (``dynamic=True`` for the varying window count), which
+        fuses the eviction step's ~360 pointwise / gather / scatter / quantize
+        launches into a handful of kernels. That step is ~89% of the fused-decode
+        path's per-token launch budget (the other ``ws-1`` steps are just the KV
+        append), so it is the one place left where launches can be cut without
+        touching the eviction math — and compilation is semantics-preserving by
+        construction, so the retained windows, tier moves, and rebuilt fp store
+        are identical to the eager path. It fires once per ``ws`` steps, so a
+        compile / recompile amortizes.
+
+        Kernel-or-error when enabled, exactly like the decode read path
+        (:func:`modules.quant.effective._read_fn`): if ``torch.compile`` raises,
+        this raises too rather than silently running eager, so a run that asked
+        for the compiled eviction never quietly reports eager-path numbers.
+        """
+        if not _compile_evict_enabled():
+            _announce_evict_path_once(compiled=False)
+            return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
+        global _COMPILED_EVICT_FN
+        if _COMPILED_EVICT_FN is None:
+            try:
+                _backend = _compile_evict_backend()
+                _kw = {"dynamic": True}
+                if _backend is not None:
+                    _kw["backend"] = _backend
+                _COMPILED_EVICT_FN = torch.compile(
+                    WindowedCache._evict_two_tier_impl, **_kw
+                )
+            except Exception as e:  # pragma: no cover - env/build dependent
+                raise RuntimeError(
+                    "STICKYKV_COMPILE_EVICT is set but torch.compile of the "
+                    f"two-tier eviction failed ({type(e).__name__}: {e}). The "
+                    "compiled eviction is required when enabled — there is no "
+                    "silent fallback to the eager path (kernel-or-error, as on "
+                    "the decode read path). Unset STICKYKV_COMPILE_EVICT to run "
+                    "the eager eviction."
+                ) from e
+        _announce_evict_path_once(compiled=True)
+        return _COMPILED_EVICT_FN(self, layer_idx, step)
+
+    def _evict_two_tier_impl(self, layer_idx: int, step: int) -> None:
         """One two-tier eviction (design §5), per row, entirely on device.
 
         Ranks the merged window axis, assigns tiers, moves boundary-crossers

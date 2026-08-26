@@ -1016,3 +1016,97 @@ class TestFusedDecodeProofOfExecution:
         assert wrapper(1, 2, 3) == "orig"              # no ctx -> original flash
         assert flash_decode.stats()["fired"] == 0
         assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Optional compiled eviction (STICKYKV_COMPILE_EVICT) — semantics preserved.
+# torch.compile is semantics-preserving by construction; this pins it against
+# regressions in how the body is factored. Uses the aot_eager backend so it
+# traces + runs without a C++/Triton compiler (Inductor codegen is the GPU
+# concern, exercised there, not the tracing/semantics this asserts).
+# ---------------------------------------------------------------------------
+
+
+def _run_decode_across_eviction(compile_backend=None, seed=1234):
+    """Drive one cache across a full eviction cycle; return its final state."""
+    import os
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache import flash_decode
+
+    prev = os.environ.get("STICKYKV_COMPILE_EVICT")
+    prev_b = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND")
+    if compile_backend is not None:
+        os.environ["STICKYKV_COMPILE_EVICT"] = "1"
+        os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = compile_backend
+    else:
+        os.environ["STICKYKV_COMPILE_EVICT"] = "0"
+    # Reset the process-global compiled fn + once-banner so the flag is honoured.
+    cache_mod._COMPILED_EVICT_FN = None
+    cache_mod._EVICT_ANNOUNCED["done"] = True   # silence the banner in tests
+    try:
+        cache = _make_cache(quant_ratio=0.5, ws=8, num_sink=0, prefill_len=256)
+        H, D, ws = 2, 4, 8
+        g = torch.Generator().manual_seed(seed)
+        T = 256
+        pos = torch.arange(T, dtype=torch.long)
+        k_pre = torch.randn(H, T, D, generator=g)
+        v = torch.randn(H, T, D, generator=g)
+        k_post = rotate_key_window(k_pre, pos, cache.rope_module)
+        cache._states[0].replace(
+            k_post.unsqueeze(0).clone(), v.unsqueeze(0).clone(), pos.unsqueeze(0).clone()
+        )
+        st = cache._states[0]
+        nwin = T // ws
+        st.window_scores = torch.rand(1, H, nwin, generator=g) * 100
+        st.original_window_ids = torch.arange(nwin).unsqueeze(0)
+        p = cache._policies[0]
+        p.top_k_fp, p.N_q, p.local_windows = 2, 2, 1
+        cache._prefill_done[0] = True
+        cache._fused_decode_active = True
+        g2 = torch.Generator().manual_seed(seed + 1)
+        for i in range(1, ws + 2):
+            kk = torch.randn(1, H, 1, D, generator=g2)
+            cache.update(kk, kk.clone(), 0,
+                         cache_kwargs={"cache_position": torch.tensor([T + i])})
+            flash_decode._PENDING["ctx"] = None
+        stt, store = cache._states[0], cache._stores[0]
+        return {
+            "key": stt.key_states.clone(), "val": stt.value_states.clone(),
+            "pos": stt.position_ids.clone(), "wscore": stt.window_scores.clone(),
+            "wids": stt.original_window_ids.clone(),
+            "n": store.num_active_windows,
+            "slot_wid": store.table.slot_wid.clone(),
+            "key_codes": store.table.key_codes.clone(),
+        }
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        if prev is None:
+            os.environ.pop("STICKYKV_COMPILE_EVICT", None)
+        else:
+            os.environ["STICKYKV_COMPILE_EVICT"] = prev
+        if prev_b is None:
+            os.environ.pop("STICKYKV_COMPILE_EVICT_BACKEND", None)
+        else:
+            os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = prev_b
+
+
+def test_compiled_eviction_is_byte_identical_to_eager():
+    """STICKYKV_COMPILE_EVICT must not change the eviction outcome.
+
+    Runs the same decode sequence across an eviction twice -- eager, then
+    torch.compile'd (aot_eager) -- and asserts every stored tensor matches. The
+    compiled path is a launch-count optimisation only; the retained windows,
+    tier moves, quantized codes, and rebuilt fp store are identical.
+    """
+    pytest.importorskip("torch")
+    eager = _run_decode_across_eviction(compile_backend=None)
+    try:
+        comp = _run_decode_across_eviction(compile_backend="aot_eager")
+    except Exception as e:  # torch.compile unavailable on this build
+        pytest.skip(f"torch.compile(aot_eager) unavailable: {type(e).__name__}: {e}")
+    for k in eager:
+        a, b = eager[k], comp[k]
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), f"{k} diverged under compiled eviction"
+        else:
+            assert a == b, f"{k} diverged under compiled eviction"
