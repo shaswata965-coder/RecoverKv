@@ -57,6 +57,7 @@ exists to serve, and a silent degrade to it is worse than a hard failure. Decode
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -437,6 +438,38 @@ if _HAS_TRITON:
         tl.store(out_ptrs, acc, mask=n_mask)
 
 
+if _HAS_TRITON:
+    # Autotuned wrapper over the SAME kernel body. The key-outer design re-reads
+    # all of Q once per key block, so the block/warp/stage choice drives the
+    # score pass's memory traffic — and the sweet spot moves with GPU and with
+    # (S, T, D). triton.autotune benchmarks these once per new shape key and
+    # caches the winner; the math is identical to the fixed 64x64 path (autotune
+    # only *selects* among correct configs), so the CPU torch reference stays the
+    # oracle and this ships GPU-unvalidated like the kernel it wraps.
+    _SCORE_AUTOTUNE_CONFIGS = [
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    ]
+
+    _score_kernel_tuned = triton.autotune(
+        configs=_SCORE_AUTOTUNE_CONFIGS, key=["S", "T", "HEAD_DIM"]
+    )(_score_kernel)
+
+
+def _score_autotune_enabled() -> bool:
+    """Whether to autotune the score kernel's block/warp/stage (default ON).
+
+    Off (``STICKYKV_SCORE_AUTOTUNE=0``) pins the historic fixed 64x64 launch —
+    use it for byte-stable timing or if a Triton build's autotuner misbehaves.
+    """
+    v = os.environ.get("STICKYKV_SCORE_AUTOTUNE", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _token_scores_triton(
     q: Tensor,
     k: Tensor,
@@ -463,8 +496,7 @@ def _token_scores_triton(
     lse = lse.contiguous().float()
 
     out = torch.empty(B, H_q, S, device=q.device, dtype=out_dtype)
-    grid = (triton.cdiv(S, block_n), B * H_q)
-    _score_kernel[grid](
+    common = (
         q, k, lse, out,
         scaling,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -472,11 +504,20 @@ def _token_scores_triton(
         lse.stride(0), lse.stride(1), lse.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         T, S, S - T, H_q, num_groups,
-        HEAD_DIM=D,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        IS_CAUSAL=(T > 1),
     )
+    if _score_autotune_enabled():
+        # BLOCK_N is chosen by the autotuner, so the grid must read it from the
+        # winning config's meta at launch (Triton evaluates this lambda per config).
+        grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)
+        _score_kernel_tuned[grid](
+            *common, HEAD_DIM=D, IS_CAUSAL=(T > 1),
+        )
+    else:
+        grid = (triton.cdiv(S, block_n), B * H_q)
+        _score_kernel[grid](
+            *common, HEAD_DIM=D,
+            BLOCK_M=block_m, BLOCK_N=block_n, IS_CAUSAL=(T > 1),
+        )
     return out
 
 

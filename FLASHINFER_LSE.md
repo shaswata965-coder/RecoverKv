@@ -108,3 +108,42 @@ Other GPU-validation points (see the header of
 
 If FlashInfer is not importable and you did **not** request it explicitly
 (`auto`), everything degrades to the previous behaviour with no error.
+
+---
+
+# Further prefill optimization — the score pass itself
+
+FlashInfer L-reuse removes the *second* `O(N²)` pass (`compute_lse`). What
+remains is **one** score pass: the key-outer Triton kernel
+(`score_kernel._score_kernel`) that computes `Σ_q exp(scale·q·kᵀ − L_q)` per key.
+This pass is inherent — it is the exact H2O cumulative score (every query scores
+every key), which the method requires. It is already cheaper than a full
+attention pass (tensor-core `tl.dot`, triangular via causal-tile skip, and no
+`p·V` second matmul), so with L-reuse working, prefill lands ~1.6× FullKV-flash
+rather than the ~4.5× we started from.
+
+## Score-kernel autotuning (`STICKYKV_SCORE_AUTOTUNE`, default ON)
+
+The kernel is **key-outer**: each key block re-reads all of `Q`, so total `Q`
+traffic is `⌈S/BLOCK_N⌉ × T × D`. The best `BLOCK_M`/`BLOCK_N`/`num_warps`/
+`num_stages` — and in particular a larger `BLOCK_N`, which cuts the number of `Q`
+re-reads — depends on the GPU and on `(S, T, D)`. `triton.autotune` benchmarks a
+config set once per new shape key and caches the winner. The math is unchanged
+(autotune only *selects* among correct configs), so the CPU torch reference stays
+the oracle. Set `STICKYKV_SCORE_AUTOTUNE=0` to pin the historic fixed 64×64
+launch (byte-stable timing, or if a Triton build's autotuner misbehaves).
+
+**Warmup note:** the first prefill at each new shape benchmarks the config set,
+so keep `num_warmup_runs ≥ 1` (the perf runner already does) to keep that cost
+out of the measured runs.
+
+## What is NOT worth doing (and why)
+
+- **Fusing the score into the attention pass.** Tempting — the score is the
+  column-sum of the same `p_qk` flash computes — but attention is *query-outer*
+  (needs running softmax) while the exact column-sum is *key-outer* (needs the
+  final per-query `L`). The loop orders conflict, so one kernel cannot do both
+  efficiently; the two-pass split (FlashInfer attn+L, then key-outer score) is
+  the right factorization given we already have `L`.
+- **Observation-window scoring (SnapKV-style).** Rejected: it degrades as the
+  window shrinks. The method keeps full cumulative scoring.
