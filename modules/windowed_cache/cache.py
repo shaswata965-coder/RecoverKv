@@ -48,6 +48,25 @@ from modules.quant.slots import n_slots_for
 _COMPILED_EVICT_FN = None
 _EVICT_ANNOUNCED = {"done": False}
 
+#: Proof-of-execution counters for the eviction path, same contract as
+#: :data:`modules.windowed_cache.flash_decode._STATS`: being *able* to compile is
+#: not the same as the compiled body actually running. ``compiled`` counts
+#: evictions that went through ``_COMPILED_EVICT_FN``, ``eager`` the ones that
+#: took the reference body. A benchmark that believes it enabled the compiled
+#: eviction and reports ``eager > 0`` measured the path it was trying to replace.
+_EVICT_STATS = {"eager": 0, "compiled": 0}
+
+
+def evict_path_stats() -> dict:
+    """``{"eager": n, "compiled": m}`` — evictions per path since the last reset."""
+    return dict(_EVICT_STATS)
+
+
+def reset_evict_path_stats() -> None:
+    """Zero the eviction-path counters (call before a measured run)."""
+    _EVICT_STATS["eager"] = 0
+    _EVICT_STATS["compiled"] = 0
+
 
 def _compile_evict_enabled() -> bool:
     """Whether to run the eviction through ``torch.compile`` (default OFF)."""
@@ -703,6 +722,7 @@ class WindowedCache(_HFCacheBase):
         """
         if not _compile_evict_enabled():
             _announce_evict_path_once(compiled=False)
+            _EVICT_STATS["eager"] += 1
             return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
         global _COMPILED_EVICT_FN
         if _COMPILED_EVICT_FN is None:
@@ -720,10 +740,15 @@ class WindowedCache(_HFCacheBase):
                     f"two-tier eviction failed ({type(e).__name__}: {e}). The "
                     "compiled eviction is required when enabled — there is no "
                     "silent fallback to the eager path (kernel-or-error, as on "
-                    "the decode read path). Unset STICKYKV_COMPILE_EVICT to run "
-                    "the eager eviction."
+                    "the decode read path). Set STICKYKV_COMPILE_EVICT=0 to run "
+                    "the eager eviction — note that UNSETTING it is not enough "
+                    "under the perf runner, which turns it on by default for "
+                    "CUDA windowed rows (the eviction step is ~81% of the "
+                    "amortized decode launch budget) and only defers to an "
+                    "explicit value."
                 ) from e
         _announce_evict_path_once(compiled=True)
+        _EVICT_STATS["compiled"] += 1
         return _COMPILED_EVICT_FN(self, layer_idx, step)
 
     def _evict_two_tier_impl(self, layer_idx: int, step: int) -> None:

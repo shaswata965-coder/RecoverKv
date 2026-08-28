@@ -225,6 +225,195 @@ def _describe_score_backend() -> str:
         return f"unknown ({type(e).__name__}: {e})"
 
 
+#: Section names torch has used for "dynamo could not trace this" across
+#: versions. 2.x up to ~2.5 used ``graph_break``; newer builds (2.12 here) file
+#: the same events under ``unimplemented``. Reading only one name silently
+#: reports zero breaks on the other, which is the exact false negative this
+#: whole diagnostic exists to prevent — so read all of them.
+_DYNAMO_BREAK_SECTIONS = ("graph_break", "unimplemented", "unimplemented_with_reason")
+
+
+def _dynamo_counters() -> Dict[str, int]:
+    """Normalized ``torch._dynamo`` counters, or ``{}`` if unavailable.
+
+    Used to verify that ``STICKYKV_COMPILE_EVICT`` actually *fused* the eviction
+    rather than merely tracing it. ``torch.compile`` never fails loudly on a
+    graph break — it silently splits the region and runs the pieces eagerly — so
+    a compiled eviction that broke on every store mutation issues the same ~273
+    launches per layer the eager body does, and reads in the timings as "the
+    compiled eviction bought nothing". The counters are the only way to tell that
+    apart from "it fused and the eviction was never the bottleneck".
+
+    Normalized keys (raw per-section sums are kept alongside, prefixed
+    ``raw_``, so a future rename is visible rather than silently zero):
+
+    ``graph_breaks``
+        Places dynamo bailed out of the graph. Nonzero on a compiled eviction
+        means part of the body is running eagerly.
+    ``frames_ok`` / ``frames_total``
+        Frames dynamo compiled in this window. Counters are zeroed *after*
+        warmup, so anything here is compilation happening inside the measured
+        runs — i.e. a recompile, and its latency is inside the timings. This is
+        the version-independent recompile signal: torch has no stable
+        ``recompiles`` counter section.
+    ``unique_graphs``
+        Distinct compiled graphs, for reading how badly it fragmented.
+    """
+    try:
+        from torch._dynamo.utils import counters
+    except Exception:  # pragma: no cover - torch build dependent
+        return {}
+    raw: Dict[str, Dict[str, Any]] = {}
+    for section, entries in counters.items():
+        try:
+            raw[str(section)] = dict(entries)
+        except Exception:
+            continue
+
+    def _sum(section: str) -> int:
+        vals = raw.get(section, {}).values()
+        return int(sum(v for v in vals if isinstance(v, (int, float))))
+
+    def _get(section: str, key: str) -> int:
+        v = raw.get(section, {}).get(key, 0)
+        return int(v) if isinstance(v, (int, float)) else 0
+
+    out: Dict[str, int] = {
+        "graph_breaks": sum(_sum(s) for s in _DYNAMO_BREAK_SECTIONS),
+        "frames_total": _get("frames", "total"),
+        "frames_ok": _get("frames", "ok"),
+        "unique_graphs": _get("stats", "unique_graphs"),
+    }
+    for section in raw:
+        out[f"raw_{section}"] = _sum(section)
+    return out
+
+
+def _reset_dynamo_counters() -> None:
+    try:
+        from torch._dynamo.utils import counters
+        counters.clear()
+    except Exception:  # pragma: no cover - torch build dependent
+        pass
+
+
+def _lse_recompute_count() -> Optional[int]:
+    """How many times ``compute_lse`` ran, or ``None`` if unreadable."""
+    try:
+        from modules.windowed_cache.score_kernel import lse_recompute_count
+        return int(lse_recompute_count())
+    except Exception:  # pragma: no cover - environment dependent
+        return None
+
+
+def _reset_lse_recompute_count() -> None:
+    try:
+        from modules.windowed_cache.score_kernel import reset_lse_recompute_count
+        reset_lse_recompute_count()
+    except Exception:  # pragma: no cover - environment dependent
+        pass
+
+
+def _lse_reuse_requested() -> bool:
+    """Whether the run asked for L to come from the forward (the default)."""
+    return os.environ.get(
+        "STICKYKV_SCORE_LSE_FROM_FORWARD", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _lse_transient_gb(batch_size: int, model_config: Any, prefill_len: int) -> float:
+    """GB of the ``[B, H_kv, rep, chunk, S]`` fp32 block ``compute_lse`` builds.
+
+    Sized so the L-reuse failure below can say what it costs at THIS shape rather
+    than quoting one example. ``chunk`` is the query-row block
+    (``STICKYKV_PREFILL_SCORE_CHUNK``, default 1024) and ``S`` is the prefill
+    length, so the term is quadratic in context and linear in batch.
+    """
+    try:
+        chunk = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024") or 1024)
+    except (TypeError, ValueError):
+        chunk = 1024
+    h_q = int(getattr(model_config, "num_attention_heads", 0) or 0)
+    n = max(1, int(batch_size)) * h_q * min(max(chunk, 1), prefill_len) * prefill_len
+    return n * 4 / (1024 ** 3)
+
+
+def _evict_path_stats() -> Dict[str, int]:
+    try:
+        from modules.windowed_cache.cache import evict_path_stats
+        return evict_path_stats()
+    except Exception:  # pragma: no cover - environment dependent
+        return {}
+
+
+def _reset_evict_path_stats() -> None:
+    try:
+        from modules.windowed_cache.cache import reset_evict_path_stats
+        reset_evict_path_stats()
+    except Exception:  # pragma: no cover - environment dependent
+        pass
+
+
+def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
+    """What the resolved budget actually buys, in TOKENS the decode must walk.
+
+    ``cache_budget`` is a **byte** budget (design.md §7). int2 is ~8x denser than
+    fp16, so spending a fraction ``q`` of those bytes on the Q tier buys ~8q of
+    the token count, and the *number of keys attention reads* is not the budget
+    at all — it is ``fp_tokens + N_q * window_size``. At ``quant_ratio=0.5``,
+    ``cache_budget=0.5`` that comes out ABOVE the prompt length: 4885 effective
+    keys for a 4096-token prefill on Llama-3-8B geometry (1.19x), against 0.50x
+    for the same budget at ``quant_ratio=0.0``.
+
+    That is not a bug in the resolver — those really are half the bytes — but it
+    is decisive for a *latency* table, and nothing in the npz previously recorded
+    it. A q=0.5 row and a q=0.0 row at the same nominal budget do 2.4x different
+    amounts of attention work, and a reader comparing either against a full-cache
+    baseline needs ``expansion`` to know which. Recorded per config so the two
+    rows can be read side by side.
+    """
+    ws = int(resolved.window_size)
+    fp_tokens = (
+        int(resolved.num_sink_tokens)
+        + int(resolved.top_k_fp) * ws
+        + int(resolved.local_tokens)
+    )
+    q_tokens = int(resolved.N_q) * ws
+    s_eff = fp_tokens + q_tokens
+    # The same byte budget spent entirely on fp16 — i.e. what the quant_ratio=0.0
+    # row at this budget retains. `top_k_windows` is exactly that count (it is
+    # what top_k_fp collapses to at q=0), so this needs no second resolve.
+    s_eff_q0 = (
+        int(resolved.num_sink_tokens)
+        + int(resolved.top_k_windows) * ws
+        + int(resolved.local_tokens)
+    )
+    return {
+        "window_size": ws,
+        "num_sink_tokens": int(resolved.num_sink_tokens),
+        "local_tokens": int(resolved.local_tokens),
+        "top_k_windows": int(resolved.top_k_windows),
+        "top_k_fp": int(resolved.top_k_fp),
+        "N_q": int(resolved.N_q),
+        "quant_ratio": float(resolved.quant_ratio),
+        "fp_tokens": fp_tokens,
+        "q_tokens": q_tokens,
+        # The number of keys one decode step attends over — the quantity that
+        # actually sets decode cost, as opposed to the byte budget.
+        "s_eff": s_eff,
+        # What the SAME byte budget retains at quant_ratio=0.0 — the reference
+        # point for reading the row above.
+        "s_eff_at_q0": s_eff_q0,
+        # s_eff / prefill_len. >= 1.0 means the "compressed" cache is longer than
+        # the prompt it compressed.
+        "expansion": (s_eff / prefill_len) if prefill_len else float("nan"),
+        "expansion_at_q0": (s_eff_q0 / prefill_len) if prefill_len else float("nan"),
+        # Serial iterations of the fused decode kernel's Q-tier loop, per layer
+        # per token (decode_kernel.py: `for w in range(0, n_active)`).
+        "decode_q_loop_iters": int(resolved.N_q),
+    }
+
+
 def _nanmax2(a: float, b: float) -> float:
     """max(a, b) treating nan as missing; nan only if BOTH are missing."""
     if a != a:
@@ -449,6 +638,11 @@ class PerfRunner:
     """Suite C — TTFT, throughput, TPOT benchmarks."""
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
+        # Per-config diagnostics for the CURRENT grid cell, filled by
+        # _measure_config and folded into the npz by _save. Reset per cell:
+        # tier geometry and the L-transient are both shape-dependent, so a
+        # carried-over entry would attribute one cell's evidence to another.
+        self._config_diag: Dict[str, Dict[str, Any]] = {}
 
     def run(self) -> List[Path]:
         cfg = self.config
@@ -496,6 +690,7 @@ class PerfRunner:
         configs = pc.configs
         n_configs = len(configs)
         n_runs = pc.num_measurement_runs
+        self._config_diag = {}
         ttft = np.full((n_configs, n_runs), np.nan)
         throughput = np.full((n_configs, n_runs), np.nan)
         tpot = np.full((n_configs, n_runs), np.nan)
@@ -605,7 +800,8 @@ class PerfRunner:
                 "peak_decode_step0": peak_decode_step0,
                 "peak_decode_steady": peak_decode_steady,
                 "peak_host_rss": peak_host_rss,
-                "alloc_retries": alloc_retries}
+                "alloc_retries": alloc_retries,
+                "diagnostics": dict(self._config_diag)}
 
     @staticmethod
     def _warmup_decode_steps(pc, c: dict, cfg, gen_len: int) -> int:
@@ -705,15 +901,40 @@ class PerfRunner:
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
             # cache_position (transformers <= 4.47).
             assert_transformers_version_supported()
-            # Realize the fused decode read path on GPU. The compiled dequant->RoPE
-            # kernel (STICKYKV_COMPILE_READ) is the intended decode fast path but is
-            # opt-in — torch.compile buys nothing on the CPU dev box. Enable it here
-            # for CUDA windowed runs so decode is measured on the fused kernel, not
-            # the ~20-launch eager chain; setdefault semantics so an explicit env
-            # (including a deliberate "0") always wins.
-            if torch.cuda.is_available() and os.environ.get("STICKYKV_COMPILE_READ") is None:
-                os.environ["STICKYKV_COMPILE_READ"] = "1"
-                log.info("enabled STICKYKV_COMPILE_READ=1 for CUDA windowed decode")
+            # Realize the compiled decode paths on GPU. Both are opt-in (
+            # torch.compile buys nothing on the CPU dev box), and both are enabled
+            # here with setdefault semantics so an explicit env — including a
+            # deliberate "0" — always wins.
+            #
+            # STICKYKV_COMPILE_EVICT is the one that matters. Decode at these
+            # shapes is bound by DISPATCH COUNT, not by the kernels the dispatches
+            # feed: TPOT is flat to within 4% across a 32x change in batch size and
+            # a 4.2x change in effective sequence length, which only happens when
+            # the GPU is idle waiting on the host. Counting ATen dispatches through
+            # WindowedCache.update on Llama-3-8B geometry (ws=8, q=0.5):
+            #
+            #   eviction step   273 launching ops/layer  ->  8,736 launches, x32 layers
+            #   normal step       9 launching ops/layer  ->    288 launches
+            #   amortized (ws=8) 42 ops/layer/token      ->  1,344 launches/token
+            #                    ... of which the eviction step is 81%.
+            #
+            # So the eviction step IS the budget, and the compiled body is the
+            # thing built to collapse it. It had never been switched on anywhere
+            # outside its unit test, which means every perf number recorded to date
+            # measured the eager eviction. Verify it with the dynamo counters and
+            # evict_path_stats() below rather than trusting the flag.
+            #
+            # STICKYKV_COMPILE_READ, by contrast, is INERT on the fused decode
+            # path: _read_fn is only reachable through QuantizedStore.
+            # effective_q_tier, and the fused path (default on CUDA since the
+            # decode kernel landed) hands raw int2 straight to Triton and never
+            # materializes the Q tier. It is left enabled because it is still the
+            # fast path whenever the fused kernel is off (STICKYKV_FUSED_DECODE=0,
+            # or an empty Q tier), not because it does anything for the rows below.
+            for _flag in ("STICKYKV_COMPILE_READ", "STICKYKV_COMPILE_EVICT"):
+                if torch.cuda.is_available() and os.environ.get(_flag) is None:
+                    os.environ[_flag] = "1"
+                    log.info("enabled %s=1 for CUDA windowed decode", _flag)
             # Fair measurement: reject a backend/attn mismatch up front, exactly
             # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
             # it, cache_package='eager' paired with flash attention (or vice
@@ -779,10 +1000,47 @@ class PerfRunner:
         budget_basis = c.get("budget_basis") or getattr(
             pc, "budget_basis", "prefill_plus_gen")
         budget_horizon = 0 if budget_basis == "context" else gen_len
+        # Per-config diagnostics, keyed by config name and folded into the npz
+        # metadata by _save. Everything here answers "did this row measure the
+        # method it says it did", which timings alone cannot. Registered NOW and
+        # mutated in place below, so a row that OOMs or errors still carries the
+        # geometry that explains why — which is exactly when a reader wants it,
+        # and it is known before the first forward.
+        diag: Dict[str, Any] = {}
+        self._config_diag[c.get("name", "config")] = diag
         if cache_backend == "windowed":
             # Only meaningful where there IS a budget; a full-KV baseline has none.
             log.info("budget_basis=%s -> budget = %s x (%d + %d) tokens",
                      budget_basis, budget, prefill_len, budget_horizon)
+        if cache_backend == "windowed" and cc is not None:
+            # What that budget buys in KEYS, not bytes. See describe_tier_geometry.
+            geom = describe_tier_geometry(
+                cc.resolve(prefill_len, model.config, torch_dtype, budget_horizon),
+                prefill_len,
+            )
+            diag["tier_geometry"] = geom
+            log.info(
+                "tier geometry: fp %d tok (sink %d + %d x %d + local %d) + Q %d tok "
+                "(%d int2 windows) = %d effective keys = %.2fx prefill",
+                geom["fp_tokens"], geom["num_sink_tokens"], geom["top_k_fp"],
+                geom["window_size"], geom["local_tokens"], geom["q_tokens"],
+                geom["N_q"], geom["s_eff"], geom["expansion"],
+            )
+            if geom["expansion"] >= 1.0:
+                log.warning(
+                    "config %s: the compressed cache is LONGER than the prompt — "
+                    "%d effective keys for a %d-token prefill (%.2fx) at "
+                    "cache_budget=%s, quant_ratio=%.2f. cache_budget is a BYTE "
+                    "budget and int2 is ~8x denser, so half the bytes buys ~4x the "
+                    "tokens. These bytes are real, but this row does MORE attention "
+                    "work per decode step than the full-cache baseline, so read its "
+                    "latency as a memory result, not a speed one — and compare it "
+                    "against the quant_ratio=0.0 row at the same budget, which "
+                    "retains %d keys (%.2fx).",
+                    c.get("name"), geom["s_eff"], prefill_len, geom["expansion"],
+                    budget, geom["quant_ratio"],
+                    geom["s_eff_at_q0"], geom["expansion_at_q0"],
+                )
 
         def _new_cache_and_hooks():
             """``(past_key_values, hooks_or_None)`` for one fresh run."""
@@ -904,6 +1162,12 @@ class PerfRunner:
                 if hooks is not None:
                     hooks.remove()
             self._cooldown(pc, "warmup round")
+        # Zeroed AFTER warmup so the counters describe the measured runs only:
+        # warmup deliberately compiles and autotunes, so its dynamo activity is
+        # expected and would otherwise swamp the signal we want (recompiles and
+        # graph breaks that keep happening once the shapes have settled).
+        _reset_evict_path_stats()
+        _reset_dynamo_counters()
         # Measurement runs
         measurements = []
         for ri in range(pc.num_measurement_runs):
@@ -928,6 +1192,9 @@ class PerfRunner:
                     torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
                 probe.start()
+                # Zeroed per run, immediately before the prefill it describes:
+                # this counts compute_lse calls during THIS prefill.
+                _reset_lse_recompute_count()
                 # TTFT — synchronize BEFORE t0 so prior async work doesn't taint
                 # the measurement and the sync's own latency isn't timed.
                 if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -939,6 +1206,51 @@ class PerfRunner:
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 ttft_ms = (t1 - t0) * 1000
+                # L-reuse: kernel-or-error, like every other kernel contract here.
+                #
+                # _install_lse_source defaults to backend="auto", which falls back
+                # flashinfer -> flash -> recompute WITHOUT raising, and the flash
+                # capture latches off on its own if the installed build rejects
+                # return_attn_probs. The cost of landing on the last rung is not
+                # cosmetic: compute_token_scores then calls compute_lse, which is a
+                # second O(N^2) pass per prefill layer AND materializes a
+                # [B, H_kv, rep, chunk, S] fp32 transient — 17.6 GB at prefill=4096,
+                # batch=32, which is exactly the cell that OOMs while batch=32 at
+                # prefill=2048 (8.8 GB) survives. So a silent degrade shows up as a
+                # doubled TTFT and a max-B that belongs to the fallback rather than
+                # to the method, and neither is distinguishable from a real result
+                # in the recorded numbers.
+                #
+                # Escape hatch is the documented one: STICKYKV_SCORE_LSE_FROM_FORWARD=0
+                # says "measure the recompute path on purpose", and then this is
+                # silent. Only the flash package reaches compute_lse — the eager
+                # backend reads attn_weights off the module and never scores this way.
+                lse_misses = _lse_recompute_count()
+                if (cache_backend == "windowed" and cache_pkg == "flash_attn"
+                        and _lse_reuse_requested() and lse_misses):
+                    from utils.config import ConfigValidationError
+                    raise ConfigValidationError(
+                        f"config {c.get('name')!r}: L-reuse was requested (the "
+                        f"default) but compute_lse ran {lse_misses} time(s) during "
+                        f"this prefill — L did NOT come from the forward, so every "
+                        f"prefill layer paid a second O(N^2) pass plus a "
+                        f"[B, H, chunk, S] fp32 transient (~{_lse_transient_gb(batch_size, model.config, prefill_len):.1f} GB "
+                        f"at this shape). The installed L-source reported "
+                        f"{getattr(hooks, 'lse_label', 'unknown')!r}. Install "
+                        f"flashinfer on this box (or a flash-attn build that honours "
+                        f"return_attn_probs), or set "
+                        f"STICKYKV_SCORE_LSE_FROM_FORWARD=0 to measure the recompute "
+                        f"path deliberately. Refusing to report a TTFT and a max-B "
+                        f"that belong to the fallback."
+                    )
+                if ri == 0 and cache_backend == "windowed":
+                    diag["lse"] = {
+                        "label": getattr(hooks, "lse_label", None),
+                        "active": bool(getattr(hooks, "lse_active", False)),
+                        "recompute_count": lse_misses,
+                        "reuse_requested": _lse_reuse_requested(),
+                    }
+                    diag["fused_decode"] = bool(getattr(hooks, "fused_decode", False))
                 # Generate tokens for TPOT
                 pkv = out.past_key_values
                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -1027,6 +1339,46 @@ class PerfRunner:
                 if hooks is not None:
                     hooks.remove()
             self._cooldown(pc, f"measurement run {ri}")
+        # -- did the compiled eviction actually fuse? ------------------------
+        # Two separate questions, and the flag answers neither. (1) Did the
+        # compiled body RUN — evict_path_stats splits evictions by path, and any
+        # `eager` count on a run that set STICKYKV_COMPILE_EVICT means the
+        # dispatch we were trying to remove is still being paid. (2) Did it fuse
+        # or just trace — torch.compile responds to a graph break by splitting
+        # the region and running the pieces eagerly, silently, so a "compiled"
+        # eviction that broke on every store mutation issues the same ~273
+        # launches per layer and is indistinguishable in the timings from "the
+        # eviction was never the bottleneck". The eviction body mutates
+        # QuantizedStore in place and calls free_slots, so breaks are the
+        # expected failure mode, not a remote one.
+        if cache_backend == "windowed":
+            ev = _evict_path_stats()
+            dyn = _dynamo_counters()
+            diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn}
+            log.info("eviction path: %s | dynamo: %s", ev or "n/a", dyn or "n/a")
+            if os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
+                    "1", "true", "yes", "on") and ev.get("eager"):
+                log.warning(
+                    "config %s: STICKYKV_COMPILE_EVICT is on but %d eviction(s) "
+                    "still ran the EAGER body (compiled: %d). Those steps paid the "
+                    "full ~273-launch-per-layer eviction this flag exists to "
+                    "remove.", c.get("name"), ev["eager"], ev.get("compiled", 0))
+            if dyn.get("graph_breaks"):
+                log.warning(
+                    "config %s: %d dynamo graph break(s) during the MEASURED runs "
+                    "(warmup is excluded). torch.compile runs the broken-out "
+                    "regions eagerly, so the compiled eviction may be issuing the "
+                    "eager launch count under a compiled name. Inspect with "
+                    "TORCH_LOGS=graph_breaks before trusting this row's TPOT.",
+                    c.get("name"), dyn["graph_breaks"])
+            if dyn.get("frames_ok"):
+                log.warning(
+                    "config %s: dynamo compiled %d frame(s) during the MEASURED "
+                    "runs (counters are zeroed after warmup, so this is "
+                    "recompilation). The eviction is compiled dynamic=True "
+                    "precisely so the varying window count does not retrigger "
+                    "compilation; this is compile latency inside the timings.",
+                    c.get("name"), dyn["frames_ok"])
         # Cleanup
         del model
         gc.collect()
@@ -1067,6 +1419,14 @@ class PerfRunner:
             # bought nothing", so an efficiency number is unattributable without
             # this. See modules/windowed_cache/score_kernel.py.
             "score_backend": _describe_score_backend(),
+            # Per-config evidence about WHICH method each row measured, keyed by
+            # config name: `tier_geometry` (how many keys the byte budget buys —
+            # see describe_tier_geometry), `lse` (which L-source installed and
+            # whether compute_lse ran anyway), `fused_decode`, and `eviction`
+            # (eager-vs-compiled eviction counts plus dynamo graph-break /
+            # recompile counters). A timing column cannot say any of this, and
+            # every one of them has silently changed what a row measured before.
+            "diagnostics": result.get("diagnostics", {}),
             # Where each row compacts, so the printer can charge compression to
             # the right column per method instead of assuming this project's shape.
             "compaction": {

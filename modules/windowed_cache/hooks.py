@@ -216,11 +216,26 @@ class HookHandles:
     ``_cleanups`` holds zero-arg callables run at removal — used to restore the
     optional flash ``softmax_lse`` monkeypatch (:mod:`flash_lse`) so the process
     is left exactly as we found it.
+
+    ``lse_active`` / ``lse_label`` / ``fused_decode`` report what
+    :func:`install_score_hooks` actually installed, as opposed to what was asked
+    for. The L-source selection is ``auto`` by default and degrades silently
+    (:func:`_install_lse_source`), and a silent degrade to recomputing ``L`` is
+    not a cosmetic difference: it adds a second O(N²) pass per prefill layer plus
+    a ``[B, H, chunk, S]`` fp32 transient. A benchmark that cannot read back
+    which source ran cannot say whether its TTFT is the method's or the
+    fallback's, so the answer is published here rather than only in the banner.
     """
 
     _hook_handles: List[Any] = field(default_factory=list)
     _cleanups: List[Any] = field(default_factory=list)
     _removed: bool = False
+    #: True iff an L-source was installed (``L`` comes from the forward).
+    lse_active: bool = False
+    #: ``flashinfer`` / ``flash`` / ``off (...)`` — the banner's label.
+    lse_label: str = "off (hooks not installed)"
+    #: True iff the fused two-tier decode kernel path was armed.
+    fused_decode: bool = False
 
     def remove(self) -> None:
         """Remove all hooks and run cleanups.  Idempotent."""
@@ -324,6 +339,7 @@ def install_score_hooks(
     # output. enable() returns None if flash-attn isn't installed, in which case
     # capture is silently disabled and the score path recomputes L as before.
     lse_capture, lse_label = _install_lse_source(handles)
+    handles.lse_active, handles.lse_label = lse_capture, lse_label
     # The module whose clear()/pop() the per-layer hooks below must call — the
     # FlashInfer path and the flash-attn capture keep independent stashes.
     lse_mod = flashinfer_lse if lse_label == "flashinfer" else flash_lse
@@ -335,6 +351,7 @@ def install_score_hooks(
     # materialize read path (and a CPU flash run already raises at the first
     # prefill), so hook-install unit tests on CPU are unaffected.
     fused_active = fused_decode_enabled() and _cuda
+    handles.fused_decode = fused_active
     if fused_active:
         assert_prefill_kernel_available(True)
         assert_decode_kernel_available(True)

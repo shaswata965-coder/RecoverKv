@@ -1110,3 +1110,38 @@ def test_compiled_eviction_is_byte_identical_to_eager():
             assert torch.equal(a, b), f"{k} diverged under compiled eviction"
         else:
             assert a == b, f"{k} diverged under compiled eviction"
+
+
+def test_evict_path_stats_split_eager_from_compiled():
+    """``evict_path_stats`` must say which body ran, not which flag was set.
+
+    Setting ``STICKYKV_COMPILE_EVICT`` is not evidence that the compiled eviction
+    ran: the flag is read per call, the compiled fn is built lazily, and a
+    benchmark harness that trusts the flag will report eager launch counts under
+    a compiled name. The counters are the proof-of-execution contract
+    ``flash_decode`` already applies to the decode kernel (armed vs fired), and
+    ``perf_runner`` fails a row on them, so they have to actually discriminate.
+    """
+    pytest.importorskip("torch")
+    from modules.windowed_cache.cache import (
+        evict_path_stats, reset_evict_path_stats,
+    )
+
+    reset_evict_path_stats()
+    _run_decode_across_eviction(compile_backend=None)
+    eager = evict_path_stats()
+    assert eager["eager"] >= 1, "the eager body ran but was not counted"
+    assert eager["compiled"] == 0
+
+    reset_evict_path_stats()
+    try:
+        _run_decode_across_eviction(compile_backend="aot_eager")
+    except Exception as e:  # torch.compile unavailable on this build
+        pytest.skip(f"torch.compile(aot_eager) unavailable: {type(e).__name__}: {e}")
+    comp = evict_path_stats()
+    assert comp["compiled"] == eager["eager"], (
+        "the compiled run must take the compiled body for exactly the evictions "
+        f"the eager run took eagerly (compiled={comp}, eager={eager})"
+    )
+    assert comp["eager"] == 0, "an eviction fell back to the eager body silently"
+    reset_evict_path_stats()

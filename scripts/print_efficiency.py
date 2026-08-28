@@ -191,6 +191,96 @@ def build_report(files: list[Path]) -> str:
                      f"-- that is the step-0 compaction amortized over "
                      f"{max(gen_len - 1, 1)} steps, not per-token cost.")
 
+        # -- what the budget bought, in KEYS rather than bytes ---------------
+        # cache_budget is a BYTE budget. int2 is ~8x denser than fp16, so a
+        # quant_ratio=0.5 row and a quant_ratio=0.0 row at the same nominal
+        # budget retain wildly different numbers of tokens -- and it is the token
+        # count, not the byte count, that sets decode latency. Without this the
+        # two rows look like the same operating point with different numbers, and
+        # the obvious reading ("quantization made it 2x slower") attributes to the
+        # int2 path what is really 2.4x more attention work.
+        diags = meta.get("diagnostics", {}) or {}
+        geoms = [(n, (diags.get(n) or {}).get("tier_geometry")) for n in names]
+        if any(g for _, g in geoms):
+            emit("")
+            emit("  [what the budget bought -- KEYS one decode step attends over]")
+            emit(f"    {'config':<22} {'q_ratio':>8} {'fp_tok':>8} {'int2_tok':>9} "
+                 f"{'S_eff':>8} {'x prefill':>10} {'Qloop/layer/tok':>16}")
+            for name, g in geoms:
+                if not g:
+                    continue
+                emit(
+                    f"    {name:<22} {g['quant_ratio']:>8.2f} {g['fp_tokens']:>8d} "
+                    f"{g['q_tokens']:>9d} {g['s_eff']:>8d} {g['expansion']:>9.2f}x "
+                    f"{g['decode_q_loop_iters']:>16d}"
+                )
+            expanded = [(n, g) for n, g in geoms if g and g["expansion"] >= 1.0]
+            if expanded:
+                emit("")
+                for name, g in expanded:
+                    emit(
+                        f"    [warn] {name}: the compressed cache is LONGER than the "
+                        f"prompt -- {g['s_eff']} keys for a {prefill_len}-token "
+                        f"prefill ({g['expansion']:.2f}x)."
+                    )
+                ref = expanded[0][1]
+                emit("")
+                emit("           cache_budget is a BYTE budget and int2 is ~8x denser than")
+                emit("           fp16, so half the bytes buys ~4x the tokens. Those bytes")
+                emit("           are real -- the MEMORY claim stands -- but a row above 1.00x")
+                emit("           does MORE attention work per decode step than the full-cache")
+                emit("           baseline, so read its latency as a memory result, not a")
+                emit("           speed one.")
+                emit(f"           The same byte budget at quant_ratio=0.0 retains "
+                     f"{ref['s_eff_at_q0']} keys ({ref['expansion_at_q0']:.2f}x).")
+                emit("           That row is the eviction claim; it belongs in the table")
+                emit("           next to this one.")
+
+        # -- which path each row actually ran --------------------------------
+        # Every entry here has silently changed what a row measured at least
+        # once: the L-source degrades flashinfer -> flash -> recompute without
+        # raising, and torch.compile answers a graph break by running the region
+        # eagerly under a compiled name. Timings cannot distinguish any of that
+        # from "the optimization did not help".
+        if any(diags.get(n) for n in names):
+            emit("")
+            emit("  [provenance -- which path each row actually ran]")
+            for name in names:
+                d = diags.get(name) or {}
+                if not d:
+                    continue
+                lse = d.get("lse") or {}
+                evd = d.get("eviction") or {}
+                ev = evd.get("path_stats") or {}
+                dyn = evd.get("dynamo_counters") or {}
+                bits = []
+                if lse:
+                    misses = lse.get("recompute_count")
+                    bits.append(
+                        f"L={lse.get('label')}"
+                        + ("" if not misses else f" (RECOMPUTED x{misses})")
+                    )
+                if "fused_decode" in d:
+                    bits.append(f"fused_decode={'on' if d['fused_decode'] else 'off'}")
+                if ev:
+                    bits.append(
+                        f"evict compiled/eager={ev.get('compiled', 0)}/{ev.get('eager', 0)}"
+                    )
+                if dyn.get("graph_breaks"):
+                    bits.append(f"GRAPH_BREAKS={dyn['graph_breaks']}")
+                if dyn.get("frames_ok"):
+                    bits.append(f"RECOMPILED_FRAMES={dyn['frames_ok']}")
+                if bits:
+                    emit(f"    {name:<22} " + "  ".join(bits))
+            emit("")
+            emit("    evict compiled/eager: any nonzero `eager` on a run that set")
+            emit("    STICKYKV_COMPILE_EVICT means those eviction steps still paid the")
+            emit("    full ~273-launch-per-layer dispatch cost the flag exists to remove.")
+            emit("    GRAPH_BREAKS means torch.compile split the eviction and ran the")
+            emit("    pieces eagerly -- compiled in name, eager in launch count.")
+            emit("    RECOMPILED_FRAMES counts frames dynamo compiled AFTER warmup, so")
+            emit("    that compile latency landed inside the measured timings.")
+
         # peak vs steady: the whole-run peak cannot show compression at these
         # shapes, so say so rather than letting a flat peak column read as
         # "compression does nothing".
