@@ -190,7 +190,7 @@ class TestTierGeometry:
     """
 
     @staticmethod
-    def _resolved(prefill_len: int, quant_ratio: float):
+    def _resolved(prefill_len: int, quant_ratio: float, mode: str = "bytes"):
         import torch
         from modules.windowed_cache.config import WindowedCacheConfig
 
@@ -204,6 +204,7 @@ class TestTierGeometry:
         cfg = WindowedCacheConfig(
             window_size=8, num_sink_tokens=5, local_window_size=64,
             cache_budget=0.50, quant_ratio=quant_ratio, first_eviction_step=0,
+            quant_budget_mode=mode,
         )
         # max_tokens=0 == budget_basis "context" (budget is a fraction of prefill).
         return cfg.resolve(prefill_len, _MC, torch.float16, 0)
@@ -329,3 +330,110 @@ class TestDynamoCounters:
         self._with_counters(monkeypatch, {"brand_new_section": {"a": 2, "b": 3}})
         c = pr._dynamo_counters()
         assert c["raw_brand_new_section"] == 5
+
+
+class TestQuantBudgetMode:
+    """``quant_ratio`` must not move the amount of work the decode does.
+
+    Under the historic ``quant_budget_mode='bytes'`` it did: q divides the byte
+    budget, an int2 window costs ~3.9x less than an fp16 one, so the retained key
+    count grows as ``top_k_windows * (1 + 2.88q)`` and a "50% cache" at q=0.70
+    holds 1.47x the prompt. ``'tokens'`` divides the window count instead, which
+    is what makes an operating point chosen for quality safe to measure latency
+    at.
+    """
+
+    @staticmethod
+    def _geom(prefill: int, q: float, mode: str, budget: float = 0.50):
+        import torch
+        from modules.evaluation.perf_runner import describe_tier_geometry
+        from modules.windowed_cache.config import WindowedCacheConfig
+
+        class _MC:
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            hidden_size = 4096
+            head_dim = 128
+            num_hidden_layers = 32
+
+        cfg = WindowedCacheConfig(
+            window_size=8, num_sink_tokens=5, local_window_size=64,
+            cache_budget=budget, quant_ratio=q, quant_budget_mode=mode,
+            first_eviction_step=0,
+        )
+        return describe_tier_geometry(cfg.resolve(prefill, _MC, torch.float16, 0),
+                                      prefill)
+
+    @pytest.mark.parametrize("prefill", [4096, 2048, 1048])
+    def test_tokens_mode_is_q_invariant(self, prefill):
+        """The whole point: identical keys, identical decode work, any q."""
+        pytest.importorskip("torch")
+        base = self._geom(prefill, 0.0, "tokens")
+        for q in (0.1, 0.5, 0.70, 0.9):
+            g = self._geom(prefill, q, "tokens")
+            assert g["s_eff"] == base["s_eff"], (q, g["s_eff"], base["s_eff"])
+            assert g["retained_windows"] == base["retained_windows"], q
+            assert g["q_invariant"] is True
+
+    @pytest.mark.parametrize("prefill", [4096, 2048, 1048])
+    def test_tokens_mode_spends_the_saving_on_bytes(self, prefill):
+        """Same keys, monotonically fewer bytes as q rises. That is the claim."""
+        pytest.importorskip("torch")
+        prev = None
+        for q in (0.0, 0.5, 0.70, 0.9):
+            g = self._geom(prefill, q, "tokens")
+            if prev is not None:
+                assert g["retained_bytes"] < prev, (q, g["retained_bytes"], prev)
+            prev = g["retained_bytes"]
+        assert self._geom(prefill, 0.0, "tokens")["bytes_vs_fp16"] == pytest.approx(1.0)
+
+    def test_bytes_mode_grows_the_key_count_with_q(self):
+        """Pins the behaviour 'tokens' exists to replace, so the two stay distinct."""
+        pytest.importorskip("torch")
+        seen = [self._geom(4096, q, "bytes")["s_eff"] for q in (0.0, 0.5, 0.70)]
+        assert seen[0] < seen[1] < seen[2], seen
+        # A "50% budget" that holds more keys than the prompt it compressed.
+        assert self._geom(4096, 0.70, "bytes")["expansion"] > 1.0
+
+    def test_bytes_mode_saturates_tier_counts_and_drops_nothing(self):
+        """Past q ~ 0.36 at budget 0.50 the first eviction retains every window.
+
+        EvictionPolicy.tier_counts clamps n_q to the windows that exist, so the
+        resolved N_q is unreachable and the pass only moves windows between
+        tiers. No timing column can show this; the geometry must.
+        """
+        pytest.importorskip("torch")
+        low = self._geom(4096, 0.2, "bytes")
+        high = self._geom(4096, 0.70, "bytes")
+        assert low["first_eviction_windows_dropped"] > 0, low
+        assert low["tier_counts_saturated"] is False
+        assert high["first_eviction_windows_dropped"] == 0, high
+        assert high["tier_counts_saturated"] is True
+        # 'tokens' mode at the same q still evicts.
+        tok = self._geom(4096, 0.70, "tokens")
+        assert tok["first_eviction_windows_dropped"] > 0, tok
+        assert tok["tier_counts_saturated"] is False
+
+    def test_q0_is_identical_under_both_modes(self):
+        """No quantization means nothing to divide; the modes must not diverge."""
+        pytest.importorskip("torch")
+        for prefill in (4096, 2048, 1048):
+            a = self._geom(prefill, 0.0, "bytes")
+            b = self._geom(prefill, 0.0, "tokens")
+            for k in ("top_k_fp", "N_q", "s_eff", "fp_tokens", "q_tokens"):
+                assert a[k] == b[k], (prefill, k, a[k], b[k])
+
+    def test_steady_state_is_reported_as_a_step_count(self):
+        """s_eff is an asymptote; the Q tier fills at ~1 window per ws steps."""
+        pytest.importorskip("torch")
+        g = self._geom(4096, 0.70, "bytes")
+        assert g["steps_to_steady_state"] == g["N_q"] * g["window_size"]
+        # 4096/256 runs 255 decode steps against ~5368 needed -- measured mid-fill.
+        assert g["steps_to_steady_state"] > 255
+
+    def test_invalid_mode_is_rejected(self):
+        from modules.windowed_cache.config import WindowedCacheConfig
+        with pytest.raises(ValueError, match="quant_budget_mode"):
+            WindowedCacheConfig(window_size=8, num_sink_tokens=5,
+                                local_window_size=64, cache_budget=0.5,
+                                quant_ratio=0.5, quant_budget_mode="megabytes")

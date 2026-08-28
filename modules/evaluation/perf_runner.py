@@ -297,21 +297,49 @@ def _reset_dynamo_counters() -> None:
         pass
 
 
+#: Resolved once, not per call. These are read on the measured path (the reset
+#: sits just before the prefill timer and the read just after it), and the
+#: import-system lookup in a per-call ``from ... import`` measured 608 us against
+#: ~100 ns for the resolved callable — small against a multi-second run, but it
+#: is pure instrumentation cost inside the region being instrumented, which is
+#: the one place it must not be. Resolved lazily so an import failure still
+#: degrades to "unreadable" instead of failing the benchmark.
+_KERNEL_FNS: Dict[str, Any] = {}
+
+
+def _kernel_fn(name: str):
+    """A ``score_kernel`` / ``cache`` diagnostic callable, memoized (or None)."""
+    if name in _KERNEL_FNS:
+        return _KERNEL_FNS[name]
+    fn = None
+    try:
+        if name in ("lse_recompute_count", "reset_lse_recompute_count"):
+            import modules.windowed_cache.score_kernel as m
+        else:
+            import modules.windowed_cache.cache as m
+        fn = getattr(m, name, None)
+    except Exception:  # pragma: no cover - environment dependent
+        fn = None
+    _KERNEL_FNS[name] = fn
+    return fn
+
+
 def _lse_recompute_count() -> Optional[int]:
     """How many times ``compute_lse`` ran, or ``None`` if unreadable."""
+    fn = _kernel_fn("lse_recompute_count")
     try:
-        from modules.windowed_cache.score_kernel import lse_recompute_count
-        return int(lse_recompute_count())
+        return int(fn()) if fn is not None else None
     except Exception:  # pragma: no cover - environment dependent
         return None
 
 
 def _reset_lse_recompute_count() -> None:
-    try:
-        from modules.windowed_cache.score_kernel import reset_lse_recompute_count
-        reset_lse_recompute_count()
-    except Exception:  # pragma: no cover - environment dependent
-        pass
+    fn = _kernel_fn("reset_lse_recompute_count")
+    if fn is not None:
+        try:
+            fn()
+        except Exception:  # pragma: no cover - environment dependent
+            pass
 
 
 def _lse_reuse_requested() -> bool:
@@ -339,38 +367,50 @@ def _lse_transient_gb(batch_size: int, model_config: Any, prefill_len: int) -> f
 
 
 def _evict_path_stats() -> Dict[str, int]:
+    fn = _kernel_fn("evict_path_stats")
     try:
-        from modules.windowed_cache.cache import evict_path_stats
-        return evict_path_stats()
+        return fn() if fn is not None else {}
     except Exception:  # pragma: no cover - environment dependent
         return {}
 
 
 def _reset_evict_path_stats() -> None:
-    try:
-        from modules.windowed_cache.cache import reset_evict_path_stats
-        reset_evict_path_stats()
-    except Exception:  # pragma: no cover - environment dependent
-        pass
+    fn = _kernel_fn("reset_evict_path_stats")
+    if fn is not None:
+        try:
+            fn()
+        except Exception:  # pragma: no cover - environment dependent
+            pass
 
 
 def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
-    """What the resolved budget actually buys, in TOKENS the decode must walk.
+    """What the resolved budget buys, in KEYS the decode must walk.
 
-    ``cache_budget`` is a **byte** budget (design.md §7). int2 is ~8x denser than
-    fp16, so spending a fraction ``q`` of those bytes on the Q tier buys ~8q of
-    the token count, and the *number of keys attention reads* is not the budget
-    at all — it is ``fp_tokens + N_q * window_size``. At ``quant_ratio=0.5``,
-    ``cache_budget=0.5`` that comes out ABOVE the prompt length: 4885 effective
-    keys for a 4096-token prefill on Llama-3-8B geometry (1.19x), against 0.50x
-    for the same budget at ``quant_ratio=0.0``.
+    The keys a decode step reads is ``fp_tokens + N_q * window_size``, and under
+    the historic ``quant_budget_mode='bytes'`` that is NOT the budget: ``q``
+    divides the bytes, an int2 window costs ~3.9x less than an fp16 one, so the
+    retained key count grows as ``top_k_windows * (1 + 2.88q)`` on Llama-3-8B at
+    ws=8. Measured steady state at ``cache_budget=0.50``: 0.50x the prompt at
+    q=0, 1.19x at q=0.5, 1.47x at q=0.7. A "50% cache" that attends over more
+    keys than the full-cache baseline, with the operating point moving under a
+    knob nominally chosen for quality.
 
-    That is not a bug in the resolver — those really are half the bytes — but it
-    is decisive for a *latency* table, and nothing in the npz previously recorded
-    it. A q=0.5 row and a q=0.0 row at the same nominal budget do 2.4x different
-    amounts of attention work, and a reader comparing either against a full-cache
-    baseline needs ``expansion`` to know which. Recorded per config so the two
-    rows can be read side by side.
+    ``quant_budget_mode='tokens'`` (the default since this was found) divides the
+    window count instead, so ``retained_windows`` and therefore every field here
+    is q-INVARIANT and ``q`` only moves ``retained_bytes``. ``q_invariant`` says
+    which regime the row ran in.
+
+    Two further facts a single "S_eff" would hide, both recorded:
+
+    * ``windows_dropped_first_eviction`` — ``EvictionPolicy.tier_counts`` clamps
+      ``n_q`` to the windows that exist, so past the saturation point (q ~ 0.36
+      at budget 0.50) the first eviction drops NOTHING and the resolved ``N_q``
+      is not reachable at that shape.
+    * ``s_eff`` is the ASYMPTOTE. The Q tier fills at ~1 window per ``ws`` decode
+      steps, so a short generation never reaches it — measured at q=0.70,
+      4096/256 ends at 1.06x against an asymptote of 1.47x while 1048/1048
+      reaches 1.37x. Rows at different ``gen_len`` are therefore at different
+      operating points, which ``steps_to_steady_state`` quantifies.
     """
     ws = int(resolved.window_size)
     fp_tokens = (
@@ -411,6 +451,57 @@ def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
         # Serial iterations of the fused decode kernel's Q-tier loop, per layer
         # per token (decode_kernel.py: `for w in range(0, n_active)`).
         "decode_q_loop_iters": int(resolved.N_q),
+        # -- which budget regime this row ran in -------------------------------
+        "quant_budget_mode": getattr(resolved, "quant_budget_mode", "bytes"),
+        "q_invariant": getattr(resolved, "quant_budget_mode", "bytes") == "tokens",
+        "retained_windows": int(resolved.top_k_fp) + int(resolved.N_q),
+        # The memory claim, priced from the resolved config: bytes the retained
+        # windows cost, against what the same key count would cost at fp16.
+        "retained_bytes": int(getattr(resolved, "retained_evictable_bytes", 0)),
+        "evictable_budget_bytes": int(getattr(resolved, "evictable_budget_bytes", 0)),
+        "bytes_vs_fp16": (
+            resolved.retained_evictable_bytes / resolved.evictable_budget_bytes
+            if getattr(resolved, "evictable_budget_bytes", 0) else float("nan")
+        ),
+        # -- is the resolved N_q even reachable at this shape? -----------------
+        **_first_eviction_drop(resolved, prefill_len),
+        # -- how long until s_eff is the truth? --------------------------------
+        # The Q tier gains ~1 window per ws decode steps from an empty start, so
+        # this is roughly when the asymptote above is actually reached.
+        "steps_to_steady_state": int(resolved.N_q) * ws,
+    }
+
+
+def _first_eviction_drop(resolved, prefill_len: int) -> Dict[str, Any]:
+    """Windows the FIRST eviction offers vs retains — 0 dropped means no eviction.
+
+    ``EvictionPolicy.tier_counts`` clamps ``n_q`` to ``evictable_w - k_fp``, so a
+    resolved ``N_q`` larger than the band is simply unreachable and the pass
+    retains every window it was offered. That is a config that names a budget and
+    compresses nothing on its first (and largest) compaction, which no timing
+    column can reveal.
+    """
+    ws = int(resolved.window_size)
+    try:
+        from modules.windowed_cache.policy import EvictionPolicy
+        policy = EvictionPolicy(resolved)
+        # The first eviction fires at first_eviction_step, by which point the
+        # prompt plus that many decode tokens are resident.
+        total = prefill_len + int(getattr(resolved, "first_eviction_step", 0)) + 1
+        post_sink = max(total - int(resolved.num_sink_tokens), 0)
+        W = -(-post_sink // ws)
+        k_fp, n_q, local_w = policy.tier_counts(W)
+    except Exception:  # pragma: no cover - defensive; never fail a benchmark
+        return {}
+    retained = k_fp + n_q + local_w
+    return {
+        "first_eviction_windows_offered": int(W),
+        "first_eviction_k_fp": int(k_fp),
+        "first_eviction_n_q": int(n_q),
+        "first_eviction_windows_dropped": int(W - retained),
+        # True when the resolved N_q exceeds the band and tier_counts clamps it:
+        # the row is not running the split its config names.
+        "tier_counts_saturated": bool(n_q < int(resolved.N_q)),
     }
 
 
@@ -1020,26 +1111,48 @@ class PerfRunner:
             )
             diag["tier_geometry"] = geom
             log.info(
-                "tier geometry: fp %d tok (sink %d + %d x %d + local %d) + Q %d tok "
-                "(%d int2 windows) = %d effective keys = %.2fx prefill",
-                geom["fp_tokens"], geom["num_sink_tokens"], geom["top_k_fp"],
-                geom["window_size"], geom["local_tokens"], geom["q_tokens"],
-                geom["N_q"], geom["s_eff"], geom["expansion"],
+                "tier geometry [%s]: fp %d tok (sink %d + %d x %d + local %d) + "
+                "Q %d tok (%d int2 windows) = %d keys = %.2fx prefill; "
+                "bytes %.0f%% of fp16 at the same key count",
+                geom["quant_budget_mode"], geom["fp_tokens"],
+                geom["num_sink_tokens"], geom["top_k_fp"], geom["window_size"],
+                geom["local_tokens"], geom["q_tokens"], geom["N_q"],
+                geom["s_eff"], geom["expansion"], geom["bytes_vs_fp16"] * 100,
             )
-            if geom["expansion"] >= 1.0:
+            if not geom["q_invariant"] and geom["expansion"] >= 1.0:
                 log.warning(
-                    "config %s: the compressed cache is LONGER than the prompt — "
-                    "%d effective keys for a %d-token prefill (%.2fx) at "
-                    "cache_budget=%s, quant_ratio=%.2f. cache_budget is a BYTE "
-                    "budget and int2 is ~8x denser, so half the bytes buys ~4x the "
-                    "tokens. These bytes are real, but this row does MORE attention "
-                    "work per decode step than the full-cache baseline, so read its "
-                    "latency as a memory result, not a speed one — and compare it "
-                    "against the quant_ratio=0.0 row at the same budget, which "
-                    "retains %d keys (%.2fx).",
+                    "config %s: quant_budget_mode='bytes' and the cache is LONGER "
+                    "than the prompt — %d keys for a %d-token prefill (%.2fx) at "
+                    "cache_budget=%s, quant_ratio=%.2f. q divides the BYTES there, "
+                    "and an int2 window costs ~3.9x less than an fp16 one, so the "
+                    "retained key count grows with q. This row does MORE attention "
+                    "work per decode step than the full-cache baseline, and its "
+                    "operating point moves with a knob nominally chosen for "
+                    "quality. quant_budget_mode='tokens' (the default) holds it at "
+                    "%d keys (%.2fx) for every q.",
                     c.get("name"), geom["s_eff"], prefill_len, geom["expansion"],
                     budget, geom["quant_ratio"],
                     geom["s_eff_at_q0"], geom["expansion_at_q0"],
+                )
+            if geom.get("first_eviction_windows_dropped") == 0:
+                log.warning(
+                    "config %s: the FIRST eviction drops 0 of the %d windows it is "
+                    "offered — it retains everything and only moves windows between "
+                    "tiers. tier_counts clamped n_q to %d against a resolved N_q of "
+                    "%d, so this row is not running the split its config names.",
+                    c.get("name"), geom.get("first_eviction_windows_offered"),
+                    geom.get("first_eviction_n_q"), geom["N_q"],
+                )
+            if geom["steps_to_steady_state"] > max(gen_len - 1, 0):
+                log.warning(
+                    "config %s: the Q tier fills at ~1 window per %d decode steps, "
+                    "so it needs ~%d steps to reach its %d-key steady state and "
+                    "this cell runs %d. The row is measured mid-fill, at a "
+                    "different operating point from a longer-generation row of the "
+                    "same config.",
+                    c.get("name"), geom["window_size"],
+                    geom["steps_to_steady_state"], geom["s_eff"],
+                    max(gen_len - 1, 0),
                 )
 
         def _new_cache_and_hooks():

@@ -50,9 +50,51 @@ class ResolvedConfig:
     quant_ratio: float = 0.0
     top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
     N_q: int = 0               # evictable int2 windows (0 when q=0)
+    # What `quant_ratio` divides. See WindowedCacheConfig.quant_budget_mode.
+    quant_budget_mode: str = "tokens"
+    # Bytes one retained window costs in each tier, as resolve() computed them.
+    # Carried so the memory claim is derivable from the resolved config alone:
+    # under quant_budget_mode='tokens' the retained key count is fixed and the
+    # BYTES are what quant_ratio moves, so a report that cannot price a window
+    # cannot state the compression the method actually achieved.
+    bytes_per_fp_window: int = 0
+    bytes_per_q_window: int = 0
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
+
+    @property
+    def retained_evictable_bytes(self) -> int:
+        """Bytes the retained evictable windows cost across both tiers."""
+        return (self.top_k_fp * self.bytes_per_fp_window
+                + self.N_q * self.bytes_per_q_window)
+
+    @property
+    def evictable_budget_bytes(self) -> int:
+        """Bytes the SAME window count would cost at fp16 (the q=0 reference).
+
+        ``retained_evictable_bytes / evictable_budget_bytes`` is the compression
+        quantization actually bought at this operating point — 1.0 at q=0, and
+        falling with q under ``quant_budget_mode='tokens'``.
+        """
+        return self.retained_windows * self.bytes_per_fp_window
+
+    @property
+    def retained_windows(self) -> int:
+        """Evictable windows kept across both tiers. ``quant_ratio``-invariant
+        under ``quant_budget_mode='tokens'`` — that is the point of that mode."""
+        return self.top_k_fp + self.N_q
+
+    @property
+    def retained_evictable_tokens(self) -> int:
+        """Keys one decode step attends over from the evictable band."""
+        return self.retained_windows * self.window_size
+
+    @property
+    def retained_tokens(self) -> int:
+        """Total keys retained: sink + both evictable tiers + local."""
+        return (self.num_sink_tokens + self.retained_evictable_tokens
+                + self.local_tokens)
 
     def __post_init__(self) -> None:
         # top_k_fp defaults to top_k_windows so direct constructions (and every
@@ -147,6 +189,35 @@ class WindowedCacheConfig:
     track_scores: bool = False
     rerotate_on_evict: bool = False
     quant_ratio: float = 0.0
+    # What `quant_ratio` divides between the fp16 and int2 tiers.
+    #
+    # "tokens" (default) — q splits the retained WINDOW COUNT. Both tiers
+    #     together always retain `top_k_windows` evictable windows, whatever q
+    #     is, so the number of keys a decode step attends over is
+    #     q-INVARIANT and quantization is a pure memory/quality knob: raising q
+    #     spends fewer bytes on the same tokens. This is what makes the method
+    #     generalizable across q — an operating point chosen for quality does not
+    #     silently move the latency it is measured at.
+    #
+    # "bytes" — q splits the byte budget, the historic behaviour. An int2 window
+    #     costs ~3.9x less than an fp16 one (b_fp/b_q at ws=8, D=128, H_kv=8), so
+    #     spending a fraction q of the bytes on int2 buys ~3.9q of the token
+    #     count and the retained TOKENS grow with q:
+    #
+    #       retained_windows = top_k_windows * (1 + (b_fp/b_q - 1) * q)
+    #
+    #     At cache_budget=0.50 on Llama-3-8B that crosses the whole evictable
+    #     band at q ~ 0.36, and past it `EvictionPolicy.tier_counts` clamps to
+    #     the windows that exist — so the resolved N_q stops being reachable and
+    #     the config's stated ratio stops describing what runs. Measured steady
+    #     state at q=0.70, cache_budget=0.50: 6029 keys for a 4096-token prompt
+    #     (1.47x), 2941 for 2048 (1.44x), 1437 for 1048 (1.37x) — i.e. a
+    #     "50% cache" that holds more keys than the prompt, and does more
+    #     attention work per decode step than the full-cache baseline.
+    #
+    # Kept selectable because it is what every result before this change was
+    # recorded under; "bytes" reproduces those numbers exactly.
+    quant_budget_mode: str = "tokens"
     quant_memoize_read: Optional[bool] = None
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
@@ -220,6 +291,15 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
+            )
+
+        # -- quant_budget_mode (what quant_ratio divides) --
+        if self.quant_budget_mode not in ("tokens", "bytes"):
+            raise ValueError(
+                f"quant_budget_mode must be 'tokens' or 'bytes', got "
+                f"{self.quant_budget_mode!r}. 'tokens' keeps the retained key "
+                f"count invariant in quant_ratio; 'bytes' is the historic split "
+                f"and grows the retained key count with it."
             )
 
         # -- quant_ratio (two-tier split, design.md §7) --
@@ -403,8 +483,25 @@ class WindowedCacheConfig:
             + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
         )
         m_evict = remaining * bytes_per_token                           # evictable bytes
-        top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
-        N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+        if self.quant_budget_mode == "bytes":
+            # Historic split: q divides the BYTES. An int2 window is ~3.9x
+            # cheaper, so the retained WINDOW COUNT grows with q and the cache
+            # can end up holding more keys than the prompt (see the field docs).
+            top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
+            N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+        else:
+            # Token split (default): q divides the retained WINDOW COUNT, so
+            # top_k_fp + N_q == top_k_windows for every q. The keys a decode step
+            # attends over — and therefore the decode work, the score-axis width,
+            # and the eviction's tensor widths — are identical at q=0 and q=0.9;
+            # only the bytes those keys cost change. `remaining` is already the
+            # budget's token allowance, so no clamp against the sequence is
+            # needed: the count cannot exceed what the budget bought, and
+            # EvictionPolicy.tier_counts still clamps it to the windows that
+            # exist at any given eviction.
+            N_q = int(round(q * top_k_windows)) if q > 0.0 else 0
+            N_q = min(N_q, top_k_windows)
+            top_k_fp = top_k_windows - N_q
         # q=0 must reproduce today's count exactly (guard float floor drift).
         if q == 0.0:
             top_k_fp = top_k_windows
@@ -421,6 +518,9 @@ class WindowedCacheConfig:
             quant_ratio=q,
             top_k_fp=top_k_fp,
             N_q=N_q,
+            quant_budget_mode=self.quant_budget_mode,
+            bytes_per_fp_window=b_fp,
+            bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
             first_eviction_step=self.first_eviction_step,
         )

@@ -204,17 +204,47 @@ def build_report(files: list[Path]) -> str:
         if any(g for _, g in geoms):
             emit("")
             emit("  [what the budget bought -- KEYS one decode step attends over]")
-            emit(f"    {'config':<22} {'q_ratio':>8} {'fp_tok':>8} {'int2_tok':>9} "
-                 f"{'S_eff':>8} {'x prefill':>10} {'Qloop/layer/tok':>16}")
+            emit(f"    {'config':<22} {'mode':>7} {'q':>5} {'fp_tok':>8} {'int2_tok':>9} "
+                 f"{'S_eff':>8} {'x prefill':>10} {'bytes/fp16':>11} {'Qloop':>7}")
             for name, g in geoms:
                 if not g:
                     continue
+                bvf = g.get("bytes_vs_fp16", float("nan"))
                 emit(
-                    f"    {name:<22} {g['quant_ratio']:>8.2f} {g['fp_tokens']:>8d} "
+                    f"    {name:<22} {g.get('quant_budget_mode', '?'):>7} "
+                    f"{g['quant_ratio']:>5.2f} {g['fp_tokens']:>8d} "
                     f"{g['q_tokens']:>9d} {g['s_eff']:>8d} {g['expansion']:>9.2f}x "
-                    f"{g['decode_q_loop_iters']:>16d}"
+                    f"{_fmt(bvf * 100, 1):>10}% {g['decode_q_loop_iters']:>7d}"
                 )
-            expanded = [(n, g) for n, g in geoms if g and g["expansion"] >= 1.0]
+
+            # An eviction that drops nothing is not an eviction. tier_counts
+            # clamps n_q to the windows that exist, so past the saturation point
+            # the pass only moves windows between tiers and the row is measuring
+            # a full cache under a compression name.
+            nodrop = [(n, g) for n, g in geoms
+                      if g and g.get("first_eviction_windows_dropped") == 0]
+            for name, g in nodrop:
+                emit("")
+                emit(f"    [warn] {name}: the FIRST eviction drops 0 of the "
+                     f"{g.get('first_eviction_windows_offered')} windows it is offered.")
+                emit(f"           tier_counts clamped n_q to {g.get('first_eviction_n_q')} "
+                     f"against a resolved N_q of {g['N_q']}, so this row retains")
+                emit("           everything and only moves windows between tiers.")
+
+            # s_eff is the asymptote; a short generation never gets there, so two
+            # cells of the same config at different gen_len are different points.
+            midfill = [(n, g) for n, g in geoms
+                       if g and g.get("steps_to_steady_state", 0) > max(gen_len - 1, 0)]
+            for name, g in midfill:
+                emit("")
+                emit(f"    [warn] {name}: the Q tier needs ~{g['steps_to_steady_state']} "
+                     f"decode steps to reach its {g['s_eff']}-key steady state;")
+                emit(f"           this cell runs {max(gen_len - 1, 0)}. Measured mid-fill -- "
+                     f"not comparable to a longer-generation")
+                emit("           cell of the same config.")
+
+            expanded = [(n, g) for n, g in geoms
+                        if g and g["expansion"] >= 1.0 and not g.get("q_invariant")]
             if expanded:
                 emit("")
                 for name, g in expanded:
@@ -225,16 +255,13 @@ def build_report(files: list[Path]) -> str:
                     )
                 ref = expanded[0][1]
                 emit("")
-                emit("           cache_budget is a BYTE budget and int2 is ~8x denser than")
-                emit("           fp16, so half the bytes buys ~4x the tokens. Those bytes")
-                emit("           are real -- the MEMORY claim stands -- but a row above 1.00x")
-                emit("           does MORE attention work per decode step than the full-cache")
-                emit("           baseline, so read its latency as a memory result, not a")
-                emit("           speed one.")
-                emit(f"           The same byte budget at quant_ratio=0.0 retains "
-                     f"{ref['s_eff_at_q0']} keys ({ref['expansion_at_q0']:.2f}x).")
-                emit("           That row is the eviction claim; it belongs in the table")
-                emit("           next to this one.")
+                emit("           Under quant_budget_mode='bytes', quant_ratio divides the")
+                emit("           BYTES. An int2 window costs ~3.9x less than an fp16 one, so")
+                emit("           the retained KEY COUNT grows with q and the operating point")
+                emit("           moves under a knob nominally chosen for quality.")
+                emit(f"           quant_budget_mode='tokens' (the default) holds it at "
+                     f"{ref['s_eff_at_q0']} keys ({ref['expansion_at_q0']:.2f}x) for every q,")
+                emit("           and spends the saved bytes instead.")
 
         # -- which path each row actually ran --------------------------------
         # Every entry here has silently changed what a row measured at least
