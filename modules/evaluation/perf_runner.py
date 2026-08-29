@@ -487,7 +487,8 @@ def _first_eviction_drop(resolved, prefill_len: int) -> Dict[str, Any]:
         policy = EvictionPolicy(resolved)
         # The first eviction fires at first_eviction_step, by which point the
         # prompt plus that many decode tokens are resident.
-        total = prefill_len + int(getattr(resolved, "first_eviction_step", 0)) + 1
+        total = prefill_len + int(getattr(
+            resolved, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT)) + 1
         post_sink = max(total - int(resolved.num_sink_tokens), 0)
         W = -(-post_sink // ws)
         k_fp, n_q, local_w = policy.tier_counts(W)
@@ -1045,6 +1046,12 @@ class PerfRunner:
             # quant_ratio is per-config (like cache_budget), falling back to the
             # shared cache.quant_ratio; 0.0 keeps the pure-fp16 path (design.md §7).
             quant_ratio = c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0))
+            # What quant_ratio divides: 'tokens' (default) keeps the retained key
+            # count q-invariant; 'bytes' is the historic split. Per-config, like
+            # quant_ratio, so one run can compare the two modes row by row.
+            quant_budget_mode = c.get(
+                "quant_budget_mode",
+                getattr(cfg.cache, "quant_budget_mode", "tokens"))
             # None (default) = auto: memoize the dequantized Q tier at B=1, not
             # above. The default is set by the memory bound (the memo costs
             # ~149 MB/row against ~131 MB/row of actual KV, halving max-B); what
@@ -1063,6 +1070,7 @@ class PerfRunner:
                       cache_budget=budget if budget is not None else 0.5,
                       rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                       quant_ratio=quant_ratio,
+                      quant_budget_mode=quant_budget_mode,
                       quant_memoize_read=memoize,
                       first_eviction_step=first_eviction_step)
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).

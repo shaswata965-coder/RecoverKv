@@ -111,6 +111,11 @@ class CacheConfig:
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
+    # What quant_ratio divides between the fp16 and int2 tiers. "tokens"
+    # (default) keeps the retained KEY count invariant in quant_ratio, so q is a
+    # pure memory/quality knob; "bytes" is the historic split, under which the
+    # retained key count grows with q. See modules/windowed_cache/config.py.
+    quant_budget_mode: str = "tokens"
     # Decode step of the FIRST eviction, independent of window_size. 0 (default)
     # compresses the prompt on decode step 0 — before that step's query attends —
     # so every generated token comes from the budgeted cache. A positive value
@@ -177,6 +182,11 @@ class CacheConfig:
         if not isinstance(self.quant_ratio, float) or not (0.0 <= self.quant_ratio <= 1.0):
             raise ConfigValidationError(
                 f"quant_ratio must be a float in [0, 1], got {self.quant_ratio!r}"
+            )
+        if self.quant_budget_mode not in ("tokens", "bytes"):
+            raise ConfigValidationError(
+                f"quant_budget_mode must be 'tokens' or 'bytes', got "
+                f"{self.quant_budget_mode!r}"
             )
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
