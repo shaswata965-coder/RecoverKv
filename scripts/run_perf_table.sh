@@ -15,6 +15,13 @@
 #
 #   MODEL_PATH      HF id or local path to the model            (required)
 #   OUT_DIR         where the .npz + table.txt are written      (default: outputs/perf_table)
+#   DATA_SOURCE     prompt text: a corpus name, a path, or a    (default: wikitext-103)
+#                   LongBench name. Resolved by perf_runner:
+#                     wikitext-103 | pg19        built-in hub corpora
+#                     /path/to/file_or_dir       your own text (any extension)
+#                     local:relative/path        a repo-relative path
+#                     2wikimqa, qasper, ...       a LongBench dataset
+#                     longbench:NAME / corpus:NAME  force a loader
 #   QUANT_RATIO     two-tier int2 split q in [0,1]              (default: 0.70)
 #   QUANT_MODE      tokens | bytes  (see config.py)             (default: tokens)
 #   CACHE_BUDGET    fraction of the context kept                (default: 0.50)
@@ -38,6 +45,10 @@
 #   scripts/run_perf_table.sh --model /models/llama --quant-ratio 0.5 \
 #       --shapes "8192/512" --batches "1 16"
 #
+#   # your own corpus, from a file or directory of text
+#   scripts/run_perf_table.sh --model /models/llama --data-source /data/my_docs
+#   scripts/run_perf_table.sh --model /models/llama --data-source wikitext-103
+#
 #   # the historic byte-budget behaviour (cache grows with q), for comparison
 #   scripts/run_perf_table.sh --model /models/llama --quant-mode bytes --quant-ratio 0.70
 # ============================================================================
@@ -53,6 +64,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # ---- defaults (env overridable) --------------------------------------------
 MODEL_PATH="${MODEL_PATH:-}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
+DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
 QUANT_MODE="${QUANT_MODE:-tokens}"
 CACHE_BUDGET="${CACHE_BUDGET:-0.50}"
@@ -73,6 +85,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --model|--model-path)   MODEL_PATH="$2"; shift 2;;
     --out|--out-dir)        OUT_DIR="$2"; shift 2;;
+    --data-source|--dataset) DATA_SOURCE="$2"; shift 2;;
     --quant-ratio)          QUANT_RATIO="$2"; shift 2;;
     --quant-mode)           QUANT_MODE="$2"; shift 2;;
     --cache-budget|--budget) CACHE_BUDGET="$2"; shift 2;;
@@ -151,9 +164,10 @@ cache:
   first_eviction_step: 0
 
 perf:
-  # Real long-context text, chunked to exactly prefill_len and sampled per row,
-  # so every row in a batch is equal-length (the cache's Phase-2 requirement).
-  data_source: "2wikimqa"
+  # Real text, chunked to exactly prefill_len and sampled per row, so every row
+  # in a batch is equal-length (the cache's Phase-2 requirement). Resolved by
+  # perf_runner.iter_corpus_texts: a hub corpus name, a path, or a LongBench name.
+  data_source: "${DATA_SOURCE}"
   budget_basis: context          # budget = cache_budget * prefill_len
   prefill_logits: last_only      # exclude the method-independent [B,L,V] tensor
 
@@ -185,6 +199,7 @@ YAML
 {
   echo "commit: $(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo no_git)"
   echo "model: $MODEL_PATH"
+  echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
@@ -193,6 +208,7 @@ YAML
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
+echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
 echo "config: $CONFIG_FILE"
 echo ""
