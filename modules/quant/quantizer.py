@@ -45,11 +45,30 @@ _LEVELS = 3.0  # int2 asymmetric: codes in [0, 3]
 _CODES_PER_BYTE = 4  # int2: 4 crumbs per uint8
 
 
+# Keep the quant range-reductions OUT of any torch.compile graph wrapping the
+# eviction. In the demote path _affine_quantize's input is a DATA-DEPENDENT gather
+# (searchsorted-derived indices into the fp body), and Inductor <= 2.6 cannot
+# lower a reduction whose read index is a StarDep: it fuses gather→amin and then
+# fails to schedule it ("StarDep does not have an index on aten.amin.default",
+# target aten.amin.default over the quant-group dim -- see the compiled-eviction
+# traceback). Running the quantizer EAGER via a graph break sidesteps it entirely:
+# the gather / scatter / fp-store rebuild that dominate the eviction's ~273-launch
+# budget still compile; only the ~10-op affine quant (per demoted window) runs
+# eager, so the launch win is essentially intact. A no-op outside torch.compile,
+# and semantically identical either way. torch.compiler.disable is the stable API
+# (torch 2.1+); fall back to the private one on older builds.
+try:  # pragma: no cover - torch-version dependent
+    _compile_disable = torch.compiler.disable
+except AttributeError:  # pragma: no cover
+    _compile_disable = torch._dynamo.disable
+
+
 # ---------------------------------------------------------------------------
 # Core affine quant / dequant (grouped along one axis)
 # ---------------------------------------------------------------------------
 
 
+@_compile_disable
 def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]:
     """Affine asymmetric int2 quantize ``x`` grouped along ``group_dim``.
 
