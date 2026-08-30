@@ -1491,16 +1491,15 @@ class PerfRunner:
             compile_on = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
                 "1", "true", "yes", "on")
             if compile_failed:
-                # The compiled eviction was asked for and could not be lowered on
-                # this build, so every eviction ran eager. This is the loud,
-                # recorded fallback (cache.py) -- the run still produced numbers,
-                # but they are eager-path, so say so plainly rather than let the
-                # row read as "compiled and it didn't help".
+                # The compiled eviction is kernel-or-error (cache.py): it raised
+                # rather than running eager, so this config ERRORED (see the
+                # error_mask row) -- it did not quietly report eager timings. We
+                # still surface the recorded reason here for the log trail.
                 log.warning(
                     "config %s: torch.compile could NOT lower the eviction on this "
-                    "build (%s). Every eviction fell back to EAGER -- this row's "
-                    "TPOT is eager-path, the ~81%% launch budget was not cut. Fix "
-                    "the lowering or run with STICKYKV_COMPILE_EVICT=0.",
+                    "build (%s). Kernel-or-error: the cell ERRORED rather than "
+                    "running eager under a compiled label. Fix the lowering or run "
+                    "with STICKYKV_COMPILE_EVICT=0 for eager numbers.",
                     c.get("name"), compile_failed)
             elif compile_on and ev.get("eager"):
                 log.warning(

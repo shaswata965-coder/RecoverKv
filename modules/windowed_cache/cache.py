@@ -121,45 +121,54 @@ def _build_compiled_evict(dynamic: bool):
     return torch.compile(WindowedCache._evict_two_tier_impl, **kw)
 
 
-def _announce_evict_fallback_once(reason: str) -> None:
-    """Print, once, that the compiled eviction was requested but could not be
-    lowered and every eviction is running eager. Loud on purpose."""
-    if _EVICT_ANNOUNCED["done"]:
-        return
-    _EVICT_ANNOUNCED["done"] = True
-    print(
-        "[StickyKV] eviction path: COMPILED requested but torch.compile could "
-        "NOT lower it on this build -- FELL BACK TO EAGER for every eviction. "
-        f"Reason: {reason}. Timings are eager-path timings (the ~81% eviction "
-        "launch budget is NOT cut). Provenance records this (evict_compile_failed). "
-        "Run with STICKYKV_COMPILE_EVICT=0 / --compile-evict 0 to silence this.",
-        flush=True,
-    )
+_EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never silently runs the eager
+body under a compiled label -- the whole point of the flag is to MEASURE the
+compiled path, and a quiet eager run would report eager numbers as if compiled.
+So this raises rather than falling back.
+  What this is: torch.compile / Inductor could not lower
+WindowedCache._evict_two_tier_impl on this build. The known torch<=2.6 causes --
+a symbolic `((I)//ws)` guard and an `aten.amin` StarDep from a single-sided
+clamp -- are addressed in the body (concrete shape ints + a two-sided clamp). If
+it still fails, the traceback names the op that did not lower.
+  To get numbers now: rerun with STICKYKV_COMPILE_EVICT=0 (or --compile-evict 0).
+That runs the EAGER eviction -- correct, just launch-bound -- so the ~81%
+eviction launch budget is not cut and TPOT stays high.
+  To diagnose the lowering: TORCH_LOGS='+inductor,graph_breaks'
+TORCHDYNAMO_VERBOSE=1 on the failing shape, and try
+STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen -- if
+THAT works the failure is Inductor codegen, not the traced graph)."""
 
 
-def _run_compiled_evict(cache, layer_idx: int, step: int) -> bool:
-    """Try to run one eviction through ``torch.compile``.
+def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
+    """Run one eviction through ``torch.compile``, or RAISE. Kernel-or-error: no
+    eager fallback (a silent eager run under a compiled label defeats the whole
+    measurement -- the design intent). On success ``cache`` is mutated in place.
 
-    Returns ``True`` if the compiled body RAN (``cache`` mutated in place), or
-    ``False`` if it could not be lowered — in which case ``cache`` is UNTOUCHED
-    (a lowering/guard error raises before any kernel executes) and the caller
-    must run the eager body on the same step. A terminal failure is recorded in
-    :data:`_EVICT_COMPILE_FAILED` (sticky) and announced once.
-
-    Order of attempts: ``dynamic=True`` first (one graph across the varying
-    window count), then — on the torch<=2.6 symbolic-shape lowering errors —
-    once with ``dynamic=False`` (concrete shapes sidestep the ``((I)//ws)``
-    guard and the ``aten.amin`` StarDep).
+    Tries ``dynamic=True`` first (one graph across the varying window count),
+    then once with ``dynamic=False`` (concrete shapes are the belt to the body's
+    ``int()`` suspenders). If neither lowers, records the reason in
+    :data:`_EVICT_COMPILE_FAILED` (for provenance) and raises ``RuntimeError``
+    with actionable steps. Safe to raise on the same step: a lowering/guard error
+    fires before any kernel executes, so ``cache`` is untouched and the perf
+    runner catches it as an ``errored`` cell, never a corrupt one.
     """
     global _COMPILED_EVICT_FN, _EVICT_COMPILE_FAILED, _EVICT_COMPILE_TRIED_STATIC
 
+    if _EVICT_COMPILE_FAILED is not None:
+        # A prior eviction already proved this build cannot lower it; fail fast
+        # with the recorded reason rather than re-attempting the compile per cell.
+        raise RuntimeError(
+            "STICKYKV_COMPILE_EVICT is set but torch.compile of the two-tier "
+            "eviction already failed on this build "
+            f"({_EVICT_COMPILE_FAILED}).\n" + _EVICT_COMPILE_HELP
+        )
     if _COMPILED_EVICT_FN is None:
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
     try:
         _COMPILED_EVICT_FN(cache, layer_idx, step)
         _announce_evict_path_once(compiled=True)
         _EVICT_STATS["compiled"] += 1
-        return True
+        return
     except Exception as e_dyn:  # pragma: no cover - GPU/Inductor-build dependent
         terminal = e_dyn
         if not _EVICT_COMPILE_TRIED_STATIC:
@@ -169,21 +178,15 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> bool:
                 _COMPILED_EVICT_FN(cache, layer_idx, step)
                 _announce_evict_path_once(compiled=True)
                 _EVICT_STATS["compiled"] += 1
-                return True
+                return
             except Exception as e_static:
                 terminal = e_static
         _EVICT_COMPILE_FAILED = f"{type(terminal).__name__}: {terminal}"[:400]
         _COMPILED_EVICT_FN = None
-        warnings.warn(
-            "torch.compile could not lower the two-tier eviction "
-            f"({_EVICT_COMPILE_FAILED}); falling back to the eager eviction for "
-            "the rest of the run. Timings are eager-path (the compiled eviction "
-            "did not cut the launch budget). This is recorded, not silent -- see "
-            "evict_compile_failed(). Set STICKYKV_COMPILE_EVICT=0 to opt out.",
-            RuntimeWarning, stacklevel=2,
-        )
-        _announce_evict_fallback_once(_EVICT_COMPILE_FAILED)
-        return False
+        raise RuntimeError(
+            "STICKYKV_COMPILE_EVICT is set but torch.compile of the two-tier "
+            f"eviction failed ({_EVICT_COMPILE_FAILED}).\n" + _EVICT_COMPILE_HELP
+        ) from terminal
 
 
 def _announce_evict_path_once(compiled: bool) -> None:
@@ -814,37 +817,31 @@ class WindowedCache(_HFCacheBase):
         are identical to the eager path. It fires once per ``ws`` steps, so a
         compile / recompile amortizes.
 
-        **Loud, recorded fallback — not kernel-or-error.** This used to raise if
-        ``torch.compile`` could not lower the body, on the reasoning that a silent
-        eager run under a "compiled" label corrupts the measurement. But the
-        failure it actually produces (Inductor cannot lower this body on torch
-        <= 2.6: a symbolic ``((I)//ws)`` guard that "is not comparable", and a
-        symbolic clamp that lowers to an ``aten.amin`` StarDep it cannot index)
-        killed EVERY perf cell — the whole run returned dashes. Losing all the
-        numbers is a worse outcome than the one the hard error guarded against.
+        **Kernel-or-error when enabled — it never falls back to eager.** A silent
+        (or even loud) eager run under a "compiled" label defeats the flag's
+        entire purpose, which is to MEASURE the compiled path; an eager run would
+        report eager numbers, and the ~81%-of-budget eviction step would look
+        cut when it was not. So if ``torch.compile`` cannot lower the body,
+        :func:`_run_compiled_evict` raises (:data:`_EVICT_COMPILE_FAILED` records
+        the reason for provenance) rather than running eager — the perf runner
+        then marks that cell ``errored``, loudly, instead of quietly mislabelling
+        eager timings.
 
-        So on a lowering failure this now (1) retries once with ``dynamic=False``
-        — concrete shapes make both symbolic errors vanish, and the cache
-        compacts to the budget every ``ws`` steps so a static graph recompiles
-        only during the short fill phase — then (2) falls back to the eager body,
-        records the failure stickily in :data:`_EVICT_COMPILE_FAILED`, and warns
-        once. The integrity concern is still met, because the fallback is NOT
-        silent: :func:`evict_path_stats` counts the eager evictions,
-        :func:`evict_compile_failed` names the reason, and the perf runner folds
-        both into every row's provenance. A run that fell back reports eager
-        numbers and SAYS SO. Retrying is safe on the same step because a lowering
-        error raises before any kernel executes, so ``self`` is untouched.
+        The torch <= 2.6 Inductor failures this used to hit — a symbolic
+        ``((I)//ws)`` guard "not comparable" and an ``aten.amin`` StarDep from a
+        single-sided clamp — are fixed at the source in :meth:`_evict_two_tier_impl`
+        (the shape-derived control ints are made concrete, and the clamp is
+        two-sided), so on a supported build it now compiles rather than raising.
+        If a build still cannot lower it, the raised error names the failing op
+        and the steps to get numbers (``STICKYKV_COMPILE_EVICT=0`` runs eager).
         """
         if not _compile_evict_enabled():
             _announce_evict_path_once(compiled=False)
             _EVICT_STATS["eager"] += 1
             return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
-        # Compile requested. Try the compiled path unless a prior cell already
-        # proved this build cannot lower it (sticky), then fall back to eager.
-        if _EVICT_COMPILE_FAILED is None and _run_compiled_evict(self, layer_idx, step):
-            return None
-        _EVICT_STATS["eager"] += 1
-        return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
+        # Compile requested: compiled-or-raise. No eager fallback by design.
+        _run_compiled_evict(self, layer_idx, step)
+        return None
 
     def _evict_two_tier_impl(self, layer_idx: int, step: int) -> None:
         """One two-tier eviction (design §5), per row, entirely on device.
@@ -875,8 +872,20 @@ class WindowedCache(_HFCacheBase):
         device = state.key_states.device
 
         B, H_kv, T_fp, D = state.key_states.shape
-        T_body = T_fp - num_sink
-        W = state.window_scores.shape[2]
+        # CONCRETE ints for the integer index arithmetic below — arange sizes,
+        # window ranks, clamp bounds, and the ``//ws`` token→window map. Off a
+        # tensor ``.shape`` these are Python ints in eager but SymInts under
+        # torch.compile, and the eviction's gather/scatter index math then emits
+        # symbolic integer expressions Inductor cannot lower on torch <= 2.6:
+        # ``((I)//8) is not comparable`` (the ``i // ws`` guard) and the
+        # ``aten.amin`` StarDep from a symbolic single-sided clamp. ``int()``
+        # forces specialization here — a no-op in eager, byte-identical — so every
+        # count below is a real int and the index math is concrete. The cache
+        # compacts to the budget every ``ws`` steps, so this specializes to a
+        # handful of shapes during the fill phase and is stable at steady state
+        # (which is why the compiled body is worth its recompiles — design §5).
+        T_body = int(T_fp) - num_sink
+        W = int(state.window_scores.shape[2])
         # Eviction rewrites the Q tier AND compacts the fp store's positions, so
         # every memoized fused hand-off for this layer is stale. store.version
         # already covers the Q half (retain_only below bumps it); this also covers
@@ -887,7 +896,11 @@ class WindowedCache(_HFCacheBase):
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
         retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # W is a concrete int (above), so these are Python ints even under
+        # torch.compile; the int() is belt-and-suspenders against a future
+        # tier_counts that returns a tensor scalar.
         k_fp, n_q, local_w = policy.tier_counts(W)
+        k_fp, n_q, local_w = int(k_fp), int(n_q), int(local_w)
         n_fp = k_fp + local_w
 
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
@@ -1003,7 +1016,16 @@ class WindowedCache(_HFCacheBase):
         # scoring pass. When the body IS a whole number of kept windows this never
         # triggers — i // ws already tops out at n_fp - 1 — so it is a no-op on every
         # config that worked before.
-        rank = (i // ws).clamp(max=n_fp - 1)
+        # Two-sided clamp, not `.clamp(max=…)`. A single-sided clamp lowers
+        # through ``aten.amin``, whose scalar StarDep Inductor <= 2.6 cannot
+        # schedule ("StarDep does not have an index on aten.amin.default"); the
+        # two-sided form lowers as ``clamp``. ``min=0`` is a semantic no-op
+        # (``i >= 0`` and ``ws > 0`` ⇒ ``i // ws >= 0``). ``torch.div(…, 'floor')``
+        # is the explicit integer floor the ``//`` operator would do, kept as a
+        # tensor op so no symbolic ``//`` scalar reaches the guard system — with
+        # ``n_fp`` and ``new_body_len`` now concrete (above), the bound is a real
+        # int and the whole expression is Inductor-lowerable.
+        rank = torch.clamp(torch.div(i, ws, rounding_mode="floor"), 0, n_fp - 1)
         jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
         off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 

@@ -1151,17 +1151,17 @@ def test_evict_path_stats_split_eager_from_compiled():
     reset_evict_path_stats()
 
 
-def test_compile_failure_falls_back_to_eager_loudly_and_correctly():
-    """An Inductor lowering failure must NOT lose the run.
+def test_compile_failure_raises_kernel_or_error():
+    """A lowering failure must RAISE, not fall back to eager (design intent).
 
-    The user hit `LoweringException: StarDep ... aten.amin.default` (batch 1) and
-    `ValueError: ((I)//8) is not comparable` (batch 32) on torch 2.6 -- both are
-    torch.compile lowering/guard failures on the eviction body, and the old
-    kernel-or-error contract turned them into a total loss (every perf cell
-    dashed). The fallback must instead run the EAGER body, byte-identically,
-    record the failure, and warn -- so the run completes and says what happened.
+    The compiled eviction exists to MEASURE the compiled path; a silent eager run
+    under a compiled label would report eager numbers as if compiled. So when
+    torch.compile cannot lower the body, the dispatch raises (recording the reason
+    in evict_compile_failed for provenance) and the perf runner marks the cell
+    errored -- it never quietly runs eager. Verified with a backend that raises at
+    lowering time; the cache state is untouched (a lowering error fires before any
+    kernel runs), so re-raising is safe.
     """
-    import warnings
     pytest.importorskip("torch")
     from torch._dynamo import register_backend
     from modules.windowed_cache import cache as cache_mod
@@ -1169,54 +1169,80 @@ def test_compile_failure_falls_back_to_eager_loudly_and_correctly():
 
     @register_backend
     def _lowering_boom(gm, example_inputs):
-        # Mimic Inductor failing at CALL time (lowering), not at construction.
         raise RuntimeError(
             "LoweringException: NotImplementedError: StarDep does not have an "
             "index on aten.amin.default"
         )
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        # Drive the boom backend THROUGH the helper (which sets COMPILE_EVICT=1
-        # and the backend env, and resets the sticky globals for us).
-        failed = _run_decode_across_eviction(compile_backend="_lowering_boom")
+    with pytest.raises(RuntimeError, match="KERNEL-OR-ERROR"):
+        _run_decode_across_eviction(compile_backend="_lowering_boom")
 
-    # The run completed (no exception) and produced a compacted cache.
-    assert failed["key"] is not None and failed["key"].shape[2] > 0
-    # Every eviction ran eager; none reported compiled.
-    stats = evict_path_stats()
-    assert stats["eager"] >= 1 and stats["compiled"] == 0, stats
-    # The failure was recorded, not silent, and names the cause.
+    # It raised on the eviction, so nothing ran eager under a compiled label.
+    assert evict_path_stats()["eager"] == 0
+    # The reason is recorded for provenance and names the cause.
     reason = evict_compile_failed()
     assert reason and "amin" in reason, reason
-    assert any("could not lower" in str(w.message) for w in caught)
     # Leave the sticky flag clean for other tests.
     cache_mod._EVICT_COMPILE_FAILED = None
     cache_mod._EVICT_COMPILE_TRIED_STATIC = False
 
 
-def test_compile_failure_fallback_is_byte_identical_to_pure_eager():
-    """The fallback body is the eager body -- state must match a compile-off run."""
-    import warnings
+def test_compile_failure_leaves_cache_state_untouched():
+    """A raise on a lowering failure must not have mutated the cache.
+
+    Because the compiled body could not run, the state must be exactly what it was
+    BEFORE the eviction step -- so a caller that (against the design) chose to
+    catch and continue would not be operating on half-evicted state.
+    """
     pytest.importorskip("torch")
+    import torch
     from torch._dynamo import register_backend
     from modules.windowed_cache import cache as cache_mod
 
     @register_backend
-    def _boom_again(gm, example_inputs):
+    def _boom_untouched(gm, example_inputs):
         raise RuntimeError("boom")
 
-    eager = _run_decode_across_eviction(compile_backend=None)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fell_back = _run_decode_across_eviction(compile_backend="_boom_again")
+    # Build the same fixture the helper uses, but drive ONE eviction by hand so we
+    # can snapshot state around the failing call.
+    import os
+    prev = os.environ.get("STICKYKV_COMPILE_EVICT")
+    prev_b = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND")
+    os.environ["STICKYKV_COMPILE_EVICT"] = "1"
+    os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = "_boom_untouched"
+    cache_mod._COMPILED_EVICT_FN = None
     cache_mod._EVICT_COMPILE_FAILED = None
     cache_mod._EVICT_COMPILE_TRIED_STATIC = False
-
-    import torch
-    for k in eager:
-        a, b = eager[k], fell_back[k]
-        if isinstance(a, torch.Tensor):
-            assert torch.equal(a, b), f"{k} diverged on the compile-failure fallback"
-        else:
-            assert a == b, f"{k} diverged on the compile-failure fallback"
+    cache_mod._EVICT_ANNOUNCED["done"] = True
+    try:
+        cache = _make_cache(quant_ratio=0.5, ws=8, num_sink=0, prefill_len=256)
+        H, D, ws = 2, 4, 8
+        g = torch.Generator().manual_seed(7)
+        T = 256
+        pos = torch.arange(T, dtype=torch.long)
+        k_pre = torch.randn(H, T, D, generator=g)
+        v = torch.randn(H, T, D, generator=g)
+        k_post = rotate_key_window(k_pre, pos, cache.rope_module)
+        cache._states[0].replace(
+            k_post.unsqueeze(0).clone(), v.unsqueeze(0).clone(), pos.unsqueeze(0).clone()
+        )
+        st = cache._states[0]
+        nwin = T // ws
+        st.window_scores = torch.rand(1, H, nwin, generator=g) * 100
+        st.original_window_ids = torch.arange(nwin).unsqueeze(0)
+        p = cache._policies[0]
+        p.top_k_fp, p.N_q, p.local_windows = 2, 2, 1
+        cache._prefill_done[0] = True
+        before = st.key_states.clone(), st.position_ids.clone()
+        with pytest.raises(RuntimeError, match="KERNEL-OR-ERROR"):
+            cache._evict_two_tier(0, step=8)
+        assert torch.equal(st.key_states, before[0]), "keys mutated before the raise"
+        assert torch.equal(st.position_ids, before[1]), "positions mutated before the raise"
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+        if prev is None: os.environ.pop("STICKYKV_COMPILE_EVICT", None)
+        else: os.environ["STICKYKV_COMPILE_EVICT"] = prev
+        if prev_b is None: os.environ.pop("STICKYKV_COMPILE_EVICT_BACKEND", None)
+        else: os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = prev_b

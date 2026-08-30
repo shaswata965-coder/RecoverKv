@@ -518,13 +518,18 @@ class WindowedCache(_HFCacheBase):
         device = state.key_states.device
 
         B, H_kv, T_fp, D = state.key_states.shape
-        T_body = T_fp - num_sink
-        W = state.window_scores.shape[2]
+        # Concrete ints for the integer index arithmetic below (see the flash twin
+        # modules/windowed_cache/cache.py for why: SymInts off tensor .shape make
+        # the eviction's `//ws` / clamp math unlowerable under torch.compile). A
+        # no-op in eager; mirrored here to keep the eviction math byte-identical.
+        T_body = int(T_fp) - num_sink
+        W = int(state.window_scores.shape[2])
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
         retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
         k_fp, n_q, local_w = policy.tier_counts(W)
+        k_fp, n_q, local_w = int(k_fp), int(n_q), int(local_w)
         n_fp = k_fp + local_w
 
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
@@ -640,7 +645,9 @@ class WindowedCache(_HFCacheBase):
         # scoring pass. When the body IS a whole number of kept windows this never
         # triggers — i // ws already tops out at n_fp - 1 — so it is a no-op on every
         # config that worked before.
-        rank = (i // ws).clamp(max=n_fp - 1)
+        # Two-sided clamp (min=0 is a no-op since i >= 0) mirrors the flash twin:
+        # a single-sided clamp(max=) lowers through aten.amin under torch.compile.
+        rank = torch.clamp(torch.div(i, ws, rounding_mode="floor"), 0, n_fp - 1)
         jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
         off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 

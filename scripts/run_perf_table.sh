@@ -112,13 +112,14 @@ if [[ -z "$MODEL_PATH" ]]; then
 fi
 
 # The eviction step is ~81% of the amortized decode launch budget; the compiled
-# body is what collapses it. Default it on -- and it is now SAFE to default on:
-# if torch.compile cannot lower the eviction on your build (some torch 2.6
-# Inductor builds cannot), the cache retries with static shapes and then falls
-# back to the eager eviction, loudly and recorded (evict_compile_failed), so the
-# run still completes with real (eager-path) numbers instead of erroring every
-# cell. Check the [provenance] line: COMPILE_FAILED / evict compiled/eager tells
-# you which path you got. --compile-evict 0 skips the attempt entirely.
+# body is what collapses it, so default it on. It is KERNEL-OR-ERROR by design:
+# if torch.compile cannot lower the eviction on your build it RAISES (that cell
+# errors) rather than silently running eager under a compiled label -- because
+# the flag exists to MEASURE the compiled path, and eager numbers mislabelled as
+# compiled would be worse than an error. The torch<=2.6 Inductor failures
+# (`((I)//ws)` guard, `aten.amin` StarDep) are fixed at the source in cache.py,
+# so a supported build compiles. If yours still cannot, the error names the op
+# and the fix; rerun with --compile-evict 0 for eager (launch-bound) numbers.
 export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 
 case "$BACKEND" in
