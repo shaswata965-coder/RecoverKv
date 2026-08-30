@@ -293,6 +293,8 @@ def build_report(files: list[Path]) -> str:
                     bits.append(
                         f"evict compiled/eager={ev.get('compiled', 0)}/{ev.get('eager', 0)}"
                     )
+                if evd.get("compile_failed"):
+                    bits.append(f"COMPILE_FAILED[{evd['compile_failed']}]")
                 if dyn.get("graph_breaks"):
                     bits.append(f"GRAPH_BREAKS={dyn['graph_breaks']}")
                 if dyn.get("frames_ok"):
@@ -300,6 +302,8 @@ def build_report(files: list[Path]) -> str:
                 if bits:
                     emit(f"    {name:<22} " + "  ".join(bits))
             emit("")
+            emit("    COMPILE_FAILED means torch.compile could not lower the eviction on")
+            emit("    this build; every eviction fell back to eager, so TPOT is eager-path.")
             emit("    evict compiled/eager: any nonzero `eager` on a run that set")
             emit("    STICKYKV_COMPILE_EVICT means those eviction steps still paid the")
             emit("    full ~273-launch-per-layer dispatch cost the flag exists to remove.")

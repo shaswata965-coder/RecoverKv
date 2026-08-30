@@ -112,8 +112,13 @@ if [[ -z "$MODEL_PATH" ]]; then
 fi
 
 # The eviction step is ~81% of the amortized decode launch budget; the compiled
-# body is what collapses it. Default it on for these runs; an explicit env or
-# --compile-evict wins. See modules/windowed_cache/cache.py.
+# body is what collapses it. Default it on -- and it is now SAFE to default on:
+# if torch.compile cannot lower the eviction on your build (some torch 2.6
+# Inductor builds cannot), the cache retries with static shapes and then falls
+# back to the eager eviction, loudly and recorded (evict_compile_failed), so the
+# run still completes with real (eager-path) numbers instead of erroring every
+# cell. Check the [provenance] line: COMPILE_FAILED / evict compiled/eager tells
+# you which path you got. --compile-evict 0 skips the attempt entirely.
 export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 
 case "$BACKEND" in

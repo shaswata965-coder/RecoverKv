@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import warnings
 
 import torch
 from torch import Tensor
@@ -47,6 +48,8 @@ from modules.quant.slots import n_slots_for
 
 _COMPILED_EVICT_FN = None
 _EVICT_ANNOUNCED = {"done": False}
+#: True once the dynamic=True compile has failed and we have retried static.
+_EVICT_COMPILE_TRIED_STATIC = False
 
 #: Proof-of-execution counters for the eviction path, same contract as
 #: :data:`modules.windowed_cache.flash_decode._STATS`: being *able* to compile is
@@ -56,14 +59,35 @@ _EVICT_ANNOUNCED = {"done": False}
 #: eviction and reports ``eager > 0`` measured the path it was trying to replace.
 _EVICT_STATS = {"eager": 0, "compiled": 0}
 
+#: Sticky record of a torch.compile failure on the eviction, process-global and
+#: NOT cleared by :func:`reset_evict_path_stats` — a build that cannot lower the
+#: eviction cannot lower it on the next cell either, so we record it ONCE and
+#: route every later eviction straight to eager rather than re-attempting (and
+#: re-failing) per cell / per layer. ``None`` = no failure seen. Set to a short
+#: ``"Type: message"`` string on the first failure. Read via
+#: :func:`evict_compile_failed`; the perf runner folds it into each row's
+#: provenance so a fallback is visible, never silent.
+_EVICT_COMPILE_FAILED: Optional[str] = None
+
 
 def evict_path_stats() -> dict:
     """``{"eager": n, "compiled": m}`` — evictions per path since the last reset."""
     return dict(_EVICT_STATS)
 
 
+def evict_compile_failed() -> Optional[str]:
+    """The eviction's torch.compile failure (``"Type: msg"``), or ``None``.
+
+    Sticky for the life of the process. A non-None value means the compiled
+    eviction was requested, could not be lowered on THIS torch/build, and every
+    eviction fell back to the eager body — so any timings are eager-path timings.
+    """
+    return _EVICT_COMPILE_FAILED
+
+
 def reset_evict_path_stats() -> None:
-    """Zero the eviction-path counters (call before a measured run)."""
+    """Zero the per-path counters. Does NOT clear the sticky compile-failure flag
+    (that is a property of the build, not of one measured run)."""
     _EVICT_STATS["eager"] = 0
     _EVICT_STATS["compiled"] = 0
 
@@ -85,6 +109,81 @@ def _compile_evict_backend() -> Optional[str]:
     """
     v = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND", "").strip()
     return v or None
+
+
+def _build_compiled_evict(dynamic: bool):
+    """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
+    failure surfaces on the first CALL, not at construction."""
+    kw: Dict[str, Any] = {"dynamic": dynamic}
+    backend = _compile_evict_backend()
+    if backend is not None:
+        kw["backend"] = backend
+    return torch.compile(WindowedCache._evict_two_tier_impl, **kw)
+
+
+def _announce_evict_fallback_once(reason: str) -> None:
+    """Print, once, that the compiled eviction was requested but could not be
+    lowered and every eviction is running eager. Loud on purpose."""
+    if _EVICT_ANNOUNCED["done"]:
+        return
+    _EVICT_ANNOUNCED["done"] = True
+    print(
+        "[StickyKV] eviction path: COMPILED requested but torch.compile could "
+        "NOT lower it on this build -- FELL BACK TO EAGER for every eviction. "
+        f"Reason: {reason}. Timings are eager-path timings (the ~81% eviction "
+        "launch budget is NOT cut). Provenance records this (evict_compile_failed). "
+        "Run with STICKYKV_COMPILE_EVICT=0 / --compile-evict 0 to silence this.",
+        flush=True,
+    )
+
+
+def _run_compiled_evict(cache, layer_idx: int, step: int) -> bool:
+    """Try to run one eviction through ``torch.compile``.
+
+    Returns ``True`` if the compiled body RAN (``cache`` mutated in place), or
+    ``False`` if it could not be lowered — in which case ``cache`` is UNTOUCHED
+    (a lowering/guard error raises before any kernel executes) and the caller
+    must run the eager body on the same step. A terminal failure is recorded in
+    :data:`_EVICT_COMPILE_FAILED` (sticky) and announced once.
+
+    Order of attempts: ``dynamic=True`` first (one graph across the varying
+    window count), then — on the torch<=2.6 symbolic-shape lowering errors —
+    once with ``dynamic=False`` (concrete shapes sidestep the ``((I)//ws)``
+    guard and the ``aten.amin`` StarDep).
+    """
+    global _COMPILED_EVICT_FN, _EVICT_COMPILE_FAILED, _EVICT_COMPILE_TRIED_STATIC
+
+    if _COMPILED_EVICT_FN is None:
+        _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
+    try:
+        _COMPILED_EVICT_FN(cache, layer_idx, step)
+        _announce_evict_path_once(compiled=True)
+        _EVICT_STATS["compiled"] += 1
+        return True
+    except Exception as e_dyn:  # pragma: no cover - GPU/Inductor-build dependent
+        terminal = e_dyn
+        if not _EVICT_COMPILE_TRIED_STATIC:
+            _EVICT_COMPILE_TRIED_STATIC = True
+            try:
+                _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=False)
+                _COMPILED_EVICT_FN(cache, layer_idx, step)
+                _announce_evict_path_once(compiled=True)
+                _EVICT_STATS["compiled"] += 1
+                return True
+            except Exception as e_static:
+                terminal = e_static
+        _EVICT_COMPILE_FAILED = f"{type(terminal).__name__}: {terminal}"[:400]
+        _COMPILED_EVICT_FN = None
+        warnings.warn(
+            "torch.compile could not lower the two-tier eviction "
+            f"({_EVICT_COMPILE_FAILED}); falling back to the eager eviction for "
+            "the rest of the run. Timings are eager-path (the compiled eviction "
+            "did not cut the launch budget). This is recorded, not silent -- see "
+            "evict_compile_failed(). Set STICKYKV_COMPILE_EVICT=0 to opt out.",
+            RuntimeWarning, stacklevel=2,
+        )
+        _announce_evict_fallback_once(_EVICT_COMPILE_FAILED)
+        return False
 
 
 def _announce_evict_path_once(compiled: bool) -> None:
@@ -715,41 +814,37 @@ class WindowedCache(_HFCacheBase):
         are identical to the eager path. It fires once per ``ws`` steps, so a
         compile / recompile amortizes.
 
-        Kernel-or-error when enabled, exactly like the decode read path
-        (:func:`modules.quant.effective._read_fn`): if ``torch.compile`` raises,
-        this raises too rather than silently running eager, so a run that asked
-        for the compiled eviction never quietly reports eager-path numbers.
+        **Loud, recorded fallback — not kernel-or-error.** This used to raise if
+        ``torch.compile`` could not lower the body, on the reasoning that a silent
+        eager run under a "compiled" label corrupts the measurement. But the
+        failure it actually produces (Inductor cannot lower this body on torch
+        <= 2.6: a symbolic ``((I)//ws)`` guard that "is not comparable", and a
+        symbolic clamp that lowers to an ``aten.amin`` StarDep it cannot index)
+        killed EVERY perf cell — the whole run returned dashes. Losing all the
+        numbers is a worse outcome than the one the hard error guarded against.
+
+        So on a lowering failure this now (1) retries once with ``dynamic=False``
+        — concrete shapes make both symbolic errors vanish, and the cache
+        compacts to the budget every ``ws`` steps so a static graph recompiles
+        only during the short fill phase — then (2) falls back to the eager body,
+        records the failure stickily in :data:`_EVICT_COMPILE_FAILED`, and warns
+        once. The integrity concern is still met, because the fallback is NOT
+        silent: :func:`evict_path_stats` counts the eager evictions,
+        :func:`evict_compile_failed` names the reason, and the perf runner folds
+        both into every row's provenance. A run that fell back reports eager
+        numbers and SAYS SO. Retrying is safe on the same step because a lowering
+        error raises before any kernel executes, so ``self`` is untouched.
         """
         if not _compile_evict_enabled():
             _announce_evict_path_once(compiled=False)
             _EVICT_STATS["eager"] += 1
             return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
-        global _COMPILED_EVICT_FN
-        if _COMPILED_EVICT_FN is None:
-            try:
-                _backend = _compile_evict_backend()
-                _kw = {"dynamic": True}
-                if _backend is not None:
-                    _kw["backend"] = _backend
-                _COMPILED_EVICT_FN = torch.compile(
-                    WindowedCache._evict_two_tier_impl, **_kw
-                )
-            except Exception as e:  # pragma: no cover - env/build dependent
-                raise RuntimeError(
-                    "STICKYKV_COMPILE_EVICT is set but torch.compile of the "
-                    f"two-tier eviction failed ({type(e).__name__}: {e}). The "
-                    "compiled eviction is required when enabled — there is no "
-                    "silent fallback to the eager path (kernel-or-error, as on "
-                    "the decode read path). Set STICKYKV_COMPILE_EVICT=0 to run "
-                    "the eager eviction — note that UNSETTING it is not enough "
-                    "under the perf runner, which turns it on by default for "
-                    "CUDA windowed rows (the eviction step is ~81% of the "
-                    "amortized decode launch budget) and only defers to an "
-                    "explicit value."
-                ) from e
-        _announce_evict_path_once(compiled=True)
-        _EVICT_STATS["compiled"] += 1
-        return _COMPILED_EVICT_FN(self, layer_idx, step)
+        # Compile requested. Try the compiled path unless a prior cell already
+        # proved this build cannot lower it (sticky), then fall back to eager.
+        if _EVICT_COMPILE_FAILED is None and _run_compiled_evict(self, layer_idx, step):
+            return None
+        _EVICT_STATS["eager"] += 1
+        return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
 
     def _evict_two_tier_impl(self, layer_idx: int, step: int) -> None:
         """One two-tier eviction (design §5), per row, entirely on device.

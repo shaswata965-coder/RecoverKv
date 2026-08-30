@@ -383,6 +383,15 @@ def _reset_evict_path_stats() -> None:
             pass
 
 
+def _evict_compile_failed() -> Optional[str]:
+    """The eviction's sticky torch.compile failure reason, or None."""
+    fn = _kernel_fn("evict_compile_failed")
+    try:
+        return fn() if fn is not None else None
+    except Exception:  # pragma: no cover - environment dependent
+        return None
+
+
 def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
     """What the resolved budget buys, in KEYS the decode must walk.
 
@@ -1475,10 +1484,25 @@ class PerfRunner:
         if cache_backend == "windowed":
             ev = _evict_path_stats()
             dyn = _dynamo_counters()
-            diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn}
+            compile_failed = _evict_compile_failed()
+            diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn,
+                                "compile_failed": compile_failed}
             log.info("eviction path: %s | dynamo: %s", ev or "n/a", dyn or "n/a")
-            if os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
-                    "1", "true", "yes", "on") and ev.get("eager"):
+            compile_on = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
+                "1", "true", "yes", "on")
+            if compile_failed:
+                # The compiled eviction was asked for and could not be lowered on
+                # this build, so every eviction ran eager. This is the loud,
+                # recorded fallback (cache.py) -- the run still produced numbers,
+                # but they are eager-path, so say so plainly rather than let the
+                # row read as "compiled and it didn't help".
+                log.warning(
+                    "config %s: torch.compile could NOT lower the eviction on this "
+                    "build (%s). Every eviction fell back to EAGER -- this row's "
+                    "TPOT is eager-path, the ~81%% launch budget was not cut. Fix "
+                    "the lowering or run with STICKYKV_COMPILE_EVICT=0.",
+                    c.get("name"), compile_failed)
+            elif compile_on and ev.get("eager"):
                 log.warning(
                     "config %s: STICKYKV_COMPILE_EVICT is on but %d eviction(s) "
                     "still ran the EAGER body (compiled: %d). Those steps paid the "

@@ -1040,8 +1040,12 @@ def _run_decode_across_eviction(compile_backend=None, seed=1234):
         os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = compile_backend
     else:
         os.environ["STICKYKV_COMPILE_EVICT"] = "0"
-    # Reset the process-global compiled fn + once-banner so the flag is honoured.
+    # Reset the process-global compiled fn + once-banner so the flag is honoured,
+    # and clear the sticky compile-failure record so a prior test's failure (or a
+    # different backend) cannot route this run straight to eager.
     cache_mod._COMPILED_EVICT_FN = None
+    cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRIED_STATIC = False
     cache_mod._EVICT_ANNOUNCED["done"] = True   # silence the banner in tests
     try:
         cache = _make_cache(quant_ratio=0.5, ws=8, num_sink=0, prefill_len=256)
@@ -1145,3 +1149,74 @@ def test_evict_path_stats_split_eager_from_compiled():
     )
     assert comp["eager"] == 0, "an eviction fell back to the eager body silently"
     reset_evict_path_stats()
+
+
+def test_compile_failure_falls_back_to_eager_loudly_and_correctly():
+    """An Inductor lowering failure must NOT lose the run.
+
+    The user hit `LoweringException: StarDep ... aten.amin.default` (batch 1) and
+    `ValueError: ((I)//8) is not comparable` (batch 32) on torch 2.6 -- both are
+    torch.compile lowering/guard failures on the eviction body, and the old
+    kernel-or-error contract turned them into a total loss (every perf cell
+    dashed). The fallback must instead run the EAGER body, byte-identically,
+    record the failure, and warn -- so the run completes and says what happened.
+    """
+    import warnings
+    pytest.importorskip("torch")
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_path_stats, evict_compile_failed
+
+    @register_backend
+    def _lowering_boom(gm, example_inputs):
+        # Mimic Inductor failing at CALL time (lowering), not at construction.
+        raise RuntimeError(
+            "LoweringException: NotImplementedError: StarDep does not have an "
+            "index on aten.amin.default"
+        )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        # Drive the boom backend THROUGH the helper (which sets COMPILE_EVICT=1
+        # and the backend env, and resets the sticky globals for us).
+        failed = _run_decode_across_eviction(compile_backend="_lowering_boom")
+
+    # The run completed (no exception) and produced a compacted cache.
+    assert failed["key"] is not None and failed["key"].shape[2] > 0
+    # Every eviction ran eager; none reported compiled.
+    stats = evict_path_stats()
+    assert stats["eager"] >= 1 and stats["compiled"] == 0, stats
+    # The failure was recorded, not silent, and names the cause.
+    reason = evict_compile_failed()
+    assert reason and "amin" in reason, reason
+    assert any("could not lower" in str(w.message) for w in caught)
+    # Leave the sticky flag clean for other tests.
+    cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_compile_failure_fallback_is_byte_identical_to_pure_eager():
+    """The fallback body is the eager body -- state must match a compile-off run."""
+    import warnings
+    pytest.importorskip("torch")
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+
+    @register_backend
+    def _boom_again(gm, example_inputs):
+        raise RuntimeError("boom")
+
+    eager = _run_decode_across_eviction(compile_backend=None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fell_back = _run_decode_across_eviction(compile_backend="_boom_again")
+    cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+    import torch
+    for k in eager:
+        a, b = eager[k], fell_back[k]
+        if isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), f"{k} diverged on the compile-failure fallback"
+        else:
+            assert a == b, f"{k} diverged on the compile-failure fallback"
