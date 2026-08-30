@@ -342,6 +342,22 @@ def _reset_lse_recompute_count() -> None:
             pass
 
 
+def _lse_strict() -> bool:
+    """Whether an L-reuse MISS is a hard error (default) or a loud warning.
+
+    ``STICKYKV_LSE_STRICT`` (default "1"): a run that asked for L from the forward
+    but recomputed it (``compute_lse`` ran) ERRORS the cell — the rigorous
+    contract, so a degraded TTFT / max-B never masquerades as the method's. Set
+    "0" to DOWNGRADE that to a warning and keep the cell: the run completes on the
+    recompute path, TTFT is flagged recompute-path in provenance, and the decode
+    columns (TPOT / throughput / memory) — which L-reuse does not touch, it is a
+    prefill-only optimization — are reported normally. That is the right default
+    for a decode-focused table; the run_perf_table.sh script sets it.
+    """
+    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _lse_reuse_requested() -> bool:
     """Whether the run asked for L to come from the forward (the default)."""
     return os.environ.get(
@@ -1403,31 +1419,58 @@ class PerfRunner:
                 # silent. Only the flash package reaches compute_lse — the eager
                 # backend reads attn_weights off the module and never scores this way.
                 lse_misses = _lse_recompute_count()
-                if (cache_backend == "windowed" and cache_pkg == "flash_attn"
-                        and _lse_reuse_requested() and lse_misses):
-                    from utils.config import ConfigValidationError
-                    raise ConfigValidationError(
-                        f"config {c.get('name')!r}: L-reuse was requested (the "
-                        f"default) but compute_lse ran {lse_misses} time(s) during "
-                        f"this prefill — L did NOT come from the forward, so every "
-                        f"prefill layer paid a second O(N^2) pass plus a "
-                        f"[B, H, chunk, S] fp32 transient (~{_lse_transient_gb(batch_size, model.config, prefill_len):.1f} GB "
-                        f"at this shape). The installed L-source reported "
-                        f"{getattr(hooks, 'lse_label', 'unknown')!r}. Install "
-                        f"flashinfer on this box (or a flash-attn build that honours "
-                        f"return_attn_probs), or set "
-                        f"STICKYKV_SCORE_LSE_FROM_FORWARD=0 to measure the recompute "
-                        f"path deliberately. Refusing to report a TTFT and a max-B "
-                        f"that belong to the fallback."
-                    )
+                lse_requested = _lse_reuse_requested()
+                lse_degraded = bool(
+                    cache_backend == "windowed" and cache_pkg == "flash_attn"
+                    and lse_requested and lse_misses)
+                # Record the L path on run 0 BEFORE the strict check, so an errored
+                # cell still carries the diagnosis (and a kept-but-degraded cell
+                # flags its TTFT).
                 if ri == 0 and cache_backend == "windowed":
                     diag["lse"] = {
                         "label": getattr(hooks, "lse_label", None),
                         "active": bool(getattr(hooks, "lse_active", False)),
                         "recompute_count": lse_misses,
-                        "reuse_requested": _lse_reuse_requested(),
+                        "reuse_requested": lse_requested,
+                        "degraded": lse_degraded,
                     }
                     diag["fused_decode"] = bool(getattr(hooks, "fused_decode", False))
+                if lse_degraded:
+                    # Likely cause: at batch > 1 transformers takes the VARLEN flash
+                    # path (flash_attn_varlen_func, chosen when a padding
+                    # attention_mask reaches _flash_attention_forward), which the
+                    # flashinfer / flash L-capture — patched onto the plain
+                    # flash_attn_func — never sees. So L is recomputed even though a
+                    # source installed. It is a PREFILL-only cost (a second O(N^2)
+                    # pass + a [B,H,chunk,S] fp32 transient, ~%.1f GB here); it does
+                    # NOT touch decode TPOT / throughput / memory.
+                    tgb = _lse_transient_gb(batch_size, model.config, prefill_len)
+                    detail = (
+                        f"config {c.get('name')!r}: L-reuse was requested but "
+                        f"compute_lse ran {lse_misses}x this prefill — L did NOT come "
+                        f"from the forward (installed source: "
+                        f"{getattr(hooks, 'lse_label', 'unknown')!r}). Every prefill "
+                        f"layer paid a second O(N^2) pass + a [B,H,chunk,S] fp32 "
+                        f"transient (~{tgb:.1f} GB here). Most likely the batch>1 "
+                        f"VARLEN flash path bypassed the L-capture (a prefill-only "
+                        f"issue; decode TPOT / memory are unaffected)."
+                    )
+                    if _lse_strict():
+                        from utils.config import ConfigValidationError
+                        raise ConfigValidationError(
+                            detail + " Refusing to report a TTFT/max-B that belong "
+                            "to the recompute path. Set STICKYKV_LSE_STRICT=0 to keep "
+                            "the cell on the recompute path (TTFT flagged in "
+                            "provenance; decode columns are unaffected), or "
+                            "STICKYKV_SCORE_LSE_FROM_FORWARD=0 to stop requesting "
+                            "L-reuse entirely, or install a working flashinfer/"
+                            "flash-attn L source."
+                        )
+                    log.warning(
+                        "%s STICKYKV_LSE_STRICT=0: keeping the cell on the recompute "
+                        "path. TTFT is recompute-path (flagged in provenance as "
+                        "L=... RECOMPUTED); TPOT / throughput / memory are unaffected.",
+                        detail)
                 # Generate tokens for TPOT
                 pkv = out.past_key_values
                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)

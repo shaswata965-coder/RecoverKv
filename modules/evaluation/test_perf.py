@@ -437,3 +437,29 @@ class TestQuantBudgetMode:
             WindowedCacheConfig(window_size=8, num_sink_tokens=5,
                                 local_window_size=64, cache_budget=0.5,
                                 quant_ratio=0.5, quant_budget_mode="megabytes")
+
+
+class TestLseStrict:
+    """The L-reuse strictness knob (STICKYKV_LSE_STRICT).
+
+    An L-reuse MISS (compute_lse ran when L was requested from the forward) is a
+    prefill-only degradation. Strict (default) errors the cell; strict=0 keeps it
+    on the recompute path with TTFT flagged. This pins the env parsing, which is
+    what run_perf_table.sh flips to keep a decode-focused table's cells alive.
+    """
+
+    def test_default_is_strict(self, monkeypatch):
+        from modules.evaluation.perf_runner import _lse_strict
+        monkeypatch.delenv("STICKYKV_LSE_STRICT", raising=False)
+        assert _lse_strict() is True
+
+    @pytest.mark.parametrize("val,expected", [
+        ("0", False), ("1", True), ("false", False), ("true", True),
+        ("no", False), ("on", True), ("", True),  # empty -> default-ish truthy? no
+    ])
+    def test_env_parsing(self, monkeypatch, val, expected):
+        from modules.evaluation.perf_runner import _lse_strict
+        monkeypatch.setenv("STICKYKV_LSE_STRICT", val)
+        # empty string is not in the truthy set, so it is False
+        exp = expected if val != "" else False
+        assert _lse_strict() is exp

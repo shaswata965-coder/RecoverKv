@@ -36,6 +36,9 @@
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
 #   COMPILE_EVICT   1 | 0  torch.compile the eviction step      (default: 1)
+#   LSE_STRICT      1 | 0  hard-fail a cell on an L-reuse miss  (default: 0)
+#                   (0 keeps the cell on the recompute path and flags TTFT;
+#                    L-reuse is prefill-only, so decode columns are unaffected)
 #
 # ------------------------------------------------------------------- examples
 #   # the shipped table (q=0.70, the two default batch sizes)
@@ -79,6 +82,7 @@ WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
 COMPILE_EVICT="${COMPILE_EVICT:-1}"
+LSE_STRICT="${LSE_STRICT:-0}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -100,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
     --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
+    --lse-strict)           LSE_STRICT="$2"; shift 2;;
     -h|--help)              sed -n '2,54p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
@@ -121,6 +126,15 @@ fi
 # so a supported build compiles. If yours still cannot, the error names the op
 # and the fix; rerun with --compile-evict 0 for eager (launch-bound) numbers.
 export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
+
+# L-reuse (a PREFILL optimization) hands the softmax normaliser L from the flash
+# forward to the score kernel instead of recomputing it. At batch>1 transformers
+# takes the varlen flash path, which bypasses the L-capture, so L is recomputed --
+# a prefill-only cost that inflates TTFT but does NOT touch decode TPOT/throughput/
+# memory. STICKYKV_LSE_STRICT default 0 here (decode-focused table): keep the cell
+# on the recompute path and flag TTFT in provenance, rather than erroring it. Pass
+# --lse-strict 1 to hard-fail on an L-reuse miss (rigorous prefill benchmarking).
+export STICKYKV_LSE_STRICT="$LSE_STRICT"
 
 case "$BACKEND" in
   flash_attn) ATTN_IMPL="flash_attention_2";;
@@ -209,6 +223,7 @@ YAML
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
+  echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
   echo "window_size: $WINDOW_SIZE  num_sink: $NUM_SINK  local_window: $LOCAL_WINDOW"
   echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE"
 } > "$OUT_DIR/run_perf_table.env"
