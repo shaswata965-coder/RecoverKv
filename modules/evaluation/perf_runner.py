@@ -392,6 +392,15 @@ def _evict_compile_failed() -> Optional[str]:
         return None
 
 
+def _evict_compile_traceback() -> Optional[str]:
+    """The FULL Inductor traceback of the eviction compile failure, or None."""
+    fn = _kernel_fn("evict_compile_traceback")
+    try:
+        return fn() if fn is not None else None
+    except Exception:  # pragma: no cover - environment dependent
+        return None
+
+
 def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
     """What the resolved budget buys, in KEYS the decode must walk.
 
@@ -881,6 +890,12 @@ class PerfRunner:
                 skipped[ci] = True
                 errored[ci] = True
                 skip_reason[ci] = f"error: {type(e).__name__}: {e}"[:200]
+                # If the eviction's torch.compile failed, the npz skip_reason
+                # above is truncated and loses the Inductor stack that names the
+                # unlowerable op. Persist the FULL traceback next to the outputs,
+                # and echo it in full to the log, so a fix does not need another
+                # run just to see the stack. Written once per errored cell.
+                self._dump_evict_compile_error(cfg, prefill_len, batch_size, name)
         if errored.any():
             log.warning(
                 "%d config(s) failed for non-OOM reasons at prefill=%d batch=%d: "
@@ -903,6 +918,38 @@ class PerfRunner:
                 "peak_host_rss": peak_host_rss,
                 "alloc_retries": alloc_retries,
                 "diagnostics": dict(self._config_diag)}
+
+    def _dump_evict_compile_error(self, cfg, prefill_len: int, batch_size: int,
+                                  name: str) -> None:
+        """Write the full eviction-compile traceback to a file, if there is one.
+
+        The npz ``skip_reason`` is capped at 200 chars, which loses the Inductor
+        stack that actually names the unlowerable op. This writes the whole thing
+        to ``<output_dir>/evict_compile_error_<name>_p<prefill>_bs<b>.txt`` and
+        logs it in full, so the op is in hand after the first failing run — no
+        second run needed just to read the stack.
+        """
+        tb = _evict_compile_traceback()
+        reason = _evict_compile_failed()
+        if not tb and not reason:
+            return  # this error was not the eviction compile
+        try:
+            od = Path(cfg.telemetry.output_dir)
+            od.mkdir(parents=True, exist_ok=True)
+            path = od / f"evict_compile_error_{name}_p{prefill_len}_bs{batch_size}.txt"
+            body = (
+                f"# Eviction torch.compile failure\n"
+                f"# config={name} prefill={prefill_len} batch={batch_size}\n"
+                f"# summary: {reason}\n\n"
+                f"{tb or '(no traceback captured)'}\n"
+            )
+            path.write_text(body, encoding="utf-8")
+            log.error(
+                "eviction torch.compile FAILED for %s (prefill=%d bs=%d). Full "
+                "Inductor traceback written to %s and echoed below:\n%s",
+                name, prefill_len, batch_size, path, tb or reason)
+        except Exception as we:  # pragma: no cover - fs/logging dependent
+            log.warning("could not write eviction compile traceback: %s", we)
 
     @staticmethod
     def _warmup_decode_steps(pc, c: dict, cfg, gen_len: int) -> int:

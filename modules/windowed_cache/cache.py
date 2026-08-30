@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import traceback
 import warnings
 
 import torch
@@ -69,6 +70,14 @@ _EVICT_STATS = {"eager": 0, "compiled": 0}
 #: provenance so a fallback is visible, never silent.
 _EVICT_COMPILE_FAILED: Optional[str] = None
 
+#: The FULL, untruncated traceback of that failure — the Inductor stack that
+#: names the exact FX node / aten op / source line that could not be lowered.
+#: ``_EVICT_COMPILE_FAILED`` is the one-line summary (and is what gets truncated
+#: into the npz); this is the whole thing, so a diagnosis never depends on the
+#: summary. Read via :func:`evict_compile_traceback`; the perf runner writes it
+#: to a file next to the outputs so it survives the npz's field-length cap.
+_EVICT_COMPILE_TRACEBACK: Optional[str] = None
+
 
 def evict_path_stats() -> dict:
     """``{"eager": n, "compiled": m}`` — evictions per path since the last reset."""
@@ -79,10 +88,21 @@ def evict_compile_failed() -> Optional[str]:
     """The eviction's torch.compile failure (``"Type: msg"``), or ``None``.
 
     Sticky for the life of the process. A non-None value means the compiled
-    eviction was requested, could not be lowered on THIS torch/build, and every
-    eviction fell back to the eager body — so any timings are eager-path timings.
+    eviction was requested and could not be lowered on THIS torch/build (the run
+    then raised — kernel-or-error). Pair with :func:`evict_compile_traceback` for
+    the op that failed.
     """
     return _EVICT_COMPILE_FAILED
+
+
+def evict_compile_traceback() -> Optional[str]:
+    """The FULL Inductor traceback of the eviction compile failure, or ``None``.
+
+    Untruncated, unlike the npz's ``skip_reason``: this is the stack that names
+    the exact aten op / FX node / source line that did not lower, which is what a
+    fix actually needs. The perf runner also writes it to a file.
+    """
+    return _EVICT_COMPILE_TRACEBACK
 
 
 def reset_evict_path_stats() -> None:
@@ -111,6 +131,27 @@ def _compile_evict_backend() -> Optional[str]:
     return v or None
 
 
+def _clamp_index(x: Tensor, hi) -> Tensor:
+    """Clamp an index tensor to ``[0, hi]`` WITHOUT ever emitting ``aten.amin``.
+
+    torch <= 2.6's Inductor cannot schedule the scalar ``StarDep`` that a clamp's
+    UPPER bound lowers to ("StarDep does not have an index on aten.amin.default"):
+    ``tensor.clamp(max=s)`` / ``clamp_max`` / a two-sided ``clamp(x, lo, hi)`` /
+    ``torch.minimum(x, scalar)`` all decompose through ``aten.amin`` on the upper
+    side. The LOWER bound (``clamp_min`` → ``aten.amax``) lowers fine — that is why
+    the bare ``clamp_min(0)`` calls in this file never errored.
+
+    So build the upper bound out of ``clamp_min`` only, via the identity
+    ``min(x, hi) == hi - relu(hi - x)``: ``hi - x`` is a scalar-minus-tensor
+    (pointwise), ``.clamp_min(0)`` is the working ``relu`` path, and the outer
+    ``hi -`` is pointwise. No ``amin`` node is ever created. ``hi`` is a concrete
+    Python int (the body makes its shape-derived ints concrete), so nothing here
+    is symbolic either.
+    """
+    x = x.clamp_min(0)
+    return hi - (hi - x).clamp_min(0)
+
+
 def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
@@ -133,10 +174,12 @@ it still fails, the traceback names the op that did not lower.
   To get numbers now: rerun with STICKYKV_COMPILE_EVICT=0 (or --compile-evict 0).
 That runs the EAGER eviction -- correct, just launch-bound -- so the ~81%
 eviction launch budget is not cut and TPOT stays high.
-  To diagnose the lowering: TORCH_LOGS='+inductor,graph_breaks'
-TORCHDYNAMO_VERBOSE=1 on the failing shape, and try
-STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen -- if
-THAT works the failure is Inductor codegen, not the traced graph)."""
+  To diagnose the lowering: the FULL Inductor traceback (which names the exact
+aten op / source line) is in evict_compile_traceback() and is written by the perf
+runner to <output_dir>/evict_compile_error_*.txt -- read that first. Also
+TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape,
+and try STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen --
+if THAT works the failure is Inductor codegen, not the traced graph)."""
 
 
 def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
@@ -153,6 +196,7 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
     runner catches it as an ``errored`` cell, never a corrupt one.
     """
     global _COMPILED_EVICT_FN, _EVICT_COMPILE_FAILED, _EVICT_COMPILE_TRIED_STATIC
+    global _EVICT_COMPILE_TRACEBACK
 
     if _EVICT_COMPILE_FAILED is not None:
         # A prior eviction already proved this build cannot lower it; fail fast
@@ -182,6 +226,13 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
             except Exception as e_static:
                 terminal = e_static
         _EVICT_COMPILE_FAILED = f"{type(terminal).__name__}: {terminal}"[:400]
+        # Capture the WHOLE Inductor stack before we lose it — it names the aten
+        # op / FX node / source line that did not lower. Try to include the
+        # static-retry failure too if we have both.
+        _EVICT_COMPILE_TRACEBACK = "".join(
+            traceback.format_exception(type(terminal), terminal,
+                                       terminal.__traceback__)
+        )
         _COMPILED_EVICT_FN = None
         raise RuntimeError(
             "STICKYKV_COMPILE_EVICT is set but torch.compile of the two-tier "
@@ -978,9 +1029,11 @@ class WindowedCache(_HFCacheBase):
         fresh_wid, fresh_valid = self._compact(wids, fresh, n_q)
         if n_q > 0 and T_body > 0:
             start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_q]
-            tok_f = (
-                start_f.unsqueeze(-1) + torch.arange(ws, device=device)
-            ).reshape(B, n_q * ws).clamp_(0, T_body - 1)
+            tok_f = _clamp_index(
+                (start_f.unsqueeze(-1) + torch.arange(ws, device=device))
+                .reshape(B, n_q * ws),
+                T_body - 1,
+            )
             idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_q * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
             v_tok = torch.gather(body_v, 2, idx_d)
@@ -1016,21 +1069,19 @@ class WindowedCache(_HFCacheBase):
         # scoring pass. When the body IS a whole number of kept windows this never
         # triggers — i // ws already tops out at n_fp - 1 — so it is a no-op on every
         # config that worked before.
-        # Two-sided clamp, not `.clamp(max=…)`. A single-sided clamp lowers
-        # through ``aten.amin``, whose scalar StarDep Inductor <= 2.6 cannot
-        # schedule ("StarDep does not have an index on aten.amin.default"); the
-        # two-sided form lowers as ``clamp``. ``min=0`` is a semantic no-op
-        # (``i >= 0`` and ``ws > 0`` ⇒ ``i // ws >= 0``). ``torch.div(…, 'floor')``
-        # is the explicit integer floor the ``//`` operator would do, kept as a
-        # tensor op so no symbolic ``//`` scalar reaches the guard system — with
-        # ``n_fp`` and ``new_body_len`` now concrete (above), the bound is a real
-        # int and the whole expression is Inductor-lowerable.
-        rank = torch.clamp(torch.div(i, ws, rounding_mode="floor"), 0, n_fp - 1)
+        # Cap the token→window rank at the last kept window (phantom-tail
+        # handling). Via _clamp_index so the upper bound never becomes an
+        # ``aten.amin`` StarDep Inductor <= 2.6 cannot schedule.
+        # ``torch.div(…, 'floor')`` is the explicit integer floor (a tensor op,
+        # so no symbolic ``//`` scalar reaches the guard system); with ``n_fp``
+        # now concrete the bound is a real int.
+        rank = _clamp_index(torch.div(i, ws, rounding_mode="floor"), n_fp - 1)
         jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
         off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 
         start_of_rank = torch.searchsorted(body_wid, fp_wids)          # [B, n_fp]
-        src_fp = (torch.gather(start_of_rank, 1, jj) + off).clamp_(0, max(T_body - 1, 0))
+        src_fp = _clamp_index(
+            torch.gather(start_of_rank, 1, jj) + off, max(T_body - 1, 0))
         idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
         new_k = torch.gather(body_k, 2, idx_fp)
         new_v = torch.gather(body_v, 2, idx_fp)
@@ -1041,9 +1092,8 @@ class WindowedCache(_HFCacheBase):
             # freshly-rotated copy in at its chronological slot (design §5 step
             # 3): same layout, different source.
             tok_is_prom = torch.gather(fp_prom, 1, jj)                 # [B, T_new]
-            src_pr = (
-                torch.gather(prom_rank, 1, jj) * ws + off
-            ).clamp_(0, p_max * ws - 1)
+            src_pr = _clamp_index(
+                torch.gather(prom_rank, 1, jj) * ws + off, p_max * ws - 1)
             idx_pr = src_pr.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
             sel = tok_is_prom.unsqueeze(1).unsqueeze(-1)
             new_k = torch.where(sel, torch.gather(prom_k, 2, idx_pr), new_k)

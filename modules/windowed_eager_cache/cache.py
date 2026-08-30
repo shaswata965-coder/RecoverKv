@@ -35,6 +35,17 @@ from modules.quant.effective import rotate_key_window
 from modules.quant.slots import n_slots_for
 
 
+def _clamp_index(x: Tensor, hi) -> Tensor:
+    """Clamp an index tensor to ``[0, hi]`` without emitting ``aten.amin`` — see
+    the flash twin (modules/windowed_cache/cache.py) for why torch <= 2.6 Inductor
+    cannot schedule the scalar StarDep that a clamp's upper bound lowers to. The
+    upper bound is built from ``clamp_min`` alone via ``min(x, hi) = hi -
+    relu(hi - x)``. A no-op semantically; mirrored to keep the eviction math in
+    sync (this twin is not compiled, so it never hits the bug)."""
+    x = x.clamp_min(0)
+    return hi - (hi - x).clamp_min(0)
+
+
 class WindowedCache(_HFCacheBase):
     """Windowed KV cache with H2O-style cumulative eviction.
 
@@ -609,7 +620,8 @@ class WindowedCache(_HFCacheBase):
             start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_q]
             tok_f = (
                 start_f.unsqueeze(-1) + torch.arange(ws, device=device)
-            ).reshape(B, n_q * ws).clamp_(0, T_body - 1)
+            ).reshape(B, n_q * ws)
+            tok_f = _clamp_index(tok_f, T_body - 1)
             idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_q * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
             v_tok = torch.gather(body_v, 2, idx_d)
@@ -647,12 +659,13 @@ class WindowedCache(_HFCacheBase):
         # config that worked before.
         # Two-sided clamp (min=0 is a no-op since i >= 0) mirrors the flash twin:
         # a single-sided clamp(max=) lowers through aten.amin under torch.compile.
-        rank = torch.clamp(torch.div(i, ws, rounding_mode="floor"), 0, n_fp - 1)
+        rank = _clamp_index(torch.div(i, ws, rounding_mode="floor"), n_fp - 1)
         jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
         off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 
         start_of_rank = torch.searchsorted(body_wid, fp_wids)          # [B, n_fp]
-        src_fp = (torch.gather(start_of_rank, 1, jj) + off).clamp_(0, max(T_body - 1, 0))
+        src_fp = _clamp_index(
+            torch.gather(start_of_rank, 1, jj) + off, max(T_body - 1, 0))
         idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
         new_k = torch.gather(body_k, 2, idx_fp)
         new_v = torch.gather(body_v, 2, idx_fp)
@@ -665,7 +678,8 @@ class WindowedCache(_HFCacheBase):
             tok_is_prom = torch.gather(fp_prom, 1, jj)                 # [B, T_new]
             src_pr = (
                 torch.gather(prom_rank, 1, jj) * ws + off
-            ).clamp_(0, p_max * ws - 1)
+            )
+            src_pr = _clamp_index(src_pr, p_max * ws - 1)
             idx_pr = src_pr.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
             sel = tok_is_prom.unsqueeze(1).unsqueeze(-1)
             new_k = torch.where(sel, torch.gather(prom_k, 2, idx_pr), new_k)

@@ -1045,8 +1045,15 @@ def _run_decode_across_eviction(compile_backend=None, seed=1234):
     # different backend) cannot route this run straight to eager.
     cache_mod._COMPILED_EVICT_FN = None
     cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRACEBACK = None
     cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+    cache_mod._EVICT_COMPILE_TRACEBACK = None
     cache_mod._EVICT_ANNOUNCED["done"] = True   # silence the banner in tests
+    # Zero the per-path counters too, so a test asserting on eager/compiled counts
+    # sees only THIS run's evictions, not those accumulated by earlier tests in
+    # the same process (reset_evict_path_stats does not touch the sticky
+    # compile-failure record, which each caller clears explicitly above).
+    cache_mod.reset_evict_path_stats()
     try:
         cache = _make_cache(quant_ratio=0.5, ws=8, num_sink=0, prefill_len=256)
         H, D, ws = 2, 4, 8
@@ -1184,6 +1191,7 @@ def test_compile_failure_raises_kernel_or_error():
     assert reason and "amin" in reason, reason
     # Leave the sticky flag clean for other tests.
     cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRACEBACK = None
     cache_mod._EVICT_COMPILE_TRIED_STATIC = False
 
 
@@ -1212,6 +1220,7 @@ def test_compile_failure_leaves_cache_state_untouched():
     os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = "_boom_untouched"
     cache_mod._COMPILED_EVICT_FN = None
     cache_mod._EVICT_COMPILE_FAILED = None
+    cache_mod._EVICT_COMPILE_TRACEBACK = None
     cache_mod._EVICT_COMPILE_TRIED_STATIC = False
     cache_mod._EVICT_ANNOUNCED["done"] = True
     try:
@@ -1241,6 +1250,7 @@ def test_compile_failure_leaves_cache_state_untouched():
     finally:
         cache_mod._COMPILED_EVICT_FN = None
         cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
         cache_mod._EVICT_COMPILE_TRIED_STATIC = False
         if prev is None: os.environ.pop("STICKYKV_COMPILE_EVICT", None)
         else: os.environ["STICKYKV_COMPILE_EVICT"] = prev
