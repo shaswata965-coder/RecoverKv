@@ -95,6 +95,39 @@ class TestAgainstTheLoggedRun:
             CALIBRATION["measured_device_peak_gb"], abs=0.05)
 
 
+class TestOutOfSampleValidation:
+    """The only non-circular evidence the model works.
+
+    Everything in TestAgainstTheLoggedRun is fitted to 1048/batch-32, so
+    reproducing it proves arithmetic, not predictive power. 4096/batch-32 is a
+    shape 4x larger that the model never saw: it predicted 53.15 GB before the
+    run, and the run measured 52.46 GB. Pinned so a future change to the model
+    cannot quietly lose that agreement.
+    """
+
+    #: peak_GB (torch ALLOCATED peak) from the 4096/257 batch-32 cell, measured
+    #: with L-reuse working -- the cell that used to OOM.
+    MEASURED_4096_B32 = 52.46
+
+    def test_predicts_the_formerly_ooming_cell_within_five_percent(
+            self, llama3_8b):
+        got = _predict(llama3_8b, 32, 4096, lse_recomputes=False).alloc_total
+        err = abs(got - self.MEASURED_4096_B32) / self.MEASURED_4096_B32
+        assert err < 0.05, f"predicted {got:.2f} GB vs measured "                            f"{self.MEASURED_4096_B32} GB ({err*100:.1f}% off)"
+
+    def test_it_predicted_the_cell_would_fit(self, llama3_8b):
+        """The claim that mattered: with the transient gone, 4096/32 fits. It
+        did -- the cell ran where it previously OOMed."""
+        assert _predict(llama3_8b, 32, 4096,
+                        lse_recomputes=False).verdict == "fits"
+
+    def test_and_still_predicts_trouble_with_the_transient_back(self, llama3_8b):
+        """Same shape, transient restored: must go back over the limit, or the
+        model is not attributing the OOM to the term that actually caused it."""
+        b = _predict(llama3_8b, 32, 4096, lse_recomputes=True)
+        assert b.device_total_used > b.device_total
+
+
 class TestReproducesTheDecodeTable:
     """Every cell's observed outcome, from the run that produced the table."""
 
