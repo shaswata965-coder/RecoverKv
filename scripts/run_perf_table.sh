@@ -36,9 +36,10 @@
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
 #   COMPILE_EVICT   1 | 0  torch.compile the eviction step      (default: 1)
-#   LSE_STRICT      1 | 0  hard-fail a cell on an L-reuse miss  (default: 0)
-#                   (0 keeps the cell on the recompute path and flags TTFT;
-#                    L-reuse is prefill-only, so decode columns are unaffected)
+#   LSE_STRICT      1 | 0  hard-fail on an L-reuse miss         (default: 1)
+#                   1 raises AT the miss, naming the layer and the cause.
+#                   0 degrades to recompute: a second O(N^2) pass per layer
+#                   AND the fp32 block that OOMs 4096/batch-32.
 #
 # ------------------------------------------------------------------- examples
 #   # the shipped table (q=0.70, the two default batch sizes)
@@ -82,7 +83,7 @@ WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
 COMPILE_EVICT="${COMPILE_EVICT:-1}"
-LSE_STRICT="${LSE_STRICT:-0}"
+LSE_STRICT="${LSE_STRICT:-1}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -105,7 +106,7 @@ while [[ $# -gt 0 ]]; do
     --stat)                 STAT="$2"; shift 2;;
     --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
     --lse-strict)           LSE_STRICT="$2"; shift 2;;
-    -h|--help)              sed -n '2,54p' "$0"; exit 0;;
+    -h|--help)              sed -n '2,57p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
 done
@@ -128,12 +129,17 @@ fi
 export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 
 # L-reuse (a PREFILL optimization) hands the softmax normaliser L from the flash
-# forward to the score kernel instead of recomputing it. At batch>1 transformers
-# takes the varlen flash path, which bypasses the L-capture, so L is recomputed --
-# a prefill-only cost that inflates TTFT but does NOT touch decode TPOT/throughput/
-# memory. STICKYKV_LSE_STRICT default 0 here (decode-focused table): keep the cell
-# on the recompute path and flag TTFT in provenance, rather than erroring it. Pass
-# --lse-strict 1 to hard-fail on an L-reuse miss (rigorous prefill benchmarking).
+# forward to the score kernel instead of recomputing it. DEFAULT IS STRICT: a
+# miss raises AT the miss, naming the layer and the cause.
+#
+# This defaulted to 0 with a note blaming the batch>1 varlen path. That
+# explanation is wrong for this harness -- perf_runner passes no attention_mask,
+# so _update_causal_mask hands flash_attention_2 a None mask and
+# _flash_attention_forward calls the patched flash_attn_func at every batch size.
+# Nor is the miss "prefill-only cosmetic": the recompute materialises a
+# [B, H_q, chunk, S] fp32 block that is 32 GB at 4096/batch-32 -- larger than the
+# model weights, and the reason that cell OOMs. Pass --lse-strict 0 only when you
+# knowingly want the recompute path.
 export STICKYKV_LSE_STRICT="$LSE_STRICT"
 
 case "$BACKEND" in

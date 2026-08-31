@@ -68,7 +68,17 @@ def test_capture_is_transparent_and_stashes_lse():
         handle.restore()
 
 
-def test_broken_build_latches_off_and_stays_correct():
+def test_broken_build_latches_off_and_stays_correct(monkeypatch):
+    """The degrade path — now reachable only with STICKYKV_LSE_STRICT=0.
+
+    The default became strict (see the companion test below and
+    tests/test_lse_strict.py): a build that cannot hand back ``L`` costs a
+    second O(N^2) prefill pass per layer plus the fp32 block that OOMs
+    4096/batch-32, and paying that quietly is what let a whole benchmark
+    campaign be recorded on the recompute path. The degrade still has to WORK
+    when asked for, which is what this pins.
+    """
+    monkeypatch.setenv("STICKYKV_LSE_STRICT", "0")
     out = torch.ones(1, 2, 3)
     mod = _fake_module(broken=True, out=out, lse=None)
 
@@ -85,6 +95,21 @@ def test_broken_build_latches_off_and_stays_correct():
         # The retry after the TypeError plus this call: none should pass True now.
         assert mod._seen["return_attn_probs"][-1] is False
         assert len(mod._seen["return_attn_probs"]) > n_calls_before
+        # And the cause is retrievable either way — the OOM autopsy reads it.
+        assert "return_attn_probs" in (flash_lse.broken_reason() or "")
+    finally:
+        handle.restore()
+
+
+def test_broken_build_raises_by_default(monkeypatch):
+    """The new default: no silent fallback, the failure is visible."""
+    monkeypatch.delenv("STICKYKV_LSE_STRICT", raising=False)
+    mod = _fake_module(broken=True, out=torch.ones(1, 2, 3), lse=None)
+
+    handle = flash_lse.enable(mod)
+    try:
+        with pytest.raises(RuntimeError, match="return_attn_probs"):
+            mod.flash_attn_func(1, 2, 3, causal=True)
     finally:
         handle.restore()
 

@@ -117,6 +117,25 @@ def pop() -> Optional[torch.Tensor]:
     return lse
 
 
+def strict() -> bool:
+    """Whether an L-capture failure RAISES instead of degrading (default ON).
+
+    The prefill score kernel is already Triton-or-error (score_kernel.py: no
+    PyTorch prefill fallback, because the reference OOMs the shapes this method
+    targets). The L-capture was the one piece of the prefill path that still
+    degraded silently, which is why "installed source: flashinfer" and
+    "compute_lse ran 32x" could coexist for a whole benchmark campaign.
+
+    Degrading here is not a correctness fallback -- the recompute produces the
+    same L -- but it silently costs a second O(N^2) pass and a fp32 block that
+    is 32 GB at 4096/32, i.e. the OOM. A cost that large must not be paid
+    quietly. ``STICKYKV_LSE_STRICT=0`` restores the old degrade for runs where
+    only the output matters (quality suites).
+    """
+    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def broken_reason() -> Optional[str]:
     """Why the FlashInfer L-capture latched off (``"Type: msg"``), or ``None``.
 
@@ -228,15 +247,31 @@ def _make_wrapper(orig):
                 q_flat, k_flat, v_flat, return_lse=True
             )
         except Exception as exc:
-            # Any API / shape / build mismatch: latch off, run plain flash so the
-            # attention output is still correct; score path recomputes L.
-            # RECORD the reason — this latch is the difference between prefill
-            # paying one O(N^2) pass and two, and until it is reported the only
-            # visible symptom is "L-reuse installed but never fired".
+            # Any API / shape / build mismatch. RECORD the reason first — this
+            # latch is the difference between prefill paying one O(N^2) pass and
+            # two, and until it is reported the only visible symptom is "L-reuse
+            # installed but never fired".
             _STATE["broken"] = True
             _STATE["reason"] = f"{type(exc).__name__}: {exc}"
             _STATE["trace"] = traceback.format_exc()
             _STATE["lse"] = None
+            if strict():
+                # Raise FROM the original, at the point of failure, with the
+                # FlashInfer traceback intact. A post-hoc per-cell warning
+                # cannot show which call in which layer broke or why.
+                raise RuntimeError(
+                    "FlashInfer L-capture failed and STICKYKV_LSE_STRICT is on, "
+                    "so this is a hard error rather than a silent second "
+                    f"O(N^2) prefill pass. Shape was B={B} S_q={S_q} S_kv={S_kv} "
+                    f"H_q={H_q} H_kv={H_kv} D={D} causal={bool(causal)} "
+                    f"dtype={q.dtype}. Remedies, cheapest first: "
+                    "STICKYKV_LSE_BACKEND=flash (same kernel, asks it for the "
+                    "softmax_lse it already computed — attention output stays "
+                    "bit-identical); a larger "
+                    "STICKYKV_FLASHINFER_WORKSPACE_MB; or "
+                    "STICKYKV_LSE_STRICT=0 to accept the recompute. See "
+                    "PREFILL_PLAN.md Stage 1."
+                ) from exc
             return orig(*args, **kwargs)
 
         # LSE: [B*S_q, H_q] -> [B, H_q, S_q] (natural log; convert if log2 build).

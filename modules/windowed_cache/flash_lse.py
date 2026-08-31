@@ -51,6 +51,8 @@ entry point degrades to a no-op and the caller keeps recomputing ``L``.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -60,7 +62,22 @@ import torch
 # Single-slot stash. ``lse`` holds the most recent non-varlen softmax_lse (or
 # None). ``broken`` latches True if the installed flash-attn rejects
 # ``return_attn_probs`` so we stop retrying it.
-_STATE: dict = {"lse": None, "broken": False}
+_STATE: dict = {"lse": None, "broken": False, "reason": None}
+
+
+def _strict() -> bool:
+    """Whether a capture failure RAISES instead of degrading (default ON).
+
+    Mirrors :func:`flashinfer_lse.strict` and reads the same env var, so the
+    two L sources cannot disagree about whether a miss is survivable.
+    """
+    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def broken_reason():
+    """Why the flash L-capture latched off, or ``None``."""
+    return _STATE["reason"]
 
 
 def clear() -> None:
@@ -100,11 +117,21 @@ def _make_wrapper(orig):
             k2 = dict(kwargs)
             k2["return_attn_probs"] = True
             out = orig(*args, **k2)
-        except TypeError:
-            # This flash-attn build doesn't accept return_attn_probs. Latch off
-            # and fall back to a clean call — capture disabled, output correct.
+        except TypeError as exc:
+            # This flash-attn build doesn't accept return_attn_probs.
             _STATE["broken"] = True
+            _STATE["reason"] = f"{type(exc).__name__}: {exc}"
             _STATE["lse"] = None
+            if _strict():
+                raise RuntimeError(
+                    "flash_attn_func rejected return_attn_probs, so L cannot be "
+                    "captured from the forward. STICKYKV_LSE_STRICT is on, so "
+                    "this is a hard error rather than a silent second O(N^2) "
+                    "prefill pass (which also materialises the fp32 block that "
+                    "OOMs 4096/batch-32). Either install a flash-attn build "
+                    "that supports it, use STICKYKV_LSE_BACKEND=flashinfer, or "
+                    "set STICKYKV_LSE_STRICT=0 to accept the recompute."
+                ) from exc
             return orig(*args, **kwargs)
 
         # With return_attn_probs the return is (out, softmax_lse, S_dmask).

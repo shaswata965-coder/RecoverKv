@@ -146,6 +146,25 @@ def _install_lse_source(handles: "HookHandles") -> Tuple[bool, str]:
     return False, "off (flash-attn unavailable; recomputing L)"
 
 
+def _lse_strict() -> bool:
+    """Whether an L-reuse MISS raises instead of degrading (default ON).
+
+    The prefill score path is otherwise already fail-loud: ``compute_token_scores``
+    is Triton-or-error for ``T > 1`` because the PyTorch reference OOMs the
+    shapes this method targets. The L-capture was the last piece that degraded
+    quietly, and it degrades into exactly that reference's transient — a second
+    ``O(N^2)`` pass and a ``[B, H_q, chunk, S]`` fp32 block (32 GB at 4096/32,
+    larger than the model weights). Paying that silently is how a whole campaign
+    of prefill numbers got recorded on the recompute path.
+
+    Read by both L sources and by the consumer below, so no part of the chain
+    can disagree about whether a miss is survivable. ``STICKYKV_LSE_STRICT=0``
+    restores the degrade for runs where only the output matters.
+    """
+    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _score_softmax_dtype() -> torch.dtype:
     """Dtype for the auxiliary-score softmax intermediate.
 
@@ -554,11 +573,53 @@ def install_score_hooks(
                 lse = None
                 if lse_capture and q.shape[2] > 1 and score_meta is None:
                     cand = lse_mod.pop()
+                    want = (q.shape[0], q.shape[1], q.shape[2])
                     if (
                         isinstance(cand, torch.Tensor)
-                        and tuple(cand.shape) == (q.shape[0], q.shape[1], q.shape[2])
+                        and tuple(cand.shape) == want
                     ):
                         lse = cand.to(device=q.device)
+                    elif _lse_strict():
+                        # The MISS the capture itself cannot see. A latched
+                        # capture raises at its own call site; this catches the
+                        # other two failures: the patched symbol was never
+                        # called (cand is None with no recorded reason), and a
+                        # capture that fired but produced the wrong layout.
+                        # Without this the run degrades to compute_lse, which is
+                        # a second O(N^2) pass per layer plus the fp32 block
+                        # that OOMs 4096/batch-32 — silently.
+                        latched = getattr(lse_mod, "broken_reason", lambda: None)()
+                        if cand is None and not latched:
+                            what = (
+                                "the capture was NEVER REACHED — the patched "
+                                "flash_attn_func is not the symbol this model "
+                                "called for this layer. Check what the attention "
+                                "module actually resolves (a direct `from "
+                                "flash_attn import flash_attn_func` inside the "
+                                "attention module would bypass the patch on "
+                                "transformers.modeling_flash_attention_utils), "
+                                "and note a padded/varlen call also bypasses it."
+                            )
+                        elif cand is None:
+                            what = f"the capture latched off earlier: {latched}"
+                        else:
+                            what = (
+                                f"the capture fired but produced "
+                                f"{tuple(cand.shape)}, expected {want} "
+                                f"(B, H_q, T). A varlen capture returns "
+                                f"(nheads, total_q) and lands here."
+                            )
+                        raise RuntimeError(
+                            f"L-reuse MISS at layer {lidx} (source "
+                            f"{lse_label!r}): {what} STICKYKV_LSE_STRICT is on, "
+                            "so this is a hard error rather than a silent "
+                            "fallback to compute_lse. Cheapest remedy: "
+                            "STICKYKV_LSE_BACKEND=flash — the same kernel, asked "
+                            "for the softmax_lse it already computed, so the "
+                            "attention output stays bit-identical. See "
+                            "PREFILL_PLAN.md Stage 1. STICKYKV_LSE_STRICT=0 "
+                            "restores the degrade."
+                        )
 
                 token_scores = compute_token_scores(
                     q,
