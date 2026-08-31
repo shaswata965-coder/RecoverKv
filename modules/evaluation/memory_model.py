@@ -41,11 +41,22 @@ from typing import Any, Dict, Optional
 
 GB = 1024 ** 3
 
-#: ``compute_lse``'s chunk chain holds two full fp32 blocks at the crossover:
-#: ``matmul(...).float()`` produces one, ``* scaling`` allocates the next while
-#: the first is still referenced, and ``aw.masked_fill(...)`` does it again.
-#: None of them are in-place. Raise this to 1.0 to model an in-place chain.
-NONINPLACE_FACTOR = 2.0
+#: How many full fp32 blocks ``compute_lse`` holds live at its crossover.
+#:
+#: This was a guess (2.0, reasoning that ``matmul(...).float()``, ``* scaling``
+#: and ``masked_fill`` each allocate while the previous is still referenced).
+#: It is now SOLVED from two measurements at the same shape — 1048/batch-32,
+#: L recomputed vs L reused — which differ only by this term:
+#:
+#:     L recomputed : torch alloc peak 29.25 GB
+#:     L reused     : torch alloc peak 24.73 GB
+#:     difference   :                   4.52 GB   <- the transient, measured
+#:     one fp32 block at that shape:     4.09 GB
+#:
+#: So the real factor is 1.10, not 2.0: the allocator reuses the freed block
+#: for the next op far more often than the source reading suggests. Measured
+#: beats reasoned; the guess was 82% too high.
+NONINPLACE_FACTOR = 4.52 / 4.094
 
 #: The single measured point this model's ``other`` term is calibrated against.
 #: Meta-Llama-3-8B-Instruct, A100-80GB, fp16, from the run that produced
@@ -61,6 +72,12 @@ CALIBRATION = {
     "measured_alloc_peak_gb": 29.25,
     "measured_device_peak_gb": 35.67,
     "measured_end_alloc_gb": 16.00,
+    #: The SAME cell with L-reuse working (STICKYKV_LSE_BACKEND=flash). Differs
+    #: from the row above only by the compute_lse transient, which is what makes
+    #: both that term and ``other`` solvable rather than fitted. Buffer sizing
+    #: does not depend on gen length (cache.py:367), so the shorter generation
+    #: this was measured at does not affect the prefill peak.
+    "measured_alloc_peak_lse_reused_gb": 24.73,
 }
 
 #: Fraction by which the device's used peak exceeds torch's allocated peak
@@ -213,17 +230,17 @@ def _calibrated_other_gb(model_config: Any, batch_size: int, prefill_len: int,
     Everything the four named terms do not cover: attention and MLP
     activations, the logit tensor, transient copies. Fitted, not derived.
 
-    Fitted with the SAME ``noninplace_factor`` and the SAME derived weights the
-    caller predicts with — otherwise the model does not reproduce its own
-    calibration point, and every number downstream inherits that offset.
+    Fitted against the L-REUSED measurement, where the transient is absent, so
+    the residual is not contaminated by the term whose size we are also
+    estimating. With both measurements at one shape the system is exactly
+    determined: their difference gives the transient, and the L-reused point
+    gives ``other`` directly.
     """
     c = CALIBRATION
     residual = (
-        c["measured_alloc_peak_gb"]
+        c["measured_alloc_peak_lse_reused_gb"]
         - w_gb
         - prefill_kv_gb(model_config, c["batch_size"], c["prefill_len"])
-        - lse_recompute_gb(model_config, c["batch_size"], c["prefill_len"],
-                           chunk=1024, noninplace_factor=noninplace_factor)
     )
     residual = max(residual, 0.0)
     base = c["batch_size"] * c["prefill_len"]

@@ -60,6 +60,29 @@ class TestAgainstTheLoggedRun:
         assert w < end
         assert end - w < 2.0, "residual is meant to be the compacted KV, not a bug"
 
+    def test_reproduces_BOTH_measured_points_at_the_calibration_shape(
+            self, llama3_8b):
+        """1048/batch-32 was measured twice — L recomputed and L reused — and
+        the two differ only by the compute_lse transient. That makes the system
+        exactly determined, so the model must hit BOTH, not just the one it was
+        fitted on."""
+        off = _predict(llama3_8b, 32, 1048, lse_recomputes=True)
+        on = _predict(llama3_8b, 32, 1048, lse_recomputes=False)
+        assert off.alloc_total == pytest.approx(
+            CALIBRATION["measured_alloc_peak_gb"], abs=0.05)
+        assert on.alloc_total == pytest.approx(
+            CALIBRATION["measured_alloc_peak_lse_reused_gb"], abs=0.05)
+
+    def test_the_transient_is_measured_not_assumed(self, llama3_8b):
+        """NONINPLACE_FACTOR was a guessed 2.0; the two points give 1.10. Pin
+        that it is derived from the measurements, not re-guessed."""
+        from modules.evaluation.memory_model import NONINPLACE_FACTOR
+        measured = (CALIBRATION["measured_alloc_peak_gb"]
+                    - CALIBRATION["measured_alloc_peak_lse_reused_gb"])
+        one_block = lse_recompute_gb(llama3_8b, 32, 1048, noninplace_factor=1.0)
+        assert NONINPLACE_FACTOR == pytest.approx(measured / one_block, rel=1e-3)
+        assert 1.0 <= NONINPLACE_FACTOR < 1.5, "a guess crept back in"
+
     def test_reproduces_its_own_calibration_point(self, llama3_8b):
         """The model must return the measured peak at the shape it was fitted
         on. It did not, before the fit and the prediction were made to share a
@@ -114,15 +137,24 @@ class TestTheLeverIsTheLseTransient:
 
         Deliberately NOT asserting the as-run cell predicts "oom": the model
         puts it 7 GB over an 80 GB card, which is a genuine overrun but only a
-        9% one, and the ``other`` term is fitted from a single point. Over the
-        limit is what the model supports; certainty is not.
+        9% one. Over the limit is what the model supports; certainty is not.
         """
+        from modules.evaluation.memory_model import OVERHEAD_FRACTION
         broken = _predict(llama3_8b, 32, 4096)
         assert broken.device_total_used > broken.device_total
         fixed = _predict(llama3_8b, 32, 4096, lse_recomputes=False)
         assert fixed.lse_recompute == 0.0
         assert fixed.verdict == "fits"
-        assert fixed.device_total_used < broken.device_total_used - 30.0
+        # The saving is exactly the transient plus its share of allocator
+        # overhead — an identity, not a threshold. The previous version asserted
+        # "> 30 GB", which silently encoded the 2.0 transient factor that the
+        # two measured points later disproved; a magic number in an assertion
+        # outlives the reasoning that produced it.
+        saved = broken.device_total_used - fixed.device_total_used
+        assert saved == pytest.approx(
+            broken.lse_recompute * (1 + OVERHEAD_FRACTION), rel=1e-6)
+        assert fixed.device_total < broken.device_total_used, (
+            "the cell must be over the limit before and under it after")
 
     def test_smaller_chunk_also_clears_it_without_touching_logic(self, llama3_8b):
         """STICKYKV_PREFILL_SCORE_CHUNK is a pure env knob: same FLOPs, smaller
