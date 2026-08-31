@@ -29,11 +29,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 
 MB_PER_GB = 1024.0
+
+#: Cells written further apart than this did not come from one run.
+STALE_S = 3600.0
 
 
 def _cells(npz_dir: Path):
@@ -101,6 +105,8 @@ def build_table(npz_dir: Path, config: str | None, stat: str) -> str:
     lines = [fmt_row(header), "-" * (sum(widths) + 2 * (len(widths) - 1))]
 
     any_row = False
+    notes: list = []
+    ages: list = []
     for prefill, gen, batch, path in _cells(npz_dir):
         data = _load(path)
         if data is None:
@@ -113,6 +119,10 @@ def build_table(npz_dir: Path, config: str | None, stat: str) -> str:
             continue
         any_row = True
         shape = f"{prefill}/{gen}"
+        try:
+            ages.append((path.stat().st_mtime, shape, batch))
+        except OSError:
+            pass
 
         oom = bool(np.asarray(data.get("oom_mask", np.zeros(n_cfg)))[ci]) \
             if "oom_mask" in data else False
@@ -121,11 +131,24 @@ def build_table(npz_dir: Path, config: str | None, stat: str) -> str:
         skipped = bool(np.asarray(data.get("skipped_mask", np.zeros(n_cfg)))[ci]) \
             if "skipped_mask" in data else False
 
+        reason = ""
+        if "skip_reason" in data:
+            try:
+                reason = str(np.asarray(data["skip_reason"], dtype=object)[ci])
+            except Exception:
+                reason = ""
+
         if oom:
             lines.append(fmt_row([shape, batch, "OOM", "-", "-", "-", "-"]))
+            notes.append((shape, batch, "OOM", reason))
             continue
         if err or skipped:
-            lines.append(fmt_row([shape, batch, "-", "-", "-", "-", "-"]))
+            # NOT dashes. A row of dashes reads as "nothing happened", which is
+            # how a deliberate hard error (the strict L-reuse miss) got mistaken
+            # for a slow-but-successful cell. The reason is in the npz and has
+            # always been; it was simply never printed.
+            lines.append(fmt_row([shape, batch, "ERROR", "-", "-", "-", "-"]))
+            notes.append((shape, batch, "ERROR" if err else "SKIPPED", reason))
             continue
 
         ttft = _stat(_col(data, "ttft_ms", n_cfg, n_run)[ci], fn) / 1000.0
@@ -143,6 +166,33 @@ def build_table(npz_dir: Path, config: str | None, stat: str) -> str:
     if not any_row:
         hint = f" matching --config {config!r}" if config else ""
         lines.append(f"(no perf npz found in {npz_dir}{hint})")
+        return "\n".join(lines)
+
+    if notes:
+        lines.append("")
+    for shape, batch, kind, reason in notes:
+        lines.append(f"  {kind}  {shape} batch={batch}: "
+                     f"{reason or '(no reason recorded in the npz)'}")
+
+    # Provenance. This printer globs the WHOLE directory, so a run that
+    # re-measures one cell leaves every other cell showing its previous
+    # result -- with nothing on screen to say so. Cells written more than
+    # STALE_S apart did not come from the same run and must not be read as
+    # one table.
+    if len(ages) >= 2:
+        newest = max(a[0] for a in ages)
+        stale = [(t, s, b) for t, s, b in ages if newest - t > STALE_S]
+        if stale:
+            lines.append("")
+            lines.append(f"  !! MIXED RUNS: {len(stale)} of {len(ages)} cells "
+                         f"are older than the newest by more than "
+                         f"{STALE_S / 3600:.0f}h. This is not one table.")
+            for t, s, b in sorted(stale, key=lambda r: r[0]):
+                hrs = (newest - t) / 3600.0
+                lines.append(f"     stale  {s} batch={b}   {hrs:.1f}h older "
+                             f"({time.strftime('%Y-%m-%d %H:%M', time.localtime(t))})")
+            lines.append("     Re-run those shapes, or point --npz-dir at a "
+                         "clean directory, before comparing rows.")
     return "\n".join(lines)
 
 
