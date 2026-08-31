@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import math
 import os
+import traceback
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -70,7 +71,17 @@ import torch
 # Single-slot stash + latches, mirroring flash_lse._STATE. ``lse`` holds the most
 # recent prefill softmax_lse as [B, H_q, T] (or None); ``broken`` latches True on
 # the first FlashInfer failure so we stop retrying and run plain flash.
-_STATE: dict = {"lse": None, "broken": False}
+#
+# ``reason`` / ``trace`` record WHY it latched. Without them the latch is
+# indistinguishable from "the patched seam was never reached": both present as
+# a successful install whose L never arrives, so the perf runner's L-reuse-miss
+# warning had to *guess* at a cause (it blames the batch>1 varlen path, which
+# the perf harness cannot take — it passes no attention_mask, so
+# _update_causal_mask hands flash_attention_2 a None mask and
+# _flash_attention_forward calls the patched flash_attn_func). Same lesson the
+# eviction's compile failure learned in d44baba: a swallowed exception on a
+# fallback path costs more than the fallback saves.
+_STATE: dict = {"lse": None, "broken": False, "reason": None, "trace": None}
 
 # Reusable device workspace + a plan cache keyed on shape. FlashInfer's wrapper
 # wants a scratch buffer and a per-shape plan(); prefill calls every layer at the
@@ -104,6 +115,22 @@ def pop() -> Optional[torch.Tensor]:
     lse = _STATE["lse"]
     _STATE["lse"] = None
     return lse
+
+
+def broken_reason() -> Optional[str]:
+    """Why the FlashInfer L-capture latched off (``"Type: msg"``), or ``None``.
+
+    ``None`` with ``compute_lse`` still running every layer means the capture
+    never *failed* — it was never *reached*, which is a different bug in a
+    different place (the patched ``flash_attn_func`` symbol is not the one the
+    model calls). Distinguishing those two is the whole point of recording it.
+    """
+    return _STATE["reason"]
+
+
+def broken_traceback() -> Optional[str]:
+    """Full traceback of the latching failure, or ``None``."""
+    return _STATE["trace"]
 
 
 def _flashinfer():
@@ -200,10 +227,15 @@ def _make_wrapper(orig):
             out_flat, lse_flat = wrapper_fi.run(
                 q_flat, k_flat, v_flat, return_lse=True
             )
-        except Exception:
+        except Exception as exc:
             # Any API / shape / build mismatch: latch off, run plain flash so the
             # attention output is still correct; score path recomputes L.
+            # RECORD the reason — this latch is the difference between prefill
+            # paying one O(N^2) pass and two, and until it is reported the only
+            # visible symptom is "L-reuse installed but never fired".
             _STATE["broken"] = True
+            _STATE["reason"] = f"{type(exc).__name__}: {exc}"
+            _STATE["trace"] = traceback.format_exc()
             _STATE["lse"] = None
             return orig(*args, **kwargs)
 

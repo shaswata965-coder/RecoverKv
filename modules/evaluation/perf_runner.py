@@ -408,6 +408,20 @@ def _evict_compile_failed() -> Optional[str]:
         return None
 
 
+def _lse_broken_reason() -> Optional[str]:
+    """Why the FlashInfer L-capture latched off, or None if it never failed.
+
+    ``None`` while ``compute_lse`` still runs every prefill layer is itself the
+    finding: the capture did not break, it was never reached — a different bug
+    with a different fix (see the L-reuse-miss warning).
+    """
+    try:
+        from modules.windowed_cache import flashinfer_lse
+        return flashinfer_lse.broken_reason()
+    except Exception:  # pragma: no cover - environment dependent
+        return None
+
+
 def _evict_compile_traceback() -> Optional[str]:
     """The FULL Inductor traceback of the eviction compile failure, or None."""
     fn = _kernel_fn("evict_compile_traceback")
@@ -1433,6 +1447,7 @@ class PerfRunner:
                         "recompute_count": lse_misses,
                         "reuse_requested": lse_requested,
                         "degraded": lse_degraded,
+                        "broken_reason": _lse_broken_reason(),
                     }
                     diag["fused_decode"] = bool(getattr(hooks, "fused_decode", False))
                 if lse_degraded:
@@ -1445,15 +1460,36 @@ class PerfRunner:
                     # pass + a [B,H,chunk,S] fp32 transient, ~%.1f GB here); it does
                     # NOT touch decode TPOT / throughput / memory.
                     tgb = _lse_transient_gb(batch_size, model.config, prefill_len)
+                    # The recorded reason, not a guess. A latched capture (the
+                    # wrapper ran and FlashInfer raised) and an unreached capture
+                    # (the model never called the patched symbol) look identical
+                    # from the miss count alone, and they have opposite fixes.
+                    lse_reason = _lse_broken_reason()
+                    if lse_reason:
+                        cause = (
+                            f"The FlashInfer L-capture LATCHED OFF on its first "
+                            f"call and ran plain flash for the rest of the process: "
+                            f"{lse_reason}. Fix that failure (or install a working "
+                            f"flashinfer build) and the second pass goes away."
+                        )
+                    else:
+                        cause = (
+                            "The L-capture never failed — it was never REACHED, so "
+                            "the patched flash_attn_func is not the symbol this "
+                            "model calls. Note the perf harness passes no "
+                            "attention_mask, so the batch>1 VARLEN path is NOT the "
+                            "explanation here (_update_causal_mask hands "
+                            "flash_attention_2 a None mask); look at where the "
+                            "attention module resolves its flash entry point."
+                        )
                     detail = (
                         f"config {c.get('name')!r}: L-reuse was requested but "
                         f"compute_lse ran {lse_misses}x this prefill — L did NOT come "
                         f"from the forward (installed source: "
                         f"{getattr(hooks, 'lse_label', 'unknown')!r}). Every prefill "
                         f"layer paid a second O(N^2) pass + a [B,H,chunk,S] fp32 "
-                        f"transient (~{tgb:.1f} GB here). Most likely the batch>1 "
-                        f"VARLEN flash path bypassed the L-capture (a prefill-only "
-                        f"issue; decode TPOT / memory are unaffected)."
+                        f"transient (~{tgb:.1f} GB here). {cause} A prefill-only "
+                        f"issue; decode TPOT / memory are unaffected."
                     )
                     if _lse_strict():
                         from utils.config import ConfigValidationError
