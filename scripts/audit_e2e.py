@@ -135,24 +135,83 @@ def _kernel_metadata(torch) -> Dict[str, Any]:
     return out
 
 
+def _perf_cell(cfg) -> dict:
+    """The first ``perf.configs`` entry — where the generated perf config puts
+    ``cache_budget`` and the quant settings. They are NOT under ``cfg.cache``,
+    so reading them from there silently gives defaults (cache_budget 0.5 instead
+    of 0.20) and the ladder measures a different method than the table."""
+    try:
+        return dict(cfg.perf.configs[0])
+    except Exception:
+        return {}
+
+
+def resolve_cache_kwargs(cfg, q: float) -> Dict[str, Any]:
+    """WindowedCacheConfig kwargs, resolved EXACTLY as perf_runner resolves them.
+
+    Kept as a pure function so it can be checked without a GPU or a model: this
+    is the single place where the ladder could silently diverge from the
+    benchmarked method, and a divergence here would not surface as an error —
+    it would surface as deltas that quietly fail to add up to the table.
+
+    ``q`` is the ladder's own axis and overrides whatever the config says.
+    """
+    from utils.config import FIRST_EVICTION_STEP_DEFAULT
+
+    c = _perf_cell(cfg)
+    w = cfg.window
+    budget = c.get("cache_budget", getattr(cfg.cache, "cache_budget", None))
+    return {
+        "window_size": int(c.get("window_size", w.window_size)),
+        "num_sink_tokens": int(c.get("num_sink_tokens", w.num_sink_tokens)),
+        "local_window_size": c.get("local_window_size", w.local_window_size),
+        "cache_budget": budget if budget is not None else 0.5,
+        "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
+        "quant_ratio": q,
+        "quant_budget_mode": c.get(
+            "quant_budget_mode",
+            getattr(cfg.cache, "quant_budget_mode", "tokens")),
+        "quant_memoize_read": c.get(
+            "quant_memoize_read",
+            getattr(cfg.cache, "quant_memoize_read", None)),
+        "first_eviction_step": c.get(
+            "first_eviction_step",
+            getattr(cfg.cache, "first_eviction_step",
+                    FIRST_EVICTION_STEP_DEFAULT)),
+    }
+
+
 def _build_cache(cfg, model, prefill_len: int, gen_len: int, q: float,
                  dtype, pkg: str):
-    """A fresh windowed cache + installed hooks for one rung."""
+    """A fresh windowed cache + hooks, resolved EXACTLY as perf_runner does.
+
+    Mirrors modules/evaluation/perf_runner.py's resolution block field for
+    field. Any divergence — a missing ``first_eviction_step``, a different
+    ``quant_budget_mode``, a budget read from the wrong section — makes every
+    rung measure a method adjacent to the benchmarked one, and the ladder's
+    deltas would then not add up to the table they are meant to explain.
+    """
     from utils.cache_factory import get_cache_classes
+    from utils.config import FIRST_EVICTION_STEP_DEFAULT
+
     WC, WCC, install_hooks = get_cache_classes(pkg)
+    c = _perf_cell(cfg)
+    w = cfg.window
+
+    # Two-pass RoPE discovery, as perf_runner does: some models expose the
+    # module only as a submodule attribute, and a None rope breaks the cache.
     rope = None
     for name, mod in model.named_modules():
         if "rotary" in name.lower() or "rope" in name.lower():
             rope = mod
             break
-    cc = WCC(
-        window_size=cfg.window.window_size,
-        num_sink_tokens=cfg.window.num_sink_tokens,
-        local_window_size=cfg.window.local_window_size,
-        cache_budget=getattr(cfg.cache, "cache_budget", None) or 0.20,
-        rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
-        quant_ratio=q,
-    )
+    if rope is None:
+        for name, mod in model.named_modules():
+            if hasattr(mod, "rotary_emb"):
+                rope = mod.rotary_emb
+                break
+
+    cc = WCC(**resolve_cache_kwargs(cfg, q))
     cache = WC(config=cc, prefill_len=prefill_len, model_config=model.config,
                kv_dtype=dtype, rope_module=rope,
                num_layers=model.config.num_hidden_layers, max_tokens=gen_len)

@@ -184,3 +184,80 @@ class TestProfileRungEnvIsolation:
             _profile_rung(_torch, _Exploding(RuntimeError("boom")), ids, rung,
                           cfg, 8, 4, _torch.float16, "flash_attn", 1, 2, 5)
         assert os.environ["STICKYKV_FUSED_DECODE"] == "1"
+
+
+class TestLadderMatchesTheBenchmarkedMethod:
+    """The ladder is only meaningful if its rungs run the SAME method the decode
+    table ran. A divergence here does not raise — it produces deltas that
+    quietly fail to add up, which is the most expensive kind of wrong.
+    """
+
+    @pytest.fixture
+    def generated_cfg(self):
+        """Mirrors scripts/run_perf_table.sh's generated YAML: window geometry
+        under `window:`, budget and quant settings under `perf.configs[0]`."""
+        import types
+        return types.SimpleNamespace(
+            window=types.SimpleNamespace(window_size=8, num_sink_tokens=5,
+                                         local_window_size=64),
+            cache=types.SimpleNamespace(quant_ratio=0.70,
+                                        quant_budget_mode="tokens",
+                                        first_eviction_step=0,
+                                        rerotate_on_evict=False),
+            perf=types.SimpleNamespace(configs=[{
+                "name": "ours_q0.70", "cache_backend": "windowed",
+                "cache_package": "flash_attn", "cache_budget": 0.20,
+                "quant_ratio": 0.70, "quant_budget_mode": "tokens",
+            }]),
+        )
+
+    def test_budget_comes_from_perf_configs_not_cfg_cache(self, generated_cfg):
+        """cache_budget lives in perf.configs[0]; reading cfg.cache would give
+        the 0.5 default and silently change the tier geometry."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        assert resolve_cache_kwargs(generated_cfg, 0.70)["cache_budget"] == 0.20
+
+    def test_first_eviction_step_is_carried(self, generated_cfg):
+        """first_eviction_step=0 puts the compaction on decode step 0. Dropping
+        it changes which step carries the O(prefill) cost."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        assert resolve_cache_kwargs(generated_cfg, 0.70)["first_eviction_step"] == 0
+
+    def test_quant_budget_mode_is_carried(self, generated_cfg):
+        from scripts.audit_e2e import resolve_cache_kwargs
+        assert resolve_cache_kwargs(generated_cfg, 0.70)["quant_budget_mode"] == "tokens"
+
+    def test_window_geometry_comes_from_the_window_section(self, generated_cfg):
+        from scripts.audit_e2e import resolve_cache_kwargs
+        k = resolve_cache_kwargs(generated_cfg, 0.70)
+        assert (k["window_size"], k["num_sink_tokens"], k["local_window_size"]) \
+            == (8, 5, 64)
+
+    def test_q_is_the_ladders_axis_and_overrides_the_config(self, generated_cfg):
+        """Rung 1 must actually run q=0 even though the config says 0.70."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        assert resolve_cache_kwargs(generated_cfg, 0.0)["quant_ratio"] == 0.0
+        assert resolve_cache_kwargs(generated_cfg, 0.70)["quant_ratio"] == 0.70
+
+    def test_every_key_is_a_real_WindowedCacheConfig_field(self, generated_cfg):
+        """A stale kwarg name would TypeError on the first GPU invocation,
+        after the model load — the most annoying place to find out."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        from utils.cache_factory import get_cache_classes
+        _, WCC, _ = get_cache_classes("flash_attn")
+        fields = set(WCC.__dataclass_fields__)
+        assert set(resolve_cache_kwargs(generated_cfg, 0.70)) <= fields
+
+    def test_resolution_matches_perf_runners_own_field_list(self, generated_cfg):
+        """Guards against perf_runner gaining a field the ladder does not set."""
+        import re
+        from scripts.audit_e2e import resolve_cache_kwargs
+        src = open("modules/evaluation/perf_runner.py", encoding="utf-8").read()
+        block = src[src.index("cc = WCC("):]
+        block = block[:block.index(")\n")]
+        used = set(re.findall(r"(\w+)\s*=", block))
+        ours = set(resolve_cache_kwargs(generated_cfg, 0.70))
+        missing = used - ours - {"cc", "WCC"}
+        assert not missing, (
+            f"perf_runner sets {sorted(missing)} and the ladder does not; the "
+            "rungs would run a different method than the table.")
