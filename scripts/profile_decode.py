@@ -39,7 +39,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
+from pathlib import Path
 
 
 def _env_gate(args) -> None:
@@ -57,6 +59,15 @@ def _self_device_us(ev) -> float:
         if v is not None:
             return float(v)
     return 0.0
+
+
+def _perf_cell_quant(cfg) -> float:
+    """quant_ratio as the benchmarked cell sets it (perf.configs[0] first)."""
+    try:
+        c = dict(cfg.perf.configs[0])
+    except Exception:
+        c = {}
+    return float(c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0)))
 
 
 def main() -> None:
@@ -93,11 +104,20 @@ def main() -> None:
               "float32": torch.float32}
     dtype = dtypes.get(cfg.model.dtype, torch.float16)
 
-    print(f"loading {cfg.model.name} (attn={cfg.model.attn_implementation}) ...")
+    # Backend from the PERF cell, not cfg.model: the generated perf config's
+    # model section carries only name/revision/dtype, so cfg.model.
+    # attn_implementation silently yields ModelConfig's "eager" default and
+    # both the model load and the cache package come out wrong. Shared with
+    # audit_e2e so the two tools cannot disagree about what they measured.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from audit_e2e import resolve_backend
+    pkg, attn_impl = resolve_backend(cfg)
+
+    print(f"loading {cfg.model.name} (attn={attn_impl}, cache_package={pkg}) ...")
     tok = AutoTokenizer.from_pretrained(cfg.model.name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.name, torch_dtype=dtype,
-        attn_implementation=cfg.model.attn_implementation, device_map="auto")
+        attn_implementation=attn_impl, device_map="auto")
     model.eval()
 
     input_ids = torch.randint(1000, 20000, (args.batch, args.prefill),
@@ -105,9 +125,6 @@ def main() -> None:
 
     # -- cache + hooks: same construction as scripts/diagnose_perf.py --------
     from utils.cache_factory import get_cache_classes
-    pkg = getattr(cfg.cache, "backend_package", None)
-    if not pkg:
-        raise SystemExit("config has no cache.backend_package (not a windowed run)")
     WindowedCache, WindowedCacheConfig, install_score_hooks = get_cache_classes(pkg)
 
     rope = None
@@ -117,14 +134,12 @@ def main() -> None:
             break
 
     total_steps = args.warmup + args.steps + 1
-    cache_config = WindowedCacheConfig(
-        window_size=cfg.cache.window_size,
-        num_sink_tokens=cfg.cache.num_sink_tokens,
-        local_window_size=cfg.cache.local_window_size,
-        cache_budget=cfg.cache.cache_budget or 0.20,
-        rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
-        quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
-    )
+    # Shared with audit_e2e: budget and quant settings live in perf.configs[0],
+    # not cfg.cache, and first_eviction_step must be carried or this profiles a
+    # different method than the table.
+    from audit_e2e import resolve_cache_kwargs
+    q = _perf_cell_quant(cfg)
+    cache_config = WindowedCacheConfig(**resolve_cache_kwargs(cfg, q, pkg))
     cache = WindowedCache(
         config=cache_config, prefill_len=args.prefill, model_config=model.config,
         kv_dtype=dtype, rope_module=rope,

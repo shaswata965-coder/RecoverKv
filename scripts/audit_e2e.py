@@ -146,7 +146,38 @@ def _perf_cell(cfg) -> dict:
         return {}
 
 
-def resolve_cache_kwargs(cfg, q: float) -> Dict[str, Any]:
+def resolve_backend(cfg) -> tuple:
+    """``(cache_package, attn_implementation)`` from the PERF cell, not the
+    model section.
+
+    The generated perf config's ``model:`` block carries only name / revision /
+    dtype. The backend lives in ``perf.configs[0]`` as ``cache_package`` and
+    ``attn_implementation``. Reading ``cfg.model.attn_implementation`` instead
+    silently gets ``ModelConfig``'s dataclass default ``"eager"``
+    (utils/config.py:100), which then selects the EAGER cache package — a
+    different implementation, whose WindowedCacheConfig has no
+    ``quant_budget_mode`` field, and which also loads the model with eager
+    attention so the "flash baseline" rung is not a flash baseline at all.
+    One wrong lookup, two symptoms.
+
+    The pairing is validated here, as perf_runner does before its model load, so
+    a mismatch fails with a named cause rather than a TypeError from a
+    constructor several frames down.
+    """
+    from utils.cache_factory import validate_backend_attn_pairing
+
+    c = _perf_cell(cfg)
+    attn = c.get("attn_implementation",
+                 getattr(cfg.model, "attn_implementation", "eager"))
+    pkg = c.get("cache_package",
+                getattr(cfg.cache, "backend_package", None))
+    if pkg is None:
+        pkg = "flash_attn" if attn != "eager" else "eager"
+    validate_backend_attn_pairing(pkg, attn)
+    return pkg, attn
+
+
+def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, Any]:
     """WindowedCacheConfig kwargs, resolved EXACTLY as perf_runner resolves them.
 
     Kept as a pure function so it can be checked without a GPU or a model: this
@@ -155,13 +186,18 @@ def resolve_cache_kwargs(cfg, q: float) -> Dict[str, Any]:
     it would surface as deltas that quietly fail to add up to the table.
 
     ``q`` is the ladder's own axis and overrides whatever the config says.
+
+    ``pkg`` selects which WindowedCacheConfig the kwargs must fit. The two
+    packages do NOT share a field list — the eager one has no
+    ``quant_budget_mode`` — so unknown fields are dropped, and dropping a
+    NON-DEFAULT value raises rather than quietly changing the method.
     """
     from utils.config import FIRST_EVICTION_STEP_DEFAULT
 
     c = _perf_cell(cfg)
     w = cfg.window
     budget = c.get("cache_budget", getattr(cfg.cache, "cache_budget", None))
-    return {
+    kw = {
         "window_size": int(c.get("window_size", w.window_size)),
         "num_sink_tokens": int(c.get("num_sink_tokens", w.num_sink_tokens)),
         "local_window_size": c.get("local_window_size", w.local_window_size),
@@ -179,6 +215,26 @@ def resolve_cache_kwargs(cfg, q: float) -> Dict[str, Any]:
             getattr(cfg.cache, "first_eviction_step",
                     FIRST_EVICTION_STEP_DEFAULT)),
     }
+    if pkg is None:
+        return kw
+
+    from utils.cache_factory import get_cache_classes
+    _, WCC, _ = get_cache_classes(pkg)
+    fields = set(WCC.__dataclass_fields__)
+    unknown = set(kw) - fields
+    for name in sorted(unknown):
+        default = WCC.__dataclass_fields__.get(name)
+        # The eager package genuinely does not implement quant_budget_mode, so
+        # dropping the DEFAULT is correct. Dropping a value the config actually
+        # asked for would silently run a different method.
+        if name == "quant_budget_mode" and kw[name] in ("tokens", None):
+            continue
+        raise ValueError(
+            f"cache package {pkg!r} has no {name!r} field, but the config sets "
+            f"it to {kw[name]!r}. Running anyway would silently measure a "
+            f"different method. (default would be "
+            f"{getattr(default, 'default', 'n/a')!r})")
+    return {k: v for k, v in kw.items() if k in fields}
 
 
 def _build_cache(cfg, model, prefill_len: int, gen_len: int, q: float,
@@ -211,7 +267,7 @@ def _build_cache(cfg, model, prefill_len: int, gen_len: int, q: float,
                 rope = mod.rotary_emb
                 break
 
-    cc = WCC(**resolve_cache_kwargs(cfg, q))
+    cc = WCC(**resolve_cache_kwargs(cfg, q, pkg))
     cache = WC(config=cc, prefill_len=prefill_len, model_config=model.config,
                kv_dtype=dtype, rope_module=rope,
                num_layers=model.config.num_hidden_layers, max_tokens=gen_len)
@@ -531,13 +587,16 @@ def main() -> None:
     dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16,
               "float32": torch.float32}
     dtype = dtypes.get(cfg.model.dtype, torch.float16)
-    pkg = "flash_attn" if cfg.model.attn_implementation != "eager" else "eager"
+    # From the perf cell, NOT cfg.model — see resolve_backend. The model load
+    # uses the same resolved value, so rung 0 is the flash baseline the ladder
+    # claims to compare against rather than an eager one.
+    pkg, attn_impl = resolve_backend(cfg)
 
-    print(f"loading {cfg.model.name} (attn={cfg.model.attn_implementation}) ...")
+    print(f"loading {cfg.model.name} (attn={attn_impl}, cache_package={pkg}) ...")
     AutoTokenizer.from_pretrained(cfg.model.name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.name, torch_dtype=dtype,
-        attn_implementation=cfg.model.attn_implementation, device_map="auto")
+        attn_implementation=attn_impl, device_map="auto")
     model.eval()
 
     rungs = RUNGS if args.rungs is None else [

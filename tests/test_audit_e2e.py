@@ -303,3 +303,107 @@ class TestEquivalenceReporting:
         from scripts.audit_e2e import _report_equivalence
         _report_equivalence(self._rungs([1, 2, 3], [1, 2]))
         assert "OK" in capsys.readouterr().out
+
+
+class TestBackendResolutionMatchesTheGeneratedConfig:
+    """The bug this class exists for: the generated perf config's `model:` block
+    has ONLY name/revision/dtype. Reading cfg.model.attn_implementation gets
+    ModelConfig's dataclass default "eager" (utils/config.py:100), which selects
+    the EAGER cache package -- a different implementation whose
+    WindowedCacheConfig has no quant_budget_mode (TypeError at construction) --
+    and loads the model with eager attention, so rung 0 is not the flash
+    baseline the ladder claims to compare against. One wrong lookup, two
+    symptoms.
+
+    The earlier config-parity tests missed it because their fixture had no
+    `model` section at all and never exercised package selection. This fixture
+    mirrors run_perf_table.sh's YAML exactly, absent fields included.
+    """
+
+    @pytest.fixture
+    def generated_cfg(self):
+        import types
+        from utils.config import ModelConfig
+        return types.SimpleNamespace(
+            # EXACTLY what the generated YAML sets: no attn_implementation.
+            model=ModelConfig(name="meta-llama/Meta-Llama-3-8B-Instruct",
+                              revision=None, dtype="float16"),
+            window=types.SimpleNamespace(window_size=8, num_sink_tokens=5,
+                                         local_window_size=64),
+            cache=types.SimpleNamespace(quant_ratio=0.70,
+                                        quant_budget_mode="tokens",
+                                        first_eviction_step=0,
+                                        rerotate_on_evict=False),
+            perf=types.SimpleNamespace(configs=[{
+                "name": "ours_q0.70", "cache_backend": "windowed",
+                "cache_package": "flash_attn",
+                "attn_implementation": "flash_attention_2",
+                "cache_budget": 0.20, "quant_ratio": 0.70,
+                "quant_budget_mode": "tokens",
+            }]),
+        )
+
+    def test_the_model_section_really_does_lack_attn_implementation(
+            self, generated_cfg):
+        """Pins the premise: if this ever changes, the bug class disappears and
+        this whole test group can be revisited."""
+        from utils.config import ModelConfig
+        assert ModelConfig().attn_implementation == "eager"
+        assert generated_cfg.model.attn_implementation == "eager"
+
+    def test_backend_comes_from_the_perf_cell_not_the_model_section(
+            self, generated_cfg):
+        from scripts.audit_e2e import resolve_backend
+        pkg, attn = resolve_backend(generated_cfg)
+        assert pkg == "flash_attn", "resolved the eager package for a flash run"
+        assert attn == "flash_attention_2", "would load the model with eager attn"
+
+    def test_cache_kwargs_fit_the_resolved_package(self, generated_cfg):
+        """The exact TypeError from the first GPU invocation:
+        WindowedCacheConfig.__init__() got an unexpected keyword argument
+        'quant_budget_mode'."""
+        from scripts.audit_e2e import resolve_backend, resolve_cache_kwargs
+        from utils.cache_factory import get_cache_classes
+        pkg, _ = resolve_backend(generated_cfg)
+        _, WCC, _ = get_cache_classes(pkg)
+        WCC(**resolve_cache_kwargs(generated_cfg, 0.70, pkg))  # must not raise
+
+    def test_kwargs_are_filtered_to_the_eager_packages_smaller_field_list(
+            self, generated_cfg):
+        """The eager package genuinely has no quant_budget_mode. Filtering the
+        DEFAULT is correct; see the next test for a non-default."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        from utils.cache_factory import get_cache_classes
+        _, WCC, _ = get_cache_classes("eager")
+        kw = resolve_cache_kwargs(generated_cfg, 0.0, "eager")
+        assert "quant_budget_mode" not in kw
+        WCC(**kw)
+
+    def test_dropping_a_NON_default_value_raises_instead(self, generated_cfg):
+        """Silently discarding a setting the config asked for would run a
+        different method under the benchmarked name."""
+        from scripts.audit_e2e import resolve_cache_kwargs
+        generated_cfg.perf.configs[0]["quant_budget_mode"] = "bytes"
+        with pytest.raises(ValueError, match="quant_budget_mode"):
+            resolve_cache_kwargs(generated_cfg, 0.0, "eager")
+
+    def test_a_mismatched_pairing_fails_with_a_named_cause(self, generated_cfg):
+        """perf_runner validates this before its model load; the ladder now does
+        too, so a mismatch is not a TypeError several frames down."""
+        from utils.config import ConfigValidationError
+        from scripts.audit_e2e import resolve_backend
+        generated_cfg.perf.configs[0]["attn_implementation"] = "eager"
+        with pytest.raises(ConfigValidationError):
+            resolve_backend(generated_cfg)
+
+    def test_falls_back_to_the_model_section_when_the_cell_is_silent(self):
+        """A hand-written config that sets it the old way must still work."""
+        import types
+        from scripts.audit_e2e import resolve_backend
+        from utils.config import ModelConfig
+        cfg = types.SimpleNamespace(
+            model=ModelConfig(attn_implementation="flash_attention_2"),
+            cache=types.SimpleNamespace(backend_package="flash_attn"),
+            perf=types.SimpleNamespace(configs=[]),
+        )
+        assert resolve_backend(cfg) == ("flash_attn", "flash_attention_2")
