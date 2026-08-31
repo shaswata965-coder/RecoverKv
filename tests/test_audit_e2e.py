@@ -261,3 +261,45 @@ class TestLadderMatchesTheBenchmarkedMethod:
         assert not missing, (
             f"perf_runner sets {sorted(missing)} and the ladder does not; the "
             "rungs would run a different method than the table.")
+
+
+class TestEquivalenceReporting:
+    """Rungs 2 and 3 differ only by STICKYKV_FUSED_DECODE, so they are one
+    method computed two ways. The fused kernel is the CUDA default and has never
+    been checked against its reference on a GPU (test_decode_kernel.py:109-120
+    is a comment, not a test), so this report is the first evidence either way —
+    it must not stay silent on a divergence."""
+
+    def _rungs(self, mat, fus):
+        return [
+            {"id": "2_q70_materialize", "what": "m", "ttft_s": 1.0,
+             "tpot_steady_s": 0.1, "first_tokens": mat},
+            {"id": "3_q70_fused", "what": "f", "ttft_s": 1.0,
+             "tpot_steady_s": 0.1, "first_tokens": fus},
+        ]
+
+    def test_identical_sequences_report_ok(self, capsys):
+        from scripts.audit_e2e import _report_equivalence
+        _report_equivalence(self._rungs([1, 2, 3], [1, 2, 3]))
+        assert "OK" in capsys.readouterr().out
+
+    def test_a_divergence_is_reported_loudly_with_the_index(self, capsys):
+        from scripts.audit_e2e import _report_equivalence
+        _report_equivalence(self._rungs([1, 2, 3, 4], [1, 2, 9, 4]))
+        out = capsys.readouterr().out
+        assert "DIVERGED" in out
+        assert "decode token 2" in out
+        assert "materialize=3" in out and "fused=9" in out
+
+    def test_silent_when_a_rung_did_not_run(self, capsys):
+        """A ladder run with --rungs 3_q70_fused has nothing to compare, and
+        must not imply agreement it never checked."""
+        from scripts.audit_e2e import _report_equivalence
+        _report_equivalence([{"id": "3_q70_fused", "what": "f",
+                              "first_tokens": [1, 2]}])
+        assert capsys.readouterr().out == ""
+
+    def test_compares_only_the_common_prefix(self, capsys):
+        from scripts.audit_e2e import _report_equivalence
+        _report_equivalence(self._rungs([1, 2, 3], [1, 2]))
+        assert "OK" in capsys.readouterr().out

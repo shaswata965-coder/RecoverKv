@@ -249,12 +249,24 @@ def _time_rung(torch, model, input_ids, rung: dict, cfg, prefill_len: int,
 
             pkv = out.past_key_values
             nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            # Equivalence evidence, captured as it is generated. Rungs 2 and 3
+            # are the same method by two routes (materialize vs fused Triton
+            # kernel), but the kernel has never been validated against its
+            # reference on a GPU — tests/test_decode_kernel.py:109-120 is a
+            # COMMENT describing that check, not a test. Greedy decode is
+            # deterministic, so from an identical prefill the rungs must emit an
+            # identical token sequence. A divergence means the shipped decode
+            # path does not reproduce the method's scores.
+            toks = [int(nxt[0, 0])]
+
             # Cross the first compaction and any JIT/autotune before timing.
             for _ in range(warmup_steps):
                 out = model(input_ids=nxt, past_key_values=pkv,
                             use_cache=True, return_dict=True)
                 pkv = out.past_key_values
                 nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                toks.append(int(nxt[0, 0]))
+            rec["first_tokens"] = toks
             _sync(torch)
 
             n_steps = max(gen_len - warmup_steps - 2, 1)
@@ -458,6 +470,35 @@ def _report(results: List[Dict[str, Any]], batch: int) -> None:
         print(f"\n    TOTAL  prefill x{top['ttft_s'] / max(base['ttft_s'], 1e-9):.2f}"
               f"   decode x{top['tpot_steady_s'] / max(base['tpot_steady_s'], 1e-9):.2f}"
               f"   (vs the no-StickyKV floor)")
+
+    _report_equivalence(results)
+
+
+def _report_equivalence(results: List[Dict[str, Any]]) -> None:
+    """Do the materialize and fused routes emit the same tokens?
+
+    Rungs 2 and 3 differ only by STICKYKV_FUSED_DECODE, so they are the same
+    method computed two ways and MUST agree. The fused kernel is the default on
+    CUDA and has never been checked against its reference on a GPU, so this is
+    the first evidence either way.
+    """
+    by_id = {r["id"]: r for r in results}
+    mat, fus = by_id.get("2_q70_materialize"), by_id.get("3_q70_fused")
+    if not (mat and fus and mat.get("first_tokens") and fus.get("first_tokens")):
+        return
+    a, b = mat["first_tokens"], fus["first_tokens"]
+    n = min(len(a), len(b))
+    print("\n  equivalence — materialize vs fused (same method, two routes):")
+    if a[:n] == b[:n]:
+        print(f"    OK — identical for all {n} decode tokens")
+        return
+    first = next(i for i in range(n) if a[i] != b[i])
+    print(f"    *** DIVERGED at decode token {first}: "
+          f"materialize={a[first]} fused={b[first]}")
+    print(f"        materialize {a[:n]}")
+    print(f"        fused       {b[:n]}")
+    print("        The shipped decode path does not reproduce the method's "
+          "scores. Fix this before any timing on rung 3 means anything.")
 
 
 def main() -> None:
