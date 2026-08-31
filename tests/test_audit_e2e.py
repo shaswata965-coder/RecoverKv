@@ -140,3 +140,47 @@ class TestEnvIsolationBetweenRungs:
         _time_rung(torch, _Watcher(), ids, rung, cfg, 8, 4, torch.float16,
                    "flash_attn", 1)
         assert seen["v"] == "0"
+
+
+class TestComputeLseMarkerIsUnambiguous:
+    """`aten::logsumexp` is the only thing that isolates compute_lse — no env
+    switch does, because L-reuse currently misses in BOTH arms of its A/B. If a
+    second logsumexp ever lands in the hot path, the attribution silently starts
+    over-counting and the trace still looks authoritative."""
+
+    def test_torch_logsumexp_occurs_exactly_once_in_modules(self):
+        import pathlib
+        import re
+
+        hits = []
+        for p in pathlib.Path("modules").rglob("*.py"):
+            for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+                code = line.split("#", 1)[0]
+                if re.search(r"(torch\.logsumexp|\.logsumexp)\s*\(", code):
+                    hits.append(f"{p}:{i}")
+        assert len(hits) == 1, (
+            f"the compute_lse marker is no longer unique: {hits}. Update "
+            "_LSE_MARKER in scripts/audit_e2e.py or the attribution over-counts.")
+        assert "score_kernel" in hits[0]
+
+    def test_the_marker_constant_matches_that_op(self):
+        from scripts.audit_e2e import _LSE_CHAIN, _LSE_MARKER
+        assert _LSE_MARKER == "aten::logsumexp"
+        assert _LSE_MARKER in _LSE_CHAIN
+
+
+class TestProfileRungEnvIsolation:
+    """_profile_rung sets the same env as _time_rung and must restore it the
+    same way — a leak here mislabels the attribution, not just the timing."""
+
+    def test_env_restored_after_a_failing_profile_rung(self, cfg, monkeypatch):
+        import torch as _torch
+        from scripts.audit_e2e import RUNGS, _profile_rung
+
+        monkeypatch.setenv("STICKYKV_FUSED_DECODE", "1")
+        rung = dict(RUNGS[0], env={"STICKYKV_FUSED_DECODE": "0"})
+        ids = _torch.zeros((1, 8), dtype=_torch.long)
+        with pytest.raises(Exception):
+            _profile_rung(_torch, _Exploding(RuntimeError("boom")), ids, rung,
+                          cfg, 8, 4, _torch.float16, "flash_attn", 1, 2, 5)
+        assert os.environ["STICKYKV_FUSED_DECODE"] == "1"

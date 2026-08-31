@@ -35,12 +35,33 @@ Rung 3 minus rung 2 is the fused kernel. Rung 2 minus rung 1 is the Q tier.
 Rung 1 minus rung 0 is everything else we add. Whichever gap holds the ~78 ms
 is the answer, and it is one subtraction, not an inference.
 
-``--lse-ab`` adds the prefill pair (L recomputed vs reused) that isolates
-``compute_lse``, the term the OOM analysis implicates.
+**What the ladder does NOT resolve, and why ``--profile`` exists.** Gap 0->1
+contains everything we add outside the Q tier: ``cache.update``, the score
+hook, ``compute_lse``, the Triton score kernel and the eviction. ALL 334 ms of
+the fixed prefill cost lands in that one gap, undivided, and the decode cost may
+too. The ladder would narrow decode to one of three buckets and prefill to a
+single bucket that is the whole overhead -- useful, not sufficient.
+
+An env A/B on L-reuse cannot fill that hole either: ``STICKYKV_SCORE_LSE_FROM_
+FORWARD=1`` currently MISSES, so both arms would recompute and the delta would
+be zero. There is no switch that isolates ``compute_lse``.
+
+``--profile`` does, by op name. ``torch.logsumexp`` appears exactly once in the
+codebase -- score_kernel.py:318, inside ``compute_lse`` -- so ``aten::logsumexp``
+in a trace is an unambiguous marker for it, and its chain (matmul -> _to_copy ->
+mul -> masked_fill -> logsumexp) runs over one ``[B, H_kv, rep, chunk, S]``
+tensor, making those op totals directly comparable. Prefill and decode are
+profiled SEPARATELY because they are different regimes, and each reports CUDA
+self time against wall time -- the number that separates "the host is idle
+waiting on kernels" from "the GPU is idle waiting on the host".
 
 Usage:
+    # attribution by layer
     python scripts/audit_e2e.py --config outputs/perf_table/_perf_table.generated.yaml \\
         --prefill 1048 --gen 64 --batches 1 32
+
+    # attribution by op, inside the gap the ladder points at
+    python scripts/audit_e2e.py --config ... --batches 1 --profile --rungs 3_q70_fused
 """
 
 from __future__ import annotations
@@ -220,6 +241,139 @@ def _time_rung(torch, model, input_ids, rung: dict, cfg, prefill_len: int,
     return rec
 
 
+#: ``compute_lse``'s op chain. ``aten::logsumexp`` is UNAMBIGUOUS — torch.logsumexp
+#: occurs exactly once in the codebase, inside compute_lse. The rest of the chain
+#: runs over the same tensor and is reported alongside it, flagged as shared
+#: because matmul/_to_copy/mul are issued by other code too.
+_LSE_MARKER = "aten::logsumexp"
+_LSE_CHAIN = ("aten::logsumexp", "aten::masked_fill", "aten::_to_copy",
+              "aten::mul", "aten::matmul", "aten::bmm")
+
+
+def _self_device_us(ev) -> float:
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        v = getattr(ev, attr, None)
+        if v is not None:
+            return float(v)
+    return 0.0
+
+
+def _profile_phase(torch, label: str, fn, n_iter: int, top: int) -> None:
+    """Profile one phase and attribute it by op name.
+
+    Prefill and decode are profiled separately: one is a single large forward,
+    the other a stream of tiny ones, and averaging them hides whichever regime
+    is the problem.
+    """
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    wall_us = (time.perf_counter() - t0) * 1e6
+
+    evs = prof.key_averages()
+    gpu_us = sum(_self_device_us(e) for e in evs)
+    launches = sum(e.count for e in evs if _self_device_us(e) > 0)
+    n = max(n_iter, 1)
+
+    print(f"\n  --- {label} ---")
+    print(f"    wall          {wall_us / n / 1000:9.3f} ms")
+    print(f"    CUDA kernels  {gpu_us / n / 1000:9.3f} ms")
+    busy = gpu_us / max(wall_us, 1.0)
+    print(f"    GPU busy      {busy * 100:9.1f} %"
+          f"   -> {'HOST-BOUND' if busy < 0.5 else 'KERNEL-BOUND' if busy > 0.85 else 'MIXED'}")
+    print(f"    launches      {launches / n:9.0f}")
+
+    lse = {e.key: (_self_device_us(e), e.count) for e in evs if e.key in _LSE_CHAIN}
+    marker = lse.get(_LSE_MARKER, (0.0, 0))
+    if marker[1]:
+        chain_us = sum(v[0] for v in lse.values())
+        print(f"    compute_lse   {marker[0] / n / 1000:9.3f} ms in {_LSE_MARKER} "
+              f"({marker[1] / n:.0f} calls) — UNAMBIGUOUS marker")
+        print(f"                  {chain_us / n / 1000:9.3f} ms across its whole chain "
+              f"({chain_us / max(gpu_us, 1) * 100:.1f}% of GPU) — chain ops are shared,"
+              f" treat as an upper bound")
+    else:
+        print(f"    compute_lse   not present in this phase "
+              f"(no {_LSE_MARKER} — L-reuse hit, or wrong phase)")
+
+    for title, key in (("CUDA self time", _self_device_us),
+                       ("CPU self time", lambda e: float(e.self_cpu_time_total))):
+        print(f"    top {top} by {title}:")
+        for e in sorted(evs, key=lambda x: -key(x))[:top]:
+            if key(e) <= 0:
+                break
+            print(f"      {key(e) / n / 1000:8.3f} ms  n={e.count / n:7.1f}  {e.key[:52]}")
+
+
+def _profile_rung(torch, model, input_ids, rung: dict, cfg, prefill_len: int,
+                  gen_len: int, dtype, pkg: str, warmup_steps: int,
+                  profile_steps: int, top: int) -> None:
+    """Op-level attribution for one rung, prefill and decode profiled apart.
+
+    Same env discipline as :func:`_time_rung` — a leaked var here would
+    mislabel the attribution as well as the timing.
+    """
+    from transformers import DynamicCache
+
+    saved = {k: os.environ.get(k) for k in rung["env"]}
+    os.environ.update(rung["env"])
+    hooks = None
+    try:
+        print(f"\n  === {rung['id']} — {rung['what']} ===")
+        if rung["windowed"]:
+            pkv, hooks = _build_cache(cfg, model, prefill_len, gen_len,
+                                      rung["q"], dtype, pkg)
+        else:
+            pkv = DynamicCache()
+
+        with torch.no_grad():
+            state = {}
+
+            def _prefill():
+                out = model(input_ids=input_ids, past_key_values=pkv,
+                            use_cache=True, return_dict=True)
+                state["pkv"] = out.past_key_values
+                state["nxt"] = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            _profile_phase(torch, "PREFILL (1 forward)", _prefill, 1, top)
+
+            for _ in range(warmup_steps):
+                out = model(input_ids=state["nxt"], past_key_values=state["pkv"],
+                            use_cache=True, return_dict=True)
+                state["pkv"] = out.past_key_values
+                state["nxt"] = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            torch.cuda.synchronize()
+
+            def _decode():
+                for _ in range(profile_steps):
+                    out = model(input_ids=state["nxt"],
+                                past_key_values=state["pkv"],
+                                use_cache=True, return_dict=True)
+                    state["pkv"] = out.past_key_values
+                    state["nxt"] = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            _profile_phase(torch, f"DECODE (per step, {profile_steps} steps)",
+                           _decode, profile_steps, top)
+    finally:
+        if hooks is not None:
+            try:
+                hooks.remove()
+            except Exception:
+                pass
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def _report(results: List[Dict[str, Any]], batch: int) -> None:
     print("\n" + "=" * 78)
     print(f"LADDER  batch={batch}   (each rung adds exactly one layer)")
@@ -258,6 +412,11 @@ def main() -> None:
                     help="decode steps before timing; must exceed window_size")
     ap.add_argument("--rungs", nargs="+", default=None,
                     help="subset of rung ids to run (default: all)")
+    ap.add_argument("--profile", action="store_true",
+                    help="also attribute each rung BY OP NAME, prefill and decode "
+                         "separately — the only thing that isolates compute_lse")
+    ap.add_argument("--profile-steps", type=int, default=16)
+    ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
@@ -292,6 +451,20 @@ def main() -> None:
                               dtype, pkg, args.warmup_steps) for r in rungs]
         all_results[batch] = results
         _report(results, batch)
+
+        if args.profile:
+            print("\n" + "=" * 78)
+            print(f"OP ATTRIBUTION  batch={batch}")
+            print("=" * 78)
+            for rung in rungs:
+                try:
+                    _profile_rung(torch, model, ids, rung, cfg, args.prefill,
+                                  args.gen, dtype, pkg, args.warmup_steps,
+                                  args.profile_steps, args.top)
+                except Exception as e:
+                    print(f"\n  {rung['id']}: profiling FAILED — "
+                          f"{type(e).__name__}: {e}")
+                    print(traceback.format_exc())
 
     # Batch scaling — question 3, answered by the ladder itself.
     if len(args.batches) >= 2:
