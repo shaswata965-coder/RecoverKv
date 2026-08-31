@@ -259,3 +259,60 @@ class TestFlashinferMustNotDropAttentionArguments:
             assert called.get("hit") is True
         finally:
             h.restore()
+
+
+class TestTheStrictErrorCarriesTheCauseInline:
+    """`raise ... from exc` puts the real cause in a SEPARATE traceback block
+    above the new one — the first thing to scroll off a cluster log, and the
+    only part that says what FlashInfer actually objected to. The message must
+    stand alone.
+    """
+
+    def _raise_it(self, monkeypatch):
+        import sys
+        import types
+
+        import torch as _t
+        from modules.windowed_cache import flashinfer_lse
+
+        monkeypatch.setenv("STICKYKV_LSE_STRICT", "1")
+        fake = types.ModuleType("flashinfer")
+
+        def _boom(*a, **k):
+            raise ValueError("plan() got an unexpected keyword 'head_dim_qk'")
+
+        fake.BatchPrefillWithRaggedKVCacheWrapper = _boom
+        monkeypatch.setitem(sys.modules, "flashinfer", fake)
+
+        mod = types.SimpleNamespace(flash_attn_func=lambda *a, **k: "real")
+        h = flashinfer_lse.enable(mod)
+        q = _t.zeros(2, 16, 4, 8)
+        try:
+            with pytest.raises(RuntimeError) as ei:
+                mod.flash_attn_func(q, q, q, 0.0, causal=True)
+            return str(ei.value)
+        finally:
+            h.restore()
+
+    def test_the_flashinfer_message_is_in_the_error_text(self, monkeypatch):
+        msg = self._raise_it(monkeypatch)
+        assert "head_dim_qk" in msg, "the actual cause is not in the message"
+        assert "ValueError" in msg
+
+    def test_the_raising_frame_is_named(self, monkeypatch):
+        assert "Raised at:" in self._raise_it(monkeypatch)
+
+    def test_the_shape_is_reported(self, monkeypatch):
+        msg = self._raise_it(monkeypatch)
+        assert "B=2" in msg and "S_q=16" in msg
+
+    def test_the_cheapest_remedy_leads(self, monkeypatch):
+        msg = self._raise_it(monkeypatch)
+        assert msg.index("STICKYKV_LSE_BACKEND=flash") < msg.index(
+            "STICKYKV_LSE_STRICT=0")
+
+    def test_the_full_traceback_is_still_retrievable(self, monkeypatch):
+        from modules.windowed_cache import flashinfer_lse
+        self._raise_it(monkeypatch)
+        tb = flashinfer_lse.broken_traceback()
+        assert tb and "head_dim_qk" in tb

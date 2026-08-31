@@ -290,21 +290,34 @@ def _make_wrapper(orig):
             _STATE["trace"] = traceback.format_exc()
             _STATE["lse"] = None
             if strict():
-                # Raise FROM the original, at the point of failure, with the
-                # FlashInfer traceback intact. A post-hoc per-cell warning
-                # cannot show which call in which layer broke or why.
+                # Raise FROM the original so the FlashInfer traceback survives,
+                # but INLINE the cause too. `raise ... from` prints the original
+                # in a separate block above the new one, which is the first
+                # thing to scroll off a cluster log — and that block is the
+                # whole reason this raise exists. The last frame of the original
+                # is included for the same reason: the message alone rarely says
+                # which call inside FlashInfer objected.
+                where = ""
+                tb = _STATE["trace"] or ""
+                frames = [ln.strip() for ln in tb.splitlines()
+                          if ln.strip().startswith("File ")]
+                if frames:
+                    where = f" Raised at: {frames[-1]}."
                 raise RuntimeError(
                     "FlashInfer L-capture failed and STICKYKV_LSE_STRICT is on, "
                     "so this is a hard error rather than a silent second "
-                    f"O(N^2) prefill pass. Shape was B={B} S_q={S_q} S_kv={S_kv} "
-                    f"H_q={H_q} H_kv={H_kv} D={D} causal={bool(causal)} "
-                    f"dtype={q.dtype}. Remedies, cheapest first: "
-                    "STICKYKV_LSE_BACKEND=flash (same kernel, asks it for the "
-                    "softmax_lse it already computed — attention output stays "
-                    "bit-identical); a larger "
+                    f"O(N^2) prefill pass.\n"
+                    f"  CAUSE: {_STATE['reason']}{where}\n"
+                    f"  SHAPE: B={B} S_q={S_q} S_kv={S_kv} H_q={H_q} "
+                    f"H_kv={H_kv} D={D} causal={bool(causal)} dtype={q.dtype}\n"
+                    "  REMEDIES, cheapest first: STICKYKV_LSE_BACKEND=flash "
+                    "(same kernel, asks it for the softmax_lse it already "
+                    "computed — attention output stays bit-identical); a larger "
                     "STICKYKV_FLASHINFER_WORKSPACE_MB; or "
-                    "STICKYKV_LSE_STRICT=0 to accept the recompute. See "
-                    "PREFILL_PLAN.md Stage 1."
+                    "STICKYKV_LSE_STRICT=0 to accept the recompute.\n"
+                    "  Full FlashInfer traceback: the chained exception above, "
+                    "or flashinfer_lse.broken_traceback(). See PREFILL_PLAN.md "
+                    "Stage 1."
                 ) from exc
             return orig(*args, **kwargs)
 
