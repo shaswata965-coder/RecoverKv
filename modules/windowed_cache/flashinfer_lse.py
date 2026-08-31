@@ -236,6 +236,40 @@ def _make_wrapper(orig):
         if scale is None:
             scale = 1.0 / math.sqrt(D)
 
+        # This wrapper REPLACES the attention call, so every argument that
+        # changes the result and is not forwarded to FlashInfer silently changes
+        # the model's output. Only q/k/v, causal and softmax_scale are
+        # forwarded. On Llama-3 at eval the rest are inert (dropout 0, no
+        # sliding window), which is why this has not bitten — but the repo
+        # carries Mistral branches, and Mistral's sliding window arrives exactly
+        # here as `window_size`. Dropping it would compute FULL attention and
+        # report it as the method's output.
+        unsupported = []
+        dropout_p = args[3] if len(args) > 3 else kwargs.get("dropout_p", 0.0)
+        if dropout_p:
+            unsupported.append(f"dropout_p={dropout_p}")
+        win = kwargs.get("window_size", (-1, -1))
+        if win not in ((-1, -1), [-1, -1], None):
+            unsupported.append(f"window_size={win}")
+        if kwargs.get("alibi_slopes") is not None:
+            unsupported.append("alibi_slopes")
+        if kwargs.get("softcap") not in (None, 0, 0.0):
+            unsupported.append(f"softcap={kwargs.get('softcap')}")
+        if unsupported:
+            _STATE["lse"] = None
+            if strict():
+                raise RuntimeError(
+                    "The FlashInfer L-capture REPLACES the attention call, and "
+                    f"this call passes {', '.join(unsupported)}, which the "
+                    "wrapper does not forward. Serving it would silently change "
+                    "the model's attention output (a dropped sliding window "
+                    "computes FULL attention). Use STICKYKV_LSE_BACKEND=flash, "
+                    "which asks the real kernel for the softmax_lse it already "
+                    "computed and cannot diverge this way."
+                )
+            # Non-strict: hand the call back to the real kernel untouched.
+            return orig(*args, **kwargs)
+
         try:
             wrapper_fi = _planned_wrapper(
                 fi, B, S_q, S_kv, H_q, H_kv, D, causal, scale, q.dtype, q.device

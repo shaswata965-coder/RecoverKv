@@ -174,3 +174,88 @@ class TestTheMissMessageIsActionable:
 
     def test_says_how_to_turn_it_off(self):
         assert "STICKYKV_LSE_STRICT=0" in self._hook_src()
+
+
+class TestFlashinferMustNotDropAttentionArguments:
+    """flashinfer_lse REPLACES the attention call. Any result-changing argument
+    it does not forward silently changes the model's output — and it forwards
+    only q/k/v, causal and softmax_scale. Inert on Llama-3 at eval; NOT inert on
+    the Mistral branches, whose sliding window arrives as `window_size` and
+    whose absence computes full attention.
+    """
+
+    def _wrapper(self, monkeypatch, strict="1"):
+        import sys
+        import types
+
+        import torch as _t
+        from modules.windowed_cache import flashinfer_lse
+
+        monkeypatch.setenv("STICKYKV_LSE_STRICT", strict)
+        # A flashinfer stub, so the guard is reached without the real library.
+        fake = types.ModuleType("flashinfer")
+        fake.BatchPrefillWithRaggedKVCacheWrapper = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, "flashinfer", fake)
+
+        called = {}
+
+        def _orig(*a, **k):
+            called["hit"] = True
+            return "real-kernel-output"
+
+        mod = types.SimpleNamespace(flash_attn_func=_orig)
+        h = flashinfer_lse.enable(mod)
+        assert h is not None, "stub flashinfer should let enable() succeed"
+        q = _t.zeros(1, 4, 2, 8)          # [B, S, H, D], S > 1 => prefill
+        return mod, q, called, h
+
+    def test_sliding_window_raises_rather_than_being_dropped(self, monkeypatch):
+        mod, q, _, h = self._wrapper(monkeypatch)
+        try:
+            with pytest.raises(RuntimeError, match="window_size"):
+                mod.flash_attn_func(q, q, q, 0.0, causal=True,
+                                    window_size=(4096, 0))
+        finally:
+            h.restore()
+
+    def test_nonzero_dropout_raises(self, monkeypatch):
+        mod, q, _, h = self._wrapper(monkeypatch)
+        try:
+            with pytest.raises(RuntimeError, match="dropout_p"):
+                mod.flash_attn_func(q, q, q, 0.1, causal=True)
+        finally:
+            h.restore()
+
+    def test_alibi_and_softcap_raise(self, monkeypatch):
+        mod, q, _, h = self._wrapper(monkeypatch)
+        try:
+            with pytest.raises(RuntimeError, match="alibi_slopes"):
+                mod.flash_attn_func(q, q, q, 0.0, alibi_slopes=[1.0])
+            with pytest.raises(RuntimeError, match="softcap"):
+                mod.flash_attn_func(q, q, q, 0.0, softcap=30.0)
+        finally:
+            h.restore()
+
+    def test_default_flash_arguments_are_not_flagged(self, monkeypatch):
+        """The guard must not fire on the ordinary Llama call, or it blocks the
+        very path it is protecting."""
+        mod, q, called, h = self._wrapper(monkeypatch)
+        try:
+            # Reaches the FlashInfer body (stub wrapper -> plan() fails) and
+            # raises the CAPTURE error, not the unsupported-argument error.
+            with pytest.raises(RuntimeError) as ei:
+                mod.flash_attn_func(q, q, q, 0.0, causal=True,
+                                    window_size=(-1, -1))
+            assert "does not forward" not in str(ei.value)
+        finally:
+            h.restore()
+
+    def test_non_strict_hands_the_call_back_to_the_real_kernel(self, monkeypatch):
+        """Degrading must return the REAL kernel's output, never a partial one."""
+        mod, q, called, h = self._wrapper(monkeypatch, strict="0")
+        try:
+            out = mod.flash_attn_func(q, q, q, 0.0, window_size=(4096, 0))
+            assert out == "real-kernel-output"
+            assert called.get("hit") is True
+        finally:
+            h.restore()
