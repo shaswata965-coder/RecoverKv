@@ -54,7 +54,7 @@ all flipped together by ``configs/eval_efficiency.yaml``):
 None of this changes what a ``native``-protocol run measures.
 """
 from __future__ import annotations
-import json, math, os, pathlib, time, gc
+import json, math, os, pathlib, time, gc, traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -406,6 +406,20 @@ def _evict_compile_failed() -> Optional[str]:
         return fn() if fn is not None else None
     except Exception:  # pragma: no cover - environment dependent
         return None
+
+
+def _prefill_score_chunk_env() -> int:
+    """The prefill score chunk actually in effect (mirrors hooks._prefill_score_chunk).
+
+    Sizes ``compute_lse``'s ``[B, H_q, chunk, S]`` fp32 block, so it is the one
+    knob that shrinks that transient linearly with no logic change and no change
+    in total FLOPs.
+    """
+    try:
+        v = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024"))
+        return v if v > 0 else 1024
+    except (TypeError, ValueError):
+        return 1024
 
 
 def _lse_broken_reason() -> Optional[str]:
@@ -900,7 +914,13 @@ class PerfRunner:
                     peak_decode_steady[ci, ri] = m["peak_decode_steady_mb"]
                     peak_host_rss[ci, ri] = m["peak_host_rss_mb"]
                     alloc_retries[ci, ri] = m["alloc_retries"]
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as oom_exc:
+                # Autopsy BEFORE empty_cache(), while the allocator still holds
+                # the state that explains the failure. Runs whether or not we
+                # skip: an OOM that ends the run is the one most worth explaining.
+                self._dump_oom_autopsy(
+                    cfg, prefill_len, batch_size, name, oom_exc,
+                    getattr(self, "_last_model_config", None))
                 if pc.skip_if_oom:
                     log.warning("OOM on %s at prefill %d batch %d — skipping",
                                 name, prefill_len, batch_size)
@@ -981,6 +1001,112 @@ class PerfRunner:
         except Exception as we:  # pragma: no cover - fs/logging dependent
             log.warning("could not write eviction compile traceback: %s", we)
 
+    def _dump_oom_autopsy(self, cfg, prefill_len: int, batch_size: int,
+                          name: str, exc: BaseException,
+                          model_config: Any = None) -> None:
+        """Record everything about an OOM, on the run that OOMs.
+
+        An OOM costs a full model load plus a full prefill and used to yield one
+        line ("OOM ... — skipping"), which is the most expensive possible way to
+        learn a number that :mod:`modules.evaluation.memory_model` computes on a
+        laptop. Worse, that line does not say WHICH term overflowed, so the next
+        move is a guess and the guess costs another hour.
+
+        Everything here is captured at the moment of failure and written to
+        ``<output_dir>/oom_autopsy_<name>_p<prefill>_bs<b>.txt``: the allocator's
+        own summary, the device counters, the analytic breakdown, and the
+        L-reuse state — that last because the ``compute_lse`` transient is
+        linear in ``B x S`` and is the term most likely to be the difference.
+        Never raises: an autopsy that fails must not mask the OOM.
+        """
+        lines = [
+            f"# CUDA OOM autopsy",
+            f"# config={name} prefill={prefill_len} batch={batch_size}",
+            f"# exception: {type(exc).__name__}: {exc}",
+            "",
+        ]
+        try:
+            free, total = torch.cuda.mem_get_info()
+            props = torch.cuda.get_device_properties(0)
+            lines += [
+                "## device",
+                f"  {props.name}",
+                f"  total          {total / 1024**3:8.2f} GB",
+                f"  free at OOM    {free / 1024**3:8.2f} GB",
+                f"  allocated      {torch.cuda.memory_allocated() / 1024**3:8.2f} GB",
+                f"  reserved       {torch.cuda.memory_reserved() / 1024**3:8.2f} GB",
+                f"  max allocated  {torch.cuda.max_memory_allocated() / 1024**3:8.2f} GB",
+                f"  max reserved   {torch.cuda.max_memory_reserved() / 1024**3:8.2f} GB",
+                "",
+            ]
+        except Exception as e:
+            lines += [f"## device — unavailable: {e}", ""]
+
+        # Device size is a NICE-TO-HAVE for the breakdown, not a prerequisite:
+        # the per-term split is the section that names what overflowed, and
+        # losing it because a device query threw would defeat the autopsy.
+        try:
+            dev_total_gb = torch.cuda.mem_get_info()[1] / 1024**3
+        except Exception:
+            dev_total_gb = None
+
+        if model_config is not None:
+            try:
+                from modules.evaluation.memory_model import predict_prefill_peak
+                chunk = _prefill_score_chunk_env()
+                misses = bool(_lse_recompute_count())
+                b = predict_prefill_peak(
+                    model_config, batch_size, prefill_len,
+                    lse_recomputes=misses, chunk=chunk,
+                    device_total_gb=dev_total_gb,
+                )
+                lines += ["## predicted breakdown (memory_model)", b.format(), ""]
+                if misses:
+                    fixed = predict_prefill_peak(
+                        model_config, batch_size, prefill_len,
+                        lse_recomputes=False, chunk=chunk,
+                        device_total_gb=dev_total_gb,
+                    )
+                    lines += [
+                        "## same cell with L-reuse working",
+                        f"  device used peak would be {fixed.device_total_used:.2f} GB "
+                        f"(vs {b.device_total_used:.2f} GB)"
+                        + (f" -> {fixed.verdict}" if fixed.verdict else ""),
+                        "",
+                    ]
+            except Exception as e:
+                lines += [f"## predicted breakdown — unavailable: {e}",
+                          traceback.format_exc(), ""]
+
+        lines += [
+            "## L-reuse state (the compute_lse transient is linear in B*S)",
+            f"  compute_lse calls this process: {_lse_recompute_count()}",
+            f"  flashinfer latch reason:        {_lse_broken_reason()}",
+            f"  STICKYKV_PREFILL_SCORE_CHUNK:   {_prefill_score_chunk_env()}",
+            "",
+            "## env knobs in effect",
+        ]
+        for k in sorted(k for k in os.environ if k.startswith("STICKYKV_")):
+            lines.append(f"  {k}={os.environ[k]}")
+        lines.append("")
+
+        try:
+            lines += ["## torch.cuda.memory_summary()", torch.cuda.memory_summary()]
+        except Exception as e:
+            lines += [f"## memory_summary — unavailable: {e}"]
+        lines += ["", "## traceback", traceback.format_exc()]
+
+        body = "\n".join(lines)
+        try:
+            od = Path(cfg.telemetry.output_dir)
+            od.mkdir(parents=True, exist_ok=True)
+            path = od / f"oom_autopsy_{name}_p{prefill_len}_bs{batch_size}.txt"
+            path.write_text(body, encoding="utf-8")
+            log.error("OOM autopsy for %s (prefill=%d bs=%d) written to %s:\n%s",
+                      name, prefill_len, batch_size, path, body)
+        except Exception as we:  # pragma: no cover - fs dependent
+            log.error("OOM autopsy (could not write file: %s):\n%s", we, body)
+
     @staticmethod
     def _warmup_decode_steps(pc, c: dict, cfg, gen_len: int) -> int:
         """How many decode steps each warmup round runs.
@@ -1034,6 +1160,10 @@ class PerfRunner:
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")
         model.eval()
+        # Stashed for the OOM autopsy: the failure is caught in the caller,
+        # where the model is out of scope, and the analytic breakdown needs the
+        # geometry to say WHICH term overflowed.
+        self._last_model_config = model.config
         # Create input. batch_size>1 measures batched throughput; the windowed
         # cache evicts each row independently (equal-length inputs, no padding).
         batch_size = max(1, int(batch_size))
