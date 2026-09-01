@@ -97,14 +97,25 @@ def _lse_backend() -> str:
 
     ``STICKYKV_LSE_BACKEND`` selects it (default ``auto``):
 
-    * ``flash``      — the fragile ``flash_attn_func(return_attn_probs=True)``
-                       capture (:mod:`flash_lse`). Historic default.
+    * ``flash``      — ask the REAL ``flash_attn_func`` for the ``softmax_lse``
+                       it already computed (:mod:`flash_lse`). The attention
+                       output is bit-identical, because it is the same kernel.
     * ``flashinfer`` — FlashInfer's prefill kernel, which returns ``L`` as a
-                       first-class output (:mod:`flashinfer_lse`) *and* runs the
-                       prefill attention faster. REQUIRED when named: raises at
-                       install if flashinfer is not importable, rather than
-                       silently degrading (kernel-or-error).
-    * ``auto``       — prefer ``flashinfer`` when it imports, else ``flash``.
+                       first-class output (:mod:`flashinfer_lse`). REQUIRED when
+                       named: raises at install if flashinfer is not importable,
+                       rather than silently degrading (kernel-or-error).
+    * ``auto``       — prefer ``flash``, fall back to ``flashinfer``.
+
+    **``auto`` used to prefer ``flashinfer`` and that was the wrong default**,
+    on two counts. Correctness: ``flashinfer`` REPLACES the attention call, so
+    the model's output comes from a different kernel with a different
+    accumulation order — a numerics change to the forward, not just to ``L``,
+    in a project whose requirement is identical scores. ``flash`` cannot
+    diverge that way. Practically: on the box this ships to, ``flashinfer``
+    imports (so ``auto`` always chose it) and then FAILS at the first call,
+    while ``flash`` works — so the default reliably selected the broken path
+    and the working one was never reached. Preferring ``flash`` makes the
+    safer option the one you get by not thinking about it.
     """
     return os.environ.get("STICKYKV_LSE_BACKEND", "auto").strip().lower()
 
@@ -132,18 +143,21 @@ def _install_lse_source(handles: "HookHandles") -> Tuple[bool, str]:
         handles._cleanups.append(h.restore)
         return True, "flashinfer"
 
+    # backend == "flash", or auto: the flash_lse capture FIRST. Same kernel,
+    # so the attention output is bit-identical; see _lse_backend for why this
+    # order was flipped.
+    h = flash_lse.enable()
+    if h is not None:
+        handles._cleanups.append(h.restore)
+        return True, "flash"
+
     if backend == "auto" and flashinfer_lse.available():
         h = flashinfer_lse.enable()
         if h is not None:
             handles._cleanups.append(h.restore)
             return True, "flashinfer"
 
-    # backend == "flash", or auto without flashinfer: the flash_lse capture.
-    h = flash_lse.enable()
-    if h is not None:
-        handles._cleanups.append(h.restore)
-        return True, "flash"
-    return False, "off (flash-attn unavailable; recomputing L)"
+    return False, "off (no L source available; recomputing L)"
 
 
 def _lse_strict() -> bool:

@@ -303,10 +303,21 @@ def _make_wrapper(orig):
                           if ln.strip().startswith("File ")]
                 if frames:
                     where = f" Raised at: {frames[-1]}."
+                # How this backend got selected, so "I set the env var" is
+                # distinguishable from "the default picked it for me". The old
+                # `auto` preferred flashinfer, so a run that never set the
+                # variable landed here and the message gave no hint of that.
+                sel = os.environ.get("STICKYKV_LSE_BACKEND")
+                how = (f"STICKYKV_LSE_BACKEND={sel!r}" if sel
+                       else "STICKYKV_LSE_BACKEND is UNSET, so 'auto' selected "
+                            "this — note auto now prefers 'flash', so an unset "
+                            "variable reaching FlashInfer means flash_attn's "
+                            "capture was unavailable")
                 raise RuntimeError(
                     "FlashInfer L-capture failed and STICKYKV_LSE_STRICT is on, "
                     "so this is a hard error rather than a silent second "
                     f"O(N^2) prefill pass.\n"
+                    f"  BACKEND: {how}\n"
                     f"  CAUSE: {_STATE['reason']}{where}\n"
                     f"  SHAPE: B={B} S_q={S_q} S_kv={S_kv} H_q={H_q} "
                     f"H_kv={H_kv} D={D} causal={bool(causal)} dtype={q.dtype}\n"

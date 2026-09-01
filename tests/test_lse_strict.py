@@ -316,3 +316,75 @@ class TestTheStrictErrorCarriesTheCauseInline:
         self._raise_it(monkeypatch)
         tb = flashinfer_lse.broken_traceback()
         assert tb and "head_dim_qk" in tb
+
+
+class TestAutoPrefersFlash:
+    """`auto` used to prefer flashinfer. On the target box flashinfer imports
+    (so auto always chose it) and then fails at the first call, while flash
+    works — the default reliably selected the broken path and the working one
+    was never reached. It is also the less safe of the two: flashinfer REPLACES
+    the attention call, flash asks the same kernel for the LSE it already has.
+    """
+
+    def _install(self, monkeypatch, flash_ok=True, flashinfer_ok=True):
+        import types
+        from modules.windowed_cache import flash_lse, flashinfer_lse, hooks
+
+        calls = []
+
+        def _flash_enable(module=None):
+            calls.append("flash")
+            return types.SimpleNamespace(restore=lambda: None) if flash_ok else None
+
+        def _fi_enable(module=None):
+            calls.append("flashinfer")
+            return (types.SimpleNamespace(restore=lambda: None)
+                    if flashinfer_ok else None)
+
+        monkeypatch.setattr(flash_lse, "enable", _flash_enable)
+        monkeypatch.setattr(flashinfer_lse, "enable", _fi_enable)
+        monkeypatch.setattr(flashinfer_lse, "available", lambda: flashinfer_ok)
+        handles = types.SimpleNamespace(_cleanups=[])
+        active, label = hooks._install_lse_source(handles)
+        return active, label, calls
+
+    def test_auto_picks_flash_even_when_flashinfer_is_importable(
+            self, monkeypatch):
+        monkeypatch.delenv("STICKYKV_LSE_BACKEND", raising=False)
+        active, label, calls = self._install(monkeypatch)
+        assert (active, label) == (True, "flash")
+        assert "flashinfer" not in calls, "flashinfer must not even be tried"
+
+    def test_auto_falls_back_to_flashinfer_when_flash_is_unavailable(
+            self, monkeypatch):
+        monkeypatch.delenv("STICKYKV_LSE_BACKEND", raising=False)
+        active, label, _ = self._install(monkeypatch, flash_ok=False)
+        assert (active, label) == (True, "flashinfer")
+
+    def test_naming_flashinfer_still_forces_it(self, monkeypatch):
+        """The explicit choice must survive the default flip."""
+        monkeypatch.setenv("STICKYKV_LSE_BACKEND", "flashinfer")
+        active, label, _ = self._install(monkeypatch)
+        assert (active, label) == (True, "flashinfer")
+
+    def test_naming_flashinfer_when_unavailable_is_still_a_hard_error(
+            self, monkeypatch):
+        monkeypatch.setenv("STICKYKV_LSE_BACKEND", "flashinfer")
+        with pytest.raises(RuntimeError, match="flashinfer"):
+            self._install(monkeypatch, flashinfer_ok=False)
+
+    def test_neither_available_degrades_to_recompute(self, monkeypatch):
+        monkeypatch.delenv("STICKYKV_LSE_BACKEND", raising=False)
+        active, label, _ = self._install(monkeypatch, flash_ok=False,
+                                         flashinfer_ok=False)
+        assert active is False and "recomputing L" in label
+
+    def test_the_error_says_how_the_backend_was_selected(self):
+        """An unset variable reaching the FlashInfer error used to look
+        identical to an explicit choice."""
+        src = open("modules/windowed_cache/flashinfer_lse.py",
+                   encoding="utf-8").read()
+        i = src.index("FlashInfer L-capture failed")
+        block = src[max(0, i - 900):i + 400]
+        assert "BACKEND:" in block
+        assert "UNSET" in block
