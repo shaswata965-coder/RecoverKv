@@ -66,8 +66,31 @@ Target: **0.381 → ~0.347 s**, i.e. 1.04× FullKV. That overtakes KIVI-int2,
 KIVI-int4, DefensiveKV and Eager — 4 of 7 methods — and leaves us within 4% of
 FullKV, StreamingLLM and SnapKV.
 
+> **FOUND — it was none of the three suspects below.** Budgeting the kernel's
+> three resources at 4096/batch-1 settles it without a profiler:
+>
+> | term | work | time |
+> |---|---|---|
+> | `tl.dot` | 2.2 TFLOP | ~7 ms |
+> | Q traffic (BLOCK_N=128) | 17 GB | ~11 ms |
+> | **`tl.exp`** | **8.6e9 exponentials** | **~36 ms** |
+>
+> measured overhead: **46 ms**. The kernel is **SFU-bound on the exponential**,
+> not memory- or tensor-core-bound. `tl.exp` lowers to the accurate `expf`
+> (~ten SFU ops); `ex2.approx.f32` is one instruction, which is why every
+> FlashAttention implementation uses it. Fixed by folding `log2(e)` into
+> `scale` and the `[BLOCK_M]` LSE vector — never into the `[BLOCK_M, BLOCK_N]`
+> tile — so the base change costs nothing per element. `STICKYKV_SCORE_EXP2=0`
+> restores `expf`. Larger `BLOCK_N` autotune configs were added too, since Q
+> traffic is the next bound once the exponential stops dominating.
+>
+> Numerical note: `ex2.approx` carries ~2 ulp against `expf`'s ~1. Measured
+> colsum relative error is **2.4e-7**, and scores are used for a *ranking*, so
+> this can only matter where two windows are already tied to ~1e-6.
+
 The kernel computes 3.6% of the FLOPs in 13.7% of the time. Suspects, in the
-order the profile should test them:
+order the profile should test them (kept for the record — all three were
+wrong, which is why the resource budget above is the better first move):
 
 1. **It runs as a separate pass over K.** Flash reads K once for the forward;
    we read it again. At 4096/batch-1 the fp16 K tensor is small, so this is

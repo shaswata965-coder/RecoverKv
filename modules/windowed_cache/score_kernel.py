@@ -376,6 +376,7 @@ if _HAS_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
+        USE_EXP2: tl.constexpr,
     ):
         """One program == one key block, for one (batch, query-head).
 
@@ -384,6 +385,30 @@ if _HAS_TRITON:
         this key block's slice of ``token_scores``. Disjoint key slices ⇒ plain
         stores, no atomics. ``exp(S − L)`` needs no running max because ``L`` is
         already final.
+
+        **This kernel is SFU-bound, not memory- or tensor-core-bound.** At
+        4096/batch-1 it issues one exponential per (query, key) pair — 8.6e9 of
+        them across the model — against 2.2 TFLOP of ``tl.dot`` and ~11 GB of Q
+        traffic. Budget: ~7 ms of tensor core, ~11 ms of memory, and ~36 ms of
+        exponential if that exponential is the accurate ``expf`` (roughly ten SFU
+        ops). Measured score-pass overhead was 46 ms, so the transcendental *was*
+        the kernel.
+
+        ``USE_EXP2`` switches to ``ex2.approx.f32`` — one hardware instruction,
+        ~10x the throughput — which is what every FlashAttention implementation
+        does for the same reason. It costs nothing per element because the
+        change of base is folded into ``scale`` by the caller and into the
+        ``[BLOCK_M]`` LSE vector here, never into the ``[BLOCK_M, BLOCK_N]``
+        probability tile:
+
+            exp(x) == exp2(x · log2 e)
+            exp(s·scale − L) == exp2(s·(scale·log2 e) − L·log2 e)
+
+        Mathematically identical; ``ex2.approx`` carries ~2 ulp against expf's
+        ~1, and the scores are then summed over up to S terms and used for a
+        ranking, so the perturbation only matters where two windows are already
+        tied to ~1e-6. ``STICKYKV_SCORE_EXP2=0`` restores ``expf`` for
+        bit-comparison against the historic path.
         """
         pid_n = tl.program_id(0)        # key block
         pid_bh = tl.program_id(1)       # b * H_q + h_q
@@ -424,7 +449,13 @@ if _HAS_TRITON:
 
             lse_i = tl.load(LSE + b * stride_lb + h * stride_lh + offs_m * stride_lt,
                             mask=m_mask, other=0.0)                     # [BLOCK_M]
-            p = tl.exp(s - lse_i[:, None])                             # exact softmax
+            # The base change is applied to the [BLOCK_M] vector, not to the
+            # [BLOCK_M, BLOCK_N] tile — `scale` already carries log2(e) from the
+            # caller, so the hot path does exactly the same arithmetic either way.
+            if USE_EXP2:
+                p = tl.exp2(s - lse_i[:, None] * 1.4426950408889634)
+            else:
+                p = tl.exp(s - lse_i[:, None])                         # exact softmax
 
             valid = m_mask[:, None] & n_mask[None, :]
             if IS_CAUSAL:
@@ -446,6 +477,14 @@ if _HAS_TRITON:
     # caches the winner; the math is identical to the fixed 64x64 path (autotune
     # only *selects* among correct configs), so the CPU torch reference stays the
     # oracle and this ships GPU-unvalidated like the kernel it wraps.
+    # Q traffic is (S / BLOCK_N) x T/2 rows per (batch, head) — the key-outer
+    # design re-reads Q once per key block, so BLOCK_N divides the score pass's
+    # memory traffic directly: 32x redundancy at 64, 16x at 128, 8x at 256. With
+    # the exponential no longer dominating (USE_EXP2), that traffic is the next
+    # bound (~11 ms at BLOCK_N=128, ~5.5 ms at 256 for 4096/batch-1), so the
+    # large-BLOCK_N configs are the ones worth having. They are also the ones
+    # most likely to spill, which is exactly what the autotuner is for: it
+    # benchmarks and discards, and every config here computes the same result.
     _SCORE_AUTOTUNE_CONFIGS = [
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
@@ -453,6 +492,9 @@ if _HAS_TRITON:
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_M": 256, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+        # Half the Q traffic of the widest config above.
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256}, num_warps=8, num_stages=2),
     ]
 
     _score_kernel_tuned = triton.autotune(
@@ -467,6 +509,25 @@ def _score_autotune_enabled() -> bool:
     use it for byte-stable timing or if a Triton build's autotuner misbehaves.
     """
     v = os.environ.get("STICKYKV_SCORE_AUTOTUNE", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+#: log2(e). Folded into ``scaling`` so the base change costs nothing per element.
+LOG2E = 1.4426950408889634
+
+
+def _score_exp2_enabled() -> bool:
+    """Whether the score kernel uses ``ex2.approx`` instead of ``expf`` (default ON).
+
+    The kernel issues one exponential per (query, key) pair — 8.6e9 across the
+    model at 4096/batch-1 — which made the accurate ``expf`` the single largest
+    term in the score pass (~36 ms of a measured 46 ms). ``exp2`` is one hardware
+    instruction instead of roughly ten.
+
+    Off (``STICKYKV_SCORE_EXP2=0``) restores ``expf``, for bit-comparison against
+    the historic path when a parity run needs to attribute a score difference.
+    """
+    v = os.environ.get("STICKYKV_SCORE_EXP2", "1").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
@@ -496,9 +557,14 @@ def _token_scores_triton(
     lse = lse.contiguous().float()
 
     out = torch.empty(B, H_q, S, device=q.device, dtype=out_dtype)
+    # exp(s·scale − L) == exp2(s·(scale·log2 e) − L·log2 e). Folding the base
+    # change into `scaling` here keeps the [BLOCK_M, BLOCK_N] tile arithmetic
+    # byte-for-byte the same shape of work; only the transcendental changes.
+    use_exp2 = _score_exp2_enabled()
+    eff_scale = scaling * LOG2E if use_exp2 else scaling
     common = (
         q, k, lse, out,
-        scaling,
+        eff_scale,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         lse.stride(0), lse.stride(1), lse.stride(2),
@@ -510,13 +576,14 @@ def _token_scores_triton(
         # winning config's meta at launch (Triton evaluates this lambda per config).
         grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)
         _score_kernel_tuned[grid](
-            *common, HEAD_DIM=D, IS_CAUSAL=(T > 1),
+            *common, HEAD_DIM=D, IS_CAUSAL=(T > 1), USE_EXP2=use_exp2,
         )
     else:
         grid = (triton.cdiv(S, block_n), B * H_q)
         _score_kernel[grid](
             *common, HEAD_DIM=D,
             BLOCK_M=block_m, BLOCK_N=block_n, IS_CAUSAL=(T > 1),
+            USE_EXP2=use_exp2,
         )
     return out
 

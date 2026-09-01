@@ -149,6 +149,7 @@ if _HAS_TRITON:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
+        USE_EXP2: tl.constexpr,
     ):
         pid_n = tl.program_id(0)
         pid_bh = tl.program_id(1)
@@ -185,7 +186,13 @@ if _HAS_TRITON:
 
             lse_i = tl.load(LSE + b * stride_lb + h * stride_lh + offs_m * stride_lt,
                             mask=m_mask, other=0.0)
-            p = tl.exp(s - lse_i[:, None])
+            # Mirrors production exactly, USE_EXP2 included: a debug
+            # mirror that computes different values than the kernel it
+            # mirrors is worse than no mirror.
+            if USE_EXP2:
+                p = tl.exp2(s - lse_i[:, None] * 1.4426950408889634)
+            else:
+                p = tl.exp(s - lse_i[:, None])
 
             valid = m_mask[:, None] & n_mask[None, :]
             if IS_CAUSAL:
@@ -204,17 +211,25 @@ if _HAS_TRITON:
         out_ptrs = OUT + b * stride_ob + h * stride_oh + offs_n * stride_os
         tl.store(out_ptrs, acc, mask=n_mask)
 
-    def run_debug_kernel(q, k, scaling, lse, *, block_m=64, block_n=64):
+    def run_debug_kernel(q, k, scaling, lse, *, block_m=64, block_n=64,
+                         use_exp2=None):
         """Launch the mirror; return (out, S_full, P_full) as fp32 tensors.
 
         S_full is NaN-initialised: positions never visited (query blocks skipped
         by the causal fast-path) stay NaN and are excluded from comparison. P_full
         is zero-initialised: a skipped (m,n) is all-future, whose true P is 0.
         """
+        from modules.windowed_cache.score_kernel import (
+            LOG2E, _score_exp2_enabled)
+
         B, H_q, T, D = q.shape
         H_kv, S = k.shape[1], k.shape[2]
         num_groups = H_q // H_kv
         lse = lse.contiguous().float()
+        # Default to whatever production would do, so the mirror tracks it.
+        if use_exp2 is None:
+            use_exp2 = _score_exp2_enabled()
+        scaling = scaling * LOG2E if use_exp2 else scaling
 
         out = torch.empty(B, H_q, S, device=q.device, dtype=torch.float32)
         sdump = torch.full((B, H_q, T, S), float("nan"), device=q.device, dtype=torch.float32)
@@ -231,6 +246,7 @@ if _HAS_TRITON:
             sdump.stride(0), sdump.stride(1), sdump.stride(2), sdump.stride(3),
             T, S, S - T, H_q, num_groups,
             HEAD_DIM=D, BLOCK_M=block_m, BLOCK_N=block_n, IS_CAUSAL=(T > 1),
+            USE_EXP2=use_exp2,
         )
         return out, sdump, pdump
 
