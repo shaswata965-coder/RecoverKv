@@ -19,6 +19,7 @@ from utils.config import ConfigValidationError
 __all__ = [
     "ConfigValidationError",
     "get_cache_classes",
+    "quant_budget_mode_kwargs",
     "validate_backend_attn_pairing",
     "assert_transformers_version_supported",
     "is_transformers_version_supported",
@@ -163,6 +164,40 @@ def get_cache_classes(backend: str) -> Tuple[Type, Type, Callable]:
         raise ConfigValidationError(
             f"Unknown cache backend: {backend!r}.  Must be 'flash_attn' or 'eager'."
         )
+
+
+def quant_budget_mode_kwargs(cache_config_cls: Type, requested: str) -> dict:
+    """``{"quant_budget_mode": requested}``, or ``{}`` if the backend lacks it.
+
+    The flash package supports both splits of ``quant_ratio``; the eager package
+    implements the byte split ONLY (``windowed_eager_cache/config.py:406-407``
+    has no mode branch). So the kwarg has to be omitted for eager rather than
+    passed and rejected as an unexpected argument.
+
+    Omitting it is only safe when the two agree. ``'bytes'`` is what eager
+    computes, so asking for it and dropping it is a no-op; asking for
+    ``'tokens'`` and dropping it would run a DIFFERENT operating point under the
+    config's name — at ``cache_budget=0.20, q=0.5`` the two differ by 2.2x in
+    retained keys — so that RAISES.
+
+    This asymmetry is also why the flash default went back to ``'bytes'``: from
+    f71fec0 until now the flash backend defaulted to ``'tokens'`` while eager
+    stayed on ``'bytes'``, so the two backends were silently resolving the same
+    YAML to different caches. See ACCURACY_RECOVERY_PLAN.md §2.
+    """
+    if "quant_budget_mode" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"quant_budget_mode": requested}
+    if requested != "bytes":
+        raise ConfigValidationError(
+            f"quant_budget_mode={requested!r} was requested, but "
+            f"{cache_config_cls.__module__}.{cache_config_cls.__name__} has no "
+            "such field — the eager cache package implements the BYTE split "
+            "only. Dropping it silently would run a different operating point "
+            "under this config's name (2.2x the retained keys at "
+            "cache_budget=0.20, quant_ratio=0.5). Use the flash_attn backend "
+            "for quant_budget_mode='tokens', or set it to 'bytes'."
+        )
+    return {}
 
 
 def validate_backend_attn_pairing(

@@ -23,6 +23,12 @@ cache:
   num_sink_tokens: 4
   local_window_size: 256
   quant_ratio: 0.0                  # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
+  # The mode a memory-vs-quality claim is stated in: q splits the BYTE
+  # budget, so the retained cache costs exactly cache_budget of the full
+  # cache at every q and cheaper int2 keys buy more context. Pinned, not
+  # inherited — the default flipped underneath this suite once already
+  # (f71fec0). See ACCURACY_RECOVERY_PLAN.md §2.
+  quant_budget_mode: bytes
 
 data:
   dataset: wikitext-103

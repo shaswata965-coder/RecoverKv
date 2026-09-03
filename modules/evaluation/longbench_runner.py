@@ -59,6 +59,15 @@ class LongBenchRunner:
         self._assert_tracking_off(config)
         self.config = config
 
+        # Resolved cache geometry of the first example, for the sidecar. The
+        # budget resolves per example (it scales with that example's prefill),
+        # so this is a representative sample rather than a constant — but a
+        # sidecar that records the REQUESTED budget and never the resolved one
+        # cannot tell a 20% cache from an 11% cache, which is how the
+        # quant_budget_mode regression stayed invisible. See
+        # ACCURACY_RECOVERY_PLAN.md §2.
+        self._resolved_sample = None
+
         # Extract longbench-specific config
         self.lb = getattr(config, "longbench", None)
         if self.lb is None:
@@ -469,6 +478,8 @@ class LongBenchRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
+        from utils.cache_factory import quant_budget_mode_kwargs
+
         cfg = self.config
         model = self.model
 
@@ -480,6 +491,18 @@ class LongBenchRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+            # Third instance of the same failure this file already documents
+            # twice below. Omitted until now, so `cache.quant_budget_mode` in a
+            # LongBench YAML was silently inert and every run inherited the
+            # dataclass default — which changed underneath the suite in f71fec0
+            # (bytes -> tokens), shrinking the retained cache to 63% of its byte
+            # budget at q=0.5 with nothing in the config or the sidecar saying
+            # so. That is the regression in ACCURACY_RECOVERY_PLAN.md §2.
+            # Routed through the factory because the eager package has no such
+            # field and would reject the kwarg outright.
+            **quant_budget_mode_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_budget_mode", "bytes")),
             # Same failure mode as first_eviction_step below: omitted, and the
             # YAML knob is silently inert. LongBench generates one example at a
             # time, so the auto rule (memo on at B == 1) hides it — a config
@@ -527,6 +550,24 @@ class LongBenchRunner:
             num_layers=model.config.num_hidden_layers,
             max_tokens=max_gen_len,
         )
+
+        if self._resolved_sample is None:
+            r = cache.resolved
+            self._resolved_sample = {
+                "prefill_len": int(input_ids.shape[-1]),
+                "quant_budget_mode": r.quant_budget_mode,
+                "top_k_windows": int(r.top_k_windows),
+                "top_k_fp": int(r.top_k_fp),
+                "N_q": int(r.N_q),
+                "retained_windows": int(r.retained_windows),
+                "retained_tokens": int(r.retained_tokens),
+                "retained_bytes": int(r.retained_bytes),
+                "total_budget_bytes": int(r.total_budget_bytes),
+                # ~1.0 means the cache costs what the budget granted. Below 1.0
+                # the run is holding LESS than cache_budget of the full cache
+                # while still being reported at cache_budget.
+                "budget_utilisation": round(r.budget_utilisation, 4),
+            }
 
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks
@@ -702,6 +743,13 @@ class LongBenchRunner:
             # it cannot attribute a finished run to an operating point. The
             # RULER and GSM8K sidecars have always recorded it; this one did not.
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
+            # What quant_ratio divided. Without it a finished run cannot be
+            # attributed to an operating point at all: the same cache_budget
+            # under 'tokens' holds 63% of the bytes it holds under 'bytes' at
+            # q=0.5, and nothing else in this sidecar distinguishes them.
+            "quant_budget_mode": getattr(cfg.cache, "quant_budget_mode", "bytes"),
+            # What the budget RESOLVED to, not just what was asked for.
+            "resolved_geometry_first_example": self._resolved_sample,
             "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the

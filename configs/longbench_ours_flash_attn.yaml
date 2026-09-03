@@ -24,6 +24,12 @@ cache:
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
   quant_ratio: 0.0                          # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
+  # The mode a memory-vs-quality claim is stated in: q splits the BYTE
+  # budget, so the retained cache costs exactly cache_budget of the full
+  # cache at every q and cheaper int2 keys buy more context. Pinned, not
+  # inherited — the default flipped underneath this suite once already
+  # (f71fec0). See ACCURACY_RECOVERY_PLAN.md §2.
+  quant_budget_mode: bytes
   first_eviction_step: 0                    # prompt compressed on decode step 0 (default); >0 leaves short answers at full cache
 
 window:

@@ -338,6 +338,8 @@ class GSM8KRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache + hooks. Returns ``(cache, hooks, resolved)``."""
+        from utils.cache_factory import quant_budget_mode_kwargs
+
         cfg = self.config
         model = self.model
 
@@ -349,6 +351,13 @@ class GSM8KRunner:
             cache_budget=budget,
             rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
             quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
+            # Without this the YAML knob is inert here and the run inherits
+            # whatever the dataclass default happens to be — the failure that
+            # produced ACCURACY_RECOVERY_PLAN.md §2 on LongBench. Routed through
+            # the factory: the eager package has no such field.
+            **quant_budget_mode_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_budget_mode", "bytes")),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )

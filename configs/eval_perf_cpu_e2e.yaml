@@ -19,6 +19,12 @@ model:
   revision: main
   dtype: float32
 
+cache:
+  # Pinned, not inherited — a latency suite needs the retained key count
+  # quant_ratio-invariant. The repo default is 'bytes'; see
+  # ACCURACY_RECOVERY_PLAN.md §2 for why 'tokens' is correct only here.
+  quant_budget_mode: tokens
+
 perf:
   data_source: null            # synthetic ids — no datasets dependency on CPU
 

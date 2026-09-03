@@ -7,6 +7,7 @@ fully guarded so the eager-only path works without flash-attn present.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Any, Optional
 
@@ -31,8 +32,21 @@ def capture_environment() -> dict[str, Any]:
         "gpu_name": _get_gpu_name(),
         "gpu_memory_mb": _get_gpu_memory_mb(),
         "commit_sha": _get_git_commit_sha(),
+        # Every STICKYKV_* knob that was set, verbatim. These select kernels
+        # (STICKYKV_FUSED_DECODE), L sources (STICKYKV_LSE_BACKEND) and softmax
+        # bases (STICKYKV_SCORE_EXP2) — they change what ran, and none of them
+        # appeared in any run record. An empty dict means every default was
+        # taken, which is itself the thing you need to know when a default
+        # changes underneath a suite.
+        "stickykv_env": _capture_stickykv_env(),
     }
     return env
+
+
+def _capture_stickykv_env() -> dict[str, str]:
+    """The ``STICKYKV_*`` variables set in this process, sorted."""
+    return {k: v for k, v in sorted(os.environ.items())
+            if k.startswith("STICKYKV_")}
 
 
 # ---------------------------------------------------------------------------

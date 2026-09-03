@@ -111,11 +111,16 @@ class CacheConfig:
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
     quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
-    # What quant_ratio divides between the fp16 and int2 tiers. "tokens"
-    # (default) keeps the retained KEY count invariant in quant_ratio, so q is a
-    # pure memory/quality knob; "bytes" is the historic split, under which the
-    # retained key count grows with q. See modules/windowed_cache/config.py.
-    quant_budget_mode: str = "tokens"
+    # What quant_ratio divides between the fp16 and int2 tiers. "bytes"
+    # (default) splits the byte budget, so the retained cache costs exactly
+    # cache_budget of the full cache at every q and cheaper int2 keys buy more
+    # context — the mode a memory-vs-quality claim is stated in. "tokens" splits
+    # the window count instead, holding the retained KEY count q-invariant; that
+    # is what a latency table needs (equal work per row) and what the perf suite
+    # pins explicitly, but it under-spends the budget it was granted (63% at
+    # q=0.5) and costs accuracy for memory nobody asked to save. See
+    # modules/windowed_cache/config.py and ACCURACY_RECOVERY_PLAN.md §2.
+    quant_budget_mode: str = "bytes"
     # Decode step of the FIRST eviction, independent of window_size. 0 (default)
     # compresses the prompt on decode step 0 — before that step's query attends —
     # so every generated token comes from the budgeted cache. A positive value

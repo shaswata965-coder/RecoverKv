@@ -51,12 +51,13 @@ class ResolvedConfig:
     top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
     N_q: int = 0               # evictable int2 windows (0 when q=0)
     # What `quant_ratio` divides. See WindowedCacheConfig.quant_budget_mode.
-    quant_budget_mode: str = "tokens"
+    quant_budget_mode: str = "bytes"
     # Bytes one retained window costs in each tier, as resolve() computed them.
-    # Carried so the memory claim is derivable from the resolved config alone:
-    # under quant_budget_mode='tokens' the retained key count is fixed and the
-    # BYTES are what quant_ratio moves, so a report that cannot price a window
-    # cannot state the compression the method actually achieved.
+    # Carried so the memory claim is derivable from the resolved config alone.
+    # Which of the two axes `quant_ratio` moves depends on quant_budget_mode —
+    # the window count under 'bytes', the bytes under 'tokens' — so a report
+    # that cannot price a window cannot state the compression the method
+    # actually achieved under either.
     bytes_per_fp_window: int = 0
     bytes_per_q_window: int = 0
     # None → decide from the batch size at the first forward (on at B=1, off
@@ -75,15 +76,41 @@ class ResolvedConfig:
 
         ``retained_evictable_bytes / evictable_budget_bytes`` is the compression
         quantization actually bought at this operating point — 1.0 at q=0, and
-        falling with q under ``quant_budget_mode='tokens'``.
+        falling with q under either mode.
         """
         return self.retained_windows * self.bytes_per_fp_window
 
     @property
     def retained_windows(self) -> int:
         """Evictable windows kept across both tiers. ``quant_ratio``-invariant
-        under ``quant_budget_mode='tokens'`` — that is the point of that mode."""
+        under ``quant_budget_mode='tokens'``; growing as
+        ``top_k_windows * (1 + (b_fp/b_q - 1) * q)`` under ``'bytes'``."""
         return self.top_k_fp + self.N_q
+
+    @property
+    def retained_bytes(self) -> int:
+        """Bytes the whole retained cache costs: sink + local (fp16) + both tiers."""
+        fixed = (self.num_sink_tokens + self.local_tokens) * self.bytes_per_token
+        return fixed + self.retained_evictable_bytes
+
+    @property
+    def budget_utilisation(self) -> float:
+        """``retained_bytes / total_budget_bytes`` — is the budget actually spent?
+
+        ~1.0 under ``quant_budget_mode='bytes'`` at every ``quant_ratio``: the
+        two tiers divide the byte allowance and each buys windows at its own
+        price, so the cache costs what it was granted.
+
+        Under ``'tokens'`` the window count is held fixed while the keys get
+        cheaper, so this FALLS with q — 0.63 at q=0.5, 0.48 at q=0.7 — and a run
+        reported at ``cache_budget=0.20`` is really holding 13.8% / 11.4% of the
+        full cache. That gap is a silent accuracy cost, so it is a property
+        rather than something each reader recomputes. Report it with every
+        quality row; ``ACCURACY_RECOVERY_PLAN.md`` §2 is why.
+        """
+        if self.total_budget_bytes <= 0:
+            return 0.0
+        return self.retained_bytes / self.total_budget_bytes
 
     @property
     def retained_evictable_tokens(self) -> int:
@@ -191,33 +218,40 @@ class WindowedCacheConfig:
     quant_ratio: float = 0.0
     # What `quant_ratio` divides between the fp16 and int2 tiers.
     #
-    # "tokens" (default) — q splits the retained WINDOW COUNT. Both tiers
-    #     together always retain `top_k_windows` evictable windows, whatever q
-    #     is, so the number of keys a decode step attends over is
-    #     q-INVARIANT and quantization is a pure memory/quality knob: raising q
-    #     spends fewer bytes on the same tokens. This is what makes the method
-    #     generalizable across q — an operating point chosen for quality does not
-    #     silently move the latency it is measured at.
-    #
-    # "bytes" — q splits the byte budget, the historic behaviour. An int2 window
-    #     costs ~3.9x less than an fp16 one (b_fp/b_q at ws=8, D=128, H_kv=8), so
-    #     spending a fraction q of the bytes on int2 buys ~3.9q of the token
-    #     count and the retained TOKENS grow with q:
+    # "bytes" (default) — q splits the BYTE budget; each tier then buys windows
+    #     at its own price. An int2 window costs ~3.9x less than an fp16 one
+    #     (b_fp/b_q = 32768/8448 at ws=8, D=128, H_kv=8), so the retained window
+    #     count grows with q:
     #
     #       retained_windows = top_k_windows * (1 + (b_fp/b_q - 1) * q)
     #
-    #     At cache_budget=0.50 on Llama-3-8B that crosses the whole evictable
-    #     band at q ~ 0.36, and past it `EvictionPolicy.tier_counts` clamps to
-    #     the windows that exist — so the resolved N_q stops being reachable and
-    #     the config's stated ratio stops describing what runs. Measured steady
-    #     state at q=0.70, cache_budget=0.50: 6029 keys for a 4096-token prompt
-    #     (1.47x), 2941 for 2048 (1.44x), 1437 for 1048 (1.37x) — i.e. a
-    #     "50% cache" that holds more keys than the prompt, and does more
-    #     attention work per decode step than the full-cache baseline.
+    #     The BYTES retained are exactly `cache_budget` of the full cache at
+    #     every q — 19.9% of full-cache bytes at cache_budget=0.20 whether q is
+    #     0.0, 0.5 or 0.7 — which is what makes this the mode a memory-vs-quality
+    #     claim is stated in. Cheaper keys buying more context is the entire
+    #     point of the Q tier, and this is the mode that lets them.
     #
-    # Kept selectable because it is what every result before this change was
-    # recorded under; "bytes" reproduces those numbers exactly.
-    quant_budget_mode: str = "tokens"
+    # "tokens" — q splits the retained WINDOW COUNT instead, so both tiers
+    #     together always retain `top_k_windows` evictable windows and the number
+    #     of keys a decode step attends over is q-INVARIANT. That is required for
+    #     a LATENCY table, where two rows must do equal work to be comparable,
+    #     and it is why the perf suite pins this mode explicitly rather than
+    #     inheriting it.
+    #
+    #     It is the wrong default for QUALITY, which is why it is no longer the
+    #     default: holding the key count fixed while the keys get cheaper means
+    #     declining to spend the budget that was granted. At cache_budget=0.20 it
+    #     retains 13.8% of full-cache bytes at q=0.5 and 11.4% at q=0.7 while
+    #     still being reported as a 20% cache — understating the compression, and
+    #     paying for it in accuracy to save memory nobody asked to save. See
+    #     ACCURACY_RECOVERY_PLAN.md §2.
+    #
+    # Under "bytes", past q ~ 0.36 at cache_budget=0.50 the resolved N_q crosses
+    # the whole evictable band and `EvictionPolicy.tier_counts` clamps to the
+    # windows that exist, so the config's stated ratio stops describing what
+    # runs. `describe_tier_geometry` reports the expansion and the
+    # first-eviction drop count so that case is visible rather than implied.
+    quant_budget_mode: str = "bytes"
     quant_memoize_read: Optional[bool] = None
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query

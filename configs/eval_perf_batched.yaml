@@ -88,6 +88,14 @@ window:
   num_sink_tokens: 5
   local_window_size: 64     # int -> must be a multiple of window_size
 
+cache:
+  # Pinned, not inherited. This is a LATENCY suite: rows must do equal work to
+  # be comparable, so the retained key count has to stay quant_ratio-invariant.
+  # The repo default is 'bytes' (the mode a memory-vs-quality claim is stated
+  # in — see ACCURACY_RECOVERY_PLAN.md §2); 'tokens' is correct only here.
+  # eval_perf_smoke.yaml inherits this file, so it inherits this too.
+  quant_budget_mode: tokens
+
 perf:
   # Real long-context text, chunked to exactly prefill_len and sampled per row,
   # so every row in a batch is EQUAL-LENGTH by construction. That is both what
