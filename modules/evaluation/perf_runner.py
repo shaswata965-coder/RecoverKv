@@ -1488,9 +1488,18 @@ class PerfRunner:
                     if warm_decode:
                         w_pkv = out.past_key_values
                         w_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                        # Explicit monotonic cache_position, same as the measured
+                        # loop below -- warmup has to drive the SAME path it is
+                        # warming (compile specializations, autotune, the memo
+                        # epochs all key off what actually runs).
+                        w_pos = int(input_ids.shape[-1])
                         for _ in range(warm_decode):
                             out = model(input_ids=w_tok, past_key_values=w_pkv,
-                                        use_cache=True, return_dict=True, **gen_kwargs)
+                                        use_cache=True, return_dict=True,
+                                        cache_position=torch.arange(
+                                            w_pos, w_pos + 1, device=input_ids.device),
+                                        **gen_kwargs)
+                            w_pos += 1
                             w_pkv = out.past_key_values
                             w_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                         del w_pkv, w_tok
@@ -1656,11 +1665,42 @@ class PerfRunner:
                 # is the step that compacts it -- so a single "decode" phase
                 # reports the uncompressed peak and hides the very footprint this
                 # method exists to shrink. `decode_steady` is the compressed cache.
+                #
+                # cache_position is passed EXPLICITLY and advanced monotonically,
+                # which is what `generate()` does
+                # (`_update_model_kwargs_for_generation`:
+                # `cache_position[-1:] + num_new_tokens`) and what this cache
+                # requires. Left to itself, transformers 4.47's LlamaModel.forward
+                # derives it as `arange(past_key_values.get_seq_length(), ...)`,
+                # and for an EVICTING cache that is not the absolute token index —
+                # it is the retained key count, which is a sawtooth: it drops by
+                # `window_size - 1` at every eviction once the budget binds. The
+                # decode step after an eviction would then be told it sits ~ws
+                # tokens EARLIER than the step before it, so the query's RoPE phase
+                # goes backward and the appended K/V is stored under a position
+                # that already exists in the cache (measured: positions run
+                # `... 70, 71, 72, 65, 66, 67`).
+                #
+                # This never affected the numbers this runner reports — the store's
+                # length is config arithmetic (`k_fp*ws + ...`), not data-dependent,
+                # so shapes, launch counts and KV traffic are identical either way
+                # (verified: only HF's own `arange` differs, 1 dispatch/step). But
+                # it made the perf harness semantically different from the quality
+                # harness, which goes through `generate()`, and a decode path being
+                # optimized should be the decode path that ships.
+                pos = int(input_ids.shape[-1])
+                def _cache_pos(n_new: int):
+                    nonlocal pos
+                    cp = torch.arange(pos, pos + n_new, device=input_ids.device)
+                    pos += n_new
+                    return cp
+
                 with torch.no_grad():
                     if n_decode >= 1:
                         with probe.phase("decode_step0"):
                             out = model(input_ids=next_tok, past_key_values=pkv,
-                                        use_cache=True, return_dict=True, **gen_kwargs)
+                                        use_cache=True, return_dict=True,
+                                        cache_position=_cache_pos(1), **gen_kwargs)
                             pkv = out.past_key_values
                             next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -1669,7 +1709,8 @@ class PerfRunner:
                         with probe.phase("decode_steady"):
                             for _ in range(n_decode - 1):
                                 out = model(input_ids=next_tok, past_key_values=pkv,
-                                            use_cache=True, return_dict=True, **gen_kwargs)
+                                            use_cache=True, return_dict=True,
+                                            cache_position=_cache_pos(1), **gen_kwargs)
                                 pkv = out.past_key_values
                                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 if torch.cuda.is_available(): torch.cuda.synchronize()

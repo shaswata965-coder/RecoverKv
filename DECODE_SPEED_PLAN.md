@@ -22,6 +22,49 @@ per-`(window, head, dim)` fp16 scale+zero grid (512 B/token) is **twice the K
 codes it describes** (256 B/token). That is a `ws=8` group-size artifact and it
 is priced in §5.7, not assumed away.
 
+## 0.1 Correctness invariants — non-negotiable
+
+Every change below is a launch, layout or scheduling change. None of them may
+alter what the cache holds. Three invariants make that checkable rather than
+aspirational, and each is enforced by a test that fails loudly:
+
+1. **The retained set is a function of `window_scores` alone.** Not of when the
+   eviction runs relative to the append, not of `policy.total_tokens`. This is
+   what let the eviction move to the start of the step; it is pinned by
+   `tests/test_layer_major_evict.py`, whole-cache byte-identity against the
+   per-layer path across `q ∈ {0, 0.5}`, `L ∈ {1,3}`, `B ∈ {1,2}`,
+   `ws ∈ {1…128}`, with and without sinks, and across promotion/dormancy.
+
+2. **`cache_position` is the absolute token index, and it is verified.** An
+   evicting cache breaks a transformers assumption: with no explicit
+   `cache_position`, `LlamaModel.forward` derives it as
+   `arange(get_seq_length(), …)` — treating "keys held" as "tokens processed".
+   Those diverge the moment the budget binds, because `get_seq_length()` becomes
+   a sawtooth that drops by `ws-1` at every eviction. The step after an eviction
+   is then told it sits ~`ws` tokens *earlier* than the one before it, and the
+   store accumulates duplicated, non-monotonic positions (measured:
+   `… 70, 71, 72, 65, 66, 67`).
+
+   `generate()` is immune — it advances `cache_position` itself and never
+   re-derives it — so every quality runner here was always safe. A hand-written
+   decode loop is not, and `perf_runner`'s was not. **Both are now fixed** (it
+   passes an explicit monotonic position in the warmup and measured loops), and
+   `WindowedCache._check_position_contract` refuses a wrong base outright rather
+   than letting it corrupt the store. The check is free until the retained count
+   and the absolute index actually diverge, then costs one sync, once per cache.
+
+   *This never moved the reported numbers* — store length is config arithmetic
+   (`k_fp*ws + …`), not data-dependent, so shapes, launch counts and KV traffic
+   were identical either way (verified: only HF's own `arange` differed, one
+   dispatch per step). What it moved is whether the harness being optimized runs
+   the semantics that ship.
+
+3. **No silent fallbacks.** A path that cannot run raises. This already holds for
+   the Triton kernels, the compiled eviction and the L-capture; §5 must not
+   introduce an exception. In particular a kernel that cannot satisfy an
+   alignment precondition (§5.0) must refuse, not quietly take a slow or
+   different-answer path.
+
 ## 1. Current baseline and the gap to close
 
 `run_perf_table.sh` at the shipped defaults (`STICKYKV_LAYER_MAJOR_DECODE=1`):
@@ -168,6 +211,27 @@ in its own logic — only its row count is wider — so the same fix and the sam
 gate apply without modification.
 
 ## 5. The fused decode kernel
+
+**Where the TPOT actually is, before picking an item.** At the benchmark cell the
+per-step total is ~22.3 GB of which **16.06 GB (72%) is the weights** — untouchable
+by any KV method. Roofline is ~10.9 ms; measured is 73.5 ms. So **~63 ms of the
+73.5 is not traffic at all**, and no amount of traffic reduction reaches it:
+
+| lever | what it moves | size |
+|---|---|---|
+| §5.1 traffic half | 1.11 → 0.17 GB/step of score traffic | **~0.5 ms** — 6.4× of a 5% term |
+| §5.5 `exp2` | SFU-bound exponentials | ~0.75 ms |
+| §5.5 fp16 `cos`/`sin` | 0.75 → 0.38 GB/step | ~0.18 ms |
+| §5.1 launch half | −416 launches/step | **unsized** — needs Stage 0 |
+| §5.2 Triton launcher | 32 launches/step × 50 args of Python | **unsized** — needs Stage 0 |
+| §5.3 Q-tier tiling | 179 → 23 **serial dependent** iterations | **unsized** — latency, not traffic |
+
+Adding up everything that *is* sized gives ~1.4 ms against a 4.7 ms gap to the
+20%-faster target. **So the target is not reachable on the traffic terms alone —
+it depends entirely on the three unsized launch/latency items, and which of them
+dominates is exactly what Stage 0 (§3) measures.** Resist the temptation to read
+the 6.4× in §5.1 as the headline; it is 6.4× of a small number.
+
 
 ### 5.0 The `window_size` range these three changes support — verified
 

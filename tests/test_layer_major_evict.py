@@ -501,3 +501,83 @@ def test_quant_rejects_window_size_not_multiple_of_four(ws):
             window_size=ws, num_sink_tokens=0, local_window_size=ws,
             cache_budget=0.5, quant_ratio=0.5, first_eviction_step=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# cache_position contract — an evicting cache breaks a transformers assumption
+# ---------------------------------------------------------------------------
+
+
+def _run_real_model(pass_cache_position, ws=4, steps=24, prefill=32):
+    """Decode loop through a real model, with or without an explicit position."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    mc = LlamaConfig(
+        vocab_size=256, hidden_size=64, intermediate_size=128,
+        num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+        max_position_embeddings=512, attn_implementation="eager",
+    )
+    model = LlamaForCausalLM(mc).eval()
+    cache = WindowedCache(
+        config=WindowedCacheConfig(
+            window_size=ws, num_sink_tokens=0, local_window_size=ws,
+            cache_budget=0.25, quant_ratio=0.0, first_eviction_step=0,
+        ),
+        prefill_len=prefill, model_config=mc, kv_dtype=torch.float32,
+        rope_module=model.model.rotary_emb,
+        num_layers=mc.num_hidden_layers, max_tokens=steps,
+    )
+    gen = torch.Generator().manual_seed(5)
+    ids = torch.randint(0, 256, (1, prefill),
+                        generator=torch.Generator().manual_seed(11))
+
+    def step(inp, pos):
+        kw = {"cache_position": pos} if pass_cache_position else {}
+        with torch.no_grad():
+            out = model(input_ids=inp, past_key_values=cache, use_cache=True, **kw)
+        for i in range(mc.num_hidden_layers):
+            W = _merged_windows(cache, i, ws, 0)
+            cache.cache_kwargs[i]["window_scores"] = torch.rand(
+                1, mc.num_attention_heads, W, generator=gen)
+        return out.logits[:, -1, :].argmax(-1, keepdim=True)
+
+    tok = step(ids, torch.arange(prefill))
+    for t in range(steps):
+        tok = step(tok, torch.tensor([prefill + t]))
+    return cache
+
+
+def test_derived_cache_position_is_refused():
+    """Omitting ``cache_position`` must raise, not silently corrupt the store.
+
+    transformers derives it as ``arange(get_seq_length(), …)``. For an evicting
+    cache ``get_seq_length()`` is the retained key count, which sawtooths down by
+    ``ws-1`` at every eviction — so the derived position goes *backward* and the
+    store accumulates duplicated, non-monotonic positions. Silently wrong output
+    is the worst possible failure mode for a cache, so the contract is checked.
+    """
+    with pytest.raises(RuntimeError, match="cache_position"):
+        _run_real_model(pass_cache_position=False)
+
+
+def test_explicit_cache_position_is_accepted_and_stays_monotonic():
+    """The `generate()` convention passes, and the store stays well-formed."""
+    cache = _run_real_model(pass_cache_position=True)
+    for i in range(2):
+        p = cache._states[i].position_ids[0].tolist()
+        assert p == sorted(p), f"layer {i}: positions not chronological"
+        assert len(p) == len(set(p)), f"layer {i}: duplicated position"
+
+
+def test_contract_check_costs_one_sync_at_most():
+    """It must not become a per-step sync on the decode path.
+
+    The outer guard is a host-int comparison, and the flag latches after the one
+    read, so the check can fire at most once per cache.
+    """
+    cache = _run_real_model(pass_cache_position=True)
+    assert cache._pos_contract_checked, (
+        "the check never armed — the fixture no longer evicts, so this test "
+        "would pass vacuously"
+    )

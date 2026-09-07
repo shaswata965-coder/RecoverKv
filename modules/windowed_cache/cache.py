@@ -670,6 +670,11 @@ class WindowedCache(_HFCacheBase):
         # [L*B, n_q*ws] frozen Q-tier positions, rebuilt with the fused context.
         self._joint_qpos: Optional[Tensor] = None
 
+        # Absolute tokens appended so far (host int), and a one-shot flag for the
+        # cache_position contract check below. See _check_position_contract.
+        self._tokens_seen: int = 0
+        self._pos_contract_checked: bool = False
+
     # -----------------------------------------------------------------
     # HF Cache interface
     # -----------------------------------------------------------------
@@ -713,6 +718,67 @@ class WindowedCache(_HFCacheBase):
             if store is not None:
                 store.memoize_read = memo
 
+    def _check_position_contract(
+        self, cache_kwargs: Optional[Dict[str, Any]]
+    ) -> None:
+        """Verify once that ``cache_position`` is the ABSOLUTE token index.
+
+        An evicting cache breaks an assumption transformers makes. When
+        ``cache_position`` is not supplied, ``LlamaModel.forward`` derives it as
+        ``arange(past_key_values.get_seq_length(), ...)`` — i.e. it treats "how
+        many keys do you hold" as "how many tokens have been processed". For a
+        cache that never evicts those are the same number. For this one they
+        diverge the moment the budget binds, and ``get_seq_length()`` becomes a
+        sawtooth: it drops by ``window_size - 1`` at every eviction. The step
+        after an eviction is then told it sits ~``ws`` tokens *earlier* than the
+        step before it, so the query's RoPE phase goes backward and the appended
+        K/V is stored under a position that already exists in the store.
+
+        ``generate()`` is immune — it advances ``cache_position`` itself
+        (``_update_model_kwargs_for_generation``: ``cache_position[-1:] +
+        num_new_tokens``) and never re-derives it — which is why the quality
+        runners were never affected. A hand-written decode loop that omits it is
+        not immune, which is what this check exists to catch.
+
+        **Cost: nothing until it matters.** The outer test is a host-int
+        comparison of two values the cache already tracks, so it is free on every
+        step where the retained key count still equals the absolute index — i.e.
+        before the first eviction. Only once they diverge does it read one
+        element of ``cache_position`` (a single sync, once per cache lifetime),
+        and then it never runs again.
+
+        The contract is absolute-from-zero: this cache serves one prompt followed
+        by single-token decode (``_update_joint`` refuses anything else), so a
+        base other than ``_tokens_seen`` is a bug, not a calling convention.
+        """
+        if self._pos_contract_checked:
+            return
+        # Host ints only. Before the first eviction these are equal and there is
+        # nothing a derived cache_position could get wrong.
+        if self.get_seq_length(0) >= self._tokens_seen:
+            return
+        self._pos_contract_checked = True
+        pos = (cache_kwargs or {}).get("cache_position")
+        if pos is None or not torch.is_tensor(pos) or pos.numel() == 0:
+            return
+        first = int(pos.reshape(-1)[0])          # one sync, once per cache
+        if first != self._tokens_seen:
+            raise RuntimeError(
+                f"cache_position starts at {first} but {self._tokens_seen} tokens "
+                f"have been appended; the cache currently retains "
+                f"{self.get_seq_length(0)} keys. "
+                "This is transformers deriving cache_position from "
+                "get_seq_length() because the caller did not pass it. For an "
+                "evicting cache that is the RETAINED KEY COUNT, not the absolute "
+                "token index, so positions go backward after every eviction and "
+                "the store ends up with duplicated, non-monotonic positions. "
+                "Fix: pass cache_position explicitly and advance it monotonically "
+                "(model(..., cache_position=torch.arange(pos, pos + n_new))), "
+                "which is exactly what generate() does. Every quality runner here "
+                "goes through generate() and is unaffected; a hand-written decode "
+                "loop must do it itself."
+            )
+
     def update(
         self,
         key_states: Tensor,
@@ -738,6 +804,9 @@ class WindowedCache(_HFCacheBase):
         returned for that step (and the fused hand-off built from them) must stay
         valid until the model has finished with them.
         """
+        if layer_idx == 0:
+            self._check_position_contract(cache_kwargs)
+            self._tokens_seen += key_states.shape[2]
         if (self._joint is None and self._layer_major
                 and self._evicted_this_step > 0 and layer_idx == 0):
             if self._evicted_this_step != self.num_layers:
