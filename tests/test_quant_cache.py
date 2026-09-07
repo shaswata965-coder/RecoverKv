@@ -327,7 +327,7 @@ class TestReadMemoization:
             got.append((ek.clone(), ev.clone()))
             for t in range(prefill, prefill + 14):
                 k1 = torch.randn(1, H, 1, D)
-                W = _merged_W(c, ws, 0, c._states[0].seq_length + 1)
+                W = _merged_W(c, ws, 0, c._states[0].seq_length)
                 ek, ev = c.update(k1, k1.clone(), 0, cache_kwargs={
                     "cache_position": torch.arange(t, t + 1),
                     "window_scores": torch.rand(1, H, W),
@@ -390,7 +390,7 @@ def test_eviction_preserves_whole_windows():
     saw_q = False
     for t in range(prefill, prefill + 20):
         k1 = torch.randn(1, H, 1, D)
-        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length)
         cache.update(k1, k1.clone(), 0, cache_kwargs={
             "cache_position": torch.arange(t, t + 1),
             "window_scores": torch.rand(1, H, W),
@@ -445,7 +445,7 @@ def test_slot_table_stays_within_its_bound():
     })
     for t in range(prefill, prefill + 24):
         k1 = torch.randn(1, H, 1, D)
-        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length)
         cache.update(k1, k1.clone(), 0, cache_kwargs={
             "cache_position": torch.arange(t, t + 1),
             "window_scores": torch.rand(1, H, W),
@@ -463,9 +463,20 @@ def test_slot_table_stays_within_its_bound():
 # ---------------------------------------------------------------------------
 
 
-def _merged_W(cache, ws, num_sink, after_append_tfp):
+def _merged_W(cache, ws, num_sink, tfp):
+    """Merged (fp body + Q) window count for an fp store of ``tfp`` tokens.
+
+    Callers pass the length the store has **now**, at the top of ``update()`` --
+    not the length it will have after this step's append. That is the width a
+    score hook actually produces: it runs after the previous step's append, so
+    the scores waiting at step t describe the key set as of the end of step t-1,
+    which is exactly the store the batched eviction is about to compact
+    (DECODE_SPEED_PLAN.md §4.1). Sizing to the post-append store instead is one
+    window ahead of anything the model generates, and
+    ``WindowedCache._check_score_width`` now refuses it.
+    """
     wq = cache._stores[0].num_active_windows if cache._stores[0] else 0
-    body = max(after_append_tfp - num_sink, 0)
+    body = max(tfp - num_sink, 0)
     return (body + ws - 1) // ws + wq
 
 
@@ -500,7 +511,7 @@ def test_end_to_end_generation_with_quant():
     for t in range(prefill, prefill + 16):
         k1 = torch.randn(1, H, 1, D, dtype=kdt)
         v1 = torch.randn(1, H, 1, D, dtype=kdt)
-        tfp_after = cache._states[0].seq_length + 1
+        tfp_after = cache._states[0].seq_length
         W = _merged_W(cache, ws, num_sink, tfp_after)
         ek, ev = cache.update(k1, v1, 0, cache_kwargs={
             "cache_position": torch.arange(t, t + 1), "window_scores": scores(W),
@@ -567,7 +578,7 @@ def _drive(cache, kp, vp, kd, vd, scores, ws=4, num_sink=0):
     outs.append((ek.clone(), ev.clone()))
     for i in range(kd.shape[0]):
         t = prefill + i
-        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length + 1)
+        W = _merged_W(cache, ws, num_sink, cache._states[0].seq_length)
         ek, ev = cache.update(kd[i], vd[i], 0, cache_kwargs={
             "cache_position": torch.arange(t, t + 1),
             "window_scores": scores[i + 1][:, :, :W].clone(),
@@ -821,7 +832,7 @@ def test_flash_eager_two_tier_parity(B):
     pool = _rows_diverge_scores(B, H, 12)
     for i, t in enumerate(range(prefill, prefill + 12)):
         k1 = torch.randn(B, H, 1, D); v1 = torch.randn(B, H, 1, D)
-        Wf = _merged_W(flash, ws, num_sink, flash._states[0].seq_length + 1)
+        Wf = _merged_W(flash, ws, num_sink, flash._states[0].seq_length)
         sc = pool[i + 1][:, :, :Wf]
         fk, fv = flash.update(k1.clone(), v1.clone(), 0,
                               cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
@@ -929,16 +940,24 @@ def test_fused_ctx_is_reused_between_evictions_and_dropped_by_one():
 
     Without the first half the fix does nothing; without the second it would serve
     a stale Q tier after the active set moves.
+
+    The first observed step is 17, not 16, because step 16 is the cache's first
+    eviction and step 17 is where the layer-major decode store is built
+    (DECODE_SPEED_PLAN.md §4.1). That join copies the Q tier into new tensors, so
+    it necessarily drops the memo once — a rebuild, not a stale hit. Both
+    observations therefore have to sit on the same side of it.
     """
     cache = _seeded_fused_cache(ws=4)
-    first = _drive_decode_step(cache, 16)
+    assert _drive_decode_step(cache, 16) is not None      # first eviction
+    first = _drive_decode_step(cache, 17)                 # the join rebuilds
     assert first is not None
-    second = _drive_decode_step(cache, 17)
+    second = _drive_decode_step(cache, 18)
     # Same epoch -> the identical dict, not a rebuilt copy.
     assert second["qtier"] is first["qtier"]
 
-    cache._evict_two_tier(0, step=4)
-    after = _drive_decode_step(cache, 18)
+    # Post-join the eviction is layer-major: layer_idx=None is every layer's rows.
+    cache._evict_two_tier(None, step=4)
+    after = _drive_decode_step(cache, 19)
     if after is not None:
         assert after["qtier"] is not first["qtier"]
         want_q, _ = _fresh_fused_ctx(cache)

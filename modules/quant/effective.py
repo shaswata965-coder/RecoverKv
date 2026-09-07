@@ -301,6 +301,7 @@ def materialize_effective_kv(
     window_size: int,
     rope_module: torch.nn.Module,
     out_dtype: torch.dtype = None,
+    q_tier: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Interleave the fp and Q tiers into one effective K/V (design §5, §8).
 
@@ -361,7 +362,17 @@ def materialize_effective_kv(
     # (flattened window-major) is bit-identical to N_q separate per-window calls
     # at a single kernel launch. The store may memoize this across steps — the
     # tier cannot change between evictions (§10).
-    k_q, v_q, q_pos_flat = store.effective_q_tier(rope_module, out_dtype)
+    #
+    # ``q_tier`` lets the caller supply that triple instead. The layer-major
+    # decode store (DECODE_SPEED_PLAN §4.1) holds all L layers in one row axis,
+    # so it dequantizes every layer's Q tier in ONE call and hands each layer its
+    # row slice here — the same tensors ``effective_q_tier`` would have produced
+    # for that layer, at 1/L the launches. Passing it is not optional plumbing:
+    # a layer-major store has no per-layer view to call the method on.
+    if q_tier is None:
+        k_q, v_q, q_pos_flat = store.effective_q_tier(rope_module, out_dtype)
+    else:
+        k_q, v_q, q_pos_flat = q_tier
 
     # Concatenate the two tiers UNSORTED: [sink ‖ fp body ‖ Q]. Attention is
     # order-free (RoPE bakes each key's absolute position into its value), so it

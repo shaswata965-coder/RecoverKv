@@ -128,14 +128,27 @@ class CacheState:
 
     def _allocate(self, key: Tensor, capacity: int) -> None:
         B, H, _, D = key.shape
+        self._allocate_shape(B, H, D, key.dtype, key.device, capacity)
+
+    def _allocate_shape(
+        self, rows: int, heads: int, dim: int,
+        dtype: torch.dtype, device: torch.device, capacity: int,
+    ) -> None:
+        """Allocate the backing buffers for an explicit row count.
+
+        Split out of :meth:`_allocate` because the layer-major decode store
+        (:meth:`join_layers`) has ``L * B`` rows and no single ``[R, H, T, D]``
+        tensor to take the shape from — building one just to read ``.shape``
+        would allocate the very tensor the join exists to avoid.
+        """
         self._key_buf = torch.empty(
-            (B, H, capacity, D), dtype=key.dtype, device=key.device
+            (rows, heads, capacity, dim), dtype=dtype, device=device
         )
         self._val_buf = torch.empty(
-            (B, H, capacity, D), dtype=key.dtype, device=key.device
+            (rows, heads, capacity, dim), dtype=dtype, device=device
         )
         self._pos_buf = torch.empty(
-            (B, capacity), dtype=torch.long, device=key.device
+            (rows, capacity), dtype=torch.long, device=device
         )
 
     def _grow(self, needed: int) -> None:
@@ -298,6 +311,175 @@ class CacheState:
         )
 
         self.replace(new_k, new_v, new_p)
+
+    # -----------------------------------------------------------------
+    # layer-major decode store (DECODE_SPEED_PLAN.md §4.1)
+    # -----------------------------------------------------------------
+
+    @classmethod
+    def join_layers(cls, states: "list[CacheState]", capacity: int) -> "CacheState":
+        """Fold ``L`` per-layer states into one state whose row axis is ``L*B``.
+
+        Layer ``i`` owns rows ``[i*B, (i+1)*B)``. Every op the eviction performs
+        is per-row (gather/argsort/searchsorted/cumsum along dim 1 of a ``[B, …]``
+        tensor), so widening the row axis makes one call do all ``L`` layers'
+        work — which is the whole of DECODE_SPEED_PLAN §4.1's 32x launch cut.
+
+        Called once, at the migration that follows the first eviction, when the
+        per-layer prompt buffers have **already been released** by
+        :meth:`replace`. The copy therefore peaks at two steady-state stores
+        (the ``L`` compacted per-layer buffers plus this one), not at the prompt
+        — which is why the prefill allocation is left per-layer (see
+        ``WindowedCache._migrate_to_joint``).
+
+        Every layer must be at the same length and hold the same window count;
+        that is guaranteed by construction (all layers append the same tokens on
+        the same steps and evict on the same schedule to the same config-derived
+        counts) and asserted here rather than assumed.
+        """
+        if not states:
+            raise ValueError("join_layers needs at least one layer state")
+        ref = states[0]
+        if ref.key_states is None:
+            raise RuntimeError("join_layers before the first append")
+        B, H, n, D = ref.key_states.shape
+        joint = cls(capacity=capacity, prefill_capacity=capacity)
+        joint._allocate_shape(
+            len(states) * B, H, D, ref.key_states.dtype,
+            ref.key_states.device, max(capacity, n),
+        )
+        for i, st in enumerate(states):
+            if st.key_states is None or st.key_states.shape != ref.key_states.shape:
+                raise RuntimeError(
+                    f"join_layers: layer {i} has shape "
+                    f"{None if st.key_states is None else tuple(st.key_states.shape)}, "
+                    f"expected {tuple(ref.key_states.shape)} — layers must stay "
+                    "in lockstep for the batched eviction to be well defined"
+                )
+            r0 = i * B
+            joint._key_buf[r0:r0 + B, :, :n] = st.key_states
+            joint._val_buf[r0:r0 + B, :, :n] = st.value_states
+            joint._pos_buf[r0:r0 + B, :n] = st.position_ids
+        joint._reslice(n)
+
+        # Scores and window ids: one cat each, in layer order, so row i*B+b of
+        # every joint tensor refers to the same (layer, batch row).
+        if ref.window_scores is not None:
+            joint.window_scores = torch.cat(
+                [st.window_scores for st in states], dim=0
+            ).contiguous()
+        if ref.original_window_ids is not None:
+            joint.original_window_ids = torch.cat(
+                [st.original_window_ids for st in states], dim=0
+            ).contiguous()
+        return joint
+
+    def reserve(self, n_new: int, position_ids: Optional[Tensor]) -> int:
+        """Claim ``n_new`` token slots for **every** row and write their positions.
+
+        The layer-major counterpart to the position half of :meth:`append`: the
+        length advance and the position write are shared by all ``L`` layers and
+        so must happen exactly once per step, whereas each layer's K/V arrives
+        only when that layer's attention runs and is written later by
+        :meth:`write_rows`. Returns the offset the caller must write at.
+
+        ``position_ids`` is HF's ``cache_position``, identical for every layer,
+        so a ``[B, n_new]`` input is tiled across the layer axis and a 1-D input
+        is broadcast. The K/V slots are left **uninitialised** — every one of
+        them is overwritten by a ``write_rows`` call in the same step.
+        """
+        if self._key_buf is None:
+            raise RuntimeError("reserve() before the buffers exist")
+        cur = self.seq_length
+        if cur + n_new > self.buffer_capacity:
+            self._grow(cur + n_new)
+        R = self._pos_buf.shape[0]
+        if position_ids is None:
+            new_pos = (
+                torch.arange(
+                    cur, cur + n_new, device=self._pos_buf.device, dtype=torch.long
+                )
+                .unsqueeze(0)
+                .expand(R, -1)
+            )
+        else:
+            new_pos = position_ids
+            if new_pos.dim() == 1:
+                new_pos = new_pos.unsqueeze(0).expand(R, -1)
+            elif new_pos.shape[0] != R:
+                if R % new_pos.shape[0] != 0:
+                    raise ValueError(
+                        f"reserve: position_ids has {new_pos.shape[0]} rows, "
+                        f"which does not tile into the joint store's {R}"
+                    )
+                new_pos = new_pos.repeat(R // new_pos.shape[0], 1)
+        self._pos_buf[:, cur:cur + n_new] = new_pos.to(self._pos_buf.device)
+        self._reslice(cur + n_new)
+        return cur
+
+    def write_rows(
+        self, row0: int, n_rows: int, key: Tensor, value: Tensor, start: int
+    ) -> None:
+        """Write one layer's K/V into rows ``[row0, row0+n_rows)`` at ``start``.
+
+        Pairs with :meth:`reserve`, which already advanced the length and wrote
+        the positions. Bounds are checked because a wrong ``row0`` would corrupt
+        a neighbouring layer's cache silently rather than raising.
+        """
+        n = key.shape[2]
+        if start + n > self.buffer_capacity:
+            raise RuntimeError(
+                f"write_rows past the buffer: start={start} n={n} "
+                f"capacity={self.buffer_capacity} (reserve() must run first)"
+            )
+        if row0 + n_rows > self._key_buf.shape[0]:
+            raise RuntimeError(
+                f"write_rows past the row axis: row0={row0} n_rows={n_rows} "
+                f"rows={self._key_buf.shape[0]}"
+            )
+        self._key_buf[row0:row0 + n_rows, :, start:start + n] = key
+        self._val_buf[row0:row0 + n_rows, :, start:start + n] = value
+
+    def replace_body(
+        self, num_sink: int, body_key: Tensor, body_value: Tensor,
+        body_positions: Tensor,
+    ) -> None:
+        """Rewrite ``[num_sink:]`` in place from a freshly-built compacted body.
+
+        The two-tier rebuild emits ``[sink ‖ fp windows by id]`` and the sink
+        prefix is carried through **byte-identical at the same offsets** — the
+        old code expressed that by ``cat``-ing the sink slice back on and handing
+        the whole store to :meth:`replace`, which then copied it into the buffer
+        it had just been read from. Writing only the body skips both: no
+        full-store ``cat`` (~2.9 GB of transient once the row axis carries all 32
+        layers at 4096/batch-32) and no reallocation, since the buffer is already
+        at its steady-state capacity.
+
+        The sources must not alias the buffers — they are ``gather``/``where``
+        results, which always allocate — and that is checked rather than repaired,
+        because a silent clone here would hide the aliasing bug that produced it.
+        """
+        if self._key_buf is None:
+            raise RuntimeError("replace_body() before the buffers exist")
+        for name, src, buf in (
+            ("key", body_key, self._key_buf),
+            ("value", body_value, self._val_buf),
+            ("positions", body_positions, self._pos_buf),
+        ):
+            if src.untyped_storage().data_ptr() == buf.untyped_storage().data_ptr():
+                raise RuntimeError(
+                    f"replace_body: body_{name} aliases the {name} buffer it "
+                    "would be written into; the compacted body must be a fresh "
+                    "tensor (gather/where allocate, views do not)"
+                )
+        n = num_sink + body_key.shape[2]
+        if n > self.buffer_capacity:
+            # Preserves the live prefix, which is exactly where the sinks are.
+            self._grow(n)
+        self._key_buf[:, :, num_sink:n] = body_key
+        self._val_buf[:, :, num_sink:n] = body_value
+        self._pos_buf[:, num_sink:n] = body_positions.to(self._pos_buf.device)
+        self._reslice(n)
 
     # -----------------------------------------------------------------
     # rerotate_keys

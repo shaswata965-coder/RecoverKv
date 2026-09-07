@@ -113,6 +113,58 @@ class QuantizedStore:
             )
         return self.table
 
+    @classmethod
+    def join_layers(cls, stores: "list[QuantizedStore]") -> "QuantizedStore":
+        """Fold ``L`` per-layer stores into one whose row axis is ``L*B``.
+
+        The companion to :meth:`QuantSlotTable.join_layers` and
+        :meth:`CacheState.join_layers`: layer ``i`` owns rows
+        ``[i*B, (i+1)*B)`` of the joint table, so one batched eviction covers
+        every layer (DECODE_SPEED_PLAN.md §4.1).
+
+        ``_n_active`` is a host int that is the same for every row **and** every
+        layer (it is ``n_q`` from the budget resolver, which every layer resolves
+        identically), so the joint store inherits it rather than re-deriving it;
+        a disagreement between layers means the per-layer evictions diverged and
+        raises here rather than producing a store whose count lies about its own
+        table.
+        """
+        if not stores:
+            raise ValueError("join_layers needs at least one store")
+        ref = stores[0]
+        for i, s in enumerate(stores):
+            if s._n_active != ref._n_active:
+                raise RuntimeError(
+                    f"join_layers: layer {i} has {s._n_active} active Q windows, "
+                    f"layer 0 has {ref._n_active} — layers must stay in lockstep"
+                )
+            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots) != (
+                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots):
+                raise RuntimeError(
+                    f"join_layers: layer {i}'s store geometry differs from layer 0's"
+                )
+            if (s.table is None) != (ref.table is None):
+                raise RuntimeError(
+                    f"join_layers: layer {i} "
+                    f"{'has' if s.table is not None else 'has no'} slot table but "
+                    f"layer 0 {'has' if ref.table is not None else 'has none'} — "
+                    "the table is allocated by the first eviction, which every "
+                    "layer runs on the same step"
+                )
+        joint = cls(
+            window_size=ref.window_size,
+            head_dim=ref.head_dim,
+            num_kv_heads=ref.num_kv_heads,
+            n_slots=ref.n_slots,
+            memoize_read=ref.memoize_read,
+        )
+        if ref.table is not None:
+            joint.table = QuantSlotTable.join_layers([s.table for s in stores])
+        joint._n_active = ref._n_active
+        # A fresh store starts at version 0 with an empty read memo, which is
+        # correct: nothing has read this object yet, so no memo can be stale.
+        return joint
+
     @property
     def version(self) -> int:
         """Monotonic counter — changes iff the Q tier's contents changed."""

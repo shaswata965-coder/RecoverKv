@@ -555,8 +555,16 @@ def _divergent_scores(B, H_q):
     # Widths track the COMPACTED effective window count. These tests pin
     # first_eviction_step = 0 (see _drive_divergent_cache), so the first eviction
     # fires at decode step 0 on the prefill scores, dropping the 8 prompt windows
-    # to 3, so step-1 sees 4 windows (3 survivors + 1 new), not 10. See the flash
-    # twin's _divergent_scores docstring for the full schedule.
+    # to 3, so step-1 sees 4 windows (3 survivors + 1 new), not 10.
+    #
+    # The widths here are sized for the store AFTER this step's append, which is
+    # the ordering the eager twin still uses (append, accumulate, evict). The
+    # flash twin's copy of this fixture no longer matches: its decode path is
+    # layer-major and compacts BEFORE appending, so its scores are sized to the
+    # store as it stands (DECODE_SPEED_PLAN.md §4.1). The two backends still
+    # produce identical caches — that is what
+    # tests/test_quant_cache.py::test_flash_eager_two_tier_parity asserts — they
+    # just have to be *driven* differently by a synthetic fixture.
     s0 = torch.zeros(B, H_q, 8)
     s0[0, :, [1, 3]] = 100.0
     if B > 1:

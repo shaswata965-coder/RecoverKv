@@ -3,9 +3,27 @@
 Orchestration only.  No scoring math, no Top-K math, no attention computation,
 no RoPE math — only calls into :mod:`state` and :mod:`policy`.
 
-NOTE: This module is byte-identical to ``modules/windowed_cache/cache.py``
-(backends only differ in their ``hooks.py``). Any change here MUST be mirrored
-to the flash twin until the duplication is refactored away.
+NOTE: This module used to be byte-identical to
+``modules/windowed_cache/cache.py`` (the backends differed only in their
+``hooks.py``), and everything except the layer-major decode store still is. Any
+change here MUST be mirrored to the flash twin until the duplication is
+refactored away.
+
+**The one divergence: layer-major decode (DECODE_SPEED_PLAN.md §4.1).** The flash
+twin folds ``L`` into the row axis after the first eviction so all 32 layers
+evict in one pass; this twin still evicts per layer, because the change is a
+launch-count optimization for the fused decode path and this backend — the
+reference/quality path — never reaches that kernel. Consequences to know:
+
+* **Outputs are unaffected.** ``tests/test_quant_cache.py::
+  test_flash_eager_two_tier_parity`` drives both twins step for step and compares
+  K/V, active window ids and effective length; it passes with the twins on
+  different eviction orderings, because the reordering is semantics-preserving.
+* **Synthetic fixtures must be driven differently.** This twin evicts AFTER
+  appending, so a hand-written ``window_scores`` here is sized to the post-append
+  store; the flash twin compacts first and wants the width of the store as it
+  stands. Real runs are unaffected — a score hook produces the latter in both
+  cases, since it runs after the previous step's append.
 """
 
 from __future__ import annotations

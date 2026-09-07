@@ -111,6 +111,54 @@ class QuantSlotTable:
         # with a [B*n] vector costs kilobytes instead.
         self._row_base = (torch.arange(B, device=device) * N).unsqueeze(1)  # [B, 1]
 
+    # -- layer-major join (DECODE_SPEED_PLAN.md §4.1) -------------------------
+
+    @classmethod
+    def join_layers(cls, tables: "list[QuantSlotTable]") -> "QuantSlotTable":
+        """Fold ``L`` per-layer tables into one whose row axis is ``L*B``.
+
+        The row axis is already opaque to every method here — ``lookup`` matches
+        ``[B, W, N]``, ``free_slots`` argsorts along the slot axis, ``write`` and
+        ``gather`` flat-index through :attr:`_row_base` — so widening it from
+        ``B`` to ``L*B`` needs no code change at all, only the concatenated
+        tensors and a rebuilt ``_row_base``. Layer ``i`` owns rows
+        ``[i*B, (i+1)*B)``, matching :meth:`CacheState.join_layers`.
+
+        Every table must share ``n_slots``, ``window_size``, ``head_dim`` and
+        ``num_kv_heads`` — all config-derived, hence identical across layers, and
+        checked here so a mismatch raises instead of concatenating into a table
+        whose rows mean different things.
+        """
+        if not tables:
+            raise ValueError("join_layers needs at least one table")
+        ref = tables[0]
+        for i, t in enumerate(tables):
+            if (t.n_slots, t.window_size, t.head_dim, t.num_kv_heads,
+                    t.batch_size) != (ref.n_slots, ref.window_size, ref.head_dim,
+                                      ref.num_kv_heads, ref.batch_size):
+                raise RuntimeError(
+                    f"join_layers: layer {i}'s slot table geometry differs from "
+                    "layer 0's; every layer resolves the same config, so this "
+                    "means the tables were built against different settings"
+                )
+        joint = cls.__new__(cls)
+        joint.batch_size = ref.batch_size * len(tables)
+        joint.n_slots = ref.n_slots
+        joint.window_size = ref.window_size
+        joint.head_dim = ref.head_dim
+        joint.num_kv_heads = ref.num_kv_heads
+        for field in ("key_codes", "key_scale", "key_zero",
+                      "val_codes", "val_scale", "val_zero",
+                      "slot_wid", "slot_active", "slot_pos"):
+            setattr(joint, field, torch.cat(
+                [getattr(t, field) for t in tables], dim=0
+            ).contiguous())
+        joint._row_base = (
+            torch.arange(joint.batch_size, device=ref.slot_wid.device)
+            * joint.n_slots
+        ).unsqueeze(1)
+        return joint
+
     # -- flat addressing -----------------------------------------------------
 
     def _flat(self, slot_idx: Tensor) -> Tensor:

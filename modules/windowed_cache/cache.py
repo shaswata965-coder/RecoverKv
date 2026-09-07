@@ -3,9 +3,22 @@
 Orchestration only.  No scoring math, no Top-K math, no attention computation,
 no RoPE math — only calls into :mod:`state` and :mod:`policy`.
 
-NOTE: This module is byte-identical to ``modules/windowed_eager_cache/cache.py``
-(backends only differ in their ``hooks.py``). Any change here MUST be mirrored
-to the eager twin until the duplication is refactored away.
+NOTE: This module used to be byte-identical to
+``modules/windowed_eager_cache/cache.py`` (the backends differed only in their
+``hooks.py``), and everything except the layer-major decode store still is. Any
+change here MUST be mirrored to the eager twin until the duplication is
+refactored away.
+
+**The one divergence: layer-major decode (DECODE_SPEED_PLAN.md §4.1).** This twin
+folds ``L`` into the row axis after the first eviction so all 32 layers evict in
+one pass; the eager twin still evicts per layer. That is a launch-count change on
+the flash decode path, which is the only path the decode benchmark measures — the
+eager backend is the reference/quality path and never reaches the fused decode
+kernel. **The two still produce identical caches**, which is not an assumption:
+``tests/test_quant_cache.py::test_flash_eager_two_tier_parity`` runs both and
+compares K/V, active window ids and effective length every step, and
+``tests/test_layer_major_evict.py`` pins the same equivalence within this twin
+against ``STICKYKV_LAYER_MAJOR_DECODE=0``.
 """
 
 from __future__ import annotations
@@ -36,7 +49,7 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
-from modules.quant.slots import n_slots_for
+from modules.quant.slots import QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +142,193 @@ def _compile_evict_backend() -> Optional[str]:
     """
     v = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND", "").strip()
     return v or None
+
+
+def _layer_major_decode() -> bool:
+    """Whether decode uses the layer-major store (default **ON**).
+
+    This is DECODE_SPEED_PLAN §4.1 and it is the shipped path, not an experiment:
+    one eviction for all ``L`` layers instead of ``L`` of them, which is a 32x cut
+    on ~64% of the per-token launch budget.
+
+    ``STICKYKV_LAYER_MAJOR_DECODE=0`` restores the per-layer eviction. It exists
+    for two reasons and no others: it is the control arm of
+    ``tests/test_layer_major_evict.py``, which asserts the two paths produce
+    byte-identical caches, and it is how the same A/B is run on a GPU. It is not
+    a fallback — nothing selects it automatically, and no failure degrades into
+    it; a layer-major path that cannot run raises.
+    """
+    v = os.environ.get("STICKYKV_LAYER_MAJOR_DECODE", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _prefill_layer_major() -> bool:
+    """Whether PREFILL also allocates layer-major (default OFF).
+
+    Decode is layer-major unconditionally — that is DECODE_SPEED_PLAN §4.1 and
+    it is the default path, not a flag. Prefill is not, and the reason is memory
+    rather than taste: a layer-major prompt buffer means the first compaction has
+    to hold the whole ``L*B``-row prompt AND the whole ``L*B``-row steady store at
+    once, where per-layer buffers compact one at a time and only ever hold a
+    single layer's steady store alongside the prompt. At 4096/batch-32 that is
+    about +4 GB of peak — roughly 8% of the cell, taken straight out of max
+    batch, which is the number the whole method exists to raise.
+
+    So prefill stays per-layer and this knob exists to MEASURE the other side on
+    a box where the peak has headroom. It changes allocation only; the eviction,
+    the retained set and the cache contents are identical either way.
+    """
+    v = os.environ.get("STICKYKV_PREFILL_LAYER_MAJOR", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+class _LayerStateView:
+    """Read-only per-layer window onto the layer-major :class:`CacheState`.
+
+    ``WindowedCache._states[i]`` keeps working after the join — for the score
+    hooks, the parity runner and the tests — by becoming one of these. Slices are
+    built lazily on attribute access (a view, no kernel) rather than refreshed
+    eagerly every step, so the fused decode path, which reads none of them, pays
+    nothing.
+
+    Writes go through the joint state, never through a view: a view has no
+    buffers of its own and silently mutating one would desynchronise the layer
+    from the store the eviction actually rewrites.
+    """
+
+    __slots__ = ("_joint", "_r0", "_rows")
+
+    def __init__(self, joint: CacheState, r0: int, rows: int) -> None:
+        self._joint = joint
+        self._r0 = r0
+        self._rows = rows
+
+    def _rowslice(self, t: Optional[Tensor]) -> Optional[Tensor]:
+        return None if t is None else t[self._r0:self._r0 + self._rows]
+
+    @property
+    def key_states(self) -> Optional[Tensor]:
+        return self._rowslice(self._joint.key_states)
+
+    @property
+    def value_states(self) -> Optional[Tensor]:
+        return self._rowslice(self._joint.value_states)
+
+    @property
+    def position_ids(self) -> Optional[Tensor]:
+        return self._rowslice(self._joint.position_ids)
+
+    @property
+    def window_scores(self) -> Optional[Tensor]:
+        return self._rowslice(self._joint.window_scores)
+
+    @property
+    def original_window_ids(self) -> Optional[Tensor]:
+        return self._rowslice(self._joint.original_window_ids)
+
+    @property
+    def seq_length(self) -> int:
+        return self._joint.seq_length
+
+
+class _ReadOnlySlotTableView(QuantSlotTable):
+    """One layer's rows of a layer-major slot table, for reads only.
+
+    Every read on :class:`QuantSlotTable` goes through the row axis generically —
+    ``lookup`` matches ``[B, W, N]``, ``free_slots`` and ``active_order`` argsort
+    the slot axis, ``gather`` flat-indexes through ``_row_base`` — so a view built
+    from row slices plus a rebuilt ``_row_base`` answers all of them exactly for
+    the layer it covers.
+
+    The mutators do NOT work on a slice: ``retain_only`` rebinds ``slot_wid``
+    rather than writing through it, so a mutation here would land on the view and
+    vanish. They raise instead of silently doing nothing — the eviction mutates
+    the joint table directly and has no reason to come through here.
+    """
+
+    def __init__(self, parent: QuantSlotTable, r0: int, rows: int) -> None:
+        self.batch_size = rows
+        self.n_slots = parent.n_slots
+        self.window_size = parent.window_size
+        self.head_dim = parent.head_dim
+        self.num_kv_heads = parent.num_kv_heads
+        for field in ("key_codes", "key_scale", "key_zero",
+                      "val_codes", "val_scale", "val_zero",
+                      "slot_wid", "slot_active", "slot_pos"):
+            setattr(self, field, getattr(parent, field)[r0:r0 + rows])
+        self._row_base = (
+            torch.arange(rows, device=parent.slot_wid.device) * parent.n_slots
+        ).unsqueeze(1)
+
+    def _readonly(self, *_a, **_k):
+        raise RuntimeError(
+            "this slot table is a per-layer VIEW of the layer-major table and is "
+            "read-only; mutations must go through the joint table the batched "
+            "eviction owns (WindowedCache._joint_store.table)"
+        )
+
+    write = set_active = retain_only = _readonly
+
+
+class _LayerStoreView:
+    """Read-only per-layer window onto the layer-major :class:`QuantizedStore`.
+
+    The counts (``num_active_windows``, ``num_active_tokens``, ``version``) are
+    layer-independent by construction — they come from the budget resolver, which
+    every layer resolves identically — so they pass straight through.
+    :meth:`active_ids` and :attr:`table` are row-shaped and get sliced.
+    """
+
+    __slots__ = ("_joint", "_r0", "_rows")
+
+    def __init__(self, joint: QuantizedStore, r0: int, rows: int) -> None:
+        self._joint = joint
+        self._r0 = r0
+        self._rows = rows
+
+    @property
+    def num_active_windows(self) -> int:
+        return self._joint.num_active_windows
+
+    @property
+    def num_active_tokens(self) -> int:
+        return self._joint.num_active_tokens
+
+    @property
+    def version(self) -> int:
+        return self._joint.version
+
+    @property
+    def memoize_read(self) -> bool:
+        return self._joint.memoize_read
+
+    @property
+    def table(self):
+        """This layer's rows of the joint slot table (read-only).
+
+        At ``L == 1`` the slice is the whole table, so the joint object is handed
+        back unwrapped — no view, no copy, and mutators keep working for the
+        single-layer callers (the quant unit tests) that drive the store directly.
+        """
+        t = self._joint.table
+        if t is None or (self._r0 == 0 and self._rows == t.batch_size):
+            return t
+        return _ReadOnlySlotTableView(t, self._r0, self._rows)
+
+    def active_ids(self) -> Optional[Tensor]:
+        ids = self._joint.active_ids()
+        return None if ids is None else ids[self._r0:self._r0 + self._rows]
+
+    def validate(self) -> None:
+        """Assert the joint store's invariants (test-only; syncs).
+
+        Deliberately validates the WHOLE table rather than this layer's slice:
+        the invariants — one slot per window id per row, no active-but-free slot,
+        ``_n_active`` agreeing with ``slot_active`` — are properties of the table
+        the eviction actually writes, and checking a read-only slice of it would
+        be a weaker claim that could pass while the joint table was broken.
+        """
+        self._joint.validate()
 
 
 def _clamp_index(x: Tensor, hi) -> Tensor:
@@ -422,6 +622,54 @@ class WindowedCache(_HFCacheBase):
         # backends' score hooks consume it; see modules.quant.effective.
         self._last_score_meta: List[Optional[Any]] = [None] * num_layers
 
+        # -----------------------------------------------------------------
+        # Layer-major decode (DECODE_SPEED_PLAN.md §4.1)
+        # -----------------------------------------------------------------
+        # Every layer evicts on the SAME step, at shapes that come from config
+        # and W rather than from data, so all 32 evictions are one call over a
+        # wider row axis. Folding L into the row axis (R = L*B, layer i owning
+        # rows [i*B, (i+1)*B)) is enough: every op the eviction performs is
+        # per-row, so the body is unchanged and only the row count grows. That
+        # takes the eviction from 273 launching ops x 32 layers = 8,736 per
+        # eviction to 273 — the single largest launch cut available, and the
+        # eviction is ~64% of the amortized per-token launch budget.
+        #
+        # PHASES. Prefill and the first eviction run PER LAYER, exactly as
+        # before: joining before the first compaction would require the prompt
+        # to be resident in one L*B-row tensor, which raises the prefill peak by
+        # a whole extra copy of the steady-state cache — and peak memory is the
+        # number this method exists to lower. So the join happens immediately
+        # AFTER the first eviction, when every per-layer prompt buffer has
+        # already been released and the copy peaks at two steady-state stores
+        # instead. Layer-major prefill is a separate, gated change (see
+        # _PREFILL_LAYER_MAJOR).
+        #
+        # ORDERING. From the join onward, eviction moves from "inside layer i's
+        # update, after that layer appended this step's token" to "once, before
+        # any layer appends". It has to: when layer 0's update runs at step t,
+        # layers 1..L-1 have not produced token t yet, so the only state all L
+        # layers share is the state as of the end of step t-1. The retained set
+        # is unchanged — compute_two_tier_retain reads only window_scores, whose
+        # width and values are the same either way, and this step's token has no
+        # score column and sits in the never-evictable local region — so the
+        # cache at the END of each step is identical; only "append then compact"
+        # becomes "compact then append". tests/test_layer_major_evict.py pins
+        # that byte-for-byte against the per-layer path.
+        self._layer_major: bool = _layer_major_decode()
+        self._joint: Optional[CacheState] = None
+        self._joint_store: Optional[QuantizedStore] = None
+        self._joint_step: int = 0
+        self._joint_write_at: int = 0
+        self._layers_opened: int = 0
+        self._evicted_this_step: int = 0
+        self._steady_capacity: int = steady
+        # The joint Q-tier read, memoized on the joint store's version exactly as
+        # QuantizedStore.effective_q_tier memoizes the per-layer one. Only the
+        # materialize path uses it; the fused path never dequantizes.
+        self._joint_qtier_memo: Optional[Any] = None
+        # [L*B, n_q*ws] frozen Q-tier positions, rebuilt with the fused context.
+        self._joint_qpos: Optional[Tensor] = None
+
     # -----------------------------------------------------------------
     # HF Cache interface
     # -----------------------------------------------------------------
@@ -473,6 +721,51 @@ class WindowedCache(_HFCacheBase):
         cache_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Append new KV states and optionally evict.
+
+        Two phases, switched once and never switched back (§4.1, and the
+        ``_joint`` block in :meth:`__init__`):
+
+        * **before the first eviction** — :meth:`_update_per_layer`, this cache's
+          original body: prefill and step 0, per layer, each layer owning its own
+          prompt-sized buffer.
+        * **after it** — :meth:`_update_joint`: one layer-major store, one
+          batched eviction for all ``L`` layers, and each layer's ``update``
+          reduced to writing its own rows.
+
+        The switch happens in :meth:`_migrate_to_joint`, on the first ``update``
+        of the step **after** every layer has evicted for the first time — not at
+        the end of that eviction step, because the tensors this method already
+        returned for that step (and the fused hand-off built from them) must stay
+        valid until the model has finished with them.
+        """
+        if (self._joint is None and self._layer_major
+                and self._evicted_this_step > 0 and layer_idx == 0):
+            if self._evicted_this_step != self.num_layers:
+                raise RuntimeError(
+                    f"{self._evicted_this_step} of {self.num_layers} layers "
+                    "evicted on the first eviction step. Every layer shares one "
+                    "schedule and one budget, so a partial eviction means some "
+                    "layer reached update() unscored — the batched decode path "
+                    "cannot be built on layers that are not in lockstep, and "
+                    "silently staying per-layer would hide the unscored layer."
+                )
+            self._migrate_to_joint()
+        if self._joint is not None:
+            return self._update_joint(
+                key_states, value_states, layer_idx, cache_kwargs
+            )
+        return self._update_per_layer(
+            key_states, value_states, layer_idx, cache_kwargs
+        )
+
+    def _update_per_layer(
+        self,
+        key_states: Tensor,
+        value_states: Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Per-layer append + evict — prefill and the first eviction.
 
         Steps:
         1. ``state.append(k, v, pos)``
@@ -593,6 +886,7 @@ class WindowedCache(_HFCacheBase):
         if should_evict and state.window_scores is not None and self._q > 0.0:
             # Two-tier eviction (design §5). B == 1 in v1 (guarded at append).
             self._evict_two_tier(layer_idx, step)
+            self._evicted_this_step += 1
         elif should_evict and state.window_scores is not None:
             B = state.key_states.shape[0]
             H_q = state.window_scores.shape[1]
@@ -654,6 +948,7 @@ class WindowedCache(_HFCacheBase):
 
             # Update policy
             policy.set_total_after_compaction(state.seq_length)
+            self._evicted_this_step += 1
 
         # Advance generation step (only after prefill is done)
         if not is_prefill:
@@ -706,6 +1001,486 @@ class WindowedCache(_HFCacheBase):
             self._last_score_meta[layer_idx] = score_meta
             return eff_k, eff_v
         return state.key_states, state.value_states
+
+    # -----------------------------------------------------------------
+    # Layer-major decode (DECODE_SPEED_PLAN.md §4.1)
+    # -----------------------------------------------------------------
+
+    def _migrate_to_joint(self) -> None:
+        """Fold the ``L`` per-layer stores into one whose row axis is ``L*B``.
+
+        Runs once, on the first ``update`` after every layer has evicted. At that
+        point each layer's prompt-sized buffer has already been released by
+        ``CacheState.replace`` (which reallocates down to the steady capacity at
+        the first compaction), so the copy peaks at two steady-state stores
+        rather than at the prompt — which is why prefill is left per-layer.
+
+        After this, ``_states[i]`` / ``_stores[i]`` become read-only views onto
+        the joint objects so the score hooks, the parity runner and the tests
+        keep reading a per-layer shape.
+        """
+        B = self._states[0].key_states.shape[0]
+        self._joint = CacheState.join_layers(self._states, self._steady_capacity)
+        if self._q > 0.0:
+            self._joint_store = QuantizedStore.join_layers(self._stores)
+        # Per-layer handles become views. The originals are dropped here, which
+        # is what releases the L separate steady buffers the join copied from.
+        self._states = [
+            _LayerStateView(self._joint, i * B, B) for i in range(self.num_layers)
+        ]
+        if self._joint_store is not None:
+            self._stores = [
+                _LayerStoreView(self._joint_store, i * B, B)
+                for i in range(self.num_layers)
+            ]
+        # The memoized fused hand-offs were built against the per-layer stores.
+        self._fused_ctx = [None] * self.num_layers
+        self._joint_qtier_memo = None
+        # Every layer advanced its own counter identically; adopt it as the one
+        # global step, and keep the per-layer list in sync for the readers that
+        # still index it (ours_parity_runner, demo_generate).
+        self._joint_step = self._generation_step[0]
+        self._layers_opened = 0
+        self._evicted_this_step = 0
+
+    def _begin_step(self, n_new: int, position_ids: Optional[Tensor]) -> None:
+        """Open one decode step for ALL layers at once — the §4.1 batched pass.
+
+        Runs exactly once per step, from the first layer's ``update``, and does
+        in three calls what the per-layer path did in ``3 * L``:
+
+        1. accumulate every layer's pending window scores (one ``cat``, one add),
+        2. evict every layer in ONE batched pass when the schedule says so,
+        3. reserve this step's token slot and write its positions.
+
+        Step 2 is the reorder §4.1 rests on: it runs **before** any layer has
+        appended this step's token, because that token does not exist yet for
+        layers 1..L-1. The retained set is unaffected — the tier assignment reads
+        only ``window_scores``, and this step's token has no score column — so the
+        cache at the end of the step is identical to appending first and
+        compacting after.
+        """
+        step = self._joint_step
+        joint = self._joint
+
+        # A dequantized Q tier is only carried between steps when the store's own
+        # read memo is on; at its B>1 default (off) it is dropped here so the
+        # materialize path never holds one longer than the step that built it.
+        if self._joint_store is not None and not self._joint_store.memoize_read:
+            self._joint_qtier_memo = None
+
+        # 1. Scores. The hooks wrote one [B, H_q, W] per layer during the
+        #    previous step's forward; concatenating in layer order lands each
+        #    layer on exactly the rows join_layers gave it.
+        pending = []
+        missing = []
+        for i in range(self.num_layers):
+            lk = self.cache_kwargs.get(i)
+            ws_i = lk.pop("window_scores", None) if lk is not None else None
+            pending.append(ws_i)
+            if ws_i is None:
+                missing.append(i)
+        if len(missing) < self.num_layers:
+            if missing:
+                raise RuntimeError(
+                    f"layers {missing} produced no window scores for step "
+                    f"{step} while the others did. Scoring is per layer per "
+                    "step and kernel-or-error; a partial step means one layer's "
+                    "score hook silently returned, and accumulating the rest "
+                    "would time an unscored layer under this method's name."
+                )
+            self._check_score_width(pending[0].shape[-1])
+            self._accumulate_joint_scores(torch.cat(pending, dim=0))
+
+        # 2. Eviction — one pass over L*B rows.
+        if (self._policies[0].should_evict(step)
+                and joint.window_scores is not None):
+            self._evict_joint(step)
+
+        # 3. This step's token slot, for every layer at once. Each layer's K/V
+        #    lands later, in its own update(), through write_rows.
+        self._joint_write_at = joint.reserve(n_new, position_ids)
+        for policy in self._policies:
+            policy.extend_total_after_append(n_new)
+
+        self._joint_step = step + 1
+        for i in range(self.num_layers):
+            self._generation_step[i] = self._joint_step
+
+    def _merged_window_count(self) -> int:
+        """Merged (fp body + Q) window count of the joint store as it stands."""
+        ws = self.resolved.window_size
+        body = max(self._joint.seq_length - self.resolved.num_sink_tokens, 0)
+        n_q = (
+            self._joint_store.num_active_windows
+            if self._joint_store is not None else 0
+        )
+        return -(-body // ws) + n_q
+
+    def _check_score_width(self, width: int) -> None:
+        """The incoming score axis must describe the store the eviction will see.
+
+        Under the batched ordering the eviction runs **before** this step's token
+        is appended, so the scores it consumes and the store it compacts describe
+        the same key set — which is exactly what a score pass over the previous
+        step's attention produces, since that attention ran after that step's
+        append. The two agreeing is not an accident, it is the contract.
+
+        Violating it is silent and catastrophic rather than merely wrong: a score
+        axis one window wider than the store makes ``n_ev_fp_cur`` over-count, so
+        the rebuild's ``searchsorted`` resolves a window id that is not in the
+        body, clamps to the end, and lands the same token in both tiers. Cheaper
+        to refuse than to debug.
+        """
+        want = self._merged_window_count()
+        if width != want:
+            raise RuntimeError(
+                f"window scores span {width} merged windows but the store spans "
+                f"{want} (fp body {self._joint.seq_length} tokens, "
+                f"{self._merged_window_count() - width} window(s) apart). The "
+                "batched eviction compacts BEFORE this step's token is appended, "
+                "so scores must describe the store as it stands now — i.e. the "
+                "key set the previous step's attention saw. A width sized for "
+                "the post-append store belongs to the per-layer ordering "
+                "(STICKYKV_LAYER_MAJOR_DECODE=0)."
+            )
+
+    def _accumulate_joint_scores(self, new_window_scores: Tensor) -> None:
+        """Accumulate ``[L*B, H_q, W_new]`` into the joint running scores.
+
+        The layer-major counterpart of step 3 of :meth:`_update_per_layer`, with
+        the same width-reconciliation: a wider incoming tensor extends the
+        running scores and mints new original window ids, a narrower one is
+        right-padded so the in-place add keeps ``accumulate``'s contract. All
+        ``L`` layers share one width (they append the same tokens on the same
+        steps), so this runs once instead of ``L`` times.
+        """
+        joint = self._joint
+        if joint.window_scores is None:
+            joint.window_scores = new_window_scores.clone()
+            W = new_window_scores.shape[-1]
+            R = new_window_scores.shape[0]
+            joint.original_window_ids = (
+                torch.arange(W, device=new_window_scores.device, dtype=torch.long)
+                .unsqueeze(0).expand(R, -1).contiguous()
+            )
+            for i in range(self.num_layers):
+                self._next_original_window_id[i] = W
+            return
+
+        W_old = joint.window_scores.shape[-1]
+        W_new = new_window_scores.shape[-1]
+        if W_new > W_old:
+            pad = torch.zeros(
+                joint.window_scores.shape[0], joint.window_scores.shape[1],
+                W_new - W_old,
+                device=joint.window_scores.device,
+                dtype=joint.window_scores.dtype,
+            )
+            joint.window_scores = torch.cat([joint.window_scores, pad], dim=-1)
+            if joint.original_window_ids is not None:
+                n_extra = W_new - W_old
+                start_id = self._next_original_window_id[0]
+                R = joint.original_window_ids.shape[0]
+                extra = (
+                    torch.arange(
+                        start_id, start_id + n_extra,
+                        device=joint.original_window_ids.device, dtype=torch.long,
+                    ).unsqueeze(0).expand(R, -1)
+                )
+                joint.original_window_ids = torch.cat(
+                    [joint.original_window_ids, extra], dim=1
+                )
+                for i in range(self.num_layers):
+                    self._next_original_window_id[i] = start_id + n_extra
+        elif W_new < W_old:
+            pad = torch.zeros(
+                new_window_scores.shape[0], new_window_scores.shape[1],
+                W_old - W_new,
+                device=new_window_scores.device, dtype=new_window_scores.dtype,
+            )
+            new_window_scores = torch.cat([new_window_scores, pad], dim=-1)
+        accumulate(joint.window_scores, new_window_scores)
+
+    def _evict_joint(self, step: int) -> None:
+        """One eviction for every layer. ``layer_idx=None`` selects the joint state.
+
+        At ``q > 0`` this is :meth:`_evict_two_tier` over ``L*B`` rows — the same
+        body, the same compiled path, ``L`` times fewer launches. At ``q == 0`` it
+        is the single-tier retain, likewise widened.
+        """
+        if self._q > 0.0:
+            self._evict_two_tier(None, step)
+            self._joint_qtier_memo = None
+            for policy in self._policies:
+                policy.set_total_after_compaction(
+                    self._joint.seq_length + self._joint_store.num_active_tokens
+                )
+            return
+
+        joint = self._joint
+        policy = self._policies[0]
+        R = joint.key_states.shape[0]
+        H_q = joint.window_scores.shape[1]
+        retained_window_idx = policy.compute_retain_window_indices(
+            joint.window_scores
+        )
+        retain_token_idx = policy.expand_to_token_indices(
+            retained_window_idx, joint.window_scores.shape[2]
+        )
+        self._record_joint_scores(step, joint.window_scores, retain_token_idx)
+        old_positions = (
+            torch.gather(
+                joint.position_ids, 1,
+                retain_token_idx.to(joint.position_ids.device),
+            ).clone()
+            if self.resolved.rerotate_on_evict
+            else None
+        )
+        joint.slice_and_keep(retain_token_idx)
+        if self.resolved.rerotate_on_evict:
+            joint.rerotate_keys(self.rope_module, old_positions)
+        idx_w = retained_window_idx.unsqueeze(1).expand(R, H_q, -1)
+        joint.window_scores = torch.gather(
+            joint.window_scores, dim=-1, index=idx_w
+        ).contiguous()
+        if joint.original_window_ids is not None:
+            joint.original_window_ids = torch.gather(
+                joint.original_window_ids, 1,
+                retained_window_idx.to(joint.original_window_ids.device),
+            ).contiguous()
+        for p in self._policies:
+            p.set_total_after_compaction(joint.seq_length)
+
+    def _record_joint_scores(
+        self, step: int, window_scores: Tensor, retained: Tensor
+    ) -> None:
+        """Split the joint row axis back into layers for the telemetry recorder.
+
+        Telemetry is per layer by contract and the joint tensors are ``L*B``-row,
+        so the split has to happen somewhere. It happens here, and only when a
+        real recorder is installed: the perf suite runs ``NullTelemetry`` and must
+        not pay ``L`` slices per eviction for a no-op.
+        """
+        if isinstance(self.telemetry, NullTelemetry):
+            return
+        B = window_scores.shape[0] // self.num_layers
+        for i in range(self.num_layers):
+            r0 = i * B
+            self.telemetry.record_scores(
+                i, step, window_scores[r0:r0 + B], retained[r0:r0 + B]
+            )
+
+    def _update_joint(
+        self,
+        key_states: Tensor,
+        value_states: Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """One layer's part of a layer-major decode step.
+
+        Everything shared — scores, eviction, the length advance, the position
+        write — happened once in :meth:`_begin_step`. What is left per layer is
+        writing this layer's K/V into its own rows and building its return value.
+        """
+        if key_states.shape[2] != 1 and self._joint.seq_length > 0:
+            # A multi-token update after the join means a second prompt, which
+            # this cache does not model: the joint store's capacity, the window
+            # schedule and the score width are all sized for one prompt followed
+            # by single-token decode.
+            raise RuntimeError(
+                f"layer {layer_idx} appended {key_states.shape[2]} tokens after "
+                "the layer-major decode store was built; only single-token "
+                "decode steps are defined past the first eviction."
+            )
+        B = key_states.shape[0]
+        if self._layers_opened >= self.num_layers:
+            self._layers_opened = 0
+
+        # Scores handed in with the call, rather than pre-written to
+        # cache.cache_kwargs[layer_idx] by a score hook. The batched step reads
+        # every layer's pending scores in one pass at the START of the step, so
+        # an inline score can only be consumed in the same step it arrived if the
+        # step has not been opened yet — i.e. on the first update() of the step.
+        # It is stashed where _begin_step looks, which is exactly what the hooks
+        # do; past that point it would be picked up a step late, and a silent
+        # one-step shift in the eviction's evidence is precisely the kind of
+        # change this path must not make quietly.
+        inline_scores = (
+            cache_kwargs.get("window_scores") if cache_kwargs is not None else None
+        )
+        if inline_scores is not None:
+            if self._layers_opened != 0:
+                raise RuntimeError(
+                    f"layer {layer_idx} passed window_scores through update()'s "
+                    "cache_kwargs after this step was already opened by an "
+                    "earlier layer. The batched decode path collects every "
+                    "layer's scores once per step, before any layer appends, so "
+                    "these would be accumulated one step late. Write them to "
+                    "cache.cache_kwargs[layer_idx]['window_scores'] during the "
+                    "previous step instead — that is what both score hooks do."
+                )
+            self.cache_kwargs.setdefault(layer_idx, {})["window_scores"] = (
+                inline_scores
+            )
+
+        if self._layers_opened == 0:
+            pos = (
+                cache_kwargs.get("cache_position")
+                if cache_kwargs is not None else None
+            )
+            self._begin_step(key_states.shape[2], pos)
+        self._layers_opened += 1
+
+        joint = self._joint
+        r0 = layer_idx * B
+        joint.write_rows(r0, B, key_states, value_states, self._joint_write_at)
+
+        k_layer = joint.key_states[r0:r0 + B]
+        v_layer = joint.value_states[r0:r0 + B]
+        if self._q <= 0.0:
+            return k_layer, v_layer
+
+        store = self._joint_store
+        ws = self.resolved.window_size
+        if self._fused_decode_active and store.num_active_windows > 0:
+            from . import flash_decode
+            n = store.num_active_windows
+            qtier = self._fused_qtier_joint(layer_idx, store, B, n, ws)
+            score_meta = self._fused_meta_joint(layer_idx, B, ws)
+            flash_decode.set_pending({
+                "layer_idx": layer_idx,
+                "qtier": qtier,
+                "score_meta": score_meta,
+                "num_sink": self.resolved.num_sink_tokens,
+                "window_size": ws,
+                "scaling": self._attn_scaling,
+                "cache": self,
+            })
+            self._last_effective_k[layer_idx] = None
+            self._last_score_meta[layer_idx] = None
+            return k_layer, v_layer
+
+        eff_k, eff_v, score_meta = self._materialize_joint(layer_idx, B)
+        self._last_effective_k[layer_idx] = eff_k
+        self._last_score_meta[layer_idx] = score_meta
+        return eff_k, eff_v
+
+    def _build_joint_fused_ctx(self, store, B: int, n: int, ws: int) -> None:
+        """Rebuild EVERY layer's fused hand-off in one pass.
+
+        The per-layer :meth:`_fused_qtier` costs ~21 launches per layer to gather
+        the active slots and derive the RoPE halves; layer-major it is one gather
+        and one rotary call for all ``L``, then ``L`` free views. The memo
+        contract is unchanged — keyed on the store's version, which only moves at
+        eviction — so this fires once per eviction cycle, not once per step.
+
+        The split back to per-layer dicts is exact: ``QuantSlotTable.gather``
+        flattens ``[R, n]`` row-major and ``R = L*B`` is laid out layer-major, so
+        the flat axis is ``(layer, row, slot)`` and reshaping to ``[L, B, n, …]``
+        puts each layer's slots where :meth:`_migrate_to_joint` put its rows.
+        """
+        from .decode_kernel import rope_cos_sin_halves
+
+        L = self.num_layers
+        idx = store.table.active_order(n)                       # [R, n] slots
+        kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)  # [R*n, …]
+        fields = [t.reshape(L, B, n, *t.shape[1:]) for t in (kc, ks, kz, vc, vs, vz)]
+        qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
+        cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
+        self._joint_qpos = qpos_flat
+
+        key = (store.version, n, B)
+        kc, ks, kz, vc, vs, vz = fields
+        for i in range(L):
+            r0 = i * B
+            self._fused_ctx[i] = {
+                "qkey": key,
+                "qtier": {
+                    "k_codes": kc[i], "k_scale": ks[i], "k_zero": kz[i],
+                    "v_codes": vc[i], "v_scale": vs[i], "v_zero": vz[i],
+                    "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
+                    "window_size": ws,
+                },
+                "qpos": qpos_flat[r0:r0 + B],
+                "mkey": None, "score_meta": None,
+            }
+
+    def _fused_qtier_joint(self, layer_idx: int, store, B: int, n: int, ws: int):
+        """Layer ``layer_idx``'s Q-tier context, off the layer-major rebuild."""
+        slot = self._fused_ctx[layer_idx]
+        key = (store.version, n, B)
+        if slot is None or slot["qkey"] != key:
+            self._build_joint_fused_ctx(store, B, n, ws)
+            slot = self._fused_ctx[layer_idx]
+        return slot["qtier"]
+
+    def _fused_meta_joint(self, layer_idx: int, B: int, ws: int):
+        """Layer ``layer_idx``'s ``(order, q_token_len)`` scatter map.
+
+        Same window-epoch memo as :meth:`_fused_meta` — ``compute_score_meta``
+        reads the fp body's positions at a ``ws`` stride, so its result depends on
+        the body only through how many whole windows it spans — and likewise
+        rebuilt for all ``L`` layers at once, since the joint positions are one
+        tensor.
+        """
+        slot = self._fused_ctx[layer_idx]
+        num_sink = self.resolved.num_sink_tokens
+        n_body = max(self._joint.position_ids.shape[1] - num_sink, 0)
+        n_body_win = -(-n_body // ws)            # ceil
+        key = (slot["qkey"], n_body_win)
+        if slot["mkey"] == key:
+            return slot["score_meta"]
+
+        from modules.quant.effective import compute_score_meta
+
+        order, q_token_len = compute_score_meta(
+            self._joint.position_ids, self._joint_qpos, num_sink, ws,
+        )
+        for i in range(self.num_layers):
+            s = self._fused_ctx[i]
+            s["mkey"] = (s["qkey"], n_body_win)
+            r0 = i * B
+            s["score_meta"] = (order[r0:r0 + B], q_token_len)
+        return slot["score_meta"]
+
+    def _joint_qtier_read(self):
+        """The joint dequantized + RoPE'd Q tier, for the materialize path.
+
+        One call for all ``L`` layers instead of ``L``. Held across steps only
+        when the store's own read memo is on (``quant_memoize_read``, default:
+        on at B=1, off above) — :meth:`_begin_step` drops it otherwise, so the
+        B>1 default still never carries a dequantized tier between steps.
+        """
+        store = self._joint_store
+        memo = self._joint_qtier_memo
+        if memo is not None and memo[0] == store.version:
+            return memo[1]
+        res = store.effective_q_tier(
+            self.rope_module, self._joint.key_states.dtype
+        )
+        self._joint_qtier_memo = (store.version, res)
+        return res
+
+    def _materialize_joint(self, layer_idx: int, B: int):
+        """``[sink ‖ body ‖ Q]`` effective K/V for one layer of the joint store."""
+        joint = self._joint
+        store = self._joint_store
+        r0 = layer_idx * B
+        k_layer = joint.key_states[r0:r0 + B]
+        v_layer = joint.value_states[r0:r0 + B]
+        if store is None or store.num_active_windows == 0:
+            return k_layer, v_layer, None
+        q_k, q_v, q_pos = self._joint_qtier_read()
+        return materialize_effective_kv(
+            k_layer, v_layer, joint.position_ids[r0:r0 + B], store,
+            num_sink=self.resolved.num_sink_tokens,
+            window_size=self.resolved.window_size,
+            rope_module=self.rope_module,
+            out_dtype=joint.key_states.dtype,
+            q_tier=(q_k[r0:r0 + B], q_v[r0:r0 + B], q_pos[r0:r0 + B]),
+        )
 
     # -----------------------------------------------------------------
     # Fused-decode hand-off, memoized (design §10 — entries are write-once)
@@ -806,7 +1581,16 @@ class WindowedCache(_HFCacheBase):
         must not assume they alias the stored fp cache, design §9) plus the
         score-scatter map the hook needs, or ``score_meta=None`` at an empty Q
         tier (the fp store, byte-identical).
+
+        Routes to :meth:`_materialize_joint` once the layer-major decode store
+        exists: past that point ``_stores[i]`` is a read-only view with no slot
+        table of its own, so the per-layer body below cannot run. The score
+        hook's "update() didn't run for this layer" fallback calls this, so it
+        has to stay correct in both phases.
         """
+        if self._joint is not None:
+            B = self._joint.key_states.shape[0] // self.num_layers
+            return self._materialize_joint(layer_idx, B)
         state = self._states[layer_idx]
         store = self._stores[layer_idx]
         if store is None or store.num_active_windows == 0:
@@ -852,8 +1636,28 @@ class WindowedCache(_HFCacheBase):
         valid.scatter_(1, idx, mask)
         return out[:, :width], valid[:, :width]
 
-    def _evict_two_tier(self, layer_idx: int, step: int) -> None:
+    def _evict_targets(self, layer_idx: Optional[int]):
+        """``(state, store, policy)`` for an eviction.
+
+        ``layer_idx=None`` selects the layer-major store — one call covering every
+        layer's rows (DECODE_SPEED_PLAN §4.1), which is the decode default from
+        the first eviction onward. An int selects that layer's own objects, which
+        is prefill and the first eviction.
+        """
+        if layer_idx is None:
+            return self._joint, self._joint_store, self._policies[0]
+        return (
+            self._states[layer_idx],
+            self._stores[layer_idx],
+            self._policies[layer_idx],
+        )
+
+    def _evict_two_tier(self, layer_idx: Optional[int], step: int) -> None:
         """Dispatch one two-tier eviction to the eager or torch.compile'd body.
+
+        ``layer_idx=None`` is the layer-major eviction: identical body, ``L*B``
+        rows instead of ``B``, so all ``L`` layers' 273 launching ops collapse
+        into one set of 273 (§4.1).
 
         Default (``STICKYKV_COMPILE_EVICT`` off) calls the eager implementation
         below — byte-for-byte the historic path, one extra function-pointer hop.
@@ -894,8 +1698,17 @@ class WindowedCache(_HFCacheBase):
         _run_compiled_evict(self, layer_idx, step)
         return None
 
-    def _evict_two_tier_impl(self, layer_idx: int, step: int) -> None:
+    def _evict_two_tier_impl(self, layer_idx: Optional[int], step: int) -> None:
         """One two-tier eviction (design §5), per row, entirely on device.
+
+        **The row axis is opaque here**, which is what makes the layer-major
+        decode path (§4.1) a change of caller rather than of body: every
+        operation below is per row — ``gather``/``scatter`` on dim 1, ``argsort``
+        and ``cumsum`` along dim 1, ``searchsorted`` row-wise — and every width is
+        a host int from :meth:`EvictionPolicy.tier_counts`. So passing
+        ``layer_idx=None`` (rows = ``L*B``, layer ``i`` owning
+        ``[i*B, (i+1)*B)``) evicts all ``L`` layers with exactly the arithmetic
+        one layer used, at ``1/L`` the launches.
 
         Ranks the merged window axis, assigns tiers, moves boundary-crossers
         (demote K→Q / promote Q→K), rebuilds the fp store as
@@ -912,9 +1725,7 @@ class WindowedCache(_HFCacheBase):
         :meth:`EvictionPolicy.tier_counts` — host ints that are identical across
         rows (BATCHING_PLAN.md §3), so nothing has to be measured off a tensor.
         """
-        state = self._states[layer_idx]
-        policy = self._policies[layer_idx]
-        store = self._stores[layer_idx]
+        state, store, policy = self._evict_targets(layer_idx)
         rope = self.rope_module
 
         ws = self.resolved.window_size
@@ -940,8 +1751,12 @@ class WindowedCache(_HFCacheBase):
         # Eviction rewrites the Q tier AND compacts the fp store's positions, so
         # every memoized fused hand-off for this layer is stale. store.version
         # already covers the Q half (retain_only below bumps it); this also covers
-        # the fp half without relying on that ordering.
-        self._fused_ctx[layer_idx] = None
+        # the fp half without relying on that ordering. A layer-major eviction
+        # (layer_idx is None) rewrites every layer, so it drops every entry.
+        if layer_idx is None:
+            self._fused_ctx = [None] * self.num_layers
+        else:
+            self._fused_ctx[layer_idx] = None
 
         n_q_prev = store.num_active_windows
 
@@ -957,7 +1772,12 @@ class WindowedCache(_HFCacheBase):
         # Telemetry: snapshot the merged-axis scores. For the two-tier path the
         # retained indices are merged-WINDOW indices (not token indices — the fp
         # and Q survivors live in different stores).
-        self.telemetry.record_scores(layer_idx, step, state.window_scores, retained_idx)
+        if layer_idx is None:
+            self._record_joint_scores(step, state.window_scores, retained_idx)
+        else:
+            self.telemetry.record_scores(
+                layer_idx, step, state.window_scores, retained_idx
+            )
 
         wids = torch.gather(state.original_window_ids, 1, retained_idx)   # [B, W_ret]
         is_q_new = new_tier == 1
@@ -1102,11 +1922,24 @@ class WindowedCache(_HFCacheBase):
                 tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
             )
 
-        state.replace(
-            torch.cat([state.key_states[:, :, :num_sink, :], new_k], dim=2),
-            torch.cat([state.value_states[:, :, :num_sink, :], new_v], dim=2),
-            torch.cat([state.position_ids[:, :num_sink], new_pos], dim=1),
-        )
+        if layer_idx is None:
+            # Layer-major: the buffer is already at its steady capacity (the
+            # per-layer first eviction is what sized it), so the compacted body
+            # goes straight in behind the sink prefix, which this rebuild carries
+            # through byte-identically at the same offsets. That skips the three
+            # full-store `cat`s below — ~2.9 GB of transient at 4096/batch-32 once
+            # the row axis carries all 32 layers — and the reallocation `replace`
+            # performs whenever the target size moves.
+            state.replace_body(num_sink, new_k, new_v, new_pos)
+        else:
+            # Per-layer: this IS the first eviction, where `replace` reallocating
+            # from the prompt capacity down to the budget is the point — it is
+            # what releases the prompt-sized buffer.
+            state.replace(
+                torch.cat([state.key_states[:, :, :num_sink, :], new_k], dim=2),
+                torch.cat([state.value_states[:, :, :num_sink, :], new_v], dim=2),
+                torch.cat([state.position_ids[:, :num_sink], new_pos], dim=1),
+            )
 
         # --- 5. Gather scores + ids to the retained merged axis -------------
         H_q = state.window_scores.shape[1]

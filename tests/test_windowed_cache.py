@@ -6,6 +6,7 @@ No real model loads.
 
 from __future__ import annotations
 
+import os
 import ast
 import inspect
 import math
@@ -936,25 +937,30 @@ def _make_pos_keys(B, H_kv, T, D, start=0):
 
 
 def _divergent_scores(B, H_q):
-    """Row 0 favours evictable windows {1,3}; row 1 favours {5,7}.
+    """Row 0 favours evictable windows {1,3}; row 1 favours {4,6}.
 
-    Per-call window_scores for prefill (8 windows) + 2 decode steps. These tests
-    pin ``first_eviction_step = 0`` (see :func:`_drive_divergent_cache`) so the
-    first eviction fires at decode step 0 (on the prefill scores), compacting the
-    8 prefill windows to 3 (each row's top-2 + the shared local window). So the
-    widths track the *compacted* effective window count, exactly as the real
-    score hook would size them: prefill 8 → step-0 scores 9 (8 + the new window)
-    → step-1 scores 4 (the 3 survivors + the new window). The new windows score
-    ~0, so both evictions rank purely by the prefill scores in ``s0``.
+    Prefill scores over 8 windows. The decode steps' widths are NOT fixed here:
+    :func:`_drive_divergent_cache` sizes each from the store as it then stands,
+    because that is what a score hook produces. The hook is a forward hook, so
+    the scores waiting at step ``s`` were computed at step ``s-1`` and describe
+    the key set as of then — ``EvictionPolicy.expand_to_token_indices`` says so
+    itself, and its whole "unscored tail" branch exists because of it. A width
+    sized for the store *after* this step's append is one window ahead of
+    anything the model generates, and the batched decode path
+    (DECODE_SPEED_PLAN.md §4.1), which compacts before appending, rejects it.
+
+    Both favourites of both rows sit inside the evictable band ``[0, 7)`` — the
+    newest window is local and is never a top-k pick — so each row's top-2 is
+    unambiguous and the divergence this class is about is real.
     """
     s0 = torch.zeros(B, H_q, 8)
     s0[0, :, [1, 3]] = 100.0
     if B > 1:
-        s0[1, :, [5, 7]] = 100.0
-    return [s0, torch.zeros(B, H_q, 9), torch.zeros(B, H_q, 4)]
+        s0[1, :, [4, 6]] = 100.0
+    return s0
 
 
-def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
+def _drive_divergent_cache(prefill_scores, B=2, H_kv=2, D=8, layer_major=True):
     """Drive a full WindowedCache through prefill + 2 decode steps.
 
     Geometry (window_size=1, num_sink=0, local=1, budget=0.375, prefill=8)
@@ -964,28 +970,45 @@ def _drive_divergent_cache(scores_per_call, B=2, H_kv=2, D=8):
     step 8, which these 2-step runs would never reach). Eviction then fires every
     window_size steps including step 0, so both decode calls evict: step 0
     compacts the prompt on the prefill scores, step 1 slides the local window
-    forward. Returns the layer-0 CacheState.
+    forward.
+
+    ``layer_major`` selects the decode path. The tests below run **both** and
+    require them to agree, so the expected ids are anchored to the per-layer
+    reference rather than to whichever path happens to be the default.
+
+    Returns the layer-0 CacheState.
     """
     model_cfg = _FakeModelConfig()
     cfg = WindowedCacheConfig(
         window_size=1, num_sink_tokens=0, local_window_size=1, cache_budget=0.375,
     )
-    cache = WindowedCache(
-        config=cfg, prefill_len=8, model_config=model_cfg,
-        kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
-        num_layers=1, max_tokens=0,
-    )
+    os.environ["STICKYKV_LAYER_MAJOR_DECODE"] = "1" if layer_major else "0"
+    try:
+        cache = WindowedCache(
+            config=cfg, prefill_len=8, model_config=model_cfg,
+            kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+            num_layers=1, max_tokens=0,
+        )
+    finally:
+        del os.environ["STICKYKV_LAYER_MAJOR_DECODE"]
     cache._policies[0].first_eviction_step = 0
+    H_q = prefill_scores.shape[1]
     k = _make_pos_keys(B, H_kv, 8, D)
     cache.update(k, k.clone(), 0, cache_kwargs={
         "cache_position": torch.arange(8),
-        "window_scores": scores_per_call[0],
+        "window_scores": prefill_scores,
     })
-    for i, pos in enumerate((8, 9)):
+    for pos in (8, 9):
+        # The width a hook would emit: the merged window count of the store as
+        # it stands now (window_size=1, num_sink=0, so one window per token).
+        store = cache._stores[0]
+        W = cache._states[0].seq_length + (
+            store.num_active_windows if store is not None else 0
+        )
         k1 = _make_pos_keys(B, H_kv, 1, D, start=pos)
         cache.update(k1, k1.clone(), 0, cache_kwargs={
             "cache_position": torch.arange(pos, pos + 1),
-            "window_scores": scores_per_call[i + 1],
+            "window_scores": torch.zeros(B, H_q, W),
         })
     return cache._states[0]
 
@@ -999,21 +1022,40 @@ class TestBatching:
 
         # original_window_ids is per-row [B, W_retained]; each row kept its own
         # top-2 evictable windows plus the shared local window. Step 0 compacts
-        # the prompt to {top-2, pos 8}; step 1 slides the local window to pos 9.
+        # the prompt to {top-2, local 7} and carries the unscored token 8; step 1
+        # ranks those four, keeps {top-2, local 8}, and carries token 9.
         assert state.original_window_ids.shape == (2, 3)
-        assert state.original_window_ids[0].tolist() == [1, 3, 9]
-        assert state.original_window_ids[1].tolist() == [5, 7, 9]
+        assert state.original_window_ids[0].tolist() == [1, 3, 8]
+        assert state.original_window_ids[1].tolist() == [4, 6, 8]
 
-        # position_ids gathered per row to the surviving ORIGINAL positions.
-        assert state.position_ids.shape == (2, 3)
-        assert state.position_ids[0].tolist() == [1, 3, 9]
-        assert state.position_ids[1].tolist() == [5, 7, 9]
+        # position_ids gathered per row to the surviving ORIGINAL positions. The
+        # fourth entry is the token this step appended: it has no score column
+        # yet (scores lag by one update), so it carries no window id.
+        assert state.position_ids.shape == (2, 4)
+        assert state.position_ids[0].tolist() == [1, 3, 8, 9]
+        assert state.position_ids[1].tolist() == [4, 6, 8, 9]
 
         # Keys encode their original token index → confirm the right tokens
         # survived in each row independently.
         kept = state.key_states[:, 0, :, 0]  # [B, T_retained]
-        assert kept[0].tolist() == [1.0, 3.0, 9.0]
-        assert kept[1].tolist() == [5.0, 7.0, 9.0]
+        assert kept[0].tolist() == [1.0, 3.0, 8.0, 9.0]
+        assert kept[1].tolist() == [4.0, 6.0, 8.0, 9.0]
+
+    def test_divergent_eviction_is_the_same_on_both_decode_paths(self):
+        """The layer-major decode path evicts each row exactly as per-layer does.
+
+        This is what anchors the ids asserted above: they are the per-layer
+        reference's answer, not whichever path happens to be the default.
+        """
+        H_q = 4
+        ref = _drive_divergent_cache(_divergent_scores(2, H_q), B=2,
+                                     layer_major=False)
+        got = _drive_divergent_cache(_divergent_scores(2, H_q), B=2,
+                                     layer_major=True)
+        assert torch.equal(ref.original_window_ids, got.original_window_ids)
+        assert torch.equal(ref.position_ids, got.position_ids)
+        assert torch.equal(ref.key_states, got.key_states)
+        assert torch.equal(ref.value_states, got.value_states)
 
     def test_batch_row_matches_standalone_b1(self):
         """Row 0 of a B=2 batch is identical to the same row run at B=1
