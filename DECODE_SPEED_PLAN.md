@@ -1,13 +1,9 @@
-# Decode speed plan — get competitive without touching the scores
+# Decode speed plan — remaining work
 
-`PREFILL_SPEED_PLAN.md` closed prefill to 1.09–1.14× FullKV. Decode is still
-**2.05× slower than FullKV and 5.3× slower than SnapKV** at the headline cell.
-
-This plan replaces `DECODE_PLAN.md`, whose arithmetic was written against a
-`cache_budget=0.20` / 20%-of-keys cell that **is not the cell the table
-benchmarks** — `scripts/run_perf_table.sh` defaults to `CACHE_BUDGET=0.50`,
-`QUANT_RATIO=0.70`, `QUANT_MODE=tokens`. Every number below is re-derived at
-that geometry.
+`PREFILL_SPEED_PLAN.md` closed prefill to 1.09–1.14× FullKV. Cross-layer
+batched eviction (formerly this plan's §4.1) is landed and default-on — see
+`git log` on `modules/windowed_cache/cache.py` and
+`tests/test_layer_major_evict.py`. This document is what is left.
 
 ## 0. The cell, stated exactly
 
@@ -26,41 +22,44 @@ per-`(window, head, dim)` fp16 scale+zero grid (512 B/token) is **twice the K
 codes it describes** (256 B/token). That is a `ws=8` group-size artifact and it
 is priced in §5.7, not assumed away.
 
-## 1. Where the time goes — the table already answers it
+## 1. Current baseline and the gap to close
 
-| shape / B | ours | Flash | ratio | ours − Flash |
-|---|---|---|---|---|
-| 1048 / 1 | 0.1016 | 0.024 | 4.23× | 77.6 ms |
-| 2048 / 1 | 0.1024 | 0.024 | 4.27× | 78.4 ms |
-| 4096 / 1 | 0.1011 | 0.025 | 4.04× | 76.1 ms |
-| 1048 / 32 | 0.1045 | 0.043 | 2.43× | 61.5 ms |
-| 2048 / 32 | 0.1142 | 0.055 | 2.08× | 59.2 ms |
-| **4096 / 32** | **0.1760** | **0.086** | **2.05×** | **90.0 ms** |
+`run_perf_table.sh` at the shipped defaults (`STICKYKV_LAYER_MAJOR_DECODE=1`):
 
-Two sensitivities settle the diagnosis:
+| shape / B | ours (TPOT) | Flash (FullKV) | ratio |
+|---|---|---|---|
+| 4096/256, B=1 | 0.0586 | 0.0250 | 2.34× slower |
+| **4096/256, B=32** | **0.0735** | 0.0860 | **1.17× faster** |
+| 2048/512, B=1 | 0.0588 | 0.0240 | 2.45× slower |
+| 2048/512, B=32 | 0.0641 | 0.0550 | 1.17× slower |
+| 1024/1024, B=1 | 0.0594 | 0.0240 | 2.48× slower |
+| 1024/1024, B=32 | 0.0607 | 0.0430 | 1.41× slower |
+
+**The headline cell (4096/B=32) already beats FullKV.** What is left is closing
+the gap to the harder targets:
+
+| | target | current | gap |
+|---|---|---|---|
+| 20% faster than Flash @ 4096/B=32 | ≤ 0.0688 | 0.0735 | **4.7 ms** |
+| stretch @ 4096/B=32 | ≤ 0.050 | 0.0735 | **23.5 ms** |
+| beat KIVI-int2 @ ~1024/B=32 | < 0.044 | 0.0607 | **16.3 ms** |
+| approach SnapKV @ 4096/B=32 | ~ 0.033 | 0.0735 | **40.5 ms** |
+
+Sensitivities at the current baseline:
 
 ```
-1048 -> 4096 at B=1 :  ours  -0.5%      flash  +4.2%
-   B=1 -> B=32 @1048:  ours  +2.9%      flash +79.2%
+B=1, 1024 -> 4096  :  ours -1.3%      (flat — decode cost still ~independent of context at B=1)
+B=1 -> B=32 @4096  :  ours +25.4%
+B=1 -> B=32 @1024  :  ours  +2.2%
 ```
 
-**A 32× increase in batch costs us 2.9%.** A 4× increase in context costs us
-nothing. The GPU is idle. There is a **fixed ~101 ms/step** that depends on
-neither B nor S; Flash's own harness floor is ~24.5 ms, so
+At B=1 the excess is still nearly flat across context length, which is what a
+fixed per-step host/launch cost looks like. At B=32/4096 it grows faster in
+*relative* terms than before the eviction change, because what remains scales
+more with the traffic and GPU work the sections below target — not because the
+launch cut stopped helping.
 
-> **our own host overhead is 76.6 ms/step = 2.39 ms per layer per step.**
-
-Only at 4096/B=32 does GPU work finally surface: 176 − 101 = **75 ms of exposed
-GPU** for 4.42 GB of KV, against Flash's 62 ms for 17.18 GB — **4.7× less
-efficient per byte** than the flash decode path.
-
-So the excess is two independent terms, and they are close to equal at the
-headline cell: **77 ms host + 75 ms GPU.** `DECODE_PLAN.md`'s Fact B (a roughly
-even split) survives the re-derivation. Its Fact A ("decode cost barely depends
-on cache size") does not: it is true only at B=1, where the host floor hides
-everything. At B=32 the cost is **+68%** from 1048 to 4096.
-
-### The roofline, so the target is bounded honestly
+### The roofline, so the targets are bounded honestly
 
 | | per-step traffic | @2.04 TB/s |
 |---|---|---|
@@ -68,12 +67,13 @@ everything. At B=32 the cost is **+68%** from 1048 to 4096.
 | ours | 16.06 + 4.42 GB KV = 20.5 GB | 10.0 ms |
 | ours + avoidable overhead traffic (§1.1) | 22.4 GB | 11.0 ms |
 
-Measured: FullKV 86 ms (**5.3× off**), ours 176 ms (**17.5× off**). The 5.3× is
-the harness — per-layer Python, no CUDA graphs — and every method in the table
-pays it. The gap from 5.3× to 17.5× is ours alone, and it is what this plan
-removes.
+Flash measures 86 ms against its own 16.3 ms roofline (5.3× off) — that is the
+harness's own per-layer Python cost, paid by every method in the table, not
+something this plan can remove without a CUDA-graph change that would have to
+be offered to every method (§6). Our 73.5 ms against a ~10–11 ms roofline is
+what §2 and §5 are for.
 
-### 1.1 Traffic we pay for nothing
+### 1.1 Traffic we pay for nothing — the concrete target for §5.1
 
 | | per layer / step | per step | share of our KV |
 |---|---|---|---|
@@ -82,117 +82,29 @@ removes.
 | | | **1.86 GB** | **42%** |
 
 Both are pure overhead. `decode_kernel.py:353` allocates the score buffer in
-**fp32 at token granularity**, `decode_kernel.py:302` reads the whole thing back
-for a second normalizing pass, and `scorer.py:93` reads it a third time to
+**fp32 at token granularity**, `decode_kernel.py:302` reads the whole thing
+back for a second normalizing pass, and `scorer.py:93` reads it a third time to
 reduce `S → W`. The RoPE tables (`decode_kernel.py:124`) are fp32 because
 `rope_cos_sin_halves` builds them off `torch.empty(1,1,1)` (default dtype), and
 they are **frozen between evictions** yet re-read every step.
 
-### 1.2 Measured on GPU after §4.1 landed
+## 2. The launch budget still on the table
 
-`run_perf_table.sh` re-run at the shipped defaults (`STICKYKV_LAYER_MAJOR_DECODE=1`,
-the new default), same shapes and batches as §1's table:
+The remaining excess is a mix of host-side launch overhead (§5.1, §5.2, §5.5)
+and exposed GPU work (§5.1's traffic cut, §5.3, §5.4, §5.6). The pre-eviction-fix
+version of this document derived a host/GPU split and a µs-per-launch rate from
+the old (much larger) excess; that derivation should **not** be reused now — the
+excess it was calibrated against was ~2.4× the current one, and a rate fit to a
+bigger gap does not transfer cleanly to a smaller one. **Stage 0 (§3) has to be
+re-run before any further ms projection in this document is trusted.** Until
+then, treat every "expected" figure in §5 and §8 as a launch/byte-count fact
+(real, architecture-level) with an *unverified* ms translation.
 
-| shape / B | TPOT before §4.1 | TPOT after §4.1 | speedup | Flash (FullKV) | after §4.1 vs Flash |
-|---|---|---|---|---|---|
-| 4096/256, B=1 | 0.1011 | **0.0586** | 1.73× | 0.0250 | 2.34× slower |
-| **4096/256, B=32** | 0.1760 | **0.0735** | **2.39×** | 0.0860 | **1.17× faster** |
-| 2048/512, B=1 | 0.1024 | **0.0588** | 1.74× | 0.0240 | 2.45× slower |
-| 2048/512, B=32 | 0.1142 | **0.0641** | 1.78× | 0.0550 | 1.17× slower |
-| 1024/1024, B=1 | 0.1016 | **0.0594** | 1.71× | 0.0240 | 2.48× slower |
-| 1024/1024, B=32 | 0.1045 | **0.0607** | 1.72× | 0.0430 | 1.41× slower |
-
-**§4.1 alone flips the headline cell from losing to beating FullKV**: 4096/B=32
-was 2.05× slower than Flash before this change, and is now **1.17× faster** —
-the launch cut this document projected as the single biggest lever is the
-reason. The table's "throughput (tok/s)" column understates this because it
-divides by wall time *including TTFT*, and our TTFT barely moved (§4.1 is a
-decode-only change); the decode-only figure (`B / TPOT_steady`) is 435 tok/s
-against Flash's 372 — also a win, consistently with TPOT.
-
-**Every other shape and batch improved too, B=1 included** (1.71–1.78× faster),
-which the pre-§4.1 diagnosis predicts but is still worth confirming: launch
-count, not batch size, was the dominant cost, so cutting it 4.75× (§2) pays off
-even where there is no batch to amortize over.
-
-**Memory did not regress** — the concern §4.1's design note flagged (§4.1's
-"LANDED" callout) was real but stayed inside the deliberately-per-layer prefill,
-so it never surfaces: peak GB moved -0.8% to -1.5% across the B=32 cells,
-steadyKV GB within ±0.8%. The layer-major decode store costs nothing extra once
-built.
-
-**Sensitivities, recomputed post-§4.1:**
-
-```
-B=1, 1024 -> 4096  :  ours -1.3%      (was -0.5%; still flat — Fact A intact at B=1)
-B=1 -> B=32 @4096  :  ours +25.4%     (was +2.9% pre-§4.1 -- see note below)
-B=1 -> B=32 @1024  :  ours  +2.2%     (was +2.9%)
-```
-
-The 4096 row's `B=1 -> B=32` jump grew in *relative* terms (+25.4% vs the old
-+2.9%) even though the absolute step time roughly *halved* (0.176 → 0.0735).
-That is arithmetic, not a regression: with the fixed host floor mostly cut
-away, what is left scales more visibly with the work that remains — the exposed
-GPU term identified in §1 (KV traffic + the fp32 score/RoPE overhead of §1.1),
-which *does* grow with B. The B=1→32 story at 1024 tokens (+2.2%, still flat)
-confirms the floor is genuinely smaller now, not that Fact A stopped holding.
-
-**What is left, sized against the actual result, not the projection.** §2's
-"landing arithmetic" projected 176 → ~51 ms at 4096/B=32 from stacking §4.1 with
-§5.1 + §5.5 + Q-tier tiling. §4.1 alone delivered 176 → 73.5 ms — most of the
-way there in absolute terms. The remaining gap to the ≤0.0688 (20%-faster)
-target is now **4.7 ms**, and to the ≤0.050 stretch target **23.5 ms** — both
-far smaller asks than before, and both squarely what §5.1 (host **and** GPU
-traffic) and §5.5 (the free ones) target next. We are still 1.38× slower than
-KIVI-int2 at the ~1024-token cell (0.0607 vs 0.044), which is the batch-32
-analogue of the B=1 story: short contexts are close to weight-bound, so this is
-where §5's per-step fixed costs (not the KV-proportional ones) matter most.
-
-**What this does *not* tell us.** The host/GPU split in §1 was derived from a
-B=1-proxy heuristic ("host floor ≈ B=1 TPOT"), which was reasonable when the
-excess was almost entirely launch count. Re-deriving that split mechanically
-from the new numbers produces a swing (implied per-byte GPU efficiency going
-from 4.7× worse than Flash to roughly on par) that is more likely the heuristic
-breaking down at a smaller excess than a real efficiency change — §4.1 touched
-launch count only, not kernel math. **Stage 0's profiler run
-(`profile_decode.py --prefill 4096 --batch 32`) should be re-run now** to get a
-real GPU-busy-% and CPU-self-time breakdown of the remaining ~35 ms/step,
-rather than trusting a proxy that was built for a 4–5× larger gap.
-
-## 2. The launch budget, and what each fix is worth
-
-`perf_runner.py:1217-1226` counted ATen dispatches through `update()`:
-273 launching ops/layer on an eviction step, 9 on a normal step. Adding the ~10
-the fused epilogue issues *outside* `update()` (`flash_decode.py:139` →
-`scorer.py:93` → `accumulate`):
-
-```
-eviction step   273 ops/layer x 32 = 8,736 launches, every ws=8 steps
-normal step      19 ops/layer x 32 =   608 launches, every step
-amortized                            1,700 launches/step   <- eviction is 64%
-```
-
-76.6 ms / 1,700 = **45 µs per launching op.** That is 5–10× a bare
-`cudaLaunchKernel`, and it is the single most important thing Stage 0 must
-confirm or refute — it says the cost is Python / dispatch / Triton launcher, not
-the driver.
-
-| after | launches/step | host cost @45 µs |
-|---|---|---|
-| today | 1,700 | 76.6 ms |
-| + cross-layer eviction (§4.1) | 642 | 28.9 ms |
-| + score epilogue in the kernel (§5.1) | 226 | 10.2 ms |
-| + `eviction_interval = 4·ws` (§4.2) | 201 | 9.1 ms |
-
-**Landing arithmetic.** Host 76.6 → ~9 ms and GPU 75 → ~18 ms (flash-class
-efficiency on 4.42 GB) gives **24.5 + 9 + 18 ≈ 51 ms** at 4096/B=32 — 1.7×
-faster than FullKV and 1.5× off SnapKV. At B=1 the same work gives ~0.033 s,
-which beats KIVI (0.043) and lands within 30% of FullKV.
-
-## 3. Stage 0 — the one run that gates everything
+## 3. Stage 0 — the one run that gates everything else
 
 `scripts/profile_decode.py` and `scripts/audit_e2e.py` exist and are unblocked.
-Run **at the shape the table reports**, not at B=1:
+Run **at the shape the table reports**, not at B=1, on the current default
+(layer-major decode, already on):
 
 ```bash
 python scripts/profile_decode.py --config outputs/perf_table/_perf_table.generated.yaml \
@@ -206,92 +118,25 @@ python scripts/profile_decode.py --config outputs/perf_table/_perf_table.generat
 
 Read four things, in order:
 
-1. **GPU busy %.** §1 predicts ~10% at B=1 and ~45% at B=32. If B=1 comes back
-   >70%, the host-bound reading is wrong, §5 is the whole plan, and §4.1 is
-   wasted work — stop and re-plan.
+1. **GPU busy %.** With the eviction batched, host overhead should be smaller
+   than before at every batch size — get the real number rather than assuming
+   it. If B=32 already reads >80%, §5.1–§5.6 (GPU/traffic-bound) matter more
+   than §5.2/§5.5 (launch-count-bound); if it is still well under that, the
+   opposite.
 2. **CPU self time, top 20.** If `JITFunction.run` / Triton frames dominate,
    §5.2 moves to the front. The profiler cannot name Python that isn't an ATen
-   op, so pair it with a `cProfile` over 24 steps — that is the tool that answers
-   "45 µs of *what*".
+   op, so pair it with a `cProfile` over 24 steps.
 3. **`STICKYKV_COMPILE_EVICT=1` vs `=0` at this shape.** `run_perf_table.sh`
-   defaults it on and `perf_runner.py:1242` force-enables it on CUDA, so every
-   published number already used it. If the A/B is <5%, the
-   `torch._dynamo.disable` on `_affine_quantize` (`quant/quantizer.py:48-61`) is
-   breaking the graph once per layer per eviction, and the compiled path is
-   issuing eager launch counts under a compiled name — §4.3.
-4. **Eviction wall time per call, split from the normal step.** Everything in §4
-   is sized off it.
+   defaults it on and `perf_runner.py:1242` force-enables it on CUDA. If the A/B
+   is small, the `torch._dynamo.disable` on `_affine_quantize`
+   (`quant/quantizer.py:48-61`) is still breaking the graph inside the (now
+   batched) eviction body — §4.3.
+4. **Eviction wall time per call, split from the normal step.** Sizes whether
+   §4.2/§4.3 are still worth doing versus §5's per-step fixed costs.
 
-Do not start §4 or §5 before this returns. That is the discipline the eviction
-compile skipped, and it cost a campaign.
+Do not start §4 or §5 changes before this returns.
 
-## 4. Stage 1 — the eviction (64% of the launch budget)
-
-### 4.1 Batch the eviction across layers — the single biggest lever
-
-> **LANDED (default on).** `WindowedCache` folds `L` into the row axis after the
-> first eviction: one `[L·B, …]` state and one `[L·B, …]` slot table, so all `L`
-> layers evict in one pass. Measured on CPU at `L=32, B=4, ws=8`, counting ATen
-> dispatches through a whole decode step:
->
-> | | per-layer | layer-major | |
-> |---|---|---|---|
-> | the eviction body itself | 13,824 | 426 | **32.5×** |
-> | eviction step, all 32 layers | 17,664 | 1,549 | 11.4× |
-> | normal step, all 32 layers | 3,840 | 1,123 | 3.4× |
-> | **amortized per decode token** | **5,592** | **1,177** | **4.75×** |
->
-> The eviction body hits the predicted 32×. The step-level ratios are lower
-> because what remains is irreducibly per layer (each layer's K/V write, its
-> return slice, its `set_pending`). These are *dispatch* counts on the CPU
-> materialize path, not GPU launch counts on the fused path — the ratio is the
-> transferable part; the wall-clock number needed `run_perf_table.sh` on a GPU.
->
-> **GPU wall-clock, now measured (§1.2 has the full table).** 4096/B=32 TPOT:
-> 0.1760 → **0.0735 s (2.39×)** — the headline cell flips from **2.05× slower
-> than FullKV to 1.17× faster**. Every shape and batch improved (1.71–2.39×),
-> B=1 included, confirming launch count was the dominant cost even without a
-> batch to amortize over. Memory unaffected (peak GB −0.8% to −1.5%).
->
-> The ordering change §4.1 requires (compact, then append) is pinned byte-for-byte
-> against the per-layer path by `tests/test_layer_major_evict.py` — the whole
-> cache, every step, at `q ∈ {0, 0.5}`, `L ∈ {1, 3}`, `B ∈ {1, 2}`, with and
-> without sink tokens, and across a fixture that exercises promotion/dormancy.
-> `STICKYKV_LAYER_MAJOR_DECODE=0` is the control arm, not a fallback.
->
-> **Prefill is deliberately NOT layer-major** (`STICKYKV_PREFILL_LAYER_MAJOR`,
-> default off). A layer-major prompt buffer would force the first compaction to
-> hold the whole `L·B`-row prompt and the whole `L·B`-row steady store at once —
-> about +4 GB of peak at 4096/batch-32, straight out of max batch. Keeping prefill
-> per-layer and joining *after* the first eviction, once every prompt buffer has
-> been released, costs nothing: the join peaks at two steady-state stores, well
-> under the prompt peak it replaces.
-
-All 32 layers evict **on the same step, at identical shapes** (`ws`, budget,
-`n_q`, `k_fp` are config, not data). Today that is 32 sequential Python calls of
-273 ops each. Stack the per-layer state into `[L, B, …]` and it becomes **273 ops
-total: a 32× cut on 64% of the budget** (1,700 → 642 launches/step), and it
-changes no math whatsoever.
-
-The blocker is ordering: `_evict_two_tier` is called from `update()`
-(`cache.py:673`) *inside* layer *i*'s forward, so layer 0's eviction must finish
-before layer 0 attends. The unlock is to **move eviction to the end of the
-step**: after layer 31's forward at step *t*, evict all 32 layers at once, for
-use at step *t+1*.
-
-Why that is the same decision: at step *t*, `update()` appends token *t*, then
-accumulates the scores the *previous* step's attention wrote, then evicts. Doing
-it after layer 31 of step *t−1* uses the same scores over the same scored
-windows; the only difference is that token *t* is not yet appended — and token
-*t* is the newest token, which lives in the local window and is never evictable.
-
-**Hypothesis: the retained set is identical.** That is testable, not assumable —
-gate it on byte-identity of `retained_idx` / `new_tier` across a 64-step run at
-`ws=8`, alongside the existing `aot_eager` eviction test.
-
-Cost: a real refactor of `WindowedCacheState` and `QuantizedStore` to a
-layer-major layout. It is the largest engineering item here and the largest
-payoff. Do §4.2 and §5 first if time is short — they are cheaper per ms.
+## 4. The eviction — what's left
 
 ### 4.2 Decouple the eviction period from `window_size`
 
@@ -313,16 +158,16 @@ a non-default.
 
 ### 4.3 Close the `_affine_quantize` graph break
 
-If Stage 0.3 shows the compiled eviction buys <5%, fix the break rather than
+If Stage 0.3 shows the compiled eviction buys little, fix the break rather than
 route around it: compute the affine range on a **gathered, materialised** tensor
 so the reduction's read index is not a `StarDep`, or write the range reduction as
 a small Triton kernel. The `aot_eager` eviction test already pins byte identity.
 
-Lower priority than §4.1 — cross-layer batching makes the compiled body's launch
-count largely irrelevant — but it is cheap, and it unblocks compiling the batched
-body later.
+This now applies to the batched (layer-major) eviction body, which is unchanged
+in its own logic — only its row count is wider — so the same fix and the same
+gate apply without modification.
 
-## 5. Stage 2 — the fused decode kernel
+## 5. The fused decode kernel
 
 ### 5.1 Emit window scores, not token scores (host **and** GPU)
 
@@ -337,6 +182,14 @@ the epilogue rescales by `exp(m_tile − lse)`. Traffic drops from `4·S` to
 `5·W = 5·S/8` — a **6.4× cut, 1.11 GB → 0.17 GB/step** — and the `order` gather
 plus the `+=` into `state.window_scores` fold into the same epilogue, removing
 ~13 launches/layer/step (**416/step**).
+
+**Implementation note (from the "does this fix window_size" question):**
+`window_size` stays a runtime `tl.constexpr`, not a hardcoded value. What this
+change actually needs is `BLOCK_N` (currently a fixed default of 64, independent
+of `ws`) to be derived from `ws` per launch — the same way `BLOCK_WS` already is
+for the Q tier — and the fp-tier tiling has to be `num_sink`-offset-aware, since
+windows in the fp store begin at `num_sink`, not at 0. Plain
+`range(0, Sfp, BLOCK_N)` from offset zero does not respect that.
 
 Numerics: identical summands, different association in the online-softmax
 rescale. The bar is fp tolerance against `two_tier_decode_reference`, same as the
@@ -381,8 +234,8 @@ fixes the N dimension, this fixes M.
 - **Drop the `q_proj` stash hook when fused is active** (`hooks.py:424`). On the
   fused path the score hook returns before consuming it (`hooks.py:494`), so it
   is a dict store and a live tensor per layer per step, for nothing.
-- **Preallocate the `set_pending` dict** (`cache.py:678`) instead of building a
-  7-key dict per layer per step.
+- **Preallocate the `set_pending` dict** (`cache.py`, `flash_decode.set_pending`
+  call site) instead of building a 7-key dict per layer per step.
 
 ### 5.6 Split-K, for every shape that is not B=32
 
@@ -401,29 +254,26 @@ the write-once store (design §10) is built to keep independent, and it changes
 quantization error directly. This is an accuracy decision, not a perf one. Park
 it behind the §7 gate.
 
-## 6. Stage 3 — CUDA graphs, and the fairness problem
+## 6. CUDA graphs, and the fairness problem
 
-If Stages 1–2 land, our own host excess is ~9 ms and the residue is the harness's
-own 24.5 ms — HF's per-layer Python, paid identically by FullKV, SnapKV and KIVI.
-
-The decode loop (`perf_runner.py:1660-1674`) is a manual `model(...)` loop with no
-per-step sync, so it is graph-capturable in principle: `_reslice` (`state.py:123`)
-already views a preallocated buffer, and at steady state the eviction leaves `W`,
-`k_fp`, `n_q` constant, so the 7 non-eviction steps of each cycle have static
-shapes. What is missing is tensor-valued lengths (the kernel takes `Sfp` as a
-Python int it specializes on) and a fixed-capacity K/V view with masking.
+The decode loop (`perf_runner.py:1660-1674`) is a manual `model(...)` loop with
+no per-step sync, so it is graph-capturable in principle: `_reslice`
+(`state.py:123`) already views a preallocated buffer, and at steady state the
+eviction leaves `W`, `k_fp`, `n_q` constant, so the non-eviction steps of each
+cycle have static shapes. What is missing is tensor-valued lengths (the kernel
+takes `Sfp` as a Python int it specializes on) and a fixed-capacity K/V view with
+masking.
 
 **Do not do this to win the table.** CUDA-graphing our path removes overhead every
-other row still pays, and a 2× win sourced from that is not a KV-cache result. If
+other row still pays, and a win sourced from that is not a KV-cache result. If
 it is done, it has to be offered to every method in the sweep and reported as a
 separate harness column. It is listed here so that it is a decision and not an
 accident.
 
-## 7. What each change does to the scores
+## 7. What each remaining change does to the scores
 
 | change | effect on scores | gate |
 |---|---|---|
-| §4.1 cross-layer eviction | none claimed — **identical retained set** | byte-identity of `retained_idx`/`new_tier` over 64 steps |
 | §4.3 close the graph break | none | existing `aot_eager` eviction test |
 | §5.1 window-score epilogue | fp-level (softmax reassociation) | tolerance vs `two_tier_decode_reference` |
 | §5.2–5.4, §5.6 | none (launch / shape only) | `tests/test_decode_kernel.py` |
@@ -439,49 +289,45 @@ change costs.
 
 ## 8. Order of work
 
-| # | item | risk to score | status | expected |
-|---|---|---|---|---|
-| 1 | §4.1 cross-layer eviction | none (gated, byte-identity pinned) | **DONE — measured** | 176 → **73.5 ms** @4096/B=32 (2.39×); flips FullKV-losing → FullKV-beating |
-| 2 | Stage 0 profile, **re-run** at 4096/B=32 | none | next | attribute the remaining ~35 ms/step between host and GPU — §1.2's B=1 proxy is no longer trustworthy at this smaller gap |
-| 3 | §5.5 freebies (`exp2`, fp16 rope, dead hook) | fp-level | pending | ~−1 ms host, −0.4 GB traffic |
-| 4 | §5.1 window-score epilogue | fp-level | pending | ~−19 ms host, −0.94 GB — closes most of the remaining gap to both targets |
-| 5 | §5.3 + §5.4 Q-tier tiling | none | pending | the GPU half |
-| 6 | §5.6 split-K | none | pending | the B=1 and B≤8 rows |
-| 7 | §4.2 `eviction_interval` (opt-in) | **outputs** | pending | small, + quality run |
-| 8 | §5.7 quant grid / §6 CUDA graphs | **outputs / fairness** | pending | decisions, not tasks |
+| # | item | risk to score | expected |
+|---|---|---|---|
+| 1 | Stage 0 profile, re-run at 4096/B=32 | none | attribute the remaining ~35 ms/step between host and GPU — nothing below should be trusted for ms until this runs |
+| 2 | §5.5 freebies (`exp2`, fp16 rope, dead hook, prealloc dict) | fp-level | ~−1 ms host, −0.4 GB traffic |
+| 3 | §5.1 window-score epilogue | fp-level | ~−19 ms host, −0.94 GB — projected to close most of the remaining gap to the 20%-faster and stretch targets |
+| 4 | §5.3 + §5.4 Q-tier tiling | none | the GPU-bound half of the remaining excess |
+| 5 | §5.6 split-K | none | the B=1 and B≤8 rows, currently 2.3–2.5× slower than Flash |
+| 6 | §4.2 `eviction_interval` (opt-in) | **outputs** | small further cut, + quality run |
+| 7 | §5.7 quant grid / §6 CUDA graphs | **outputs / fairness** | decisions, not tasks |
 
-Items 1–6 are score-safe. Item 1's number is measured; items 3–6's are still the
-launch/traffic-count projections from §1.1/§2, unverified until each lands —
-re-run Stage 0 (item 2) before trusting them, since they were sized against the
-*old* 176 ms baseline and the remaining gap is now under a third of that.
+Items 1–6 are score-safe. Every "expected" figure past item 1 is a
+launch/traffic-count projection, not yet re-verified against the current
+(smaller) excess — that is exactly what item 1 is for.
 
 ## 9. Success criteria
 
-| | target | status |
+| | target | current gap |
 |---|---|---|
-| TPOT @ 4096/256, B=32 | **≤ 0.050** (beats Flash 0.086 by 1.7×) | not yet — **0.0735** measured, gap 23.5 ms |
-| stretch: 20% faster than Flash | ≤ 0.0688 | not yet — **0.0735** measured, gap 4.7 ms |
-| TPOT @ 4096/256, B=1 | ≤ 0.035 (beats KIVI 0.043) | not yet — 0.0586 measured |
-| **beats Flash (FullKV) @ 4096/256, B=32** | **< 0.086** | **✅ met — 0.0735 measured (1.17×)** |
-| beats KIVI @ ~1024, B=32 | < 0.044 | not yet — 0.0607 measured (1.38× slower) |
-| stretch | approach 0.033 (SnapKV) | not yet |
-| GPU busy % @ B=32 | > 80% | unmeasured — needs the Stage 0 re-run (item 2 above) |
-| scores unchanged | identical at the default config | ✅ — `test_layer_major_evict.py` pins byte-identity; full LongBench/GSM8K rerun still pending for the final config |
+| TPOT @ 4096/256, B=32 | ≤ 0.050 (beats Flash by 1.7×) | 23.5 ms |
+| stretch: 20% faster than Flash @ 4096/256, B=32 | ≤ 0.0688 | 4.7 ms |
+| TPOT @ 4096/256, B=1 | ≤ 0.035 (beats KIVI 0.043) | 23.6 ms |
+| beat KIVI @ ~1024, B=32 | < 0.044 | 16.3 ms |
+| stretch | approach 0.033 (SnapKV) | 40.5 ms |
+| GPU busy % @ B=32 | > 80% | unmeasured — Stage 0 (§3) |
+| scores unchanged at the default config | identical | full LongBench/GSM8K rerun still pending for the final (all-of-§5) configuration |
 
 Verified with `run_perf_table.sh`, fresh `OUT_DIR`, same shapes/batches as §1's
-table.
-
-Report `TPOT_steady` at a `gen` long enough to contain several evictions — a
-short `gen` puts zero evictions in the steady window and flatters the number by
-~40%.
+table. Report `TPOT_steady` at a `gen` long enough to contain several
+evictions — a short `gen` puts zero evictions in the steady window and flatters
+the number by ~40%.
 
 ## 10. Housekeeping found on the way
 
 - `DECODE_PLAN.md` is superseded: its target cell (budget 0.20, "20% keys, 48%
-  bytes", TPOT 0.1345) is not what `run_perf_table.sh` runs (budget 0.50, q=0.70,
-  TPOT 0.176). Delete it or mark it stale.
+  bytes") is not what `run_perf_table.sh` runs (budget 0.50, q=0.70). Delete it
+  or mark it stale.
 - `reports/decode_throughput_benchmarks.html` describes its second memory figure
   as "the steady-state KV cache footprint in GB". It is `peak_decode_steady_mb` —
-  **device-used** memory in the steady phase — which is why 4096/B=32 reads
-  `49.20 / steady 61.24` with the second number larger than the first. The caption
-  should say so; `print_perf_table.py:13-15` already does.
+  **device-used** memory in the steady phase, which can read higher than the
+  first (peak-allocated) figure. The caption should say so;
+  `print_perf_table.py:13-15` already does. The table itself also predates the
+  layer-major decode change and should be regenerated before it is shared again.
