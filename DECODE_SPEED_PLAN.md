@@ -169,27 +169,83 @@ gate apply without modification.
 
 ## 5. The fused decode kernel
 
+### 5.0 The `window_size` range these three changes support — verified
+
+The question "can §5.1–§5.3 take any `ws` from 1 to 128?" has a measured answer
+and a derived one, and they differ.
+
+**Measured (what works today, before any of §5.1–§5.3).**
+`tests/test_layer_major_evict.py::test_window_size_range_*` drives prefill +
+decode end-to-end at `ws ∈ {1,2,3,4,6,8,12,16,32,64,128}` and asserts the whole
+cache is byte-identical between the per-layer and layer-major paths:
+
+| | supported `ws` | why |
+|---|---|---|
+| `q = 0` (fp only) | **1 – 128, all of them** | nothing constrains it; the eviction's row axis is orthogonal to the window axis |
+| `q > 0` (int2 Q tier) | **multiples of 4 only** | int2 crumb packing, `config.py:354` — a hard `ValueError`, not a silent degrade |
+
+**Derived (what §5.1–§5.3 add on top).**
+
+| | extra constraint | supported `ws` |
+|---|---|---|
+| §5.1 window-score epilogue | `ws ≥ 2` (below that it is a pessimization) **and** power-of-2 for the clean form | `q>0`: **4, 8, 16, 32, 64, 128**;  `q=0`: also 2 |
+| §5.2 Triton launcher | none — `ws` never enters it | anything the config accepts |
+| §5.3 Q-tier tiling | none beyond `q>0`'s multiple-of-4; benefit shrinks as `ws` grows | 4 – 128 |
+
+So: **not "any ws 1–128" for §5.1.** For §5.2 and §5.3, yes.
+
+**Why §5.1 wants a power of 2.** Triton's `tl.arange(0, N)` requires `N` to be a
+power of two — that is why `BLOCK_WS = _pow2_at_least(ws)` exists at all
+(`decode_kernel.py:373`). So `BLOCK_N` is a power of two, and "each window lives
+entirely inside one tile" needs `BLOCK_N % ws == 0`, which only a power-of-2 `ws`
+satisfies. At `ws ∈ {3, 6, 12, 24, …}` windows straddle tile boundaries and the
+clean form does not apply — see the fallback below. Note masking does **not**
+rescue this: `tmask` handles *padding*, not *alignment*.
+
+**Why `ws = 1` is a pessimization.** With one window per token, `W = S` and the
+epilogue writes `5·W = 5·S` against the current `4·S` — 25% *more* traffic. Break
+-even is `ws > 1.25`. At the benchmark cell:
+
+| `ws` | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|---|---|
+| §5.1 traffic vs today | **0.8× (worse)** | 1.6× | 3.2× | **6.4×** | 12.8× | 25.7× | 51.3× | 102.6× |
+
+The 6.4× the rest of this plan quotes is the `ws = 8` column — the shipped
+default.
+
+**Fallback for non-power-of-2 `ws`,** if it is ever needed: carry the straddling
+window's partial sum and its `m` across the tile boundary instead of flushing per
+tile, reconciling at the next iteration. It costs one extra register pair and a
+carry, and it removes the alignment constraint entirely. Not worth building until
+a config actually needs `ws = 12`.
+
 ### 5.1 Emit window scores, not token scores (host **and** GPU)
 
 `decode_kernel.py:235-310` writes `[B,H_q,S]` fp32 logits to HBM, reads them back
 for a normalizing second pass, and `scorer.py:93` reads them a third time to
 reduce `S → W` and scatter by `order`. Four passes over 8.67 MB/layer.
 
-The kernel already holds the logits in registers, and windows are `ws`-aligned
-with `BLOCK_N % ws == 0`, so **each window lives entirely inside one tile.** Per
-tile, store the per-window partial sum `Σ exp(logit − m_tile)` *and* `m_tile`;
-the epilogue rescales by `exp(m_tile − lse)`. Traffic drops from `4·S` to
-`5·W = 5·S/8` — a **6.4× cut, 1.11 GB → 0.17 GB/step** — and the `order` gather
-plus the `+=` into `state.window_scores` fold into the same epilogue, removing
-~13 launches/layer/step (**416/step**).
+The kernel already holds the logits in registers, so for each tile store the
+per-window partial sum `Σ exp(logit − m_tile)` *and* `m_tile`; the epilogue
+rescales by `exp(m_tile − lse)`. At the shipped `ws = 8` traffic drops from `4·S`
+to `5·W = 5·S/8` — a **6.4× cut, 1.11 GB → 0.17 GB/step** — and the `order`
+gather plus the `+=` into `state.window_scores` fold into the same epilogue,
+removing ~13 launches/layer/step (**416/step**).
 
-**Implementation note (from the "does this fix window_size" question):**
-`window_size` stays a runtime `tl.constexpr`, not a hardcoded value. What this
-change actually needs is `BLOCK_N` (currently a fixed default of 64, independent
-of `ws`) to be derived from `ws` per launch — the same way `BLOCK_WS` already is
-for the Q tier — and the fp-tier tiling has to be `num_sink`-offset-aware, since
-windows in the fp store begin at `num_sink`, not at 0. Plain
-`range(0, Sfp, BLOCK_N)` from offset zero does not respect that.
+**Two things the original sketch of this got wrong, both now pinned by §5.0:**
+
+1. `window_size` stays a runtime `tl.constexpr` — this change does *not* fix it
+   to one value. What it needs is `BLOCK_N` (today a fixed 64, independent of
+   `ws` — `decode_kernel.py:326`) **derived from `ws` per launch** as
+   `max(64, _pow2_at_least(ws))`, the same way `BLOCK_WS` already is. That also
+   covers `ws = 128 > 64`, where a window would otherwise span two tiles.
+2. The fp-tier loop must be **`num_sink`-offset aware.** Windows in the fp store
+   begin at `num_sink`, not at 0 (`scorer.py:76-77` strips the sink prefix before
+   windowing), so `range(0, Sfp, BLOCK_N)` from offset zero misaligns every
+   window by `num_sink % ws`. Handle `[0, num_sink)` as a prologue tile that
+   contributes to the output and the LSE but emits no window score, then tile
+   `[num_sink, Sfp)` on window-aligned boundaries. This works for any `num_sink`,
+   including the benchmark cell's 5.
 
 Numerics: identical summands, different association in the online-softmax
 rescale. The bar is fp tolerance against `two_tier_decode_reference`, same as the
@@ -204,16 +260,36 @@ pass shapes instead of strides, and cache the compiled handle (`kernel.warmup(�
 once, then launch the `CompiledKernel` directly). Sized by Stage 0.2 — if
 `JITFunction.run` is not in the top CPU frames, skip this.
 
+**`ws`-independent.** Nothing here touches the window axis, so it applies at
+every `ws` the config accepts, and it is the only one of the three that is safe
+to land without re-checking the geometry.
+
 ### 5.3 Tile the Q-tier loop
 
-`decode_kernel.py:260` runs **one window (8 keys) per serial iteration** —
-`n_active = 179` dependent iterations, against the fp tier's 11 (`BLOCK_N=64`
-over `S_fp=685`). Every iteration is a full online-softmax dependency: 4
-scale/zero loads, 2 code loads, 2 fp32 `cos`/`sin` loads, 2 tiny `tl.dot`s, an
-`exp`, a store.
+`decode_kernel.py:260` runs **one window per serial iteration** — at the
+benchmark cell that is `n_active = 179` dependent iterations, against the fp
+tier's 11 (`BLOCK_N=64` over `S_fp=685`). Every iteration is a full
+online-softmax dependency: 4 scale/zero loads, 2 code loads, 2 fp32 `cos`/`sin`
+loads, 2 tiny `tl.dot`s, an `exp`, a store.
 
-Tile `BLOCK_NW` windows per iteration (8 windows → 64 keys): **179 → 23
-iterations**, and the `tl.dot` goes from `[16,64]×[64,16]` to `[16,64]×[64,64]`.
+Tile `BLOCK_NW = max(1, BLOCK_N // ws)` windows per iteration so the tile is a
+fixed ~64 keys regardless of `ws`, rather than a fixed window count. At `ws = 8`
+that is 8 windows/iteration: **179 → 23 iterations**, and the `tl.dot` goes from
+`[16,64]×[64,16]` to `[16,64]×[64,64]`.
+
+**The payoff is `ws`-dependent and vanishes at large `ws`,** because the loop is
+already coarse there — worth knowing before spending the effort at a non-default
+`ws`:
+
+| `ws` | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| iterations today | 358 | 179 | 89 | 44 | 22 | 11 |
+| iterations after §5.3 | 23 | 23 | 23 | 22 | 22 | 11 |
+| speedup on the loop | 15.6× | 7.8× | 3.9× | 2.0× | 1.0× | 1.0× |
+
+At `ws ≥ 64` this is a no-op: one window already fills the tile. Register
+pressure does not get worse either — `BLOCK_WS` is unchanged, and the codebase
+already runs `BLOCK_WS = 128` at `ws = 128` today.
 
 ### 5.4 `BLOCK_R = 16` for `rep = 4`
 

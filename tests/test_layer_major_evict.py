@@ -454,3 +454,50 @@ def test_multi_token_update_after_the_join_raises():
     with pytest.raises(RuntimeError, match="only single-token decode"):
         cache.update(k, k.clone(), 0, cache_kwargs={
             "cache_position": torch.arange(300, 303)})
+
+
+# ---------------------------------------------------------------------------
+# window_size range — what the decode path supports today
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ws", [1, 2, 3, 4, 6, 8, 12, 16, 32, 64, 128])
+def test_window_size_range_q0(ws):
+    """At ``q == 0`` every ``ws`` from 1 to 128 works, and both paths agree.
+
+    Pins the supported range rather than assuming it. The fp-only path has no
+    int2 crumb packing, so nothing constrains ``ws`` to a multiple of 4 here —
+    and nothing in the layer-major eviction cares either, since its row axis is
+    orthogonal to the window axis.
+    """
+    prefill = max(64, ws * 6)
+    kw = dict(num_layers=2, prefill_len=prefill, steps=max(10, min(ws * 2, 24)),
+              batch=1, ws=ws, num_sink=0, seed=31)
+    mk = dict(quant_ratio=0.0, num_layers=2, prefill_len=prefill)
+    ref = _drive(_make_cache(layer_major=False, ws=ws, **mk), **kw)
+    got = _drive(_make_cache(layer_major=True, ws=ws, **mk), **kw)
+    _assert_same(ref, got, f"q=0 ws={ws}")
+
+
+@pytest.mark.parametrize("ws", [4, 8, 12, 16, 32, 64, 128])
+def test_window_size_range_q_positive(ws):
+    """At ``q > 0`` the int2 crumb packing needs ``ws % 4 == 0``; within that,
+    4 through 128 all work and both paths agree."""
+    prefill = max(64, ws * 6)
+    kw = dict(num_layers=2, prefill_len=prefill, steps=max(10, min(ws * 2, 24)),
+              batch=1, ws=ws, num_sink=0, seed=37)
+    mk = dict(quant_ratio=0.5, num_layers=2, prefill_len=prefill)
+    ref = _drive(_make_cache(layer_major=False, ws=ws, **mk), **kw)
+    got = _drive(_make_cache(layer_major=True, ws=ws, **mk), **kw)
+    _assert_same(ref, got, f"q=0.5 ws={ws}")
+
+
+@pytest.mark.parametrize("ws", [1, 2, 3, 6])
+def test_quant_rejects_window_size_not_multiple_of_four(ws):
+    """The int2 constraint is a hard config rejection, not a silent degrade —
+    which is what bounds §5.1/§5.3's supported range at ``q > 0``."""
+    with pytest.raises(ValueError, match="divisible by 4"):
+        WindowedCacheConfig(
+            window_size=ws, num_sink_tokens=0, local_window_size=ws,
+            cache_budget=0.5, quant_ratio=0.5, first_eviction_step=0,
+        )
