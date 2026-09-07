@@ -233,143 +233,57 @@ dominates is exactly what Stage 0 (§3) measures.** Resist the temptation to rea
 the 6.4× in §5.1 as the headline; it is 6.4× of a small number.
 
 
-### 5.0 The `window_size` range these three changes support — verified
+### 5.0–5.3 — LANDED
 
-The question "can §5.1–§5.3 take any `ws` from 1 to 128?" has a measured answer
-and a derived one, and they differ.
-
-**Measured (what works today, before any of §5.1–§5.3).**
-`tests/test_layer_major_evict.py::test_window_size_range_*` drives prefill +
-decode end-to-end at `ws ∈ {1,2,3,4,6,8,12,16,32,64,128}` and asserts the whole
-cache is byte-identical between the per-layer and layer-major paths:
-
-| | supported `ws` | why |
-|---|---|---|
-| `q = 0` (fp only) | **1 – 128, all of them** | nothing constrains it; the eviction's row axis is orthogonal to the window axis |
-| `q > 0` (int2 Q tier) | **multiples of 4 only** | int2 crumb packing, `config.py:354` — a hard `ValueError`, not a silent degrade |
-
-**Derived (what §5.1–§5.3 add on top).**
-
-| | extra constraint | supported `ws` |
-|---|---|---|
-| §5.1 window-score epilogue | `ws ≥ 2` (below that it is a pessimization) **and** power-of-2 for the clean form | `q>0`: **4, 8, 16, 32, 64, 128**;  `q=0`: also 2 |
-| §5.2 Triton launcher | none — `ws` never enters it | anything the config accepts |
-| §5.3 Q-tier tiling | none beyond `q>0`'s multiple-of-4; benefit shrinks as `ws` grows | 4 – 128 |
-
-So: **not "any ws 1–128" for §5.1.** For §5.2 and §5.3, yes.
-
-**Why §5.1 wants a power of 2.** Triton's `tl.arange(0, N)` requires `N` to be a
-power of two — that is why `BLOCK_WS = _pow2_at_least(ws)` exists at all
-(`decode_kernel.py:373`). So `BLOCK_N` is a power of two, and "each window lives
-entirely inside one tile" needs `BLOCK_N % ws == 0`, which only a power-of-2 `ws`
-satisfies. At `ws ∈ {3, 6, 12, 24, …}` windows straddle tile boundaries and the
-clean form does not apply — see the fallback below. Note masking does **not**
-rescue this: `tmask` handles *padding*, not *alignment*.
-
-**Why `ws = 1` is a pessimization.** With one window per token, `W = S` and the
-epilogue writes `5·W = 5·S` against the current `4·S` — 25% *more* traffic. Break
--even is `ws > 1.25`. At the benchmark cell:
-
-| `ws` | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|---|---|---|---|
-| §5.1 traffic vs today | **0.8× (worse)** | 1.6× | 3.2× | **6.4×** | 12.8× | 25.7× | 51.3× | 102.6× |
-
-The 6.4× the rest of this plan quotes is the `ws = 8` column — the shipped
-default.
-
-**Fallback for non-power-of-2 `ws`,** if it is ever needed: carry the straddling
-window's partial sum and its `m` across the tile boundary instead of flushing per
-tile, reconciling at the next iteration. It costs one extra register pair and a
-carry, and it removes the alignment constraint entirely. Not worth building until
-a config actually needs `ws = 12`.
-
-### 5.1 Emit window scores, not token scores (host **and** GPU)
-
-`decode_kernel.py:235-310` writes `[B,H_q,S]` fp32 logits to HBM, reads them back
-for a normalizing second pass, and `scorer.py:93` reads them a third time to
-reduce `S → W` and scatter by `order`. Four passes over 8.67 MB/layer.
-
-The kernel already holds the logits in registers, so for each tile store the
-per-window partial sum `Σ exp(logit − m_tile)` *and* `m_tile`; the epilogue
-rescales by `exp(m_tile − lse)`. At the shipped `ws = 8` traffic drops from `4·S`
-to `5·W = 5·S/8` — a **6.4× cut, 1.11 GB → 0.17 GB/step** — and the `order`
-gather plus the `+=` into `state.window_scores` fold into the same epilogue,
-removing ~13 launches/layer/step (**416/step**).
-
-**Two things the original sketch of this got wrong, both now pinned by §5.0:**
-
-1. `window_size` stays a runtime `tl.constexpr` — this change does *not* fix it
-   to one value. What it needs is `BLOCK_N` (today a fixed 64, independent of
-   `ws` — `decode_kernel.py:326`) **derived from `ws` per launch** as
-   `max(64, _pow2_at_least(ws))`, the same way `BLOCK_WS` already is. That also
-   covers `ws = 128 > 64`, where a window would otherwise span two tiles.
-2. The fp-tier loop must be **`num_sink`-offset aware.** Windows in the fp store
-   begin at `num_sink`, not at 0 (`scorer.py:76-77` strips the sink prefix before
-   windowing), so `range(0, Sfp, BLOCK_N)` from offset zero misaligns every
-   window by `num_sink % ws`. Handle `[0, num_sink)` as a prologue tile that
-   contributes to the output and the LSE but emits no window score, then tile
-   `[num_sink, Sfp)` on window-aligned boundaries. This works for any `num_sink`,
-   including the benchmark cell's 5.
-
-**Where §5.1's value actually is — and it is not the traffic.** The 6.4× cut is
-6.4× of a term that is only ~5% of the per-step total, because the weights
-(16.06 GB) dominate. At the benchmark cell:
-
-| `ws` | score traffic now | after §5.1 | per-step **total** | roofline ms |
-|---|---|---|---|---|
-| 4 | 1.11 GB | 0.35 GB | 23.09 → 22.33 GB | 11.32 → 10.95 |
-| 8 | 1.11 GB | 0.17 GB | 22.34 → 21.41 GB | 10.95 → 10.50 |
-| 32 | 1.11 GB | 0.04 GB | 21.85 → 20.78 GB | 10.71 → 10.19 |
-
-So the traffic half of §5.1 is worth **~0.5 ms**, not the ~19 ms this plan's
-order-of-work table implies. That 19 ms was a *host launch* figure (416
-launches/step × the 45 µs/launch rate §2 has since retired), and it is exactly
-the kind of number Stage 0 has to re-derive. **Treat §5.1 as a launch-count fix
-with a traffic bonus, not the other way round.**
-
-Numerics: identical summands, different association in the online-softmax
-rescale. The bar is fp tolerance against `two_tier_decode_reference`, same as the
-prefill `exp2` change.
-
-### 5.2 Stop paying Triton's launcher 32× per step
-
-`_decode_triton` (`decode_kernel.py:319`) passes **50 arguments**, 25 of them
-`.stride()` calls made fresh on every launch. Triton's `JITFunction.run` hashes
-and specialization-checks every one. Fix: contract the tensors to contiguous,
-pass shapes instead of strides, and cache the compiled handle (`kernel.warmup(…)`
-once, then launch the `CompiledKernel` directly). Sized by Stage 0.2 — if
-`JITFunction.run` is not in the top CPU frames, skip this.
-
-**`ws`-independent.** Nothing here touches the window axis, so it applies at
-every `ws` the config accepts, and it is the only one of the three that is safe
-to land without re-checking the geometry.
-
-### 5.3 Tile the Q-tier loop
-
-`decode_kernel.py:260` runs **one window per serial iteration** — at the
-benchmark cell that is `n_active = 179` dependent iterations, against the fp
-tier's 11 (`BLOCK_N=64` over `S_fp=685`). Every iteration is a full
-online-softmax dependency: 4 scale/zero loads, 2 code loads, 2 fp32 `cos`/`sin`
-loads, 2 tiny `tl.dot`s, an `exp`, a store.
-
-Tile `BLOCK_NW = max(1, BLOCK_N // ws)` windows per iteration so the tile is a
-fixed ~64 keys regardless of `ws`, rather than a fixed window count. At `ws = 8`
-that is 8 windows/iteration: **179 → 23 iterations**, and the `tl.dot` goes from
-`[16,64]×[64,16]` to `[16,64]×[64,64]`.
-
-**The payoff is `ws`-dependent and vanishes at large `ws`,** because the loop is
-already coarse there — worth knowing before spending the effort at a non-default
-`ws`:
-
-| `ws` | 4 | 8 | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|---|---|
-| iterations today | 358 | 179 | 89 | 44 | 22 | 11 |
-| iterations after §5.3 | 23 | 23 | 23 | 22 | 22 | 11 |
-| speedup on the loop | 15.6× | 7.8× | 3.9× | 2.0× | 1.0× | 1.0× |
-
-At `ws ≥ 64` this is a no-op: one window already fills the tile. Register
-pressure does not get worse either — `BLOCK_WS` is unchanged, and the codebase
-already runs `BLOCK_WS = 128` at `ws = 128` today.
+> Implemented together, as one kernel rewrite: they touch the same loops and
+> splitting them would have meant two rewrites. **Nothing outside the kernel and
+> its immediate caller changed** — the cache, the eviction and the scoring
+> semantics are untouched.
+>
+> **§5.1 — window scores, not token scores.** The kernel now emits
+> ``wsum[B, H_q, W_phys]`` (per-window softmax mass, physical order: body windows
+> then Q windows) plus a ``wmax`` companion, and rescales in a register epilogue
+> over ``W_phys`` instead of a second pass over ``S``. Traffic ``4·S → 5·W``.
+> ``_run_fused``'s reduction collapses from pad + reshape + sum + einops-reduce +
+> cat + gather to **one gather** by ``order``.
+>
+> **§5.2 — fewer kernel arguments.** All 21 stride arguments for the Q-tier
+> tensors, ``cos``/``sin``, ``OUT`` and the score buffers are gone; the kernel
+> derives them from shapes. ``q``/``k_fp``/``v_fp`` keep explicit strides because
+> they are transposed views and forcing them contiguous would copy the whole fp
+> tier every step. The dispatcher **checks** contiguity and raises rather than
+> assuming it. 50 args → 41.
+>
+> **§5.3 — whole-window tiling, both tiers.** The Q loop went from one window per
+> serial iteration to ``BLOCK_NW`` windows, and the fp body was re-tiled the same
+> way. At ``ws=8`` that is 179 → 23 Q-tier iterations.
+>
+> **`window_size` 1–128 all work, including non-powers-of-2.** §5.0 previously
+> concluded §5.1 needed a power-of-2 ``ws``. That was wrong, and the fix is
+> better: tile in **whole windows** padded up to a power-of-2 block
+> (:func:`window_tiling`) and mask the tail. A window then never straddles a tile
+> for any ``ws``, and the ``num_sink`` offset stops mattering too, because the
+> body loop starts at ``num_sink`` and steps in window units. Cost is the padding
+> alone — 100% lane utilisation at ``ws ∈ {1,2,4,8,16,32,64,128}``, 94% at
+> ``ws=12``. The sink prefix gets its own prologue tile that feeds the softmax
+> and emits no window score, matching ``reduce_token_scores_to_windows``.
+>
+> **What is verified, and what is not.** Triton cannot run on this repo's CPU dev
+> box, so the *lowering* ships unvalidated — the same contract the score kernel
+> and the original decode kernel already ship under. The *algorithm* does not:
+> :func:`two_tier_window_reference` reproduces the kernel tile for tile (sink
+> prologue, window tiling, per-tile sums against the running max, the
+> ``exp(m_tile − lse)`` epilogue) and ``tests/test_window_scores.py`` pins it —
+> 52 tests covering ``ws ∈ {1…128}`` × ``num_sink ∈ {0,1,5}``, partial trailing
+> windows, softmax-mass normalisation, overflow safety, and **five end-to-end
+> cases against a real two-tier cache** where the old ``reduce_two_tier_scores``
+> path and the new one-gather path are driven off the same store, the same
+> effective K/V and the same ``score_meta``. Keep the oracle in step with the
+> kernel; it is the only thing standing between this and an unverified rewrite.
+>
+> **Expected gain, honestly.** The traffic half is ~0.5 ms (see §5.1's table) —
+> the value is in the launch and latency halves, which remain unsized until
+> Stage 0 (§3) runs on a GPU. Do not assume this closed the 4.7 ms gap; measure it.
 
 ### 5.4 `BLOCK_R = 16` for `rep = 4`
 
@@ -447,17 +361,17 @@ change costs.
 
 | # | item | risk to score | expected |
 |---|---|---|---|
-| 1 | Stage 0 profile, re-run at 4096/B=32 | none | attribute the remaining ~35 ms/step between host and GPU — nothing below should be trusted for ms until this runs |
+| — | §5.1 + §5.2 + §5.3 | fp-level | **DONE** — algorithm verified on CPU, Triton lowering ships unvalidated (§5.0–5.3) |
+| 1 | Stage 0 profile, re-run at 4096/B=32 | none | attribute the remaining excess between host and GPU, **and measure what §5.1–5.3 actually bought** — nothing below should be trusted for ms until this runs |
 | 2 | §5.5 freebies (`exp2`, fp16 rope, dead hook, prealloc dict) | fp-level | ~−1 ms host, −0.4 GB traffic |
-| 3 | §5.1 window-score epilogue | fp-level | −416 launches/step, and −0.94 GB = **~0.5 ms** of traffic. The launch half is the whole value and is unsized until Stage 0 runs — the old "−19 ms" used the retired 45 µs/launch rate |
-| 4 | §5.3 + §5.4 Q-tier tiling | none | 179 → 23 serial dependent iterations at ws=8 (7.8×). A latency effect, not traffic — plausibly the larger of the two levers, which Stage 0 should settle before §5.1 is assumed to be first |
-| 5 | §5.6 split-K | none | the B=1 and B≤8 rows, currently 2.3–2.5× slower than Flash |
-| 6 | §4.2 `eviction_interval` (opt-in) | **outputs** | small further cut, + quality run |
-| 7 | §5.7 quant grid / §6 CUDA graphs | **outputs / fairness** | decisions, not tasks |
+| 3 | §5.4 `BLOCK_R` packing | none | the Q-tier `tl.dot` is 25% useful rows at `rep=4`; pack 4 KV heads per tile |
+| 4 | §5.6 split-K | none | the B=1 and B≤8 rows, currently 2.3–2.5× slower than Flash |
+| 5 | §4.2 `eviction_interval` (opt-in) | **outputs** | small further cut, + quality run |
+| 6 | §5.7 quant grid / §6 CUDA graphs | **outputs / fairness** | decisions, not tasks |
 
-Items 1–6 are score-safe. Every "expected" figure past item 1 is a
-launch/traffic-count projection, not yet re-verified against the current
-(smaller) excess — that is exactly what item 1 is for.
+Items 1–4 are score-safe. Every "expected" figure is a launch/traffic-count
+projection, not yet re-verified on a GPU — including what §5.1–5.3 just landed,
+which is precisely what item 1 now has to measure first.
 
 ## 9. Success criteria
 

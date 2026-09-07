@@ -38,7 +38,6 @@ from typing import Any, Optional
 import torch
 
 from .decode_kernel import fused_two_tier_decode
-from .scorer import reduce_two_tier_scores
 
 
 # Single-slot pending context, set by the cache in update() right before the
@@ -148,15 +147,32 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     k_fp = k_flash.transpose(1, 2)                    # [B, H_kv, S_fp, D]
     v_fp = v_flash.transpose(1, 2)
 
-    out, token_scores = fused_two_tier_decode(
-        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"]
-    )                                                  # out [B,H_q,D], scores [B,H_q,S]
-
     order, q_token_len = ctx["score_meta"]
-    scores = reduce_two_tier_scores(
-        token_scores, ctx["num_sink"], ctx["window_size"], q_token_len, order
-    )
-    ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = scores
+    num_sink, ws = ctx["num_sink"], ctx["window_size"]
+    # The window axis the kernel emits must be the axis `order` permutes, so the
+    # body window count is derived the same way `compute_score_meta` derives it:
+    # from the fp body's length, ceil-divided by ws (the newest body window is
+    # usually partial and still owns a column).
+    n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
+
+    out, wsum = fused_two_tier_decode(
+        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win
+    )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+
+    # §5.1: the kernel already reduced S -> W in registers, so all that is left is
+    # the physical -> merged-id permutation. This replaces
+    # `reduce_two_tier_scores`'s pad + reshape + sum + einops-reduce + cat (and
+    # the [B,H_q,S] fp32 round trip that fed them) with one gather.
+    if order.shape[1] != wsum.shape[-1]:
+        raise RuntimeError(
+            f"score_meta permutes {order.shape[1]} windows but the kernel emitted "
+            f"{wsum.shape[-1]} (n_body_win={n_body_win}, S_fp={k_fp.shape[2]}, "
+            f"num_sink={num_sink}, ws={ws}). These are derived from the same store "
+            "and must agree; a mismatch would scatter scores onto the wrong windows."
+        )
+    idx = order.unsqueeze(1).expand(wsum.shape[0], wsum.shape[1], order.shape[1])
+    ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = torch.gather(
+        wsum, -1, idx)
 
     return out.unsqueeze(1)                            # [B, 1, H_q, D] (flash layout)
 
