@@ -247,6 +247,22 @@ removing ~13 launches/layer/step (**416/step**).
    `[num_sink, Sfp)` on window-aligned boundaries. This works for any `num_sink`,
    including the benchmark cell's 5.
 
+**Where §5.1's value actually is — and it is not the traffic.** The 6.4× cut is
+6.4× of a term that is only ~5% of the per-step total, because the weights
+(16.06 GB) dominate. At the benchmark cell:
+
+| `ws` | score traffic now | after §5.1 | per-step **total** | roofline ms |
+|---|---|---|---|---|
+| 4 | 1.11 GB | 0.35 GB | 23.09 → 22.33 GB | 11.32 → 10.95 |
+| 8 | 1.11 GB | 0.17 GB | 22.34 → 21.41 GB | 10.95 → 10.50 |
+| 32 | 1.11 GB | 0.04 GB | 21.85 → 20.78 GB | 10.71 → 10.19 |
+
+So the traffic half of §5.1 is worth **~0.5 ms**, not the ~19 ms this plan's
+order-of-work table implies. That 19 ms was a *host launch* figure (416
+launches/step × the 45 µs/launch rate §2 has since retired), and it is exactly
+the kind of number Stage 0 has to re-derive. **Treat §5.1 as a launch-count fix
+with a traffic bonus, not the other way round.**
+
 Numerics: identical summands, different association in the online-softmax
 rescale. The bar is fp tolerance against `two_tier_decode_reference`, same as the
 prefill `exp2` change.
@@ -369,8 +385,8 @@ change costs.
 |---|---|---|---|
 | 1 | Stage 0 profile, re-run at 4096/B=32 | none | attribute the remaining ~35 ms/step between host and GPU — nothing below should be trusted for ms until this runs |
 | 2 | §5.5 freebies (`exp2`, fp16 rope, dead hook, prealloc dict) | fp-level | ~−1 ms host, −0.4 GB traffic |
-| 3 | §5.1 window-score epilogue | fp-level | ~−19 ms host, −0.94 GB — projected to close most of the remaining gap to the 20%-faster and stretch targets |
-| 4 | §5.3 + §5.4 Q-tier tiling | none | the GPU-bound half of the remaining excess |
+| 3 | §5.1 window-score epilogue | fp-level | −416 launches/step, and −0.94 GB = **~0.5 ms** of traffic. The launch half is the whole value and is unsized until Stage 0 runs — the old "−19 ms" used the retired 45 µs/launch rate |
+| 4 | §5.3 + §5.4 Q-tier tiling | none | 179 → 23 serial dependent iterations at ws=8 (7.8×). A latency effect, not traffic — plausibly the larger of the two levers, which Stage 0 should settle before §5.1 is assumed to be first |
 | 5 | §5.6 split-K | none | the B=1 and B≤8 rows, currently 2.3–2.5× slower than Flash |
 | 6 | §4.2 `eviction_interval` (opt-in) | **outputs** | small further cut, + quality run |
 | 7 | §5.7 quant grid / §6 CUDA graphs | **outputs / fairness** | decisions, not tasks |
