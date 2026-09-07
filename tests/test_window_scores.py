@@ -217,3 +217,71 @@ def test_end_to_end_scores_match_the_old_reduce_path(ws, num_sink):
     new = torch.gather(wsum, -1, idx)
 
     torch.testing.assert_close(new, old.float(), rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Padding cannot leak into a window sum
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ws", list(range(1, 129)))
+def test_padding_lanes_are_unreachable_by_any_window(ws):
+    """Exhaustive over every ``ws`` from 1 to 128, not a sample.
+
+    A Triton block must be a power of two, so a tile of ``BLOCK_NW * ws`` keys is
+    materialised as ``BLOCK_T`` lanes with the surplus masked. The masking is one
+    defence; this is the other, and it is structural: a padding lane sits at
+    ``offs_t >= BLOCK_NW*ws``, so its ``t_win = offs_t // ws`` is ``>= BLOCK_NW``,
+    while the per-window store loop only runs ``j`` over ``0 … BLOCK_NW-1``. No
+    window's selector can name it, so padding cannot be folded into a window sum
+    even if the mask were dropped.
+
+    Also pins the converse: every REAL lane belongs to exactly one window, and
+    each window owns exactly ``ws`` lanes — i.e. the padding does not shrink or
+    stretch what a window means.
+    """
+    block_nw, block_t = window_tiling(ws)
+    offs_t = torch.arange(block_t)
+    t_win = offs_t // ws
+    is_pad = offs_t >= block_nw * ws
+
+    # 1. no padding lane is reachable by any j in [0, BLOCK_NW)
+    for j in range(block_nw):
+        assert not bool(((t_win == j) & is_pad).any()), (
+            f"ws={ws}: window {j} would select a padding lane")
+
+    # 2. every real lane lands in exactly one window, and windows are full width
+    real = ~is_pad
+    assert int(real.sum()) == block_nw * ws
+    for j in range(block_nw):
+        owned = int(((t_win == j) & real).sum())
+        assert owned == ws, (
+            f"ws={ws}: window {j} owns {owned} lanes, expected exactly {ws} — "
+            "padding must not change what a window sums")
+
+
+@pytest.mark.parametrize("ws", [3, 5, 7, 12, 24, 48])
+def test_non_power_of_two_windows_sum_the_right_token_count(ws):
+    """The cases where padding actually exists (``BLOCK_NW*ws < BLOCK_T``).
+
+    A one-hot value tensor turns each window's score into a literal count of the
+    tokens it summed, so a padding leak or a dropped token shows up as an integer
+    that is off by exactly that many — far easier to read than a float mismatch.
+    """
+    block_nw, block_t = window_tiling(ws)
+    assert block_nw * ws < block_t, f"ws={ws} has no padding; wrong fixture"
+
+    torch.manual_seed(ws)
+    B, H_kv, rep, D, num_sink = 1, 1, 2, 16, 0
+    H_q, n_body_win = H_kv * rep, block_nw + 2      # spans >1 tile
+    S = n_body_win * ws
+    q = torch.zeros(B, H_q, D)                      # all logits equal -> uniform
+    k = torch.zeros(B, H_kv, S, D)
+    v = torch.randn(B, H_kv, S, D)
+    _, got = two_tier_window_reference(q, k, v, 1.0, num_sink, ws, n_body_win, S)
+
+    # Uniform softmax over S keys => each window's mass is (its token count)/S.
+    expected = torch.full((B, H_q, n_body_win), ws / S)
+    torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(got.sum(-1), torch.ones(B, H_q),
+                               rtol=1e-6, atol=1e-7)

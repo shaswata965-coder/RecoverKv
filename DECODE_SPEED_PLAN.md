@@ -268,6 +268,18 @@ the 6.4× in §5.1 as the headline; it is 6.4× of a small number.
 > ``ws=12``. The sink prefix gets its own prologue tile that feeds the softmax
 > and emits no window score, matching ``reduce_token_scores_to_windows``.
 >
+> **Padding does not change what a window sums**, and that is verified rather
+> than argued. Two independent defences: the lane mask zeroes a padding lane's
+> contribution, and — structurally — a padding lane sits at
+> ``offs_t >= BLOCK_NW*ws`` so its ``t_win = offs_t // ws`` is ``>= BLOCK_NW``,
+> while the per-window store loop only runs ``j`` over ``0 … BLOCK_NW-1``. No
+> window's selector can name it even with the mask removed. The CPU oracle
+> materialises the padding lanes too (rather than slicing the exact range), so
+> the end-to-end comparisons exercise the masking; on top of that,
+> ``test_padding_lanes_are_unreachable_by_any_window`` checks the structural
+> property **exhaustively for every ``ws`` from 1 to 128**, both directions —
+> no padding lane is reachable, and every window owns exactly ``ws`` real lanes.
+>
 > **What is verified, and what is not.** Triton cannot run on this repo's CPU dev
 > box, so the *lowering* ships unvalidated — the same contract the score kernel
 > and the original decode kernel already ship under. The *algorithm* does not:

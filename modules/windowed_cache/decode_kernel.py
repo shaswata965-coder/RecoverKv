@@ -277,49 +277,72 @@ def two_tier_window_reference(
     wsum = torch.zeros((B, H_q, W_phys), dtype=torch.float32)
     wmax = torch.full((B, H_q, W_phys), NEG, dtype=torch.float32)
 
-    def tile(lo: int, hi: int, win_base: int) -> None:
-        """One tile. ``win_base < 0`` means "softmax only" (the sink prologue).
+    _, BLOCK_T = window_tiling(ws)
+    offs_t = torch.arange(BLOCK_T)
+    t_win = offs_t // ws                                   # window index in tile
+    in_tile = offs_t < (block_nw * ws)                     # masks the pow2 padding
 
-        ``lo`` is on a window boundary whenever ``win_base >= 0``, so window ``j``
-        of the tile is exactly keys ``[lo + j*ws, lo + (j+1)*ws)`` clipped to
-        ``hi``. That is the property the window tiling buys, and it is why no
-        window is ever split across two tiles for any ``ws``.
+    def tile(key0: int, end: int, win_base: int, n_win_limit: int) -> None:
+        """One tile, **including the power-of-2 padding lanes the kernel has**.
+
+        This is deliberately not the tidy "slice ``[lo, hi)``" version. A Triton
+        block must be a power of two, so a tile of ``BLOCK_NW * ws`` keys is
+        materialised as ``BLOCK_T >= BLOCK_NW * ws`` lanes and the surplus is
+        masked. Modelling the exact slice instead would verify the tiling while
+        silently assuming the masking — and the masking is the part that could
+        fold padding lanes into a window and quietly change what a "window" sums.
+
+        Two independent things keep padding out of the window sums, and this
+        function reproduces both so the tests exercise them:
+
+        1. ``nmask`` zeroes every padding lane's ``p``, so it contributes nothing
+           to the running sum, to ``acc``, or to any window.
+        2. A padding lane has ``offs_t >= BLOCK_NW*ws``, hence
+           ``t_win = offs_t // ws >= BLOCK_NW``, while the per-window loop only
+           runs ``j`` over ``0 … BLOCK_NW-1``. So no padding lane is reachable by
+           any window's selector even if (1) were removed.
+
+        ``win_base < 0`` means "softmax only" — the sink prologue, which feeds
+        the LSE and emits no window score.
         """
         nonlocal m, l, acc
-        if hi <= lo:
+        offs_n = key0 + offs_t
+        nmask = in_tile & (offs_n < end) & (offs_n >= 0)
+        if not bool(nmask.any()):
             return
-        lg = logits[:, :, lo:hi]
+        safe = offs_n.clamp(0, S - 1)
+        lg = logits[:, :, safe]                            # [B,H_q,BLOCK_T]
+        lg = torch.where(nmask, lg, torch.full_like(lg, float("-inf")))
         m_new = torch.maximum(m, lg.max(dim=-1).values)
         corr = torch.exp(m - m_new)
-        corr = torch.nan_to_num(corr, nan=0.0)          # first tile: -inf - -inf
-        p = torch.exp(lg - m_new.unsqueeze(-1))
+        corr = torch.nan_to_num(corr, nan=0.0)             # first tile: -inf - -inf
+        p = torch.where(nmask, torch.exp(lg - m_new.unsqueeze(-1)),
+                        torch.zeros_like(lg))
         acc = acc * corr.unsqueeze(-1) + torch.matmul(
-            p.unsqueeze(-2), v_flat[:, :, lo:hi]).squeeze(-2)
+            p.unsqueeze(-2), v_flat[:, :, safe]).squeeze(-2)
         l = l * corr + p.sum(dim=-1)
         m = m_new
         if win_base < 0:
             return
-        for j in range(-(-(hi - lo) // ws)):
+        for j in range(block_nw):                          # mirrors tl.static_range
             w = win_base + j
-            if w >= W_phys:
-                break
-            a, b = j * ws, min((j + 1) * ws, hi - lo)
-            wsum[:, :, w] = p[:, :, a:b].sum(dim=-1)
+            if w - win_base >= n_win_limit or w >= W_phys:
+                continue
+            sel = (t_win == j) & nmask
+            if not bool(sel.any()):
+                continue
+            wsum[:, :, w] = torch.where(sel, p, torch.zeros_like(p)).sum(dim=-1)
             wmax[:, :, w] = m_new
 
-    tile(0, num_sink, -1)                                  # sink prologue
-    pos, wb = num_sink, 0                                  # fp body
-    while pos < body_end:
-        hi = min(pos + block_nw * ws, body_end)
-        tile(pos, hi, wb)
-        wb += -(-(hi - pos) // ws)
-        pos = hi
-    pos, wb = body_end, n_body_win                         # Q tier
-    while pos < S:
-        hi = min(pos + block_nw * ws, S)
-        tile(pos, hi, wb)
-        wb += -(-(hi - pos) // ws)
-        pos = hi
+    # 1. sink prologue -- softmax only
+    for s0 in range(0, max(num_sink, 0), BLOCK_T):
+        tile(s0, num_sink, -1, 0)
+    # 2. fp body -- whole-window tiles from num_sink
+    for w0 in range(0, n_body_win, block_nw):
+        tile(num_sink + w0 * ws, body_end, w0, n_body_win - w0)
+    # 3. Q tier -- whole-window tiles
+    for w0 in range(0, n_q_win, block_nw):
+        tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
 
     out = acc / l.unsqueeze(-1)
     lse = m + torch.log(l)
