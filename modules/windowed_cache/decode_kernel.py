@@ -575,6 +575,61 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
     return v
 
 
+# ---------------------------------------------------------------------------
+# Shared-memory fit ladder
+# ---------------------------------------------------------------------------
+
+#: ``(target_keys, num_stages)`` rungs, fastest first. Bigger tiles mean fewer
+#: serial iterations (§5.3's whole point) but more ``tl.dot`` operand staging in
+#: shared memory; more pipeline stages hide more latency at the same cost. An
+#: A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands before staging,
+#: so the top rung does not fit everywhere -- hence a ladder rather than a
+#: constant. Every rung is numerically identical; only speed differs.
+_FIT_LADDER = [(64, 2), (32, 2), (32, 1), (16, 2), (16, 1)]
+
+#: Winning rung per geometry signature, so the search runs once per process.
+_FIT_CHOICE: dict = {}
+
+_FIT_ANNOUNCED: set = set()
+
+
+def _is_out_of_resources(exc: BaseException) -> bool:
+    """True for Triton's shared-memory/registers exhaustion, across versions.
+
+    Triton has moved this exception between modules (``triton.runtime.autotuner``
+    -> ``triton.runtime.errors``) and wraps it differently by version, so match on
+    the type NAME and the message rather than importing a moving target. A
+    mis-detection here would either mask a real bug (if too broad) or abort a
+    launch that a smaller tile would have served (if too narrow), so it checks
+    both.
+    """
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if type(cur).__name__ == "OutOfResources":
+            return True
+        msg = str(cur).lower()
+        if "out of resource" in msg and ("shared memory" in msg or "register" in msg):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _announce_fit(sig, target_keys: int, num_stages: int,
+                  block_nw: int, block_t: int) -> None:
+    """Say which rung won, once per geometry. Never silent: the tile size is a
+    performance fact a reader of a perf table needs, and a run that quietly
+    dropped to the smallest tile would otherwise look like the kernel simply
+    being slow."""
+    if sig in _FIT_ANNOUNCED:
+        return
+    _FIT_ANNOUNCED.add(sig)
+    print(f"[StickyKV] fused decode tiling: target_keys={target_keys} "
+          f"num_stages={num_stages} -> BLOCK_NW={block_nw} BLOCK_T={block_t} "
+          f"(ws={sig[0]}, head_dim={sig[1]})")
+
+
 def _decode_triton(
     q: Tensor,
     k_fp: Tensor,
@@ -664,21 +719,58 @@ def _decode_triton(
             )
 
     BLOCK_R = _pow2_at_least(rep)
-    BLOCK_NW, BLOCK_T = window_tiling(ws)
-    BLOCK_W = _pow2_at_least(min(W_phys, 128), floor=16)
     grid = (B * H_kv,)
-    _two_tier_decode_kernel[grid](
-        q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
-        scaling,
-        H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
-        q.stride(0), q.stride(1), q.stride(2),
-        k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
-        v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
-        HEAD_DIM=D, HALF=half, WS=ws,
-        BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T, BLOCK_W=BLOCK_W,
-        PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+
+    # Shared-memory fit ladder (see _FIT_LADDER). §5.3 widened the Q-tier tile
+    # from one window (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows,
+    # which quadrupled the `tl.dot` operand staging -- k_rlo/k_rhi go from
+    # [64,16] to [64,64] and vv from [16,128] to [64,128]. At BLOCK_T=64 that is
+    # ~128 KB of dot operands before Triton's pipelining multiplies it, and an
+    # A100 has 163 KB of shared memory per SM. The first GPU run of this kernel
+    # hit exactly that: "Required: 176128, Hardware limit: 166912".
+    #
+    # So the tile size is CHOSEN, not assumed: try the fastest rung, and step
+    # down on OutOfResources. This is a tuning search, not a correctness
+    # fallback -- every rung computes bit-identical results, only the tiling and
+    # the pipeline depth differ -- and the winner is cached per geometry so the
+    # search runs once. If no rung fits, it raises with the whole ladder, because
+    # a decode kernel that cannot launch must fail loudly (invariant 3).
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0))
+    rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
+    last: Optional[BaseException] = None
+    for target_keys, num_stages in rungs:
+        BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
+        BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
+        try:
+            _two_tier_decode_kernel[grid](
+                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
+                scaling,
+                H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+                q.stride(0), q.stride(1), q.stride(2),
+                k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
+                v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
+                HEAD_DIM=D, HALF=half, WS=ws,
+                BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
+                BLOCK_W=BLOCK_W,
+                PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+                num_stages=num_stages,
+            )
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            last = exc
+            continue
+        if _FIT_CHOICE.get(sig) != (target_keys, num_stages):
+            _FIT_CHOICE[sig] = (target_keys, num_stages)
+            _announce_fit(sig, target_keys, num_stages, BLOCK_NW, BLOCK_T)
+        return out, wsum
+
+    raise RuntimeError(
+        "fused decode could not fit in shared memory at any tile size. Tried "
+        f"(target_keys, num_stages) = {_FIT_LADDER} for ws={ws}, head_dim={D}, "
+        f"BLOCK_R={BLOCK_R}. Last error: {last}"
     )
-    return out, wsum
+
 
 
 # ---------------------------------------------------------------------------

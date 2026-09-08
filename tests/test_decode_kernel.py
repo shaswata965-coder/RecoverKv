@@ -118,3 +118,67 @@ def test_gate_is_noop_when_fused_disabled(monkeypatch):
 #     out, sc = fused_two_tier_decode(q, k_fp, v_fp, qtier, scaling)
 #     assert torch.allclose(out, out_ref, atol=1e-2, rtol=1e-2)
 #     assert torch.allclose(sc,  sc_ref,  atol=1e-2, rtol=1e-2)  # scores are [sink‖body‖Q] order
+
+
+# ---------------------------------------------------------------------------
+# Shared-memory fit ladder (§5.3 widened the Q tile; A100 smem is 163 KB)
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_resources_is_detected_by_name_and_by_message():
+    """Triton has moved this exception between modules across versions, so the
+    detector matches the type name OR the message, and unwraps causes."""
+    from modules.windowed_cache.decode_kernel import _is_out_of_resources
+
+    class OutOfResources(Exception):
+        pass
+
+    assert _is_out_of_resources(OutOfResources("anything"))
+    assert _is_out_of_resources(RuntimeError(
+        "out of resource: shared memory, Required: 176128, Hardware limit: 166912"))
+    assert _is_out_of_resources(RuntimeError("out of resource: registers"))
+    # wrapped
+    inner = OutOfResources("x")
+    outer = RuntimeError("launch failed")
+    outer.__cause__ = inner
+    assert _is_out_of_resources(outer)
+
+
+def test_unrelated_errors_are_not_swallowed_by_the_ladder():
+    """A real bug must propagate, not be retried at a smaller tile until the
+    ladder is exhausted and the true cause is buried."""
+    from modules.windowed_cache.decode_kernel import _is_out_of_resources
+
+    assert not _is_out_of_resources(RuntimeError("illegal memory access"))
+    assert not _is_out_of_resources(ValueError("shape mismatch"))
+    assert not _is_out_of_resources(RuntimeError("CUDA error: out of memory"))
+
+
+def test_fit_ladder_is_ordered_fastest_first_and_terminates():
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
+
+    assert len(_FIT_LADDER) >= 2
+    keys = [k for k, _ in _FIT_LADDER]
+    assert keys == sorted(keys, reverse=True), "biggest tile must be tried first"
+    # every rung yields a legal, shrinking tile at the shipped window size
+    seen = []
+    for target_keys, num_stages in _FIT_LADDER:
+        nw, t = window_tiling(8, target_keys)
+        assert nw >= 1 and t & (t - 1) == 0
+        assert num_stages >= 1
+        seen.append(nw)
+    assert seen[0] >= seen[-1], "tiles must not grow as the ladder steps down"
+    assert seen[-1] >= 1, "the last rung must still be launchable"
+
+
+@pytest.mark.parametrize("ws", [1, 4, 8, 12, 32, 128])
+def test_every_ladder_rung_is_a_legal_tiling(ws):
+    """A rung that produced a zero-width tile would raise instead of stepping to
+    the next one, turning a fit problem into a crash."""
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
+
+    for target_keys, _ in _FIT_LADDER:
+        nw, t = window_tiling(ws, target_keys)
+        assert nw >= 1, f"ws={ws} target={target_keys} produced {nw} windows/tile"
+        assert nw * ws <= t
+        assert t & (t - 1) == 0

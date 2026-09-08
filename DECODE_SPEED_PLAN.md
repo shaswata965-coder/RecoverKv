@@ -293,6 +293,33 @@ the 6.4× in §5.1 as the headline; it is 6.4× of a small number.
 > effective K/V and the same ``score_meta``. Keep the oracle in step with the
 > kernel; it is the only thing standing between this and an unverified rewrite.
 >
+> **Shared memory bounds the tile, so the tile is chosen, not assumed.** The
+> first GPU run of this kernel failed on every cell: ``OutOfResources: shared
+> memory, Required: 176128, Hardware limit: 166912``. §5.3 widened the Q-tier
+> tile from one window (``BLOCK_WS=16``) to ``BLOCK_NW`` windows, which
+> quadrupled the ``tl.dot`` operand staging — ``k_rlo``/``k_rhi`` go
+> ``[64,16] → [64,64]`` and ``vv`` goes ``[16,128] → [64,128]``, ~128 KB of
+> operands at ``BLOCK_T=64`` before Triton's pipelining multiplies it, against
+> an A100's 163 KB/SM.
+>
+> The fix is a **fit ladder** (``_FIT_LADDER``): try the fastest
+> ``(target_keys, num_stages)``, step down on ``OutOfResources``, cache the
+> winner per geometry, announce which rung won. Every rung is numerically
+> identical — only the tiling and pipeline depth differ — so this is a tuning
+> search, not a correctness fallback, and if no rung fits it raises with the
+> whole ladder rather than limping. At ``ws=8``, ``n_active=179``:
+>
+> | rung | BLOCK_NW | BLOCK_T | Q-tier iters | vs pre-§5.3 | dot operands |
+> |---|---|---|---|---|---|
+> | (64, 2) | 8 | 64 | 23 | 7.8× | 128 KB |
+> | (32, 2) | 4 | 32 | 45 | 4.0× | 64 KB |
+> | (16, 1) | 2 | 16 | 90 | 2.0× | 32 KB |
+>
+> Even the bottom rung halves the serial iteration count, so §5.3 pays off
+> wherever it lands; the announced rung says how much. The failing run used
+> Triton's *default* ``num_stages`` (3+) at ``BLOCK_T=64`` — the top rung pins it
+> to 2, so it may yet fit.
+>
 > **Expected gain, honestly.** The traffic half is ~0.5 ms (see §5.1's table) —
 > the value is in the launch and latency halves, which remain unsized until
 > Stage 0 (§3) runs on a GPU. Do not assume this closed the 4.7 ms gap; measure it.
