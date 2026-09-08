@@ -788,6 +788,47 @@ def build_cells(pc) -> List[tuple]:
             for p in pc.prefill_lengths for g in gens for b in batches]
 
 
+def _assert_single_device(model, model_name: str) -> None:
+    """Refuse to benchmark a model `device_map="auto"` has split across GPUs.
+
+    This is a MEASUREMENT-VALIDITY gate, not a capability one. `device_map="auto"`
+    shards by layer, so a sharded decode step serialises 32 layers across N
+    devices with a host-visible transfer between each — the per-token latency it
+    yields measures the interconnect, not the KV cache, and is not comparable to
+    the single-GPU baselines this table prints beside it (Flash 0.086 s and the
+    rest were all measured on one device). Reporting the two in one table would
+    be worse than reporting nothing.
+
+    It also happens to be where three separate failures came from on an 8-GPU
+    box: the layer-major join cannot concatenate across devices, the two-tier
+    eviction's shared `rope_module` lives on one device while the layers do not,
+    and the resulting device-side assert poisons the CUDA context so every later
+    cell in the sweep fails too. Those are worth fixing on their own merits, but
+    none of them would make a sharded measurement meaningful.
+
+    Llama-3.1-8B at the table's largest cell peaks around 48 GB, so one 80 GB
+    card is enough; the fix is to pin the run, not to shard it.
+    """
+    try:
+        devices = {p.device for p in model.parameters()}
+    except Exception:                                    # pragma: no cover
+        return
+    cuda = sorted(str(d) for d in devices if d.type == "cuda")
+    if len(cuda) <= 1:
+        return
+    raise RuntimeError(
+        f"{model_name} was sharded across {len(cuda)} GPUs {cuda} by "
+        'device_map="auto". A pipeline-sharded decode step measures the '
+        "interconnect between layers, not the KV cache, and cannot be compared "
+        "with the single-GPU baselines printed beside it, so this run would "
+        "produce numbers that look like results but are not. "
+        "Pin the run to one device: CUDA_VISIBLE_DEVICES=0 <your command>. "
+        "Note that scripts/run_perf_table.sh only DEFAULTS this "
+        '(CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"), so an existing '
+        "export in your shell wins over it and has to be overridden explicitly."
+    )
+
+
 class PerfRunner:
     """Suite C — TTFT, throughput, TPOT benchmarks."""
     def __init__(self, config: ExperimentConfig) -> None:
@@ -1160,6 +1201,7 @@ class PerfRunner:
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")
         model.eval()
+        _assert_single_device(model, cfg.model.name)
         # Stashed for the OOM autopsy: the failure is caught in the caller,
         # where the model is out of scope, and the analytic breakdown needs the
         # geometry to say WHICH term overflowed.

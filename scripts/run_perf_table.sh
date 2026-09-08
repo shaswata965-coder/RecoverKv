@@ -59,6 +59,26 @@
 set -euo pipefail
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+# Pre-flight: refuse a multi-GPU sweep before loading 16 GB of weights.
+#
+# The line above only DEFAULTS the variable -- an existing export in the shell
+# wins. On a multi-GPU box that means device_map="auto" pipeline-shards the
+# model by layer, and a sharded decode step measures the interconnect between
+# layers rather than the KV cache: the resulting TPOT is not comparable to the
+# single-GPU baselines this table prints beside it. perf_runner enforces the
+# same rule after the model loads; this catches it in a second instead of a
+# minute, and before the first cell poisons a CUDA context for the rest.
+if [[ "$CUDA_VISIBLE_DEVICES" == *,* ]]; then
+  echo "error: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES selects multiple GPUs." >&2
+  echo "       device_map=\"auto\" would shard the model by layer, and a sharded" >&2
+  echo "       decode step times the interconnect, not the cache -- the numbers" >&2
+  echo "       would not be comparable to the single-GPU baselines in the table." >&2
+  echo "       Llama-3.1-8B peaks near 48 GB at the largest cell, so one 80 GB" >&2
+  echo "       card is enough. Re-run with:" >&2
+  echo "         CUDA_VISIBLE_DEVICES=0 $0 $*" >&2
+  exit 2
+fi
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
