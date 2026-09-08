@@ -184,19 +184,78 @@ KV heads into one `BLOCK_R=16` tile (grid becomes `B·H_kv/4`) or drop to an FMA
 reduction for the Q tier. Interacts with §4.1 — both change the grid, so decide
 them together.
 
-### 4.3 The free ones
+### 4.3 The "free ones" — reviewed, and two of them are not
 
-- **`tl.exp` → `exp2`.** Same SFU fix as commit `17d866f`; fold `log2(e)` into
-  `scale` and the `[BLOCK_R]` LSE vector, never into the `[BLOCK_R,BLOCK_T]`
-  tile. ~139 M exponentials/step at this cell — worth ~0.75 ms, costs nothing.
-- **`cos`/`sin` in fp16.** `rope_cos_sin_halves` returns fp32 only because `ref`
-  is fp32. **0.75 → 0.38 GB/step** for a `.half()`, kernel math still fp32. Also
-  halves those `tl.dot` operands, which may buy a bigger tile rung (§4.4).
-- **Drop the `q_proj` stash hook when fused is active** (`hooks.py:424`). On the
-  fused path the score hook returns before consuming it (`hooks.py:494`) — a dict
-  store and a live tensor per layer per step, for nothing.
-- **Preallocate the `set_pending` dict** instead of building a 7-key dict per
-  layer per step.
+They were written against the **pre-rewrite** kernel and only two survive review.
+
+**(a) `tl.exp` → `exp2` — do it, but it is ~0.42 ms, not 0.75, and not free.**
+The base-2 fold works with the window epilogue: put `log2(e)` into `scale`, keep
+`m`/`wmax` in base-2 units, and use `lse = m + log2(l)` — `p`, `l`, `acc` and
+`out` are then bit-for-bit the same quantities, and the epilogue's
+`exp2(wmax − lse)` equals `exp(m_tile − lse)`. Verified on CPU (max rel
+`1.4e-6`, window sums still normalise to 1).
+
+Two corrections to the old entry. The exponential count is **78 M/step, not
+139 M** — the rewrite deleted the second pass over `S`, so the count fell 1.78×
+and the saving with it. And it is *not* numerically free: `1.4e-6` max relative
+is ~10× the window-score rewrite's `1e-7` and the same order as the smallest
+observed ranking gap (`8e-6`), so it needs a quality check, not just a tolerance
+test.
+
+**(b) `cos`/`sin` in fp16 — do it, but for consistency, not bandwidth.**
+
+The bandwidth claim is right (0.75 → 0.38 GB/step, ~0.18 ms) and it may buy a
+bigger tile rung (§4.4). But fp16 `cos`/`sin` perturbs a rotated key by ~`5e-4`
+mean relative — **~5000× the window-score change and ~60× the ranking gap.** On
+those numbers alone it would be a bad trade.
+
+It is still the right change, because **the kernel is currently the odd one out**:
+
+| path | `ref` passed to the rotary | dtype |
+|---|---|---|
+| HF's own RoPE for the fp tier | the fp16 hidden state | **fp16** |
+| `unrotate_key_window` on demote | the fp16 key (`_rope_cos_sin(rope, k, …)`) | **fp16** |
+| `rotate_key_window` on promote | the fp16 key | **fp16** |
+| **the decode kernel** (`rope_cos_sin_halves`) | `torch.empty(1,1,1)` → default dtype | **fp32** |
+
+So the Q tier is un-rotated in fp16, stored, and then re-rotated by the kernel in
+fp32 — the round trip does not return the key that was stored. Measured
+round-trip error on a window of 512 positions:
+
+| kernel `cos`/`sin` | mean rel | max rel |
+|---|---|---|
+| fp16 (matched) | 2.1e-04 | **6.9e-04** |
+| fp32 (current) | 3.4e-04 | **4.5e-01** |
+
+Matching the kernel to fp16 cuts the **max** round-trip error ~660×. Today a
+token's key differs depending on which tier it is in, which is not a property a
+two-tier cache should have — the tiers are meant to be interchangeable
+representations of the same key. `torch.empty(1, 1, 1)` picking the global
+default dtype looks incidental rather than intended.
+
+> **This is worth a look from the accuracy side independently of speed.**
+> `ACCURACY_RECOVERY_PLAN.md`'s causes B–D are still unmeasured, and a
+> tier-dependent key representation at `q > 0` is exactly the shape of thing that
+> would cost LongBench points without showing up in any equivalence test — every
+> test here compares the kernel against an oracle built with *the same* fp32
+> convention, so none of them can see it.
+
+**(c) Drop the `q_proj` stash hook when fused is active — NO. The claim is wrong.**
+The score hook's early return is gated on `hidden_states.shape[1] == 1`
+(`hooks.py:494`), so it only fires on **decode** steps with a non-empty Q tier.
+**Prefill (`T > 1`) falls through and consumes the stash** at `hooks.py:553`.
+Removing the hook would break prefill scoring outright. It could be made
+conditional inside the hook, but the prize is one dict store per layer per step
+plus ~8 MB of live tensor at B=32 — far below measurement noise. **Struck.**
+
+**(d) Preallocate the `set_pending` dict — not worth it.** Measured: 177 ns to
+build the 7-key dict, ×32 layers = **5.7 µs/step, 0.009% of a 62.6 ms step.**
+There are also two call sites, and mutating a shared dict trades that for
+aliasing risk. **Struck.**
+
+**Revised total for §4.3: ~0.6 ms** (0.42 + 0.18), both items carrying a
+numerical change that needs a quality run — not the "~1 ms, costs nothing" the
+old entry claimed.
 
 ### 4.4 Raise the tile rung if Stage 0 says it was capped
 
@@ -251,7 +310,7 @@ runners override `cache.quant_ratio` on the command line
 |---|---|---|---|
 | 1 | Stage 0 profile (§2) | none | the only thing that can size items 2–4 honestly |
 | 2 | §4.1 split-K | fp-level | the B=1 and short-context deficit; highest value |
-| 3 | §4.3 free ones | fp-level | ~1 ms + 0.4 GB, and may unlock §4.4 |
+| 3 | §4.3 (a) `exp2` + (b) fp16 `cos`/`sin` | **fp-level, needs a quality run** | ~0.6 ms + 0.4 GB; (b) also fixes a tier-dependent key representation, and may unlock §4.4. (c) and (d) struck on review |
 | 4 | §4.4 tile rung, §4.2 `BLOCK_R` | none | recovers the Q-tier tiling's full 7.8× if capped |
 | 5 | §3.2 `eviction_interval` (opt-in) | **outputs** | 4× on the eviction, + quality run |
 | 6 | §3.3 graph break | none | only if Stage 0.4 says so |
