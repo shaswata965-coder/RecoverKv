@@ -510,6 +510,12 @@ class WindowedCache(_HFCacheBase):
 
         self.config = config
         self.resolved = config.resolve(prefill_len, model_config, kv_dtype, max_tokens)
+        # Kept for the fused path's RoPE tables, which must be built at the STORE's
+        # dtype so the Q tier is re-rotated with the same convention it was
+        # un-rotated with (decode_kernel.rope_cos_sin_halves explains why).
+        self._kv_dtype: torch.dtype = kv_dtype
+        # One reusable fused hand-off dict per layer (see _pending_ctx).
+        self._pending_ctx_cache: List[Optional[Dict[str, Any]]] = [None] * num_layers
         self.rope_module = rope_module
         self.num_layers = num_layers
         self.telemetry = telemetry if telemetry is not None else NullTelemetry()
@@ -1047,15 +1053,8 @@ class WindowedCache(_HFCacheBase):
                 # merely equivalent ones.
                 qtier = self._fused_qtier(layer_idx, store, B, n, ws)
                 score_meta = self._fused_meta(layer_idx, state, ws)
-                flash_decode.set_pending({
-                    "layer_idx": layer_idx,
-                    "qtier": qtier,
-                    "score_meta": score_meta,
-                    "num_sink": self.resolved.num_sink_tokens,
-                    "window_size": ws,
-                    "scaling": self._attn_scaling,
-                    "cache": self,
-                })
+                flash_decode.set_pending(
+                    self._pending_ctx(layer_idx, qtier, score_meta, ws))
                 # The patch writes window_scores; the score forward-hook skips this
                 # step. Clear the materialize stashes so no stale effective-K leaks.
                 self._last_effective_k[layer_idx] = None
@@ -1447,15 +1446,8 @@ class WindowedCache(_HFCacheBase):
             n = store.num_active_windows
             qtier = self._fused_qtier_joint(layer_idx, store, B, n, ws)
             score_meta = self._fused_meta_joint(layer_idx, B, ws)
-            flash_decode.set_pending({
-                "layer_idx": layer_idx,
-                "qtier": qtier,
-                "score_meta": score_meta,
-                "num_sink": self.resolved.num_sink_tokens,
-                "window_size": ws,
-                "scaling": self._attn_scaling,
-                "cache": self,
-            })
+            flash_decode.set_pending(
+                self._pending_ctx(layer_idx, qtier, score_meta, ws))
             self._last_effective_k[layer_idx] = None
             self._last_score_meta[layer_idx] = None
             return k_layer, v_layer
@@ -1486,7 +1478,12 @@ class WindowedCache(_HFCacheBase):
         kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)  # [R*n, …]
         fields = [t.reshape(L, B, n, *t.shape[1:]) for t in (kc, ks, kz, vc, vs, vz)]
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
-        cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
+        # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
+        # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
+        # table here would re-rotate the Q tier with a different convention than
+        # the one it was un-rotated with. See rope_cos_sin_halves.
+        cos_h, sin_h = rope_cos_sin_halves(
+            self.rope_module, qpos_flat, self._kv_dtype)
         self._joint_qpos = qpos_flat
 
         key = (store.version, n, B)
@@ -1584,6 +1581,40 @@ class WindowedCache(_HFCacheBase):
     # Fused-decode hand-off, memoized (design §10 — entries are write-once)
     # -----------------------------------------------------------------
 
+    def _pending_ctx(self, layer_idx: int, qtier, score_meta, ws: int) -> Dict[str, Any]:
+        """The fused hand-off dict for one layer, built once and then mutated.
+
+        Five of its seven entries are constant for the life of the cache
+        (``layer_idx``, ``num_sink``, ``window_size``, ``scaling``, ``cache``) and
+        the other two change only when the Q tier does — both are memoized on
+        ``store.version``. Rebuilding all seven per layer per step cost 177 ns x 32
+        layers = 5.7 us/step, which is 0.009% of a 62.6 ms step: this is tidiness,
+        not a speedup, and it is recorded that way rather than claimed as one.
+
+        **Safe to reuse the object** because the lifetime is strictly nested and
+        single-threaded: ``flash_decode.set_pending`` parks it, the very next
+        ``flash_attn_func`` call inside *this same layer's* attention forward takes
+        it and clears the slot, and ``_run_fused`` has finished reading it before
+        this method can be called again for the same layer. One dict per layer, so
+        two layers can never contend for one.
+        """
+        ctx = self._pending_ctx_cache[layer_idx]
+        if ctx is None:
+            ctx = {
+                "layer_idx": layer_idx,
+                "qtier": qtier,
+                "score_meta": score_meta,
+                "num_sink": self.resolved.num_sink_tokens,
+                "window_size": ws,
+                "scaling": self._attn_scaling,
+                "cache": self,
+            }
+            self._pending_ctx_cache[layer_idx] = ctx
+            return ctx
+        ctx["qtier"] = qtier
+        ctx["score_meta"] = score_meta
+        return ctx
+
     def _fused_qtier(self, layer_idx: int, store, B: int, n: int, ws: int) -> Dict:
         """The kernel's Q-tier context — gathered int2 fields + RoPE halves.
 
@@ -1624,7 +1655,12 @@ class WindowedCache(_HFCacheBase):
         vs = vs.reshape(B, n, *vs.shape[1:])
         vz = vz.reshape(B, n, *vz.shape[1:])
         qpos_flat = qpos.reshape(B, n * ws)
-        cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
+        # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
+        # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
+        # table here would re-rotate the Q tier with a different convention than
+        # the one it was un-rotated with. See rope_cos_sin_halves.
+        cos_h, sin_h = rope_cos_sin_halves(
+            self.rope_module, qpos_flat, self._kv_dtype)
         qtier = {
             "k_codes": kc, "k_scale": ks, "k_zero": kz,
             "v_codes": vc, "v_scale": vs, "v_zero": vz,

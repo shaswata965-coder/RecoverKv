@@ -285,3 +285,115 @@ def test_non_power_of_two_windows_sum_the_right_token_count(ws):
     torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-7)
     torch.testing.assert_close(got.sum(-1), torch.ones(B, H_q),
                                rtol=1e-6, atol=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# §4.3(a) base-2 softmax
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ws,num_sink", [(4, 0), (8, 5), (12, 3), (32, 1)])
+def test_exp2_fold_matches_base_e(ws, num_sink):
+    """Folding ``log2(e)`` into ``scale`` is exact in real arithmetic.
+
+    Every logit becomes a base-2 exponent, so ``m``, ``wmax`` and ``lse`` are all
+    in base-2 units while ``p``, ``l``, ``acc`` and ``out`` are unchanged
+    quantities — including through the window epilogue's ``exp2(wmax - lse)``,
+    which is the part a naive base swap would get wrong.
+    """
+    torch.manual_seed(ws * 17 + num_sink)
+    B, H_kv, rep, D = 2, 2, 2, 16
+    H_q, n_body_win, n_q_win = H_kv * rep, 3, 2
+    S = num_sink + (n_body_win + n_q_win) * ws
+    q = torch.randn(B, H_q, D)
+    k = torch.randn(B, H_kv, S, D)
+    v = torch.randn(B, H_kv, S, D)
+    body_end = num_sink + n_body_win * ws
+
+    oe, we = two_tier_window_reference(q, k, v, D ** -0.5, num_sink, ws,
+                                       n_body_win, body_end, exp2=False)
+    o2, w2 = two_tier_window_reference(q, k, v, D ** -0.5, num_sink, ws,
+                                       n_body_win, body_end, exp2=True)
+    torch.testing.assert_close(o2.float(), oe.float(), rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(w2, we, rtol=1e-4, atol=1e-7)
+
+
+def test_exp2_is_default_and_has_a_control_arm(monkeypatch):
+    from modules.windowed_cache.decode_kernel import _LOG2E, decode_exp2_enabled
+    import math
+
+    monkeypatch.delenv("STICKYKV_DECODE_EXP2", raising=False)
+    assert decode_exp2_enabled() is True, "base-2 softmax must be the default"
+    monkeypatch.setenv("STICKYKV_DECODE_EXP2", "0")
+    assert decode_exp2_enabled() is False, "the A/B control arm must work"
+    assert _LOG2E == pytest.approx(math.log2(math.e), rel=1e-15)
+
+
+def test_no_base_e_exp_survives_in_the_kernel():
+    """The fold is per-launch on a scalar; a stray ``tl.exp`` would mean some
+    logits are base-2 and some are not, which is silently wrong rather than
+    slow."""
+    import pathlib
+    src = pathlib.Path("modules/windowed_cache/decode_kernel.py").read_text(
+        encoding="utf-8")
+    body = src[src.index("if _HAS_TRITON:"):src.index("def _pow2_at_least(")]
+    assert "tl.exp(" not in body, "base-e tl.exp left in the kernel"
+    assert "tl.log(" not in body, "base-e tl.log left in the kernel"
+    assert body.count("tl.exp2(") >= 7 and "tl.log2(" in body
+
+
+# ---------------------------------------------------------------------------
+# §4.3(b) the RoPE tables must match the store's dtype
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_rope_halves_follow_the_store_dtype(dtype):
+    from modules.windowed_cache.decode_kernel import rope_cos_sin_halves
+
+    class _Rope(torch.nn.Module):
+        def forward(self, x, position_ids):
+            pos = position_ids.to(torch.float32)
+            f = pos.unsqueeze(-1) * torch.arange(1, 9, dtype=torch.float32) * 0.01
+            e = torch.cat([f, f], dim=-1)
+            return e.cos().to(x.dtype), e.sin().to(x.dtype)
+
+    cos, sin = rope_cos_sin_halves(_Rope(), torch.arange(16).unsqueeze(0), dtype)
+    assert cos.dtype == dtype and sin.dtype == dtype
+    assert cos.is_contiguous() and sin.is_contiguous()
+
+
+def test_matching_the_rope_dtype_makes_the_q_tier_round_trip():
+    """The Q tier is un-rotated at the store dtype, so it must be re-rotated
+    there too.
+
+    Every other RoPE in this cache hands HF's rotary the fp16 *key* as its
+    reference and so runs in fp16: the model's own rotation of the fp tier, and
+    ``unrotate_key_window`` / ``rotate_key_window``. The decode kernel used to
+    pass ``torch.empty(1,1,1)`` and get fp32, so the key it reconstructed was not
+    the key that had been demoted — a token's value depended on which tier it was
+    in. This pins the fix by measuring the round trip both ways.
+    """
+    torch.manual_seed(0)
+    T, half = 512, 64
+    pos = torch.arange(1000, 1000 + T)
+    inv = 1.0 / (500000.0 ** (torch.arange(0, half).float() / half))
+    ang = pos.unsqueeze(-1).float() * inv
+    c32, s32 = ang.cos(), ang.sin()
+    c16, s16 = c32.half().float(), s32.half().float()
+    k_lo = torch.randn(T, half).half().float()
+    k_hi = torch.randn(T, half).half().float()
+
+    # demote always un-rotates at the store dtype (fp16)
+    p_lo, p_hi = k_lo * c16 + k_hi * s16, k_hi * c16 - k_lo * s16
+
+    def rel(c, s):
+        r_lo, r_hi = p_lo * c - p_hi * s, p_hi * c + p_lo * s
+        err = torch.cat([(r_lo - k_lo).abs(), (r_hi - k_hi).abs()])
+        ref = torch.cat([k_lo.abs(), k_hi.abs()]).clamp_min(1e-3)
+        return float((err / ref).max())
+
+    matched, mismatched = rel(c16, s16), rel(c32, s32)
+    assert matched < mismatched / 100, (
+        f"matching the dtype should cut max round-trip error by orders of "
+        f"magnitude; got matched={matched:.2e} mismatched={mismatched:.2e}")

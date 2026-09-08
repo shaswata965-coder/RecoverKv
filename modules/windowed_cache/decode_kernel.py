@@ -48,6 +48,7 @@ Backend contract (mirrors :mod:`score_kernel`)
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Optional, Tuple
 
@@ -61,6 +62,28 @@ try:  # pragma: no cover - import guard, exercised only where triton is present
     _HAS_TRITON = True
 except Exception:  # ImportError, or a broken triton build
     _HAS_TRITON = False
+
+
+_LOG2E = 1.4426950408889634
+"""``log2(e)``. Folded into ``scale`` so the kernel's softmax runs in base 2."""
+
+
+def decode_exp2_enabled() -> bool:
+    """Whether the decode kernel's softmax runs in base 2 (default ON).
+
+    ``tl.exp`` lowers to the accurate ``expf`` (~ten SFU ops); ``exp2`` lowers to
+    a single ``ex2.approx.f32``, which is why every FlashAttention implementation
+    uses it. The change is exact in real arithmetic — folding ``log2(e)`` into
+    ``scale`` makes every logit a base-2 exponent, so ``m``, ``wmax`` and ``lse``
+    are all in base-2 units and ``p``, ``l``, ``acc`` and ``out`` are unchanged
+    quantities. ``ex2.approx`` carries ~2 ulp against ``expf``'s ~1.
+
+    ``STICKYKV_DECODE_EXP2=0`` restores ``expf`` — a control arm for A/B'ing the
+    numerical difference, matching the prefill kernel's ``STICKYKV_SCORE_EXP2``.
+    Not a fallback: both settings are correct, one is faster.
+    """
+    v = os.environ.get("STICKYKV_DECODE_EXP2", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def fused_decode_enabled() -> bool:
@@ -122,7 +145,8 @@ def assert_decode_kernel_available(cuda: bool) -> None:
 
 
 def rope_cos_sin_halves(
-    rope_module: torch.nn.Module, pos_flat: Tensor
+    rope_module: torch.nn.Module, pos_flat: Tensor,
+    dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """``cos``/``sin`` **first halves** ``[B, T, D//2]`` for the Q positions.
 
@@ -130,8 +154,25 @@ def rope_cos_sin_halves(
     carries the distinct per-frequency values; the kernel applies RoPE from those
     halves directly (no rotate-half gather). Position-only, so this is cheap and
     holds no key data — the point of the fused path.
+
+    ``dtype`` must be **the KV store's dtype**, and passing it is not optional
+    tuning. HF's rotary returns ``cos.to(dtype=x.dtype)``, so every other RoPE in
+    this cache runs in fp16: the model's own rotation of the fp tier, and
+    ``unrotate_key_window`` / ``rotate_key_window``, which both hand
+    ``_rope_cos_sin`` the fp16 *key* as their reference. This function used to
+    hand it ``torch.empty(1, 1, 1)`` and so got fp32 — apparently incidentally,
+    since nothing depended on it.
+
+    That made the kernel the odd one out, and it broke a round trip: the Q tier is
+    un-rotated in fp16, stored, then re-rotated here in fp32, so the key the
+    kernel reconstructs is **not** the key that was demoted. Measured over 512
+    positions, matching the dtype cuts the maximum round-trip error from 4.5e-01
+    to 6.9e-04. It also halves this tensor's traffic (0.75 -> 0.38 GB/step at
+    4096/batch-32) and its ``tl.dot`` operand footprint, but that is the side
+    effect, not the reason.
     """
-    ref = torch.empty(1, 1, 1, device=pos_flat.device)
+    ref = torch.empty(1, 1, 1, device=pos_flat.device,
+                      dtype=dtype if dtype is not None else torch.float32)
     pos = pos_flat.to(torch.long)
     if pos.dim() == 1:
         pos = pos.unsqueeze(0)
@@ -227,6 +268,7 @@ def two_tier_window_reference(
     window_size: int,
     n_body_win: int,
     Sfp: Optional[int] = None,
+    exp2: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -265,7 +307,12 @@ def two_tier_window_reference(
 
     q5 = q.reshape(B, H_kv, rep, 1, D).float()
     k = k_eff.unsqueeze(2).float()
-    logits = torch.matmul(q5, k.transpose(-2, -1)) * scaling      # [B,H_kv,rep,1,S]
+    # `exp2=True` mirrors the kernel's base-2 softmax: log2(e) folds into the
+    # scale, so every logit becomes a base-2 exponent and m / wmax / lse are all
+    # in base-2 units. p, l, acc and out are unchanged quantities either way.
+    _e = math.exp2 if exp2 else math.exp
+    scale_eff = scaling * _LOG2E if exp2 else scaling
+    logits = torch.matmul(q5, k.transpose(-2, -1)) * scale_eff    # [B,H_kv,rep,1,S]
     logits = logits.reshape(B, H_q, S)
     v_flat = (v_eff.reshape(B, H_kv, 1, S, D)
               .expand(B, H_kv, rep, S, D).reshape(B, H_q, S, D).float())
@@ -314,9 +361,9 @@ def two_tier_window_reference(
         lg = logits[:, :, safe]                            # [B,H_q,BLOCK_T]
         lg = torch.where(nmask, lg, torch.full_like(lg, float("-inf")))
         m_new = torch.maximum(m, lg.max(dim=-1).values)
-        corr = torch.exp(m - m_new)
+        corr = (torch.exp2 if exp2 else torch.exp)(m - m_new)
         corr = torch.nan_to_num(corr, nan=0.0)             # first tile: -inf - -inf
-        p = torch.where(nmask, torch.exp(lg - m_new.unsqueeze(-1)),
+        p = torch.where(nmask, (torch.exp2 if exp2 else torch.exp)(lg - m_new.unsqueeze(-1)),
                         torch.zeros_like(lg))
         acc = acc * corr.unsqueeze(-1) + torch.matmul(
             p.unsqueeze(-2), v_flat[:, :, safe]).squeeze(-2)
@@ -345,9 +392,9 @@ def two_tier_window_reference(
         tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
 
     out = acc / l.unsqueeze(-1)
-    lse = m + torch.log(l)
+    lse = m + (torch.log2 if exp2 else torch.log)(l)
     live = wmax > NEG
-    wsum = torch.where(live, wsum * torch.exp(wmax - lse.unsqueeze(-1)),
+    wsum = torch.where(live, wsum * (torch.exp2 if exp2 else torch.exp)(wmax - lse.unsqueeze(-1)),
                        torch.zeros_like(wsum))
     return out.to(v_eff.dtype), wsum
 
@@ -449,8 +496,8 @@ if _HAS_TRITON:
             logit = tl.dot(qg, tl.trans(kf)) * scale
             logit = tl.where(nmask[None, :], logit, -float("inf"))
             m_new = tl.maximum(m, tl.max(logit, axis=1))
-            corr = tl.exp(m - m_new)
-            p = tl.where(nmask[None, :], tl.exp(logit - m_new[:, None]), 0.0)
+            corr = tl.exp2(m - m_new)
+            p = tl.where(nmask[None, :], tl.exp2(logit - m_new[:, None]), 0.0)
             vf = tl.load(VFP + b * vfb + kv * vfh + offs_n[:, None] * vfs
                          + offs_d[None, :] * vfd,
                          mask=nmask[:, None], other=0.0).to(tl.float32)
@@ -469,8 +516,8 @@ if _HAS_TRITON:
             logit = tl.dot(qg, tl.trans(kf)) * scale
             logit = tl.where(nmask[None, :], logit, -float("inf"))
             m_new = tl.maximum(m, tl.max(logit, axis=1))
-            corr = tl.exp(m - m_new)
-            p = tl.where(nmask[None, :], tl.exp(logit - m_new[:, None]), 0.0)
+            corr = tl.exp2(m - m_new)
+            p = tl.where(nmask[None, :], tl.exp2(logit - m_new[:, None]), 0.0)
             vf = tl.load(VFP + b * vfb + kv * vfh + offs_n[:, None] * vfs
                          + offs_d[None, :] * vfd,
                          mask=nmask[:, None], other=0.0).to(tl.float32)
@@ -517,16 +564,16 @@ if _HAS_TRITON:
             k_hi = ((kb_hi >> shift_t[None, :]) & 3).to(tl.float32) * ks_hi + kz_hi
             crow = widx * WS + t_tok
             c = tl.load(COS + b * cob + crow[None, :] * HALF + offs_hl[:, None],
-                        mask=qmask[None, :], other=0.0)
+                        mask=qmask[None, :], other=0.0).to(tl.float32)
             s = tl.load(SIN + b * cob + crow[None, :] * HALF + offs_hl[:, None],
-                        mask=qmask[None, :], other=0.0)
+                        mask=qmask[None, :], other=0.0).to(tl.float32)
             k_rlo = k_lo * c - k_hi * s
             k_rhi = k_hi * c + k_lo * s
             logit = (tl.dot(q_lo, k_rlo) + tl.dot(q_hi, k_rhi)) * scale
             logit = tl.where(qmask[None, :], logit, -float("inf"))
             m_new = tl.maximum(m, tl.max(logit, axis=1))
-            corr = tl.exp(m - m_new)
-            p = tl.where(qmask[None, :], tl.exp(logit - m_new[:, None]), 0.0)
+            corr = tl.exp2(m - m_new)
+            p = tl.where(qmask[None, :], tl.exp2(logit - m_new[:, None]), 0.0)
             vs = tl.load(VS + b * vsb + widx * vsn + kv * vsh + t_tok,
                          mask=qmask, other=0.0).to(tl.float32)
             vz = tl.load(VZ + b * vsb + widx * vsn + kv * vsh + t_tok,
@@ -548,7 +595,7 @@ if _HAS_TRITON:
                 tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=keep)
 
         out = acc / l[:, None]
-        lse = m + tl.log(l)
+        lse = m + tl.log2(l)
         tl.store(OUT + b * ob + hq[:, None] * HEAD_DIM + offs_d[None, :],
                  out.to(OUT.dtype.element_ty), mask=r_mask[:, None])
 
@@ -564,7 +611,7 @@ if _HAS_TRITON:
             ssum = tl.load(ptr, mask=sm, other=0.0)
             smax = tl.load(mptr, mask=sm, other=-float("inf"))
             scaled = tl.where(smax > -float("inf"),
-                              ssum * tl.exp(smax - lse[:, None]), 0.0)
+                              ssum * tl.exp2(smax - lse[:, None]), 0.0)
             tl.store(ptr, scaled, mask=sm)
 
 
@@ -693,7 +740,7 @@ def _decode_triton(
         ksz = torch.zeros((B, 1, H_kv, D), dtype=torch.float16, device=dev)
         vc = torch.zeros((B, 1, H_kv, ws, max(D // 4, 1)), dtype=torch.uint8, device=dev)
         vsz = torch.zeros((B, 1, H_kv, ws), dtype=torch.float16, device=dev)
-        cs = torch.zeros((B, 1, half), dtype=torch.float32, device=dev)
+        cs = torch.zeros((B, 1, half), dtype=q.dtype, device=dev)
         KC, KS, KZ = kc, ksz, ksz
         VC, VS, VZ = vc, vsz, vsz
         COS, SIN = cs, cs
@@ -720,6 +767,13 @@ def _decode_triton(
 
     BLOCK_R = _pow2_at_least(rep)
     grid = (B * H_kv,)
+
+    # Base-2 softmax: fold log2(e) into the SCALE, which is a scalar multiplied
+    # into the logits the kernel already computes — so the base change costs
+    # nothing per element. Folding it into the [BLOCK_R, BLOCK_T] logit tile
+    # instead would add a multiply per key per query head, which is the whole
+    # cost the change exists to avoid.
+    scaling = scaling * _LOG2E if decode_exp2_enabled() else scaling
 
     # Shared-memory fit ladder (see _FIT_LADDER). §5.3 widened the Q-tier tile
     # from one window (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows,

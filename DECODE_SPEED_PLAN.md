@@ -184,78 +184,72 @@ KV heads into one `BLOCK_R=16` tile (grid becomes `B·H_kv/4`) or drop to an FMA
 reduction for the Q tier. Interacts with §4.1 — both change the grid, so decide
 them together.
 
-### 4.3 The "free ones" — reviewed, and two of them are not
+### 4.3 The "free ones" — reviewed; (a), (b), (d) landed, (c) struck
 
-They were written against the **pre-rewrite** kernel and only two survive review.
+Reviewed end-to-end, because all four were written against the **pre-rewrite**
+kernel. Findings and what shipped:
 
-**(a) `tl.exp` → `exp2` — do it, but it is ~0.42 ms, not 0.75, and not free.**
-The base-2 fold works with the window epilogue: put `log2(e)` into `scale`, keep
-`m`/`wmax` in base-2 units, and use `lse = m + log2(l)` — `p`, `l`, `acc` and
-`out` are then bit-for-bit the same quantities, and the epilogue's
-`exp2(wmax − lse)` equals `exp(m_tile − lse)`. Verified on CPU (max rel
-`1.4e-6`, window sums still normalise to 1).
+**(a) base-2 softmax — LANDED.** `log2(e)` folds into `scale` at the launch (a
+scalar multiplied into logits the kernel already computes, so the base change
+costs nothing per element); `m`, `wmax` and `lse` are then all in base-2 units
+and `p`, `l`, `acc`, `out` are unchanged quantities. `STICKYKV_DECODE_EXP2=0` is
+the A/B control arm, matching the prefill kernel's precedent.
 
-Two corrections to the old entry. The exponential count is **78 M/step, not
-139 M** — the rewrite deleted the second pass over `S`, so the count fell 1.78×
-and the saving with it. And it is *not* numerically free: `1.4e-6` max relative
-is ~10× the window-score rewrite's `1e-7` and the same order as the smallest
-observed ranking gap (`8e-6`), so it needs a quality check, not just a tolerance
-test.
+Two corrections to the old entry: the exponential count is **78 M/step, not
+139 M** — the window-score rewrite deleted the second pass over `S`, so the
+saving is **~0.42 ms, not 0.75** — and it is *not* numerically free. Measured
+max relative difference `1.4e-6`: ~10× the window-score rewrite's `1e-7` and the
+same order as the smallest observed ranking gap (`8e-6`).
 
-**(b) `cos`/`sin` in fp16 — do it, but for consistency, not bandwidth.**
+**(b) RoPE tables at the store's dtype — LANDED, and it is a consistency fix.**
+The bandwidth claim was right (0.75 → 0.38 GB/step, ~0.18 ms, and it halves those
+`tl.dot` operands, which may buy a bigger tile rung — §4.4). But fp16 perturbs a
+rotated key by ~`5e-4` mean relative, ~5000× the window-score change, so on
+bandwidth grounds alone it would be a bad trade.
 
-The bandwidth claim is right (0.75 → 0.38 GB/step, ~0.18 ms) and it may buy a
-bigger tile rung (§4.4). But fp16 `cos`/`sin` perturbs a rotated key by ~`5e-4`
-mean relative — **~5000× the window-score change and ~60× the ranking gap.** On
-those numbers alone it would be a bad trade.
+It is right because **the kernel was the odd one out**:
 
-It is still the right change, because **the kernel is currently the odd one out**:
-
-| path | `ref` passed to the rotary | dtype |
+| path | reference passed to HF's rotary | dtype |
 |---|---|---|
-| HF's own RoPE for the fp tier | the fp16 hidden state | **fp16** |
-| `unrotate_key_window` on demote | the fp16 key (`_rope_cos_sin(rope, k, …)`) | **fp16** |
-| `rotate_key_window` on promote | the fp16 key | **fp16** |
-| **the decode kernel** (`rope_cos_sin_halves`) | `torch.empty(1,1,1)` → default dtype | **fp32** |
+| HF's own RoPE for the fp tier | the fp16 hidden state | fp16 |
+| `unrotate_key_window` (demote) | the fp16 key | fp16 |
+| `rotate_key_window` (promote) | the fp16 key | fp16 |
+| **the decode kernel** (was) | `torch.empty(1, 1, 1)` | **fp32** |
 
-So the Q tier is un-rotated in fp16, stored, and then re-rotated by the kernel in
-fp32 — the round trip does not return the key that was stored. Measured
-round-trip error on a window of 512 positions:
+The Q tier is un-rotated in fp16, stored, and was then re-rotated in fp32 — so
+the key the kernel reconstructed was **not** the key that had been demoted, and a
+token's value depended on which tier it was in. Measured over 512 positions,
+matching the dtype cuts the **maximum** round-trip error from `4.5e-01` to
+`6.9e-04` (~660×). `rope_cos_sin_halves` now takes the store dtype and both call
+sites pass it.
 
-| kernel `cos`/`sin` | mean rel | max rel |
-|---|---|---|
-| fp16 (matched) | 2.1e-04 | **6.9e-04** |
-| fp32 (current) | 3.4e-04 | **4.5e-01** |
+> **Still worth an accuracy look.** `ACCURACY_RECOVERY_PLAN.md`'s causes B–D are
+> unmeasured, and a tier-dependent key representation at `q > 0` is the shape of
+> thing that costs LongBench without any equivalence test seeing it — every test
+> here compared the kernel to an oracle built with the *same* fp32 convention, so
+> none of them could. This change should move those numbers; if it does not,
+> that is itself information.
 
-Matching the kernel to fp16 cuts the **max** round-trip error ~660×. Today a
-token's key differs depending on which tier it is in, which is not a property a
-two-tier cache should have — the tiers are meant to be interchangeable
-representations of the same key. `torch.empty(1, 1, 1)` picking the global
-default dtype looks incidental rather than intended.
+**(c) Drop the `q_proj` stash hook — STRUCK, the claim was wrong.** The score
+hook's early return is gated on `hidden_states.shape[1] == 1` (`hooks.py:494`),
+so it fires only on **decode** steps with a non-empty Q tier. **Prefill (`T > 1`)
+falls through and consumes the stash** (`hooks.py:553`); removing the hook would
+break prefill scoring outright. The prize was one dict store per layer per step.
+Removed from this plan entirely.
 
-> **This is worth a look from the accuracy side independently of speed.**
-> `ACCURACY_RECOVERY_PLAN.md`'s causes B–D are still unmeasured, and a
-> tier-dependent key representation at `q > 0` is exactly the shape of thing that
-> would cost LongBench points without showing up in any equivalence test — every
-> test here compares the kernel against an oracle built with *the same* fp32
-> convention, so none of them can see it.
+**(d) Reusable fused hand-off dict — LANDED, for tidiness, not speed.** Measured
+177 ns to build ×32 layers = **5.7 µs/step, 0.009% of a 62.6 ms step**. Five of
+the seven entries are constant for the cache's life and the other two are
+themselves memoized, so `_pending_ctx` builds once per layer and mutates two keys.
 
-**(c) Drop the `q_proj` stash hook when fused is active — NO. The claim is wrong.**
-The score hook's early return is gated on `hidden_states.shape[1] == 1`
-(`hooks.py:494`), so it only fires on **decode** steps with a non-empty Q tier.
-**Prefill (`T > 1`) falls through and consumes the stash** at `hooks.py:553`.
-Removing the hook would break prefill scoring outright. It could be made
-conditional inside the hook, but the prize is one dict store per layer per step
-plus ~8 MB of live tensor at B=32 — far below measurement noise. **Struck.**
+The aliasing risk flagged at review time was real and *did* surface — two tests
+hold a ctx across steps to check the qtier memo's object identity, which a
+mutated dict can no longer answer. Production is unaffected (the hand-off lives
+only from `set_pending` to the `flash_attn_func` call inside the same layer's
+forward, and each layer has its own dict), so the capture helper now snapshots.
+Recorded because the trade — real testability for 0.009% — is worth knowing.
 
-**(d) Preallocate the `set_pending` dict — not worth it.** Measured: 177 ns to
-build the 7-key dict, ×32 layers = **5.7 µs/step, 0.009% of a 62.6 ms step.**
-There are also two call sites, and mutating a shared dict trades that for
-aliasing risk. **Struck.**
-
-**Revised total for §4.3: ~0.6 ms** (0.42 + 0.18), both items carrying a
-numerical change that needs a quality run — not the "~1 ms, costs nothing" the
-old entry claimed.
+**Delivered by §4.3: ~0.6 ms**, both numerical items needing a quality run.
 
 ### 4.4 Raise the tile rung if Stage 0 says it was capped
 
@@ -294,8 +288,9 @@ offered to every method in the sweep and reported as a separate harness column.
 | §3.3 close the graph break | none | existing `aot_eager` eviction test |
 | §4.1 split-K | fp-level (softmax reassociation across splits) | tolerance vs `two_tier_window_reference` |
 | §4.2 `BLOCK_R`, §4.4 tile rung | none (shape only) | `tests/test_decode_kernel.py` |
-| §4.3 `exp2` | ~2 ulp, as in prefill | decode analog of `tests/test_score_exp2.py` |
-| §4.3 `cos`/`sin` fp16 | fp16 rounding on a rotation | tolerance + one LongBench dataset |
+| §4.3(d) reusable ctx — **landed** | none (no tensor touched) | `test_pending_ctx_*` |
+| §4.3(a) `exp2` — **landed** | max rel 1.4e-6 (verified) | `tests/test_window_scores.py::test_exp2_fold_matches_base_e` |
+| §4.3(b) RoPE dtype — **landed** | ~5e-4 on Q-tier keys; **fixes** a tier-dependent representation | round-trip test; **still owes a LongBench run** |
 | **§3.2 `eviction_interval`** | **changes outputs** | **full LongBench + GSM8K at `{ws, 2ws, 4ws}`** |
 | **§4.5 quant group size** | **changes quantization error** | **full LongBench** |
 
@@ -304,17 +299,25 @@ runners override `cache.quant_ratio` on the command line
 (`KAGGLE_RUNBOOK.md:159`), so they **do** exercise the fused kernel — the YAML's
 `0.0` is not what runs.
 
-## 7. Order of work
+## 7. Priority order
 
-| # | item | risk | expected |
-|---|---|---|---|
-| 1 | Stage 0 profile (§2) | none | the only thing that can size items 2–4 honestly |
-| 2 | §4.1 split-K | fp-level | the B=1 and short-context deficit; highest value |
-| 3 | §4.3 (a) `exp2` + (b) fp16 `cos`/`sin` | **fp-level, needs a quality run** | ~0.6 ms + 0.4 GB; (b) also fixes a tier-dependent key representation, and may unlock §4.4. (c) and (d) struck on review |
-| 4 | §4.4 tile rung, §4.2 `BLOCK_R` | none | recovers the Q-tier tiling's full 7.8× if capped |
-| 5 | §3.2 `eviction_interval` (opt-in) | **outputs** | 4× on the eviction, + quality run |
-| 6 | §3.3 graph break | none | only if Stage 0.4 says so |
-| 7 | §4.5 quant grid / §5 CUDA graphs / §3.1 multi-GPU | **outputs / fairness / scope** | decisions, not tasks |
+Ranked by expected value per unit of risk, given where the numbers now are:
+both headline targets are met, and the two remaining deficits (B=1, and short
+context at B=32) are both **fixed-per-step-cost** problems, not traffic ones.
+
+| # | item | § | why here | risk | expected |
+|---|---|---|---|---|---|
+| **1** | **Stage 0 profile** | §2 | The only thing that can size items 2–5 honestly. Every estimate below is a launch/traffic count with an unverified translation to time — the window-score rewrite was sized at 0.5 ms and delivered 11 ms. **Blocks nothing, informs everything.** | none | — |
+| **2** | **Split-K over the sequence** | §4.1 | The grid is `B·H_kv` = **8 programs on a 108-SM A100 at B=1**. B=1 is 1.9× slower than Flash at *every* context length and flat across context — an under-occupied grid is the single best explanation, and this is the only item that addresses it. Also the most likely mover for 1024/B=32. | fp-level | the whole B=1 and short-context deficit |
+| **3** | **Verify §4.3 on GPU + a quality run** | §4.3 | `exp2` and the RoPE dtype are landed but unmeasured on hardware, and (b) changes the Q tier's keys by ~5e-4 — the largest numerical change made so far. It may *improve* LongBench (it fixes a tier-dependent key), which would be worth knowing before more changes stack on top. | — | ~0.6 ms, + an accuracy answer |
+| **4** | **Raise the tile rung** | §4.4 | Free if the ladder was capped. (b) already halved the `cos`/`sin` `tl.dot` operands, so the top rung may now fit where it did not. Read the announced rung from the Stage 0 run — no separate experiment needed. | none | up to 2–4× on the Q-tier loop |
+| **5** | **`BLOCK_R` packing** | §4.2 | Every Q-tier `tl.dot` is 25% useful rows at `rep=4`. Real, but it changes the grid, so it must be decided *with* split-K rather than before it. | none | Q-tier efficiency |
+| 6 | `eviction_interval` (opt-in) | §3.2 | 4× on the eviction, but it **changes outputs** and needs a full LongBench + GSM8K gate. Off by default until that runs. | **outputs** | 4× eviction, quality-gated |
+| 7 | Close the `_affine_quantize` graph break | §3.3 | Only if Stage 0.4 shows the compiled eviction buying little. Cheap, narrow. | none | conditional |
+| — | Quant grid, CUDA graphs, multi-GPU grouping | §4.5, §5, §3.1 | **Decisions, not tasks.** Quant grid changes quantization error; CUDA graphs remove overhead every other method pays and would need offering to all of them; multi-GPU grouping is 4× not 32× and this model fits on one card. | — | — |
+
+Items 1–5 are score-safe or fp-level. Nothing past item 5 should start before
+item 1 has run.
 
 ## 8. Housekeeping
 

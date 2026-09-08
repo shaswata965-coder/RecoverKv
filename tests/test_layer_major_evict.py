@@ -643,3 +643,44 @@ def test_multi_device_error_names_both_escapes():
     assert "CUDA_VISIBLE_DEVICES" in msg
     assert "STICKYKV_LAYER_MAJOR_DECODE=0" in msg
     assert "byte-identical" in msg
+
+
+# ---------------------------------------------------------------------------
+# §4.3(d) the reusable fused hand-off dict
+# ---------------------------------------------------------------------------
+
+
+def test_pending_ctx_is_reused_per_layer_and_stays_correct():
+    """One dict per layer, mutated rather than rebuilt.
+
+    Worth only ~5.7 us/step (0.009% of a 62.6 ms step), so the point of this test
+    is not the saving — it is that reusing a mutable object cannot leak stale
+    state. The lifetime is strictly nested (set_pending parks it, the same
+    layer's flash_attn_func takes it and clears the slot), but "strictly nested"
+    is an argument, and this is the check.
+    """
+    cache = _make_cache(layer_major=False, quant_ratio=0.5,
+                        num_layers=3, prefill_len=32, ws=4)
+    a0 = cache._pending_ctx(0, {"k": 1}, ("m0", 2), 4)
+    b0 = cache._pending_ctx(0, {"k": 2}, ("m1", 3), 4)
+    assert a0 is b0, "the same layer must reuse one dict"
+    assert b0["qtier"] == {"k": 2} and b0["score_meta"] == ("m1", 3), \
+        "mutable fields must be refreshed"
+    assert b0["layer_idx"] == 0 and b0["window_size"] == 4
+    assert b0["cache"] is cache
+    assert b0["num_sink"] == cache.resolved.num_sink_tokens
+    assert b0["scaling"] == cache._attn_scaling
+    assert set(b0) == {"layer_idx", "qtier", "score_meta", "num_sink",
+                       "window_size", "scaling", "cache"}
+
+
+def test_pending_ctx_layers_never_share_a_dict():
+    """Two layers sharing one dict would let layer i+1's hand-off overwrite
+    layer i's before the kernel consumed it."""
+    cache = _make_cache(layer_major=False, quant_ratio=0.5,
+                        num_layers=4, prefill_len=32, ws=4)
+    ctxs = [cache._pending_ctx(i, {"layer": i}, (f"m{i}", i), 4) for i in range(4)]
+    assert len({id(c) for c in ctxs}) == 4, "each layer needs its own dict"
+    for i, c in enumerate(ctxs):
+        assert c["layer_idx"] == i and c["qtier"] == {"layer": i}, \
+            f"layer {i}'s context was clobbered by another layer"
