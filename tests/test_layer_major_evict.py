@@ -581,3 +581,65 @@ def test_contract_check_costs_one_sync_at_most():
         "the check never armed — the fixture no longer evicts, so this test "
         "would pass vacuously"
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-GPU: device_map="auto" shards by LAYER, which the join cannot span
+# ---------------------------------------------------------------------------
+
+
+def test_layer_major_refuses_a_model_sharded_across_devices():
+    """`device_map="auto"` puts layers 0..k on cuda:0 and the rest on cuda:1.
+
+    The join concatenates all L layers into one row axis, so it cannot span that.
+    On the first multi-GPU perf run this surfaced as "Expected all tensors to be
+    on the same device, cuda:0 and cuda:1" at batch=1, and — under
+    torch.compile — as a device-side assert at batch=32, which poisons the CUDA
+    context and takes every later cell in the sweep down with it.
+
+    The guard must fire at migration time with an actionable message, not let the
+    cat fail deep inside an eviction. Simulated here with a `meta` tensor, which
+    is a real second device on a CPU-only box.
+    """
+    ws, num_sink, prefill = 4, 0, 32
+    cache = _make_cache(layer_major=True, quant_ratio=0.0,
+                        num_layers=2, prefill_len=prefill, ws=ws)
+    gen = torch.Generator().manual_seed(3)
+    kv = torch.Generator().manual_seed(4)
+    for i in range(2):
+        k = torch.randn(1, H_KV, prefill, D, generator=kv)
+        cache.update(k, k.clone(), i,
+                     cache_kwargs={"cache_position": torch.arange(prefill)})
+    _write_pending_scores(cache, 2, ws, num_sink, gen)
+    # one decode step: every layer evicts, so the next update would migrate
+    for i in range(2):
+        k = torch.randn(1, H_KV, 1, D, generator=kv)
+        cache.update(k, k.clone(), i,
+                     cache_kwargs={"cache_position": torch.tensor([prefill])})
+    assert cache._joint is None, "fixture should not have migrated yet"
+
+    # Pretend layer 1 landed on another device, as device_map="auto" would.
+    cache._states[1].key_states = cache._states[1].key_states.to("meta")
+
+    with pytest.raises(RuntimeError, match="one device"):
+        cache._migrate_to_joint()
+
+
+def test_multi_device_error_names_both_escapes():
+    """The message has to say what to DO. A perf run that dies without telling
+    the operator which knob to turn costs another full sweep to find out."""
+    ws, prefill = 4, 32
+    cache = _make_cache(layer_major=True, quant_ratio=0.0,
+                        num_layers=2, prefill_len=prefill, ws=ws)
+    kv = torch.Generator().manual_seed(9)
+    for i in range(2):
+        k = torch.randn(1, H_KV, prefill, D, generator=kv)
+        cache.update(k, k.clone(), i,
+                     cache_kwargs={"cache_position": torch.arange(prefill)})
+    cache._states[1].key_states = cache._states[1].key_states.to("meta")
+    with pytest.raises(RuntimeError) as ei:
+        cache._migrate_to_joint()
+    msg = str(ei.value)
+    assert "CUDA_VISIBLE_DEVICES" in msg
+    assert "STICKYKV_LAYER_MAJOR_DECODE=0" in msg
+    assert "byte-identical" in msg

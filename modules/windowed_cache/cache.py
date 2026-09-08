@@ -1088,6 +1088,35 @@ class WindowedCache(_HFCacheBase):
         the joint objects so the score hooks, the parity runner and the tests
         keep reading a per-layer shape.
         """
+        # Every layer must live on ONE device: the join concatenates all L layers
+        # into a single row axis, and `device_map="auto"` shards a model across
+        # GPUs by LAYER, so on a multi-GPU box layers 0..k sit on cuda:0 and the
+        # rest on cuda:1. Concatenating across that is not merely slow, it is
+        # impossible -- it raised
+        # "Expected all tensors to be on the same device, cuda:0 and cuda:1"
+        # on the first multi-GPU perf run, and under torch.compile the same
+        # mismatch surfaced instead as a device-side assert, which poisons the
+        # CUDA context and makes every later cell in the sweep fail too.
+        #
+        # Refuse, rather than fall back silently. This is a PERF path, so quietly
+        # running the per-layer eviction would report a regression under the
+        # layer-major label and there would be nothing in the output to say why.
+        # Both escapes are named because both are legitimate: one GPU is what
+        # run_perf_table.sh already defaults to, and the env flag restores the
+        # byte-identical per-layer path (tests/test_layer_major_evict.py pins
+        # that equivalence, so nothing is lost but speed).
+        devices = {st.key_states.device for st in self._states}
+        if len(devices) > 1:
+            raise RuntimeError(
+                "layer-major decode needs every layer's KV on one device, but "
+                f"this model is sharded across {sorted(str(d) for d in devices)} "
+                "(device_map=\"auto\" splits by layer). Either pin the model to a "
+                "single GPU (CUDA_VISIBLE_DEVICES=0, which scripts/run_perf_table.sh "
+                "already defaults to) or set STICKYKV_LAYER_MAJOR_DECODE=0 to run "
+                "the per-layer eviction, which produces byte-identical results at "
+                "the pre-optimisation launch count. Per-device grouping is the "
+                "proper fix and is not implemented yet -- see DECODE_SPEED_PLAN.md."
+            )
         B = self._states[0].key_states.shape[0]
         self._joint = CacheState.join_layers(self._states, self._steady_capacity)
         if self._q > 0.0:

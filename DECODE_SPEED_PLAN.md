@@ -181,6 +181,32 @@ Do not start §4 or §5 changes before this returns.
 
 ## 4. The eviction — what's left
 
+### 4.0 Multi-GPU: per-device grouping (not implemented — currently refused)
+
+`device_map="auto"` shards a model **by layer**, so on a 2-GPU box layers `0..k`
+sit on `cuda:0` and the rest on `cuda:1`. The layer-major join concatenates all
+`L` layers into one row axis and cannot span that. The first multi-GPU perf run
+hit it three ways at once: a clean
+`Expected all tensors to be on the same device, cuda:0 and cuda:1` at `batch=1`,
+a **device-side assert** at `batch=32` (the same mismatch, surfaced differently
+under `torch.compile`), and then `flash_attn … CPU backend` on every later cell —
+that third one is not a separate bug, it is the poisoned CUDA context taking the
+rest of the sweep down with it.
+
+It now **refuses at migration time** with both escapes named
+(`CUDA_VISIBLE_DEVICES=0`, or `STICKYKV_LAYER_MAJOR_DECODE=0` for the
+byte-identical per-layer path). Refusing rather than falling back is deliberate:
+this is a perf path, and silently running the slow eviction would report a
+regression under the layer-major label with nothing in the output to explain it.
+
+**The proper fix is per-device grouping** — partition layers by device, build one
+joint store per group, and loop the batched eviction over groups. On 2 GPUs that
+is a 16× launch cut instead of 32×, which is most of the win. It is not
+implemented because it cannot be tested on this box at all (no GPU, let alone
+two), and shipping a second untested multi-GPU path on top of one that just
+failed on an untested assumption is how the first two perf runs were lost.
+
+
 ### 4.2 Decouple the eviction period from `window_size`
 
 `policy.py:92` hard-codes the cadence to `step % window_size == 0`. Add
