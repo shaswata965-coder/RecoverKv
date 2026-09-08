@@ -88,11 +88,67 @@ only §5 removes (with the fairness caveat there).
 
 ## 2. Stage 0 — the profile that has still never been run
 
-Every remaining ms estimate below is a launch/traffic count with an unverified
-translation to time. The window-score rewrite is the cautionary tale: it was
-sized at ~0.5 ms from traffic and delivered **~11 ms**, because the value was in
-launches and serial-iteration latency, neither of which was measured. Do not
-repeat that.
+### Why nothing below this is actually sized
+
+Every estimate in §3 and §4 is derived one of two ways: count the bytes removed,
+or count the launches removed. Turning either into milliseconds needs to know
+what the kernel is **bound by**, and that has never been measured.
+
+A traffic estimate says "I removed 0.94 GB/step; at 2.04 TB/s that is 0.46 ms."
+That arithmetic is valid only if the kernel is bandwidth-bound. At 4096/B=32 we
+measure 62.6 ms against a ~10 ms roofline — **6.2× off**. It is not
+bandwidth-bound, and removing bytes from a kernel that is not waiting on bytes
+buys the byte term and nothing else.
+
+### The miss, and the tell that was sitting in the result table
+
+The window-score rewrite was sized at **~0.5 ms** from traffic and delivered
+**~11 ms**. The traffic half really was ~0.5 ms — that part was right. The other
+~10.5 ms came from 416 fewer launches/step and a collapsed serial dependency
+chain, neither of which appears anywhere in a byte count.
+
+The shape of the win said so, and was not read:
+
+| cell | gain |
+|---|---|
+| 4096/B=32 | 10.9 ms |
+| 2048/B=32 | 11.0 ms |
+| 1024/B=32 | 11.9 ms |
+| 4096/B=1 | 11.5 ms |
+
+**A traffic saving scales with traffic** — it should have grown with `B` and `S`.
+A near-constant offset across a 32× batch range is the signature of a *fixed
+per-step cost* being removed. The shape of a gain tells you what kind of gain it
+is; check it against the mechanism you think you fixed.
+
+### Why this bites systematically here, not once
+
+At this cell **72% of per-step traffic is model weights** (16.06 of ~22.3 GB),
+which no KV-cache method touches. The traffic lever is therefore small by
+construction, and any traffic-derived estimate is structurally a **lower bound**
+on anything that also touches launches or latency. That is a property of the
+regime, not a one-off arithmetic slip.
+
+### The coin-flip that the current #2 rests on
+
+B=1 is 1.9× slower than Flash and **flat across context** (1024 → 4096 moves it
+−1.3%). Two explanations fit that equally well:
+
+- **A — under-occupied grid.** `B·H_kv` is 8 programs on a 108-SM A100. The GPU
+  is *busy* but wasting 93% of the machine.
+- **B — fixed host cost.** ~22 ms/step of Python and launches above Flash's own,
+  independent of the work.
+
+Both produce "slower at B=1" and "flat across context". **The perf table cannot
+tell them apart** — it reports wall clock only. And they need opposite fixes:
+split-K (§4.1) addresses A and does *nothing* for B.
+
+Split-K is not a one-liner. It needs partial `(out, lse)` per KV-split, a combine
+pass, and the window sums combined across splits with their own rescale — a new
+numerical path with its own oracle work. Building that on a coin-flip is the risk
+this section exists to remove.
+
+### The run
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python scripts/profile_decode.py \
@@ -108,17 +164,34 @@ CUDA_VISIBLE_DEVICES=0 python scripts/profile_decode.py \
 
 Read, in order:
 
-1. **GPU busy %** at B=1 and B=32. B=1 being flat across context says a fixed
-   cost still dominates there; the profile says whether it is host or an
-   under-occupied kernel (§4.1 vs §4.3).
-2. **CPU self time, top 20.** If `JITFunction.run` still dominates, the launcher
-   bypass (`kernel.warmup` + a cached `CompiledKernel`) is worth the version
-   risk; the argument-count cut reduced 50 args to 41 but left the launcher.
-3. **The chosen tile rung.** The kernel prints
+1. **`GPU busy    xx.x %   <-- THE number`**, at B=1 and at B=32. This is the one
+   that settles A vs B above:
+   - **< 50%** → host-bound. Split-K buys nothing; the lever is the launcher
+     bypass or CUDA graphs (§5).
+   - **> 85%** → kernel-bound. Split-K (§4.1) and `BLOCK_R` (§4.2) are right.
+   - in between → both terms are real; fix the larger one first.
+2. **Top kernels by CUDA self time, and the host-stall list.** These name *which*
+   code, not just which side. If `JITFunction.run` dominates the host side, the
+   launcher bypass (`kernel.warmup` + a cached `CompiledKernel`) is worth its
+   version risk — the argument-count cut took 50 args to 41 but left the launcher
+   itself in place.
+3. **The chosen tile rung**, printed by the kernel as
    `[StickyKV] fused decode tiling: target_keys=… num_stages=…`. At
-   `target_keys=64` the Q-tier tiling got its full 7.8×; at 32 it got 4×; at 16,
-   2×. If it is not 64, raising it is free performance — §4.4.
-4. **`STICKYKV_COMPILE_EVICT=1` vs `=0`.** If small, §3.3.
+   `target_keys=64` the Q-tier tiling got its full 7.8×; at 32, 4×; at 16, 2×.
+   If it is not 64, §4.4 is free performance you already own — no experiment
+   needed, just read the line.
+4. **`STICKYKV_COMPILE_EVICT=1` vs `=0`.** If the gap is small, §3.3.
+
+### Blocks nothing, informs everything
+
+**Blocks nothing:** it is read-only — load the model, run 24 decode steps under
+`torch.profiler`, print. About two minutes, no code change, nothing it can break.
+Split-K *could* be started today without it.
+
+**Informs everything:** but the ranking of items 2–5 in §7 is inference from
+wall-clock shapes, and that inference has already been shown — in this codebase,
+on this kernel — to be capable of being wrong by 20×. Two minutes of measurement
+replaces a guess that could otherwise cost a week of building the wrong kernel.
 
 ## 3. The eviction — what's left
 
