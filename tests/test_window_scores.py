@@ -319,14 +319,31 @@ def test_exp2_fold_matches_base_e(ws, num_sink):
 
 
 def test_exp2_is_default_and_has_a_control_arm(monkeypatch):
-    from modules.windowed_cache.decode_kernel import _LOG2E, decode_exp2_enabled
     import math
 
+    from modules.windowed_cache import decode_kernel as dk
+
     monkeypatch.delenv("STICKYKV_DECODE_EXP2", raising=False)
-    assert decode_exp2_enabled() is True, "base-2 softmax must be the default"
+    assert dk.decode_exp2_enabled() is True, "base-2 softmax must be the default"
+    assert dk.refresh_exp2_latch() is True
     monkeypatch.setenv("STICKYKV_DECODE_EXP2", "0")
-    assert decode_exp2_enabled() is False, "the A/B control arm must work"
-    assert _LOG2E == pytest.approx(math.log2(math.e), rel=1e-15)
+    assert dk.decode_exp2_enabled() is False, "the A/B control arm must work"
+    assert dk.refresh_exp2_latch() is False
+    monkeypatch.delenv("STICKYKV_DECODE_EXP2", raising=False)
+    dk.refresh_exp2_latch()
+    assert dk._LOG2E == pytest.approx(math.log2(math.e), rel=1e-15)
+
+
+def test_exp2_flag_is_not_read_on_the_launch_path():
+    """``_decode_triton`` runs once per layer per step; an ``os.environ`` read
+    there costs ~25 us/step at L=32 for a knob that cannot change mid-run."""
+    import inspect
+
+    from modules.windowed_cache import decode_kernel as dk
+
+    src = inspect.getsource(dk._decode_triton)
+    assert "decode_exp2_enabled" not in src,         "the env read must be latched at import, not done per launch"
+    assert "_EXP2[0]" in src
 
 
 def test_no_base_e_exp_survives_in_the_kernel():

@@ -86,6 +86,17 @@ def decode_exp2_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+#: Latched at import so the launch path never touches ``os.environ``. Tests that
+#: flip the variable call :func:`refresh_exp2_latch`.
+_EXP2 = [decode_exp2_enabled()]
+
+
+def refresh_exp2_latch() -> bool:
+    """Re-read ``STICKYKV_DECODE_EXP2``. For tests that set it after import."""
+    _EXP2[0] = decode_exp2_enabled()
+    return _EXP2[0]
+
+
 def fused_decode_enabled() -> bool:
     """Whether the fused two-tier decode path is active (default ON).
 
@@ -773,7 +784,13 @@ def _decode_triton(
     # nothing per element. Folding it into the [BLOCK_R, BLOCK_T] logit tile
     # instead would add a multiply per key per query head, which is the whole
     # cost the change exists to avoid.
-    scaling = scaling * _LOG2E if decode_exp2_enabled() else scaling
+    #
+    # The env read is latched at import, not done here: this function runs once
+    # per layer per step (32x at L=32), and `os.environ.get(...).strip().lower()`
+    # allocates two strings each time. A knob that is read on the hot path is a
+    # cost, not a feature.
+    if _EXP2[0]:
+        scaling = scaling * _LOG2E
 
     # Shared-memory fit ladder (see _FIT_LADDER). §5.3 widened the Q-tier tile
     # from one window (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows,

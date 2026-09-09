@@ -646,41 +646,51 @@ def test_multi_device_error_names_both_escapes():
 
 
 # ---------------------------------------------------------------------------
-# §4.3(d) the reusable fused hand-off dict
+# The cache must be freed by refcounting alone
 # ---------------------------------------------------------------------------
 
 
-def test_pending_ctx_is_reused_per_layer_and_stays_correct():
-    """One dict per layer, mutated rather than rebuilt.
+def test_cache_is_freed_by_refcounting():
+    """No reference cycle may reach the cache from the cache.
 
-    Worth only ~5.7 us/step (0.009% of a 62.6 ms step), so the point of this test
-    is not the saving — it is that reusing a mutable object cannot leak stale
-    state. The lifetime is strictly nested (set_pending parks it, the same
-    layer's flash_attn_func takes it and clears the slot), but "strictly nested"
-    is an argument, and this is the check.
+    Every quality runner builds one cache PER SAMPLE and frees it with a bare
+    ``del`` (``longbench_runner._cleanup_memory``). That is refcounting only, so
+    a cycle keeps the whole KV store alive until the generational collector
+    happens to run — and at LongBench sizes several live caches is an OOM.
+
+    This is a regression test with a specific history: parking the fused
+    hand-off dict on the cache to avoid rebuilding it closed exactly such a
+    cycle (cache -> list -> dict -> ``ctx["cache"]`` -> cache), and cost an OOM
+    on narrativeqa plus ~6% TPOT from allocator pressure — to save 0.009% of a
+    step. The saving is not the point; the invariant is.
     """
-    cache = _make_cache(layer_major=False, quant_ratio=0.5,
-                        num_layers=3, prefill_len=32, ws=4)
-    a0 = cache._pending_ctx(0, {"k": 1}, ("m0", 2), 4)
-    b0 = cache._pending_ctx(0, {"k": 2}, ("m1", 3), 4)
-    assert a0 is b0, "the same layer must reuse one dict"
-    assert b0["qtier"] == {"k": 2} and b0["score_meta"] == ("m1", 3), \
-        "mutable fields must be refreshed"
-    assert b0["layer_idx"] == 0 and b0["window_size"] == 4
-    assert b0["cache"] is cache
-    assert b0["num_sink"] == cache.resolved.num_sink_tokens
-    assert b0["scaling"] == cache._attn_scaling
-    assert set(b0) == {"layer_idx", "qtier", "score_meta", "num_sink",
-                       "window_size", "scaling", "cache"}
+    import gc
+    import weakref
 
+    cache = _make_cache(layer_major=True, quant_ratio=0.5,
+                        num_layers=2, prefill_len=32, ws=4)
+    gen = torch.Generator().manual_seed(3)
+    kv = torch.Generator().manual_seed(4)
+    for i in range(2):
+        k = torch.randn(1, H_KV, 32, D, generator=kv)
+        cache.update(k, k.clone(), i,
+                     cache_kwargs={"cache_position": torch.arange(32)})
+    _write_pending_scores(cache, 2, 4, 0, gen)
+    for i in range(2):
+        k = torch.randn(1, H_KV, 1, D, generator=kv)
+        cache.update(k, k.clone(), i,
+                     cache_kwargs={"cache_position": torch.tensor([32])})
 
-def test_pending_ctx_layers_never_share_a_dict():
-    """Two layers sharing one dict would let layer i+1's hand-off overwrite
-    layer i's before the kernel consumed it."""
-    cache = _make_cache(layer_major=False, quant_ratio=0.5,
-                        num_layers=4, prefill_len=32, ws=4)
-    ctxs = [cache._pending_ctx(i, {"layer": i}, (f"m{i}", i), 4) for i in range(4)]
-    assert len({id(c) for c in ctxs}) == 4, "each layer needs its own dict"
-    for i, c in enumerate(ctxs):
-        assert c["layer_idx"] == i and c["qtier"] == {"layer": i}, \
-            f"layer {i}'s context was clobbered by another layer"
+    ref = weakref.ref(cache)
+    gc.disable()
+    try:
+        del cache
+        alive = ref() is not None
+    finally:
+        gc.enable()
+    gc.collect()
+    assert not alive, (
+        "the cache survived `del` with the cyclic collector disabled, so "
+        "something on it references it back. Find the cycle rather than relying "
+        "on gc: the runners free caches by refcounting, one per sample."
+    )

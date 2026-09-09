@@ -18,6 +18,24 @@ prefill 4096, B=32, budget 0.50, q=0.70, one GPU):
 Started at 0.1760, i.e. 2.05× *slower* than FullKV. How that was done, and
 everything that went wrong doing it, is in `DECODE_HISTORY.md`.
 
+**The LongBench regression is closed.** The RoPE-dtype fix (`DECODE_HISTORY.md`
+§2.5) repaired a tier-dependent key representation — the Q tier was un-rotated in
+fp16 and re-rotated by the kernel in fp32, so a token's key depended on which
+tier held it. Against `ACCURACY_RECOVERY_PLAN.md` §1's table:
+
+| dataset | before | regressed | now |
+|---|---|---|---|
+| qasper | 42.30 | 32.78 | **42.43** |
+| multifieldqa_en | 55.74 | 50.89 | **55.86** |
+| gov_report | 33.71 | 31.28 | **33.72** |
+| trec | 71.00 | 69.00 | **71.50** |
+
+8 of 11 complete datasets are at or above the pre-regression baseline; the two
+headline losses (−9.52 and −4.85) are fully recovered. The run bundles more than
+one change, so this is not a controlled attribution — but it closes the
+regression, and it is the reason the fp16 RoPE change stays despite perturbing
+Q-tier keys by ~5e-4.
+
 **The governing constraint from here is that scores must not move.** That is a
 stronger bar than "fp tolerance", and it reclassifies most of what this plan used
 to propose. An optimisation now has to be **score-neutral by construction** —
@@ -126,10 +144,10 @@ Low value, no risk, entirely optional.
 ## Expected outcome
 
 **If nothing further is done:** the result stands as it is —
-**0.0626 s at 4096/B=32, 1.37× faster than FullKV, both targets met**, with
-scores unchanged by construction on the eviction path and the two numerical
-changes already made (base-2 softmax at 1.4e-6, RoPE dtype at ~5e-4) still owing
-one LongBench confirmation. This is a shippable position.
+**0.0626 s at 4096/B=32, 1.37× faster than FullKV, both targets met**, with the
+eviction path score-neutral by construction and the LongBench regression closed
+(introduction). Speed and accuracy are both in hand; this is a shippable
+position.
 
 **If items 1–2 are done:** one of three outcomes, all cheap to reach.
 

@@ -125,6 +125,43 @@ What it moved is whether the harness being optimised runs the semantics that shi
 of weights; `perf_runner._assert_single_device` re-checks after the model loads.
 Reason in §4.4 below.
 
+### 2.5 Base-2 softmax, RoPE dtype, and one revert
+
+**Base-2 softmax.** `log2(e)` folds into `scale` at the launch, so `m`, `wmax`
+and `lse` are in base-2 units while `p`, `l`, `acc` and `out` are unchanged
+quantities. `STICKYKV_DECODE_EXP2=0` is the control arm, latched at import — a
+knob read on the launch path cost ~25 µs/step at L=32 for something that cannot
+change mid-run.
+
+**RoPE tables at the store's dtype — the accuracy fix.** HF's rotary returns
+`cos.to(dtype=x.dtype)`, and every other RoPE here hands it the fp16 *key*: the
+model's own rotation of the fp tier, and `unrotate_key_window` /
+`rotate_key_window`. `rope_cos_sin_halves` handed it `torch.empty(1, 1, 1)` and
+so got fp32 — incidentally, since nothing depended on it. The Q tier was
+therefore un-rotated in fp16 and re-rotated in fp32, and **a token's key depended
+on which tier held it.** Matching the dtype cuts the maximum round-trip error
+from 4.5e-01 to 6.9e-04 (~660×), and closed the LongBench regression
+(`DECODE_SPEED_PLAN.md` introduction). No equivalence test could have caught it:
+they all compared the kernel to an oracle built with the *same* fp32 convention.
+
+**The reusable hand-off dict — implemented, then reverted.** Parking the fused
+context on the cache to avoid rebuilding it (worth 5.7 µs/step, 0.009%) closed a
+reference cycle: `cache → _pending_ctx_cache → dict → ctx["cache"] → cache`.
+Every quality runner builds one cache **per sample** and frees it with a bare
+`del` (`longbench_runner._cleanup_memory`), which is refcounting only — so each
+sample's whole KV store stayed alive until the generational collector happened to
+run. Cost: an **OOM on narrativeqa at 109/200**, and **~6% TPOT**
+(0.0626 → 0.0664) from the resulting allocator pressure, visible as steadyKV
+growth at the smaller cells (1024/B=1: 15.93 → 19.16 GB).
+
+Reverted. `test_cache_is_freed_by_refcounting` now pins the invariant: the cache
+must be collectable with the cyclic GC disabled.
+
+**Lesson.** A 0.009% saving is not worth a new object-lifetime edge, and the
+review that flagged it as not worth doing was right for a reason it had not
+identified. Judge a micro-optimisation by what it can break, not only by what it
+saves.
+
 ---
 
 ## 3. What was tried and rejected

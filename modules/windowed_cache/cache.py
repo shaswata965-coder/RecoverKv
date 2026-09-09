@@ -514,8 +514,15 @@ class WindowedCache(_HFCacheBase):
         # dtype so the Q tier is re-rotated with the same convention it was
         # un-rotated with (decode_kernel.rope_cos_sin_halves explains why).
         self._kv_dtype: torch.dtype = kv_dtype
-        # One reusable fused hand-off dict per layer (see _pending_ctx).
-        self._pending_ctx_cache: List[Optional[Dict[str, Any]]] = [None] * num_layers
+        # NOTE: the fused hand-off dict is built fresh per layer per step, on
+        # purpose. It carries ``"cache": self``, so parking it on the cache
+        # closes a reference cycle (cache -> list -> dict -> cache). Every
+        # quality runner builds one cache PER SAMPLE and frees it with a bare
+        # ``del`` (``longbench_runner._cleanup_memory``), which is refcounting
+        # only -- a cycle keeps each sample's whole KV store alive until the
+        # generational collector happens to run. That cost an OOM on narrativeqa
+        # and ~6% TPOT from the resulting allocator pressure, to save 5.7 us/step
+        # (0.009%). Do not re-add it; test_cache_is_freed_by_refcounting guards it.
         self.rope_module = rope_module
         self.num_layers = num_layers
         self.telemetry = telemetry if telemetry is not None else NullTelemetry()
@@ -1053,8 +1060,15 @@ class WindowedCache(_HFCacheBase):
                 # merely equivalent ones.
                 qtier = self._fused_qtier(layer_idx, store, B, n, ws)
                 score_meta = self._fused_meta(layer_idx, state, ws)
-                flash_decode.set_pending(
-                    self._pending_ctx(layer_idx, qtier, score_meta, ws))
+                flash_decode.set_pending({
+                    "layer_idx": layer_idx,
+                    "qtier": qtier,
+                    "score_meta": score_meta,
+                    "num_sink": self.resolved.num_sink_tokens,
+                    "window_size": ws,
+                    "scaling": self._attn_scaling,
+                    "cache": self,
+                })
                 # The patch writes window_scores; the score forward-hook skips this
                 # step. Clear the materialize stashes so no stale effective-K leaks.
                 self._last_effective_k[layer_idx] = None
@@ -1446,8 +1460,15 @@ class WindowedCache(_HFCacheBase):
             n = store.num_active_windows
             qtier = self._fused_qtier_joint(layer_idx, store, B, n, ws)
             score_meta = self._fused_meta_joint(layer_idx, B, ws)
-            flash_decode.set_pending(
-                self._pending_ctx(layer_idx, qtier, score_meta, ws))
+            flash_decode.set_pending({
+                "layer_idx": layer_idx,
+                "qtier": qtier,
+                "score_meta": score_meta,
+                "num_sink": self.resolved.num_sink_tokens,
+                "window_size": ws,
+                "scaling": self._attn_scaling,
+                "cache": self,
+            })
             self._last_effective_k[layer_idx] = None
             self._last_score_meta[layer_idx] = None
             return k_layer, v_layer
@@ -1580,40 +1601,6 @@ class WindowedCache(_HFCacheBase):
     # -----------------------------------------------------------------
     # Fused-decode hand-off, memoized (design §10 — entries are write-once)
     # -----------------------------------------------------------------
-
-    def _pending_ctx(self, layer_idx: int, qtier, score_meta, ws: int) -> Dict[str, Any]:
-        """The fused hand-off dict for one layer, built once and then mutated.
-
-        Five of its seven entries are constant for the life of the cache
-        (``layer_idx``, ``num_sink``, ``window_size``, ``scaling``, ``cache``) and
-        the other two change only when the Q tier does — both are memoized on
-        ``store.version``. Rebuilding all seven per layer per step cost 177 ns x 32
-        layers = 5.7 us/step, which is 0.009% of a 62.6 ms step: this is tidiness,
-        not a speedup, and it is recorded that way rather than claimed as one.
-
-        **Safe to reuse the object** because the lifetime is strictly nested and
-        single-threaded: ``flash_decode.set_pending`` parks it, the very next
-        ``flash_attn_func`` call inside *this same layer's* attention forward takes
-        it and clears the slot, and ``_run_fused`` has finished reading it before
-        this method can be called again for the same layer. One dict per layer, so
-        two layers can never contend for one.
-        """
-        ctx = self._pending_ctx_cache[layer_idx]
-        if ctx is None:
-            ctx = {
-                "layer_idx": layer_idx,
-                "qtier": qtier,
-                "score_meta": score_meta,
-                "num_sink": self.resolved.num_sink_tokens,
-                "window_size": ws,
-                "scaling": self._attn_scaling,
-                "cache": self,
-            }
-            self._pending_ctx_cache[layer_idx] = ctx
-            return ctx
-        ctx["qtier"] = qtier
-        ctx["score_meta"] = score_meta
-        return ctx
 
     def _fused_qtier(self, layer_idx: int, store, B: int, n: int, ws: int) -> Dict:
         """The kernel's Q-tier context — gathered int2 fields + RoPE halves.

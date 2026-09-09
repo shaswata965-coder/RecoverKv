@@ -907,14 +907,7 @@ def _drive_decode_step(cache, pos):
     ctx = flash_decode._PENDING["ctx"]
     # Stand in for the wrapper consuming it (the Triton launch is GPU-only).
     flash_decode._PENDING["ctx"] = None
-    # SHALLOW copy, because `WindowedCache._pending_ctx` reuses one dict per layer
-    # and mutates it in place. That is safe in production — the hand-off lives
-    # only from `set_pending` to the `flash_attn_func` call inside the same
-    # layer's forward — but these tests deliberately hold a ctx ACROSS steps to
-    # check the qtier memo's object identity, which the live dict can no longer
-    # answer. A shallow copy freezes the bindings while preserving the identity
-    # of the values, which is exactly what those assertions are about.
-    return dict(ctx) if ctx is not None else None
+    return ctx
 
 
 def test_memoized_fused_ctx_equals_a_fresh_rebuild_every_step():
