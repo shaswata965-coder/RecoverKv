@@ -414,3 +414,40 @@ def test_matching_the_rope_dtype_makes_the_q_tier_round_trip():
     assert matched < mismatched / 100, (
         f"matching the dtype should cut max round-trip error by orders of "
         f"magnitude; got matched={matched:.2e} mismatched={mismatched:.2e}")
+
+
+def test_rope_store_dtype_has_a_bisection_control_arm(monkeypatch):
+    """`STICKYKV_ROPE_STORE_DTYPE=0` restores the historical fp32 tables.
+
+    A control arm for attributing a perf change in one run, not a tuning knob —
+    fp32 reinstates the tier-dependent key representation the default fixes.
+    Latched at import like the exp2 arm, so the launch path reads no env.
+    """
+    from modules.windowed_cache import decode_kernel as dk
+
+    class _Rope(torch.nn.Module):
+        def forward(self, x, position_ids):
+            pos = position_ids.to(torch.float32)
+            f = pos.unsqueeze(-1) * torch.arange(1, 9, dtype=torch.float32) * 0.01
+            e = torch.cat([f, f], dim=-1)
+            return e.cos().to(x.dtype), e.sin().to(x.dtype)
+
+    pos = torch.arange(8).unsqueeze(0)
+    monkeypatch.delenv("STICKYKV_ROPE_STORE_DTYPE", raising=False)
+    dk.refresh_rope_dtype_latch()
+    assert dk.rope_cos_sin_halves(_Rope(), pos, torch.float16)[0].dtype == torch.float16
+    monkeypatch.setenv("STICKYKV_ROPE_STORE_DTYPE", "0")
+    assert dk.refresh_rope_dtype_latch() is False
+    assert dk.rope_cos_sin_halves(_Rope(), pos, torch.float16)[0].dtype == torch.float32
+    monkeypatch.delenv("STICKYKV_ROPE_STORE_DTYPE", raising=False)
+    dk.refresh_rope_dtype_latch()
+
+
+def test_neither_control_arm_is_read_on_the_launch_path():
+    import inspect
+
+    from modules.windowed_cache import decode_kernel as dk
+
+    src = inspect.getsource(dk._decode_triton)
+    for fn in ("decode_exp2_enabled", "rope_store_dtype_enabled"):
+        assert fn not in src, f"{fn} must be latched at import, not read per launch"

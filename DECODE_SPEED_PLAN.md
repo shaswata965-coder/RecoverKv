@@ -52,6 +52,44 @@ A100) and that floor is independent of cache size."* The same argument covers
 short context at B=32, where attention is a small share of the step. Chasing
 either would mean spending score risk on shapes the method is not for.
 
+## Open: a ~5 ms/step regression, not yet attributed
+
+The perf table has not returned to 0.0626. Reverting the reusable ctx dict fixed
+the memory (steadyKV 60.77 → 58.24 GB at 4096/B=32, narrativeqa completes) but
+left a residual:
+
+| cell | 0.0626-era | now | delta |
+|---|---|---|---|
+| 4096/256 B=32 | 0.0626 | 0.0669 | +4.3 ms |
+| 2048/512 B=32 | 0.0531 | 0.0575 | +4.4 ms |
+| 1024/1024 B=32 | 0.0488 | 0.0537 | +4.9 ms |
+| 4096/256 B=1 | 0.0471 | 0.0516 | +4.5 ms |
+| 2048/512 B=1 | 0.0468 | 0.0516 | +4.8 ms |
+| 1024/1024 B=1 | 0.0467 | 0.0520 | +5.3 ms |
+
+**+4.3 to +5.3 ms, flat across a 32× batch range and a 4× context range** — a
+fixed per-step cost (~156 µs/layer), not traffic, and not the Q-tier loop: it
+does not track `n_active` (179 / 89 / 44), which it would if the tile rung had
+changed. Only two code changes are in scope, and **neither has a mechanism that
+predicts a constant of that size**, so this is recorded as unattributed rather
+than explained away.
+
+Both now have a latched control arm, so one run each settles it:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 STICKYKV_DECODE_EXP2=0 scripts/run_perf_table.sh        # isolates (a)
+CUDA_VISIBLE_DEVICES=0 STICKYKV_ROPE_STORE_DTYPE=0 scripts/run_perf_table.sh   # isolates (b)
+```
+
+- If **(a)** — drop it. It was worth ~0.42 ms in theory and is buying nothing.
+- If **(b)** — **keep it anyway.** It is the accuracy fix (introduction), and
+  under the stated priority a ~5 ms/step cost for closing a 9.5-point qasper
+  regression is a trade worth making. Record it as the price, and note that
+  0.0669 still beats FullKV's 0.086 by 1.29× and still clears the 20% target
+  (≤ 0.0688).
+- If **neither** — the cause is outside these two changes and Stage 0's
+  `GPU busy %` becomes the next instrument.
+
 ## What is left
 
 | item | score-neutral? | verdict |
@@ -144,7 +182,7 @@ Low value, no risk, entirely optional.
 ## Expected outcome
 
 **If nothing further is done:** the result stands as it is —
-**0.0626 s at 4096/B=32, 1.37× faster than FullKV, both targets met**, with the
+**0.0669 s at 4096/B=32, 1.29× faster than FullKV, both targets still met**, with the
 eviction path score-neutral by construction and the LongBench regression closed
 (introduction). Speed and accuracy are both in hand; this is a shippable
 position.

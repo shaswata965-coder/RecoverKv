@@ -86,15 +86,36 @@ def decode_exp2_enabled() -> bool:
     return v in ("1", "true", "yes", "on")
 
 
+def rope_store_dtype_enabled() -> bool:
+    """Whether the RoPE tables are built at the KV store's dtype (default ON).
+
+    ``STICKYKV_ROPE_STORE_DTYPE=0`` restores the historical fp32 tables. This is
+    a **control arm for bisection, not a tuning knob**: fp32 is the convention
+    that made a token's key depend on which tier held it (see
+    :func:`rope_cos_sin_halves`), so turning it off reinstates a known defect.
+    It exists so a perf regression can be attributed to this change in one run
+    rather than by reverting code.
+    """
+    v = os.environ.get("STICKYKV_ROPE_STORE_DTYPE", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 #: Latched at import so the launch path never touches ``os.environ``. Tests that
 #: flip the variable call :func:`refresh_exp2_latch`.
 _EXP2 = [decode_exp2_enabled()]
+_ROPE_STORE_DTYPE = [rope_store_dtype_enabled()]
 
 
 def refresh_exp2_latch() -> bool:
     """Re-read ``STICKYKV_DECODE_EXP2``. For tests that set it after import."""
     _EXP2[0] = decode_exp2_enabled()
     return _EXP2[0]
+
+
+def refresh_rope_dtype_latch() -> bool:
+    """Re-read ``STICKYKV_ROPE_STORE_DTYPE``. For tests that set it after import."""
+    _ROPE_STORE_DTYPE[0] = rope_store_dtype_enabled()
+    return _ROPE_STORE_DTYPE[0]
 
 
 def fused_decode_enabled() -> bool:
@@ -182,8 +203,8 @@ def rope_cos_sin_halves(
     4096/batch-32) and its ``tl.dot`` operand footprint, but that is the side
     effect, not the reason.
     """
-    ref = torch.empty(1, 1, 1, device=pos_flat.device,
-                      dtype=dtype if dtype is not None else torch.float32)
+    want = dtype if (dtype is not None and _ROPE_STORE_DTYPE[0]) else torch.float32
+    ref = torch.empty(1, 1, 1, device=pos_flat.device, dtype=want)
     pos = pos_flat.to(torch.long)
     if pos.dim() == 1:
         pos = pos.unsqueeze(0)
