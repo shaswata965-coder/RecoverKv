@@ -1,0 +1,115 @@
+# ============================================================================
+# StickyKV — Shape sweep (Suite C): 3 (prefill, decode) shapes x B = 1/32/64
+# ============================================================================
+# Answers one question: at a fixed token count per row, how does our decode cost
+# move as the prompt/generation split changes, and how does that scale with B.
+#
+#   prefill=1024  decode=1024   generation-dominated  (2048 tok/row)
+#   prefill=2048  decode= 512   balanced              (2560 tok/row)
+#   prefill=4096  decode= 256   prompt-dominated      (4352 tok/row)  <- LongBench-ish
+#
+# gen_len = decode_steps + 1. The prefill forward emits the first token, so a
+# cell asking for 1024 DECODE STEPS is gen_len: 1025. This is the classic
+# off-by-one in this comparison (scripts/run_efficiency.sh --decode does the
+# same conversion); the grid below is written in gen_len, already converted.
+#
+# HYGIENE — these four are not optional and are why this file exists rather
+# than a CLI override of eval_perf_batched.yaml:
+#
+#   prefill_logits: last_only   At prefill=4096, V=128256, the full [B, L, V]
+#                               logits tensor is 1.05 GB PER ROW in fp16 (~67 GB
+#                               at B=64) — several times the KV cache it is being
+#                               compared against, identical for every method, and
+#                               enough on its own to OOM the B=64 rungs and stop
+#                               the ladder early for reasons that have nothing to
+#                               do with the cache.
+#   cooldown_s / clock locking  Nine cells x 4 configs x 6 passes runs the part
+#                               hot; without these, later cells are measured on a
+#                               slower GPU and the drift reads as method variance.
+#   num_measurement_runs: 5     The printer takes a MEDIAN. At n=2 a median is a
+#                               mean of two and one stray run moves it by half the
+#                               excess.
+#   allow_shared_gpu: false     A co-tenant process is indistinguishable from a
+#                               slow method in these numbers.
+#
+# quant_budget_mode: tokens is inherited from eval_perf_batched.yaml and is
+# correct here for the same reason: this is a LATENCY suite, so rows must do
+# equal work to be comparable.
+# ============================================================================
+_base_: eval_perf_batched.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+perf:
+  data_source: "2wikimqa"
+  prefill_logits: last_only
+
+  # -- GPU-state hygiene -----------------------------------------------------
+  num_warmup_runs: 1
+  warmup_decode_steps: null        # auto: crosses the first eviction, so the
+                                   # Triton eviction kernel JITs in WARMUP
+  num_measurement_runs: 5
+  cooldown_s: 3.0
+  enable_clock_locking: true       # needs elevated perms; warns and continues
+  clock_settle_s: 5.0
+  allow_shared_gpu: false
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+  configs:
+    - name: full_cache
+      cache_backend: dynamic
+      cache_package: null
+      attn_implementation: flash_attention_2
+      cache_budget: null
+      requires_flash_attn: true
+
+    - name: ours_b20_q00
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.0
+      requires_flash_attn: true
+
+    # The stated operating point: q=0.7 puts ~90% of retained evictable windows
+    # in the int2 tier ((0.7/0.3) * (b_fp/b_q) = 9.05x as many Q windows as fp).
+    - name: ours_b20_q70
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.7
+      requires_flash_attn: true
+
+    # Prices the dequantized-Q-tier memo at this shape. It defaults OFF above
+    # B=1, so the B=32/64 rungs of ours_b20_q70 are the memo-off side and this
+    # row is the only memo-on evidence there.
+    - name: ours_b20_q70_memo_on
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.7
+      quant_memoize_read: true
+      requires_flash_attn: true
+
+  grid:
+    # -- A. generation-dominated: prefill=1024, decode=1024 -------------------
+    - { prefill_len: 1024, gen_len: 1025, batch_size: 1 }
+    - { prefill_len: 1024, gen_len: 1025, batch_size: 32 }
+    - { prefill_len: 1024, gen_len: 1025, batch_size: 64 }
+    # -- B. balanced: prefill=2048, decode=512 -------------------------------
+    - { prefill_len: 2048, gen_len: 513, batch_size: 1 }
+    - { prefill_len: 2048, gen_len: 513, batch_size: 32 }
+    - { prefill_len: 2048, gen_len: 513, batch_size: 64 }
+    # -- C. prompt-dominated: prefill=4096, decode=256 -----------------------
+    - { prefill_len: 4096, gen_len: 257, batch_size: 1 }
+    - { prefill_len: 4096, gen_len: 257, batch_size: 32 }
+    - { prefill_len: 4096, gen_len: 257, batch_size: 64 }
+
+telemetry:
+  track_scores: false
+  output_dir: outputs/perf_shapes
