@@ -52,6 +52,23 @@ all flipped together by ``configs/eval_efficiency.yaml``):
   two are split and ``prefill_plus_compress_ms`` is the directly comparable one.
 
 None of this changes what a ``native``-protocol run measures.
+
+Which throughput field to quote
+-------------------------------
+Three are recorded and they are not interchangeable:
+
+* ``throughput_decode_tokps`` = ``batch / tpot_steady_ms`` — **the decode claim.**
+  Built on the steady state, so the one-off prompt compaction charged to decode
+  step 0 is excluded. A rate built on ``tpot_ms`` instead would fold an
+  O(prefill) cost into every token, with a bias that decays as ``1/gen_len``, so
+  the same method would report a different decode throughput purely as a
+  function of how many tokens the cell asked for.
+* ``throughput_e2e_tokps`` = ``batch * gen_len / (t3 - t0)`` — **the end-to-end
+  claim.** Consistent with ``e2e_latency_ms`` by construction.
+* ``throughput_tokps`` — **legacy, kept bit-for-bit for existing npz readers.**
+  Its denominator is ``gen_time + TTFT``, which omits ``prefill_to_decode_gap_ms``
+  (the L-reuse/recompute and the first argmax between the two timed regions), so
+  it overstates the rate by ``gap / (e2e - gap)``. Do not quote it.
 """
 from __future__ import annotations
 import json, math, os, pathlib, time, gc, traceback
@@ -888,6 +905,12 @@ class PerfRunner:
         self._config_diag = {}
         ttft = np.full((n_configs, n_runs), np.nan)
         throughput = np.full((n_configs, n_runs), np.nan)
+        # The two throughput figures a claim can actually be built on, plus the
+        # untimed prefill->decode interval that makes `throughput` disagree with
+        # `e2e_latency`. `throughput` keeps its original meaning for old readers.
+        throughput_e2e = np.full((n_configs, n_runs), np.nan)
+        throughput_decode = np.full((n_configs, n_runs), np.nan)
+        prefill_to_decode_gap = np.full((n_configs, n_runs), np.nan)
         tpot = np.full((n_configs, n_runs), np.nan)
         e2e_latency = np.full((n_configs, n_runs), np.nan)
         # Compression accounting (see _measure_config): step 0 is where this
@@ -940,6 +963,9 @@ class PerfRunner:
                 for ri, m in enumerate(measurements):
                     ttft[ci, ri] = m["ttft_ms"]
                     throughput[ci, ri] = m["throughput_tokps"]
+                    throughput_e2e[ci, ri] = m["throughput_e2e_tokps"]
+                    throughput_decode[ci, ri] = m["throughput_decode_tokps"]
+                    prefill_to_decode_gap[ci, ri] = m["prefill_to_decode_gap_ms"]
                     tpot[ci, ri] = m["tpot_ms"]
                     e2e_latency[ci, ri] = m["e2e_latency_ms"]
                     decode_step0[ci, ri] = m["decode_step0_ms"]
@@ -996,7 +1022,10 @@ class PerfRunner:
                 ", ".join(n for n, e in zip(names, errored) if e),
             )
         return {"names": names, "attn_impls": attn_impls, "ttft": ttft,
-                "throughput": throughput, "tpot": tpot, "e2e_latency": e2e_latency,
+                "throughput": throughput, "throughput_e2e": throughput_e2e,
+                "throughput_decode": throughput_decode,
+                "prefill_to_decode_gap": prefill_to_decode_gap,
+                "tpot": tpot, "e2e_latency": e2e_latency,
                 "decode_step0": decode_step0, "tpot_steady": tpot_steady,
                 "prefill_plus_compress": prefill_plus_compress,
                 "peak_mem": peak_mem, "skipped": skipped,
@@ -1772,14 +1801,36 @@ class PerfRunner:
                 prefill_plus_compress_ms = ttft_ms + (
                     decode_step0_ms if n_decode >= 1 else 0.0)
                 e2e_latency_ms = (t3 - t0) * 1000
-                # End-to-end throughput includes prefill (TTFT) + decode time; this
-                # mirrors the legacy field name but is NOT decode-only. Counts all
-                # batch_size rows (B=1 ⇒ identical to the legacy value).
+                # The interval between end-of-prefill and start-of-decode: the
+                # L-reuse / recompute and the first argmax. It is real work, it IS
+                # inside e2e_latency_ms (= t3 - t0), and it is NOT inside
+                # throughput_tokps' denominator — which is exactly why those two
+                # published fields disagree. Recorded so the disagreement is
+                # auditable rather than something a reader has to infer.
+                prefill_to_decode_gap_ms = (t2 - t1) * 1000
+                # LEGACY — kept bit-for-bit so existing npz readers are unaffected.
+                # Its denominator is gen_time + TTFT, which omits the gap above, so
+                # it slightly OVERSTATES the rate. It is neither a clean end-to-end
+                # figure nor a decode figure; prefer the two fields below.
                 throughput_tokps = (batch_size * gen_len) / max(gen_time + (t1-t0), 1e-9)
+                # End-to-end, consistent with e2e_latency_ms by construction.
+                throughput_e2e_tokps = (batch_size * gen_len) / max(t3 - t0, 1e-9)
+                # Decode-only, built on the STEADY state. Deliberately NOT tpot_ms:
+                # that averages in decode step 0, which is where this design
+                # compacts the whole prompt, so a rate built on it charges a one-off
+                # O(prefill) cost into every token and the bias decays as 1/gen_len
+                # — the same method then reports a different decode throughput
+                # purely as a function of how many tokens the cell asked for.
+                throughput_decode_tokps = (
+                    batch_size / (tpot_steady_ms / 1000.0)
+                    if n_decode >= 2 and tpot_steady_ms > 0 else float("nan"))
                 peak = probe.stop().report()
                 phase_peak = {p.name: p for p in peak.phases}
                 measurements.append({
                     "ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
+                    "throughput_e2e_tokps": throughput_e2e_tokps,
+                    "throughput_decode_tokps": throughput_decode_tokps,
+                    "prefill_to_decode_gap_ms": prefill_to_decode_gap_ms,
                     "tpot_ms": tpot_ms, "e2e_latency_ms": e2e_latency_ms,
                     "decode_step0_ms": decode_step0_ms,
                     "tpot_steady_ms": tpot_steady_ms,
@@ -1950,7 +2001,14 @@ class PerfRunner:
             config_names=np.array(result["names"], dtype=object),
             attn_implementations=np.array(result["attn_impls"], dtype=object),
             ttft_ms=result["ttft"],
+            # `throughput_tokps` keeps its original formula and meaning so old
+            # readers are unaffected; it omits `prefill_to_decode_gap_ms` from its
+            # denominator and therefore overstates the rate slightly. The two
+            # fields beside it are the ones a throughput claim should quote.
             throughput_tokps=result["throughput"],
+            throughput_e2e_tokps=result["throughput_e2e"],
+            throughput_decode_tokps=result["throughput_decode"],
+            prefill_to_decode_gap_ms=result["prefill_to_decode_gap"],
             tpot_ms=result["tpot"],
             e2e_latency_ms=result["e2e_latency"],
             # Compression accounting. tpot_ms keeps its original meaning (mean

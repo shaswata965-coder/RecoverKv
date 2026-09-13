@@ -204,8 +204,12 @@ def report(out_dir: Path, batches: list[int], baseline_name: str) -> str:
                         or _med(data, "peak_memory_mb", ci))
                 total = _med(data, "device_total_mb", ci)
 
-                dec = bs / (tpot_s / 1000.0)
-                e2t = (bs * gen) / (e2e / 1000.0) if e2e else None
+                # Prefer the runner's own fields; derive them for npz written
+                # before perf_runner started recording them.
+                dec = (_med(data, "throughput_decode_tokps", ci)
+                       or bs / (tpot_s / 1000.0))
+                e2t = (_med(data, "throughput_e2e_tokps", ci)
+                       or ((bs * gen) / (e2e / 1000.0) if e2e else None))
                 gap = 100.0 * (stored - e2t) / e2t if (stored and e2t) else None
                 pct = 100.0 * peak / total if (peak and total) else None
                 rows[name] = {"dec": dec, "e2e": e2t}
