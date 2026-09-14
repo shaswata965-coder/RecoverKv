@@ -1713,8 +1713,11 @@ class WindowedCache(_HFCacheBase):
                 "quant_gate_margin is not implemented on the fused decode path: "
                 "the fused gate is a top-k on the card estimate with no margin "
                 "term, so a finite margin would be accepted and then ignored. Use "
-                "quant_gate_ratio to set selectivity, or run the materialize path "
-                "(STICKYKV_FUSED_DECODE=0), whose gate_and_select honours it."
+                "quant_gate_ratio to set selectivity. Falling back is NOT an "
+                "option here: the materialize path does not gate at all — it "
+                "dequantizes the whole tier — so it honours a margin even less. "
+                "The only code that reads a margin is gate_and_select, which "
+                "today has no caller but gated_decode_step (the CPU reference)."
             )
         return {
             "card": store.table.gather_sketch(idx),
