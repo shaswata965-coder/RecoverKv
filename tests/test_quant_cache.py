@@ -265,21 +265,24 @@ def test_fused_ctx_dequant_matches_effective_q_tier():
 
 
 class TestReadMemoization:
-    """The Q-tier read memo is configurable and OFF by default above B=1.
+    """The Q-tier read memo, now that the gate has superseded it.
 
-    It caches the dequantized + RoPE'd Q tier between evictions — correct and
-    free at B=1, where decode is weight-bound (BATCHING_PLAN.md §5) and the memo
-    saves 7 of every 8 steps' dequant at window_size=8. Above B=1 it is charged
-    per row: measured at the qasper steady state it holds ~149 MB/row against
-    ~131 MB/row of actual two-tier KV, so it more than doubles per-row memory and
-    halves the batch that fits — and batch capacity is the entire thesis.
+    The memo cached the whole dequantized + RoPE'd Q tier between evictions,
+    keyed on ``store.version``. That key only moves at eviction, while the gate's
+    selected set moves every step -- so a memo beside a live gate would serve a
+    set the gate did not choose. And the gate is not optional: it is the read
+    path wherever a Q tier exists.
+
+    So the memo is now unreachable in any configuration that has a store, and
+    these tests say so rather than pretending the old batch heuristic still
+    decides anything. The mechanism is kept because ``effective_q_tier`` remains
+    the gated path's test oracle; it is no longer a production read path.
     """
 
-    def _cache(self, memo, q=0.5, gate=False):
+    def _cache(self, memo, q=0.5):
         cfg = WindowedCacheConfig(
             window_size=4, num_sink_tokens=0, local_window_size=4,
             cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
-            quant_sketch_enabled=gate,
         )
         return WindowedCache(
             config=cfg, prefill_len=16, model_config=_FakeModelConfig(),
@@ -287,40 +290,23 @@ class TestReadMemoization:
             num_layers=1, max_tokens=8,
         )
 
-    def test_auto_default_is_on_at_b1_off_above(self):
-        c = self._cache(None, gate=False)
-        c._resolve_memoization(1)
-        assert c._stores[0].memoize_read is True
-        c = self._cache(None, gate=False)
-        c._resolve_memoization(4)
-        assert c._stores[0].memoize_read is False, (
-            "the memo must default OFF at B>1 — it costs ~149 MB/row and halves "
-            "max batch, which is what the method exists to raise"
-        )
+    def test_memo_is_off_wherever_a_q_tier_exists(self):
+        """No batch size turns it back on: the gate wins unconditionally."""
+        for batch in (1, 4, 32):
+            c = self._cache(None)
+            c._resolve_memoization(batch)
+            assert c._stores[0].memoize_read is False, (
+                f"B={batch}: the gate is the read path, so the whole-tier memo "
+                "must be off -- it is keyed on store.version, which does not "
+                "move between evictions, while the selected set moves every step"
+            )
 
-    def test_auto_memo_yields_to_the_read_gate(self):
-        """The gate and the whole-tier memo are alternatives, not companions.
+    def test_asking_for_the_memo_beside_a_q_tier_is_a_config_error(self):
+        """Kernel-or-error, applied to config: no silently ignored request."""
+        with pytest.raises(ValueError, match="quant_memoize_read"):
+            self._cache(True)
 
-        The memo is keyed on ``store.version``, which only moves at eviction; the
-        gate's selected set moves every step. So a memo alongside a live gate
-        would be serving a set the gate did not choose. Config rejects the
-        explicit clash; this is the AUTO side, where the gate simply wins — and
-        it matters because the gate is now the default wherever q > 0, so B=1
-        would otherwise silently get both.
-        """
-        c = self._cache(None, gate=True)
-        c._resolve_memoization(1)
-        assert c._stores[0].memoize_read is False
-        # An explicit False is already off; an explicit True is a config error,
-        # so AUTO is the only path that could have collided.
-        c = self._cache(None, gate=False)
-        c._resolve_memoization(1)
-        assert c._stores[0].memoize_read is True
-
-    def test_explicit_setting_overrides_the_batch_heuristic(self):
-        c = self._cache(True)
-        c._resolve_memoization(8)
-        assert c._stores[0].memoize_read is True
+    def test_explicit_false_is_accepted_and_redundant(self):
         c = self._cache(False)
         c._resolve_memoization(1)
         assert c._stores[0].memoize_read is False
@@ -331,11 +317,20 @@ class TestReadMemoization:
         Codes and grids are written once at first demotion and position_range is
         never rebased (§10), so the dequant + RoPE cannot move between evictions.
         If these ever diverged, the memo would be serving stale reads.
+
+        The flag is set on the store directly rather than through config, because
+        config now refuses to pair the memo with a Q tier. The mechanism is still
+        worth pinning: ``effective_q_tier`` is the gated path's test oracle, and
+        an oracle that can serve a stale read is not one.
         """
         ws, H, D, prefill = 4, 2, 4, 16
         outs = []
         for memo in (True, False):
-            c = self._cache(memo)
+            c = self._cache(None)
+            for st_ in c._stores:
+                if st_ is not None:
+                    st_.memoize_read = memo
+            c._memoization_resolved = True
             c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 2, 2, 1
             torch.manual_seed(5)
             kp = torch.randn(1, H, prefill, D)

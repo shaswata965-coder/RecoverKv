@@ -269,10 +269,11 @@ class WindowedCacheConfig:
     # the bar. Because the bound is a bound, a skipped window provably carries no
     # logit above it: the gate can over-select, it cannot miss.
     #
-    # None (default) = AUTO: on wherever there is a Q tier to gate (quant_ratio >
-    # 0), off at q=0 where there is nothing to skip. Mirrors quant_memoize_read's
-    # tri-state. An explicit True at q=0 is a config error, not a silent no-op.
-    quant_sketch_enabled: Optional[bool] = None
+    # There is NO on/off knob: the gate is the read path, not a variant of it.
+    # It is on wherever there is a Q tier to gate and off at q=0, where there is
+    # nothing to skip -- `ResolvedConfig.quant_sketch_enabled` carries that
+    # derivation so no reader repeats it.
+    #
     # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
     # operating point the efficiency arithmetic is costed on: the card is 26.5%
     # of a window, so break-even sits at ~0.735 and 0.25 leaves real headroom.
@@ -361,24 +362,14 @@ class WindowedCacheConfig:
             )
 
         # -- rank-1 read gate --
-        if self.quant_sketch_enabled is True:
-            # Explicit, so a contradiction is an error rather than a quiet
-            # downgrade. AUTO (None) resolves silently and never lands here.
-            if self.quant_ratio <= 0.0:
-                raise ValueError(
-                    "quant_sketch_enabled=True needs quant_ratio > 0: the gate only "
-                    "decides which int2 windows to read, and at q=0 there are none. "
-                    "Leave it None (auto) to have it switch itself off at q=0."
-                )
-            if self.quant_memoize_read is True:
-                raise ValueError(
-                    "quant_sketch_enabled and quant_memoize_read are alternatives, "
-                    "not companions. The memo caches the WHOLE dequantized Q tier "
-                    "keyed on store.version; the gate's selected set changes every "
-                    "step while version does not, so the memo would either be dead "
-                    "weight or serve a set the gate did not choose. Auto-memo "
-                    "yields to the gate on its own; only an explicit True clashes."
-                )
+        if self.quant_ratio > 0.0 and self.quant_memoize_read is True:
+            raise ValueError(
+                "quant_memoize_read=True cannot be combined with a Q tier: the "
+                "gate is the only read path now, and the memo caches the WHOLE "
+                "dequantized tier keyed on store.version -- which only moves at "
+                "eviction, while the gate's selected set moves every step. It "
+                "would serve a set the gate did not choose. Leave it None."
+            )
         if not (0.0 < self.quant_gate_ratio <= 1.0):
             raise ValueError(
                 f"quant_gate_ratio must be in (0, 1], got {self.quant_gate_ratio}. "
@@ -621,11 +612,9 @@ class WindowedCacheConfig:
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
-            # AUTO settles here: on wherever there is a Q tier to gate.
-            quant_sketch_enabled=(
-                q > 0.0 if self.quant_sketch_enabled is None
-                else bool(self.quant_sketch_enabled)
-            ),
+            # Derived, not configured: the gate IS the read path wherever there
+            # is a Q tier, and there is no way to ask for the ungated one.
+            quant_sketch_enabled=q > 0.0,
             quant_gate_ratio=self.quant_gate_ratio,
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,

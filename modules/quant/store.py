@@ -402,6 +402,95 @@ class QuantizedStore:
         )
         return keep, logmass, slots
 
+    def gated_q_tier(
+        self,
+        keep: Tensor,
+        slots: Tensor,
+        rope_module: torch.nn.Module,
+        out_dtype: torch.dtype,
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Read-ready Q tier for the SELECTED windows only — the gated read path.
+
+        The counterpart of :meth:`effective_q_tier`, which dequantizes the whole
+        tier. This one dequantizes ``n_sel`` windows per ``(row, KV head)``, which
+        is the point of the gate.
+
+        Selection is per **KV head**, not per row, and that is load-bearing.
+        Measured on a shape-C tier (271 windows, 8 KV heads, 32 query heads) at a
+        0.25 ratio:
+
+            per (row, KV head)      68/271 windows read   100.00% mass recall
+            per row, union of heads 240/271               100.00%
+            per row, top-k row-max   68/271                97.54%
+
+        The union reads 89% of the tier — the gate buys nothing — and a row-level
+        top-k pays 2.5% of the worst head's mass for the same traffic. So each KV
+        head picks its own windows, and the cost is that positions become
+        per-head: ``[B, H_kv, n_sel*ws]`` rather than the shared ``[B, n*ws]``.
+
+        Counts are equal across rows and heads (the cap is a fixed
+        ``ceil(ratio * n_active)``), so the result is still dense and needs no
+        padding or keep-mask — the same rectangularity argument the tier split
+        already relies on (BATCHING_PLAN.md §3).
+
+        Parameters
+        ----------
+        keep : ``[B, H_kv, n_active]`` bool, equal row sums, from
+            :meth:`gate_and_select`.
+        slots : ``[B, n_active]`` the slot behind each column, same call.
+
+        Returns
+        -------
+        ``(keys, values, positions)`` with keys/values ``[B, H_kv, n_sel*ws, D]``
+        and positions ``[B, H_kv, n_sel*ws]``, or ``None`` for an empty tier.
+        """
+        if self.table is None or self._n_active == 0:
+            return None
+        from .effective import dequant_rotate_q_keys
+        from .quantizer import dequantize_value_windows
+
+        B, H, S, D = keep.shape[0], self.num_kv_heads, self.window_size, self.head_dim
+        n_sel = int(keep[0, 0].sum())
+        # Rank within each head, descending on the mask: the selected columns come
+        # first, so a fixed-width slice takes exactly them. argsort of ~keep is
+        # stable, so column order stays ascending-by-id within the selection —
+        # which is what compute_score_meta_gated relies on.
+        pick = torch.argsort(~keep, dim=-1, stable=True)[..., :n_sel]   # [B,H,n_sel]
+        sel = torch.gather(slots.unsqueeze(1).expand(B, H, slots.shape[1]), 2, pick)
+
+        t = self.table
+        rows = torch.arange(B, device=sel.device)[:, None, None]
+        heads = torch.arange(H, device=sel.device)[None, :, None]
+
+        def take(store_t, head_axis=True):
+            return (store_t[rows, sel, heads] if head_axis
+                    else store_t[rows, sel])
+
+        k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//4]
+        k_scale, k_zero = take(t.key_scale), take(t.key_zero)
+        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
+        v_scale, v_zero = take(t.val_scale), take(t.val_zero)
+        pos = take(t.slot_pos, head_axis=False)        # [B,H,n_sel,S]
+
+        # Fold the head axis into the batch axis: the read kernel treats its
+        # leading axis as opaque, so a per-head selection costs no new code path,
+        # only a reshape. cos/sin then come from this row's own positions.
+        BH = B * H
+        pos_flat = pos.reshape(BH, n_sel * S)
+        keys = dequant_rotate_q_keys(
+            k_codes.reshape(BH * n_sel, 1, D, S // 4),
+            k_scale.reshape(BH * n_sel, 1, D), k_zero.reshape(BH * n_sel, 1, D),
+            S, pos_flat, rope_module, out_dtype, BH, n_sel, 1, D,
+        ).reshape(B, H, n_sel * S, D)
+
+        values = dequantize_value_windows(
+            v_codes.reshape(BH * n_sel, 1, S, D // 4),
+            v_scale.reshape(BH * n_sel, 1, S), v_zero.reshape(BH * n_sel, 1, S),
+            D, out_dtype=out_dtype,
+        ).reshape(B, H, n_sel * S, D).to(out_dtype)
+
+        return keys, values, pos.reshape(B, H, n_sel * S)
+
     def effective_q_tier(
         self, rope_module: torch.nn.Module, out_dtype: torch.dtype
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:

@@ -164,3 +164,59 @@ def accumulate(state_scores: Tensor, new_scores: Tensor) -> Tensor:
     """
     state_scores += new_scores
     return state_scores
+
+
+def fill_skipped_window_scores(
+    exact: Tensor,
+    keep: Tensor,
+    logmass: Tensor,
+) -> Tensor:
+    """Complete the Q-tier window scores when only some windows were read.
+
+    The gated read path dequantizes a fraction of the int2 tier, so only those
+    windows receive real attention and only they produce a real score. Leaving
+    the rest at zero is not an option: ``window_scores`` is what eviction ranks
+    on, so a skipped window would score zero, rank last, and be dropped — the
+    gate would silently destroy the tier it exists to read less often, and at
+    ``quant_ratio = 0.7`` that is 70% of the evictable cache.
+
+    So every skipped window is credited with the estimate its own card produced,
+    rescaled onto the same footing as the real scores:
+
+        c = sum(exact over selected) / sum(estimated over selected)
+
+    ``c`` costs one extra reduction and needs nothing the step did not already
+    compute — the selected windows have *both* a real and an estimated score, so
+    the correction factor is free and self-calibrating. Without it the two
+    populations sit on different scales and the ranking between them is
+    arbitrary.
+
+    Parameters
+    ----------
+    exact : ``[B, H_q, W]`` real per-window scores. Only entries where ``keep``
+        are read; the rest may hold anything.
+    keep : ``[B, H_q, W]`` bool — which windows were actually dequantized. Pass
+        the KV-head mask expanded over its query-head group; a window read for a
+        KV head was read for every query head sharing it.
+    logmass : ``[B, H_q, W]`` the card's log-domain mass estimate for **every**
+        window, from :func:`modules.quant.sketch.gate_and_score`.
+
+    Returns
+    -------
+    ``[B, H_q, W]`` — ``exact`` where selected, ``c * estimate`` where not.
+    """
+    # Exponentiate relative to each head's own maximum. The offset cancels in the
+    # ratio below, so this is a pure overflow guard, not an approximation.
+    est = (logmass - logmass.amax(dim=-1, keepdim=True)).exp()
+    sel = keep.to(est.dtype)
+    num = (exact * sel).sum(dim=-1, keepdim=True)
+    den = (est * sel).sum(dim=-1, keepdim=True)
+    c = num / den.clamp_min(torch.finfo(est.dtype).tiny)
+    return torch.where(keep, exact, c * est)
+
+
+def expand_keep_to_query_heads(keep: Tensor, num_query_heads: int) -> Tensor:
+    """``[B, H_kv, W]`` -> ``[B, H_q, W]``. A window read for a KV head was read
+    for every query head sharing it, so the mask repeats along the group."""
+    B, hkv, W = keep.shape
+    return keep.repeat_interleave(num_query_heads // hkv, dim=1)

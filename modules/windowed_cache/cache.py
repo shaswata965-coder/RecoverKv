@@ -728,12 +728,11 @@ class WindowedCache(_HFCacheBase):
         self._memoization_resolved = True
         pref = self.resolved.quant_memoize_read
         memo = (batch_size == 1) if pref is None else pref
-        # The gate and the whole-tier memo are alternatives (config validates the
-        # explicit clash). When AUTO-memo would have switched on at B=1 but the
-        # gate is live, the gate wins: its selected set changes every step while
-        # store.version -- the memo's key -- does not, so a memo here would serve
-        # a set the gate did not choose.
-        if self.resolved.quant_sketch_enabled and pref is None:
+        # The gate is the read path wherever there is a Q tier, and the
+        # whole-tier memo is keyed on store.version -- which only moves at
+        # eviction, while the gate's selected set moves every step. So a live
+        # gate means no memo, full stop; config rejects an explicit True.
+        if self.resolved.quant_sketch_enabled:
             memo = False
         for store in self._stores:
             if store is not None:
