@@ -63,6 +63,11 @@ class ResolvedConfig:
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
+    # Rank-1 gate (modules/quant/sketch.py). Off by default; `inf` margin makes
+    # an enabled gate a provable no-op, which is how it goes in dark.
+    quant_sketch_enabled: bool = False
+    quant_gate_margin: float = float("inf")
+    quant_gate_max_windows: Optional[int] = None
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -253,6 +258,19 @@ class WindowedCacheConfig:
     # first-eviction drop count so that case is visible rather than implied.
     quant_budget_mode: str = "bytes"
     quant_memoize_read: Optional[bool] = None
+    # -- rank-1 read gate (modules/quant/sketch.py) -------------------------
+    # Each int2 window carries a card written once at demotion; the decode step
+    # scans the cards and dequantizes only the windows whose UPPER BOUND clears
+    # a per-head threshold. Off by default.
+    quant_sketch_enabled: bool = False
+    # Delta. A window survives when its bound is within Delta of its head's best
+    # bound -- a top-p in log space, so a peaked head keeps few windows and a
+    # flat head keeps many, with no calibration and no sort. `inf` keeps
+    # everything: an enabled-but-inf gate is a provable no-op, which is how the
+    # feature ships dark and how its own overhead gets priced.
+    quant_gate_margin: float = float("inf")
+    # Hard cap on windows dequantized per head per step; None = no cap.
+    quant_gate_max_windows: Optional[int] = None
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -326,6 +344,29 @@ class WindowedCacheConfig:
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
             )
+
+        # -- rank-1 read gate --
+        if self.quant_sketch_enabled:
+            if self.quant_ratio <= 0.0:
+                raise ValueError(
+                    "quant_sketch_enabled needs quant_ratio > 0: the gate only "
+                    "decides which int2 windows to read, and at q=0 there are none."
+                )
+            if self.quant_memoize_read:
+                raise ValueError(
+                    "quant_sketch_enabled and quant_memoize_read are alternatives, "
+                    "not companions. The memo caches the WHOLE dequantized Q tier "
+                    "keyed on store.version; the gate's selected set changes every "
+                    "step while version does not, so the memo would either be dead "
+                    "weight or serve a set the gate did not choose."
+                )
+        if self.quant_gate_margin != float("inf") and self.quant_gate_margin < 0:
+            raise ValueError(
+                f"quant_gate_margin must be >= 0 or inf, got {self.quant_gate_margin}"
+            )
+        if (self.quant_gate_max_windows is not None
+                and self.quant_gate_max_windows < 1):
+            raise ValueError("quant_gate_max_windows must be >= 1 or None")
 
         # -- quant_budget_mode (what quant_ratio divides) --
         if self.quant_budget_mode not in ("tokens", "bytes"):
@@ -556,5 +597,8 @@ class WindowedCacheConfig:
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
+            quant_sketch_enabled=self.quant_sketch_enabled,
+            quant_gate_margin=self.quant_gate_margin,
+            quant_gate_max_windows=self.quant_gate_max_windows,
             first_eviction_step=self.first_eviction_step,
         )

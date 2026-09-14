@@ -37,13 +37,25 @@ Sizing: see :func:`n_slots_for`.
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 from torch import Tensor
 
 FREE = -1
 """``slot_wid`` sentinel for an unoccupied slot. Real window ids are >= 0."""
+
+SKETCH_FIELDS = (
+    "sk_mu_q", "sk_mu_s", "sk_v_q", "sk_v_s",
+    "sk_t_q", "sk_t_s", "sk_e_q", "sk_e_s",
+)
+"""The rank-1 gate card's columns, in :class:`modules.quant.sketch.Sketch` order.
+
+They ride the slot table rather than living beside it so they inherit its whole
+lifecycle for free: ``write`` freezes a card at first demotion, ``retain_only``
+drops it with its window, ``set_active`` reactivates it on re-demotion without
+recomputation, and ``join_layers`` folds it layer-major. None of those needed a
+code change -- only this name list."""
 
 
 def n_slots_for(top_k_fp: int, n_q: int) -> int:
@@ -87,6 +99,7 @@ class QuantSlotTable:
         head_dim: int,
         num_kv_heads: int,
         device: torch.device,
+        sketch: bool = False,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -104,6 +117,26 @@ class QuantSlotTable:
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)
+
+        # Rank-1 gate cards (modules/quant/sketch.py). Allocated only when the
+        # gate is on, so a q>0 run with the gate off is byte-identical to before.
+        #
+        # Slot-major with D innermost, mirroring `key_scale [B, N, H, D]`: that
+        # layout already gives 256 contiguous bytes per (slot, head) at D=128, so
+        # a gathered window is a contiguous run rather than a scalar gather, and
+        # every existing index path (`_flat`, `write`, `gather`, `retain_only`)
+        # works on it unchanged. A head-major layout would coalesce no better --
+        # the inner dim is what matters -- and would need a `slots.py` refactor.
+        self.sketch = sketch
+        if sketch:
+            self.sk_mu_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_mu_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+            self.sk_v_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+            self.sk_t_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+            self.sk_t_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+            self.sk_e_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
+            self.sk_e_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
         # ws//2] index tensor would allocate an int64 index the size of the codes
@@ -147,9 +180,13 @@ class QuantSlotTable:
         joint.window_size = ref.window_size
         joint.head_dim = ref.head_dim
         joint.num_kv_heads = ref.num_kv_heads
-        for field in ("key_codes", "key_scale", "key_zero",
-                      "val_codes", "val_scale", "val_zero",
-                      "slot_wid", "slot_active", "slot_pos"):
+        joint.sketch = ref.sketch
+        fields = ["key_codes", "key_scale", "key_zero",
+                  "val_codes", "val_scale", "val_zero",
+                  "slot_wid", "slot_active", "slot_pos"]
+        if ref.sketch:
+            fields += list(SKETCH_FIELDS)
+        for field in fields:
             setattr(joint, field, torch.cat(
                 [getattr(t, field) for t in tables], dim=0
             ).contiguous())
@@ -219,6 +256,7 @@ class QuantSlotTable:
         v_scale: Tensor,
         v_zero: Tensor,
         pos: Tensor,
+        sketch: Optional[Sequence[Tensor]] = None,
     ) -> None:
         """Write ``n`` fresh entries per row, masked by ``valid``.
 
@@ -257,6 +295,14 @@ class QuantSlotTable:
         put(self.val_scale, v_scale)
         put(self.val_zero, v_zero)
         put(self.slot_pos, pos)
+        if sketch is not None:
+            if not self.sketch:
+                raise RuntimeError(
+                    "write() was given sketch fields but the table was built "
+                    "without them; pass sketch=True to QuantSlotTable."
+                )
+            for name, src in zip(SKETCH_FIELDS, sketch):
+                put(getattr(self, name), src)
         put(self.slot_wid, wid)
         put(self.slot_active, torch.ones_like(valid))
 
@@ -295,6 +341,21 @@ class QuantSlotTable:
             take(self.val_codes), take(self.val_scale), take(self.val_zero),
             take(self.slot_pos),
         )
+
+    def gather_sketch(self, slot_idx: Tensor) -> Tuple[Tensor, ...]:
+        """The eight card fields for ``[B, n]`` slots, keeping the ``[B, n]``
+        leading pair (unlike :meth:`gather`, which flattens it): the gate is a
+        per-(row, window) reduction, not a per-window quantizer op."""
+        if not self.sketch:
+            raise RuntimeError("this slot table carries no sketch fields")
+        fi = self._flat(slot_idx)
+        B, n = slot_idx.shape
+        out = []
+        for name in SKETCH_FIELDS:
+            st = getattr(self, name)
+            flat = st.view(st.shape[0] * st.shape[1], *st.shape[2:])
+            out.append(flat[fi].reshape(B, n, *st.shape[2:]))
+        return tuple(out)
 
     def active_order(self, n_active: int) -> Tensor:
         """Slot indices of each row's active windows, **ascending by window id**.

@@ -67,12 +67,22 @@ class QuantizedStore:
         num_kv_heads: int,
         n_slots: int,
         memoize_read: bool = True,
+        sketch_enabled: bool = False,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
         self.memoize_read = memoize_read
+
+        # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
+        # off nothing is allocated and every path below is the pre-gate one.
+        self.sketch_enabled = sketch_enabled
+        # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
+        # be frozen, not running: a card is written once and never revisited
+        # (§10), so a later anchor change would silently reinterpret every card
+        # already on disk. Freezing makes the encoding as immutable as the codes.
+        self._anchor: Optional[Tensor] = None
 
         # Allocated on first use: the row count and device are not known until
         # the first forward pass reaches the cache.
@@ -105,6 +115,7 @@ class QuantizedStore:
                 head_dim=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
                 device=device,
+                sketch=self.sketch_enabled,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -157,7 +168,12 @@ class QuantizedStore:
             num_kv_heads=ref.num_kv_heads,
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
+            sketch_enabled=ref.sketch_enabled,
         )
+        # Anchors are per-row already, so joining is the same row-axis concat the
+        # tables use: layer i owns rows [i*B, (i+1)*B).
+        if ref.sketch_enabled and all(s._anchor is not None for s in stores):
+            joint._anchor = torch.cat([s._anchor for s in stores], dim=0)
         if ref.table is not None:
             joint.table = QuantSlotTable.join_layers([s.table for s in stores])
         joint._n_active = ref._n_active
@@ -225,6 +241,7 @@ class QuantizedStore:
         keys_pre_rope: Tensor,
         values: Tensor,
         position_ranges: Tensor,
+        keys_post_rope: Optional[Tensor] = None,
     ) -> None:
         """First-time demotion of up to ``n`` windows per row, in one quantize.
 
@@ -240,6 +257,12 @@ class QuantizedStore:
         wid : ``[B, n]`` int64 window ids (``-1`` on invalid lanes).
         keys_pre_rope, values : ``[B, n, H_kv, window, D]``.
         position_ranges : ``[B, n, window]`` int64 original absolute positions.
+        keys_post_rope : ``[B, n, H_kv, window, D]``, required when
+            :attr:`sketch_enabled`. The gate card is built from the keys **as
+            they are here**, i.e. still rotated, which is why it costs no extra
+            RoPE: the caller already holds them (it is about to un-rotate them to
+            get ``keys_pre_rope``). The card is then frozen for life, because
+            eviction never rebases positions.
         """
         self._invalidate()
         B, n = slot_idx.shape
@@ -253,11 +276,28 @@ class QuantizedStore:
         k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
         v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
 
+        sketch = None
+        if self.sketch_enabled:
+            if keys_post_rope is None:
+                raise ValueError(
+                    "sketch_enabled but demote_many got no keys_post_rope; the "
+                    "card must be built from the rotated keys (see §5, §10)."
+                )
+            from .sketch import build_sketch
+            kp = keys_post_rope.reshape(B * n, H, S, D).to(torch.float32)
+            if self._anchor is None:
+                # Frozen here, from the first batch of demoted windows: the mean
+                # over (window, token) of this layer's keys, per row and head.
+                self._anchor = kp.reshape(B, n, H, S, D).mean(dim=(1, 3))
+            anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
+            sketch = tuple(build_sketch(kp, anc))
+
         self.table.write(
             slot_idx, valid, wid,
             k_codes, k_scale, k_zero,
             v_codes, v_scale, v_zero,
             position_ranges.to(torch.long),
+            sketch=sketch,
         )
 
     # -- promotion -----------------------------------------------------------
@@ -297,6 +337,52 @@ class QuantizedStore:
         )
 
     # -- read-path gather ----------------------------------------------------
+
+    def gate_and_select(
+        self,
+        query: Tensor,
+        scaling: float,
+        margin: float,
+        max_windows: Optional[int] = None,
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Which active Q windows this step must dequantize, and what the rest score.
+
+        Parameters
+        ----------
+        query : ``[B, H_q, D]`` post-RoPE decode query.
+        scaling : attention ``1 / sqrt(head_dim)``.
+        margin : ``Delta``. A window survives when its bound is within ``Delta``
+            of its head's best bound -- a top-p in log space, so a peaked head
+            keeps few windows and a flat head keeps many, with no calibration and
+            no sort. ``inf`` keeps everything and makes this a no-op.
+        max_windows : hard cap, for a worst-case work bound.
+
+        Returns
+        -------
+        ``(keep, logmass, slots)`` or ``None`` for an empty tier.
+        keep : ``[B, H_kv, n_active]`` bool -- the union over each GQA group, which
+            is what the kernel needs because one program owns a whole group.
+        logmass : ``[B, H_q, n_active]`` -- the estimated log mass of EVERY window,
+            selected or not. The skipped ones are what the caller writes back to
+            ``window_scores``; without that a skipped window scores zero, ranks
+            last, and gets evicted -- which would silently destroy the tier this
+            gate exists to read less often.
+        slots : ``[B, n_active]`` the slot index behind each column.
+        """
+        if self.table is None or self._n_active == 0:
+            return None
+        if not self.sketch_enabled or self._anchor is None:
+            raise RuntimeError(
+                "gate_and_select needs sketch cards; construct the store with "
+                "sketch_enabled=True and demote at least once."
+            )
+        from .sketch import Sketch, gate_and_score, group_union, select_windows
+
+        slots = self.table.active_order(self._n_active)
+        card = Sketch(*self.table.gather_sketch(slots))
+        bound, logmass = gate_and_score(query, card, self._anchor, scaling)
+        keep = select_windows(bound, margin, max_windows)
+        return group_union(keep, self.num_kv_heads), logmass, slots
 
     def effective_q_tier(
         self, rope_module: torch.nn.Module, out_dtype: torch.dtype

@@ -552,6 +552,7 @@ class WindowedCache(_HFCacheBase):
                     # Provisional: `None` means auto, resolved from the real batch
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
+                    sketch_enabled=self.resolved.quant_sketch_enabled,
                 )
                 for _ in range(num_layers)
             ]
@@ -1985,6 +1986,14 @@ class WindowedCache(_HFCacheBase):
                 k_pre_d.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
                 v_tok.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
                 prange.reshape(B, n_q, ws),
+                # The gate card is built from the ROTATED keys -- the tensor we
+                # already hold, one line above un-rotating it -- so it costs no
+                # extra RoPE, and positions are never rebased so it stays valid
+                # for the window's whole life (§5, §10).
+                keys_post_rope=(
+                    k_post.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4)
+                    if store.sketch_enabled else None
+                ),
             )
 
         # --- 4. Rebuild the fp store: [sink ‖ fp windows by id] -------------
