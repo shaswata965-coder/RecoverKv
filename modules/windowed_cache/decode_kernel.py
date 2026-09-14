@@ -291,6 +291,45 @@ def window_tiling(window_size: int, target_keys: int = 64) -> Tuple[int, int]:
     return block_nw, _pow2_at_least(block_nw * window_size, floor=1)
 
 
+def check_gate_selection(
+    sel: Optional[Tensor], B: int, H_kv: int, n_active: int,
+) -> int:
+    """Validate the gate's pick; return ``n_sel``, or ``0`` when ungated.
+
+    Split out of :func:`_decode_triton` for the same reason :func:`window_tiling`
+    is a function: the launch path cannot run on a CPU-only box, so anything left
+    inside it ships untested. This is the contract that keeps a malformed
+    selection an **error** rather than silently wrong output — a ``sel`` of the
+    wrong shape, dtype or layout would not fail on a GPU, it would index the
+    wrong windows and emit scores that still look exactly like probabilities.
+
+    The kernel derives ``SEL``'s innermost stride as 1 and indexes it with
+    ``b * selb + kv * selh + slot``, so contiguity is a checked contract here,
+    not an assumption there.
+    """
+    if sel is None or n_active == 0:
+        return 0
+    if sel.dim() != 3 or sel.shape[0] != B or sel.shape[1] != H_kv:
+        raise RuntimeError(
+            f"fused decode gate expects sel [B, H_kv, n_sel] = [{B}, {H_kv}, *]; "
+            f"got {tuple(sel.shape)}.")
+    n_sel = int(sel.shape[-1])
+    if not 0 < n_sel <= n_active:
+        raise RuntimeError(
+            f"fused decode gate selected {n_sel} of {n_active} active windows; it "
+            "must pick at least one and no more than the tier holds. A larger "
+            "n_sel means sel was built against a different store version than "
+            "qtier, which would index past the gathered codes.")
+    if sel.dtype != torch.int32:
+        raise RuntimeError(
+            f"fused decode gate requires an int32 sel, got {sel.dtype}.")
+    if not sel.is_contiguous():
+        raise RuntimeError(
+            "fused decode requires a contiguous sel; its innermost stride is "
+            "assumed to be 1 inside the kernel.")
+    return n_sel
+
+
 def two_tier_window_reference(
     q: Tensor,
     k_eff: Tensor,
@@ -301,6 +340,7 @@ def two_tier_window_reference(
     n_body_win: int,
     Sfp: Optional[int] = None,
     exp2: bool = False,
+    sel: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -317,6 +357,26 @@ def two_tier_window_reference(
     ``k_eff``/``v_eff`` are the effective ``[sink ‖ body ‖ Q]`` store, exactly
     what ``two_tier_decode_reference`` takes. ``Sfp`` is where the fp tier ends
     and the Q tier begins; it defaults to "all of it" (no Q tier).
+
+    ``sel`` is the **gate's** selection: ``[B, H_kv, n_sel]`` int, the active Q
+    columns this step actually reads, ascending. ``None`` means read the whole
+    tier, which is the ungated path and leaves every line below unchanged.
+
+    When ``sel`` is given, ``k_eff``/``v_eff`` still carry the **full** Q tier —
+    the gate skips *reads*, it does not shrink the store — so the Q region is
+    still ``n_active`` windows and ``W_phys`` is still ``n_body_win + n_active``.
+    The loop then runs over ``n_sel`` physical slots and dereferences each
+    through ``sel``, which is exactly the kernel's ``widx = tl.load(SEL + …)``.
+    Two consequences the kernel shares and this models:
+
+    * A window's score lands on column ``n_body_win + sel[b, kv, j]``, its own
+      column, not on the ``j``-th one. Getting this wrong would credit a read
+      window's mass to a skipped one — plausible-looking scores on the wrong
+      windows, which no shape check would catch.
+    * A skipped column is never written, so it must be *pre-set* rather than
+      left at whatever the buffer held: the epilogue rescales every column it
+      reads. Here they start at ``0``/``-inf``; the kernel stores the same
+      sentinel in a prologue (see its ``GATED`` block).
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` where ``W_phys`` is
     ``n_body_win + n_q_win`` in **physical** order — body windows then Q windows,
@@ -359,6 +419,7 @@ def two_tier_window_reference(
     _, BLOCK_T = window_tiling(ws)
     offs_t = torch.arange(BLOCK_T)
     t_win = offs_t // ws                                   # window index in tile
+    t_tok = offs_t % ws                                    # token index in window
     in_tile = offs_t < (block_nw * ws)                     # masks the pow2 padding
 
     def tile(key0: int, end: int, win_base: int, n_win_limit: int) -> None:
@@ -413,15 +474,78 @@ def two_tier_window_reference(
             wsum[:, :, w] = torch.where(sel, p, torch.zeros_like(p)).sum(dim=-1)
             wmax[:, :, w] = m_new
 
+    def q_tile_gated(w0: int, sel_q: Tensor, n_sel: int) -> None:
+        """One Q-tier tile **under SEL indirection** — the kernel's gated loop.
+
+        Same online softmax as :func:`tile`, but the lane -> key map goes through
+        ``sel`` instead of being ``key0 + offs_t``. Every lane of a tile is
+        resolved independently, per ``(row, KV head)``, because the gate selects
+        per KV head (see ``QuantizedStore.gated_q_tier`` for why the union or a
+        row-level top-k will not do).
+        """
+        nonlocal m, l, acc
+        slot = w0 + t_win                                  # physical slot in sel
+        live = in_tile & (slot < n_sel)                    # [BLOCK_T]
+        if not bool(live.any()):
+            return
+        # Clamp rather than mask the dereference: `live` already decides what
+        # counts, and a clamped index keeps every derived offset (the key, and in
+        # the kernel the RoPE row) inside the tier. The kernel clamps for the
+        # same reason.
+        col = sel_q[:, :, slot.clamp(0, n_sel - 1)]        # [B,H_q,BLOCK_T]
+        idx = body_end + col * ws + t_tok                  # key index per lane
+        nmask = live.expand_as(idx) & (idx < S) & (idx >= body_end)
+        safe = idx.clamp(0, S - 1)
+
+        lg = torch.gather(logits, -1, safe)                # [B,H_q,BLOCK_T]
+        lg = torch.where(nmask, lg, torch.full_like(lg, float("-inf")))
+        m_new = torch.maximum(m, lg.max(dim=-1).values)
+        corr = (torch.exp2 if exp2 else torch.exp)(m - m_new)
+        corr = torch.nan_to_num(corr, nan=0.0)
+        p = torch.where(nmask, (torch.exp2 if exp2 else torch.exp)(
+            lg - m_new.unsqueeze(-1)), torch.zeros_like(lg))
+        vg = torch.gather(v_flat, 2, safe.unsqueeze(-1).expand(*safe.shape, D))
+        acc = acc * corr.unsqueeze(-1) + torch.matmul(
+            p.unsqueeze(-2), vg).squeeze(-2)
+        l = l * corr + p.sum(dim=-1)
+        m = m_new
+
+        for j in range(block_nw):                          # mirrors tl.static_range
+            if w0 + j >= n_sel:
+                continue
+            selm = (t_win == j) & nmask
+            if not bool(selm.any()):
+                continue
+            # The j-th slot of THIS tile scores onto its own active column.
+            wcol = (n_body_win + sel_q[:, :, w0 + j]).unsqueeze(-1)   # [B,H_q,1]
+            wsum.scatter_(-1, wcol, torch.where(
+                selm, p, torch.zeros_like(p)).sum(dim=-1, keepdim=True))
+            wmax.scatter_(-1, wcol, m_new.unsqueeze(-1))
+
     # 1. sink prologue -- softmax only
     for s0 in range(0, max(num_sink, 0), BLOCK_T):
         tile(s0, num_sink, -1, 0)
     # 2. fp body -- whole-window tiles from num_sink
     for w0 in range(0, n_body_win, block_nw):
         tile(num_sink + w0 * ws, body_end, w0, n_body_win - w0)
-    # 3. Q tier -- whole-window tiles
-    for w0 in range(0, n_q_win, block_nw):
-        tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
+    # 3. Q tier -- whole-window tiles, through the gate's selection when given
+    if sel is None:
+        for w0 in range(0, n_q_win, block_nw):
+            tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
+    else:
+        if sel.shape[0] != B or sel.shape[1] != H_kv:
+            raise ValueError(
+                f"sel must be [B, H_kv, n_sel] = [{B}, {H_kv}, *], got "
+                f"{tuple(sel.shape)}")
+        n_sel = int(sel.shape[-1])
+        if n_sel > n_q_win:
+            raise ValueError(
+                f"sel picks {n_sel} windows but the Q tier holds only {n_q_win}. "
+                "The gate selects a subset of the tier it is handed; a larger "
+                "selection means sel was built against a different store.")
+        sel_q = sel.to(torch.long).repeat_interleave(H_q // H_kv, dim=1)
+        for w0 in range(0, n_sel, block_nw):
+            q_tile_gated(w0, sel_q, n_sel)
 
     out = acc / l.unsqueeze(-1)
     lse = m + (torch.log2 if exp2 else torch.log)(l)
@@ -444,15 +568,18 @@ if _HAS_TRITON:
         KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
         VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
+        SEL,                       # gate's pick: int32 [B, H_kv, n_sel], ascending
         OUT, WSUM, WMAX,
         scale,
-        H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+        H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
         sqb, sqh, sqd,
         kfb, kfh, kfs, kfd,
         vfb, vfh, vfs, vfd,
+        selb, selh,
         HEAD_DIM: tl.constexpr, HALF: tl.constexpr, WS: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_NW: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
+        GATED: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -467,6 +594,32 @@ if _HAS_TRITON:
         ``tests/test_window_scores.py``. **Keep the two in step**: that oracle is
         the only thing standing between this kernel and an unverified rewrite,
         because Triton cannot run on the CPU box this repo is developed on.
+
+        ``GATED`` — the read gate
+        ~~~~~~~~~~~~~~~~~~~~~~~~~
+        When ``GATED``, the Q-tier loop runs over ``n_sel`` **physical slots** and
+        dereferences each through ``SEL`` (``widx = tl.load(SEL + …)``) instead of
+        walking the tier in order. ``KC``/``KS``/``VC``/``COS``/… are still the
+        **whole** gathered tier, indexed by active column — the gate skips *reads*,
+        it does not shrink the store — so nothing is re-gathered per step and the
+        traffic saved is exactly the windows not named by ``SEL``. This is why the
+        selection is an indirection and not a host-side ``index_select``: the
+        latter would move the very bytes the gate exists not to move.
+
+        Two things follow, and both are load-bearing:
+
+        * A window's score is stored at ``n_body_win + widx``, its own column —
+          not at the slot's position in the tile. Crediting slot ``j``'s mass to
+          column ``j`` would put real scores on the wrong windows and still look
+          entirely plausible downstream.
+        * Skipped columns are never written by the Q loop, so the ``GATED``
+          prologue below seeds them (``WSUM = 0``, ``WMAX = -inf``) before it
+          runs. Without that, the epilogue would rescale whatever the buffer
+          happened to hold — ``wsum``/``wmax`` are ``torch.empty``.
+
+        ``GATED`` is a ``constexpr``, so the ungated kernel is a separate compile
+        with the indirection folded away — the gate costs the ungated path
+        nothing, not even a predicated load.
 
         Strides for the Q-tier tensors, ``COS``/``SIN``, ``OUT``, ``WSUM`` and
         ``WMAX`` are DERIVED from shapes rather than passed (§5.2); the dispatcher
@@ -567,13 +720,43 @@ if _HAS_TRITON:
                 tl.store(WMAX + b * wsb + hq * wsh + w, m_new, mask=keep)
 
         # ---- 3. Q tier: int2 dequant + RoPE in registers, whole-window tiles ---
+        # Under GATED, seed the Q columns this program owns: the loop below writes
+        # only the selected ones and the epilogue reads them all.
+        if GATED:
+            offs_wi = tl.arange(0, BLOCK_W)
+            for wi0 in range(n_body_win, W_phys, BLOCK_W):
+                icols = wi0 + offs_wi
+                imask = r_mask[:, None] & (icols < W_phys)[None, :]
+                iptr = b * wsb + hq[:, None] * wsh + icols[None, :]
+                tl.store(WSUM + iptr, tl.zeros([BLOCK_R, BLOCK_W], tl.float32),
+                         mask=imask)
+                tl.store(WMAX + iptr,
+                         tl.full([BLOCK_R, BLOCK_W], -float("inf"), tl.float32),
+                         mask=imask)
+
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
-        for w0 in range(0, n_active, BLOCK_NW):
-            widx = w0 + t_win                                # [BLOCK_T] window ids
-            qmask = in_tile & (widx < n_active)
+        # A statement, not a ternary: `if` on a constexpr is the form Triton's
+        # frontend is guaranteed to fold, and only the taken branch is traced.
+        if GATED:
+            n_q_iter = n_sel
+        else:
+            n_q_iter = n_active
+        for w0 in range(0, n_q_iter, BLOCK_NW):
+            if GATED:
+                # Slot -> active column. Clamp the dereference rather than mask
+                # it: `qmask` already decides what counts, and a clamped widx
+                # keeps every offset derived from it (the codes, and `crow` into
+                # COS/SIN) inside the tier for the dead lanes too.
+                slot = w0 + t_win                            # [BLOCK_T] slots
+                qmask = in_tile & (slot < n_sel)
+                widx = tl.load(SEL + b * selb + kv * selh
+                               + tl.minimum(slot, n_sel - 1)).to(tl.int32)
+            else:
+                widx = w0 + t_win                            # [BLOCK_T] window ids
+                qmask = in_tile & (widx < n_active)
             ks_lo = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
                             + offs_hl[:, None],
                             mask=qmask[None, :], other=0.0).to(tl.float32)
@@ -618,11 +801,19 @@ if _HAS_TRITON:
             l = l * corr + tl.sum(p, axis=1)
             m = m_new
             for j in tl.static_range(BLOCK_NW):
-                w = w0 + j
-                sel = (t_win == j) & qmask
-                pj = tl.sum(tl.where(sel[None, :], p, 0.0), axis=1)
-                keep = r_mask & (w < n_active)
-                col = n_body_win + w
+                lane = (t_win == j) & qmask
+                pj = tl.sum(tl.where(lane[None, :], p, 0.0), axis=1)
+                if GATED:
+                    # Slot w0+j scores onto ITS OWN column, not onto column j.
+                    sj = w0 + j
+                    col = n_body_win + tl.load(
+                        SEL + b * selb + kv * selh
+                        + tl.minimum(sj, n_sel - 1)).to(tl.int32)
+                    keep = r_mask & (sj < n_sel)
+                else:
+                    w = w0 + j
+                    col = n_body_win + w
+                    keep = r_mask & (w < n_active)
                 tl.store(WSUM + b * wsb + hq * wsh + col, pj, mask=keep)
                 tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=keep)
 
@@ -717,6 +908,7 @@ def _decode_triton(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -731,6 +923,11 @@ def _decode_triton(
     int2 fields shaped ``[B, n, H_kv, ...]`` plus RoPE halves ``cos``/``sin``
     ``[B, n*ws, D//2]`` and ``window_size`` — the int2 unpack + affine dequant +
     RoPE all happen inside the kernel, so no fp16 Q tensor is built.
+
+    ``sel`` is the gate's ``[B, H_kv, n_sel]`` int32 pick of active columns
+    (ascending). ``None`` reads the whole tier. ``qtier`` is the **full** tier
+    either way — ``sel`` is an indirection inside the kernel, not a pre-gather,
+    which is what keeps the skipped windows' bytes off the wire.
     """
     if not _HAS_TRITON:
         raise RuntimeError("Triton not available; fused decode requires CUDA+triton.")
@@ -797,6 +994,16 @@ def _decode_triton(
                 f"§5.2). Got shape {tuple(t.shape)} strides {tuple(t.stride())}."
             )
 
+    n_sel = check_gate_selection(sel, B, H_kv, n_active)
+    gated = n_sel > 0
+    if gated:
+        SEL, selb, selh = sel, sel.stride(0), sel.stride(1)
+    else:
+        # A valid pointer the kernel never dereferences: the Q loop runs while
+        # w0 < n_sel == 0, and the GATED blocks are compiled out entirely.
+        SEL = torch.zeros((1,), dtype=torch.int32, device=dev)
+        selb = selh = 0
+
     BLOCK_R = _pow2_at_least(rep)
     grid = (B * H_kv,)
 
@@ -827,7 +1034,10 @@ def _decode_triton(
     # the pipeline depth differ -- and the winner is cached per geometry so the
     # search runs once. If no rung fits, it raises with the whole ladder, because
     # a decode kernel that cannot launch must fail loudly (invariant 3).
-    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0))
+    # `gated` joins the signature: GATED is a constexpr, so the two variants are
+    # separate compiles with different register and staging pressure, and a rung
+    # that fit one is not evidence about the other.
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated))
     rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
     last: Optional[BaseException] = None
     for target_keys, num_stages in rungs:
@@ -835,16 +1045,19 @@ def _decode_triton(
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
         try:
             _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
+                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL,
+                out, wsum, wmax,
                 scaling,
-                H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+                H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
                 q.stride(0), q.stride(1), q.stride(2),
                 k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
                 v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
+                selb, selh,
                 HEAD_DIM=D, HALF=half, WS=ws,
                 BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
                 BLOCK_W=BLOCK_W,
                 PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+                GATED=gated,
                 num_stages=num_stages,
             )
         except BaseException as exc:                     # noqa: BLE001
@@ -878,6 +1091,7 @@ def fused_two_tier_decode(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -888,9 +1102,15 @@ def fused_two_tier_decode(
     n_body_win : scored windows the fp body spans. Defaults to
         ``ceil((S_fp - num_sink) / ws)``; pass it when the caller already knows
         it, so the kernel's window axis matches the caller's score axis exactly.
+    sel : the gate's ``[B, H_kv, n_sel]`` int32 pick of active columns, or None
+        to read the whole tier.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
-    physical order (body windows, then Q windows).
+    physical order (body windows, then Q windows). ``W_phys`` counts the **whole**
+    Q tier whether or not ``sel`` gated it; a skipped window's column comes back
+    ``0`` for the caller to fill from its card (see
+    :func:`scorer.fill_skipped_window_scores`, and why leaving it at zero would
+    evict the tier the gate exists to preserve).
     """
     if not (_HAS_TRITON and q.is_cuda):
         reason = "triton not installed" if not _HAS_TRITON else "not on CUDA"
@@ -899,4 +1119,4 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
-    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win)
+    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win, sel)

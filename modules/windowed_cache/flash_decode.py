@@ -23,11 +23,21 @@ Layout: ``flash_attn_func`` is called with ``[B, S, H, D]`` (seqlen-major), so t
 wrapper transposes q/k/v to the heads-major ``[B, H, S, D]`` the kernel and cache
 use, and transposes the output back.
 
+The read gate runs here too, for a reason that is structural rather than
+incidental: picking which int2 windows to dequantize needs the **query**, and
+``Cache.update()`` is handed keys and values only. So ``update()`` hands over the
+frozen tier plus its sketch cards, and :func:`_run_fused` — the one place that
+holds ``q`` — scores the cards, picks the top ``n_sel``, and passes the pick to
+the kernel as an indirection (``sel``). See :func:`_gated_window_scores` for why
+the windows it skipped still get a score.
+
 GPU-verify points (this file is exercised only on a CUDA+flash-attn box; the CPU
 dev box never installs the patch): (1) ``flash_attn_func``'s positional arg order
 ``(q, k, v, ...)`` and the ``[B, S, H, D]`` layout; (2) that the module passes the
 fp tier we returned from ``update`` as ``k``/``v``; (3) the softmax scale (we use
-the cache-provided ``head_dim ** -0.5``, correct for Llama/Qwen).
+the cache-provided ``head_dim ** -0.5``, correct for Llama/Qwen); (4) that
+``_gate_kernel`` matches :func:`~modules.windowed_cache.gate_kernel.gate_reference`
+— it has never been executed.
 """
 
 from __future__ import annotations
@@ -38,6 +48,8 @@ from typing import Any, Optional
 import torch
 
 from .decode_kernel import fused_two_tier_decode
+from .gate_kernel import fused_gate
+from .scorer import expand_keep_to_query_heads, fill_skipped_window_scores
 
 
 # Single-slot pending context, set by the cache in update() right before the
@@ -135,6 +147,31 @@ def _flash_utils_module():
         return None
 
 
+def _gated_window_scores(wsum: torch.Tensor, sel: torch.Tensor,
+                         logmass: torch.Tensor, n_body_win: int,
+                         h_kv: int) -> torch.Tensor:
+    """Complete the Q-tier score axis after a gated read.
+
+    The kernel writes a real score for the windows ``sel`` named and leaves the
+    rest at ``0``. Shipping those zeros would be the one failure mode this whole
+    feature has to avoid: ``window_scores`` is what eviction ranks on, so a
+    skipped window would score zero, rank last, and be dropped — the gate would
+    destroy the tier it exists to read *less often*. So each skipped window is
+    credited with its own card's estimate, put on the same footing as the real
+    scores by the ratio the selected windows give for free (they have both a real
+    and an estimated score). See :func:`scorer.fill_skipped_window_scores`.
+
+    The body half is untouched: the fp tier is never gated.
+    """
+    B, hq, _ = wsum.shape
+    n_active = logmass.shape[-1]
+    keep = torch.zeros((B, h_kv, n_active), dtype=torch.bool, device=wsum.device)
+    keep.scatter_(-1, sel.to(torch.long), True)
+    q_win = fill_skipped_window_scores(
+        wsum[..., n_body_win:], expand_keep_to_query_heads(keep, hq), logmass)
+    return torch.cat([wsum[..., :n_body_win], q_win], dim=-1)
+
+
 def _run_fused(ctx: dict, q_flash: torch.Tensor,
                k_flash: torch.Tensor, v_flash: torch.Tensor) -> torch.Tensor:
     """Compute the fused decode output + score for one layer. Returns flash layout.
@@ -142,6 +179,14 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     ``q_flash`` is ``[B, 1, H_q, D]``; ``k_flash``/``v_flash`` are the fp tier
     ``[B, S_fp, H_kv, D]`` (seqlen-major, as flash receives them). The Q tier and
     the score-scatter map come from ``ctx`` (heads-major, built by the cache).
+
+    **This is where the read gate lives**, and it has to be here rather than in
+    ``Cache.update()``: selecting windows needs the **query**, and transformers
+    hands ``update()`` keys and values only. That is the shape of the API, not a
+    choice we can revisit — so ``update()`` hands over the frozen tier and its
+    cards, and the selection happens one layer later, with ``q`` in hand. The
+    pure-PyTorch statement of the same step is
+    :func:`~modules.windowed_cache.gated_decode.gated_decode_step`.
     """
     q_hd = q_flash.transpose(1, 2)[:, :, 0, :]        # [B, H_q, D]
     k_fp = k_flash.transpose(1, 2)                    # [B, H_kv, S_fp, D]
@@ -155,9 +200,29 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     # usually partial and still owns a column).
     n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
 
+    # 1. Gate: score every window from its card, keep the top `n_sel`. One extra
+    #    launch reading 280 B/head/window, against the 8448 B/window it decides
+    #    not to read. `sel` is an INDIRECTION into the tier the cache already
+    #    gathered, not a re-gather — see `_two_tier_decode_kernel`'s GATED block.
+    #    Indexed, not `.get`: a missing key would run ungated and correct, i.e. a
+    #    decode silently timed against a method it is not running — the same
+    #    failure FusedDecodeNotReached exists to refuse. `None` is the explicit
+    #    way to say "this store has no cards".
+    gate, sel, logmass = ctx["gate"], None, None
+    if gate is not None:
+        sel, logmass = fused_gate(
+            q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+
+    # 2. Attend over [sink | fp body | selected Q], scoring as it goes.
     out, wsum = fused_two_tier_decode(
-        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win
+        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
+        sel=sel,
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+
+    # 3. Every window gets a score — exact where read, card estimate where not.
+    if gate is not None:
+        wsum = _gated_window_scores(
+            wsum, sel, logmass, n_body_win, k_fp.shape[1])
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is
     # the physical -> merged-id permutation. This replaces

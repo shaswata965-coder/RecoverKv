@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import os
 import traceback
 import warnings
@@ -1071,6 +1072,9 @@ class WindowedCache(_HFCacheBase):
                     "layer_idx": layer_idx,
                     "qtier": qtier,
                     "score_meta": score_meta,
+                    # The gate needs `q`, which update() never sees; the patch
+                    # selects with it in hand. See flash_decode._run_fused.
+                    "gate": self._fused_ctx[layer_idx]["gate"],
                     "num_sink": self.resolved.num_sink_tokens,
                     "window_size": ws,
                     "scaling": self._attn_scaling,
@@ -1471,6 +1475,7 @@ class WindowedCache(_HFCacheBase):
                 "layer_idx": layer_idx,
                 "qtier": qtier,
                 "score_meta": score_meta,
+                "gate": self._fused_ctx[layer_idx]["gate"],
                 "num_sink": self.resolved.num_sink_tokens,
                 "window_size": ws,
                 "scaling": self._attn_scaling,
@@ -1514,6 +1519,11 @@ class WindowedCache(_HFCacheBase):
             self.rope_module, qpos_flat, self._kv_dtype)
         self._joint_qpos = qpos_flat
 
+        # The gate's cards ride the same one-gather-for-all-L trick as the codes:
+        # `gather_sketch` keeps the [R, n] leading pair, and R is layer-major, so
+        # layer i's rows are the same [r0, r0+B) slice everything else here uses.
+        joint_gate = self._gate_ctx(store, idx, n)
+
         key = (store.version, n, B)
         kc, ks, kz, vc, vs, vz = fields
         for i in range(L):
@@ -1528,6 +1538,11 @@ class WindowedCache(_HFCacheBase):
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
+                "gate": None if joint_gate is None else {
+                    "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
+                    "anchor": joint_gate["anchor"][r0:r0 + B],
+                    "n_sel": joint_gate["n_sel"],
+                },
             }
 
     def _fused_qtier_joint(self, layer_idx: int, store, B: int, n: int, ws: int):
@@ -1664,8 +1679,48 @@ class WindowedCache(_HFCacheBase):
         self._fused_ctx[layer_idx] = {
             "qkey": key, "qtier": qtier, "qpos": qpos_flat,
             "mkey": None, "score_meta": None,
+            "gate": self._gate_ctx(store, idx, n),
         }
         return qtier
+
+    def _gate_ctx(self, store, idx: Tensor, n: int) -> Optional[Dict]:
+        """The read gate's hand-off — the cards, the anchor, and how many to keep.
+
+        ``None`` disables the gate and reads the whole tier, which is what a store
+        without sketch cards (``quant_sketch_enabled=False``, or nothing demoted
+        yet) must do: there is nothing to select on.
+
+        Memoized with the tier for the same reason the tier is (design §10): cards
+        are written once when a window is sealed and reactivated unchanged on
+        re-demotion, so between evictions this gather is pure repeat work.
+
+        ``n_sel`` is resolved against the **live** ``n_active`` rather than pinned,
+        because ``N_q`` moves with the shape and a fixed count would not be the
+        same fraction anywhere.
+        """
+        ratio = self.resolved.quant_gate_ratio
+        if not (store.sketch_enabled and store._anchor is not None
+                and getattr(store.table, "sketch", False)):
+            return None
+        if ratio >= 1.0:
+            return None
+        # The fused gate ranks by a plain top-k on the card estimate; it has no
+        # margin term. At the default `inf` margin the two agree exactly (an inf
+        # margin keeps everything, leaving the cap to decide), but a finite margin
+        # would be silently dropped — a configured selectivity that does nothing.
+        if self.resolved.quant_gate_margin != float("inf"):
+            raise NotImplementedError(
+                "quant_gate_margin is not implemented on the fused decode path: "
+                "the fused gate is a top-k on the card estimate with no margin "
+                "term, so a finite margin would be accepted and then ignored. Use "
+                "quant_gate_ratio to set selectivity, or run the materialize path "
+                "(STICKYKV_FUSED_DECODE=0), whose gate_and_select honours it."
+            )
+        return {
+            "card": store.table.gather_sketch(idx),
+            "anchor": store._anchor,
+            "n_sel": max(1, math.ceil(ratio * n)),
+        }
 
     def _fused_meta(self, layer_idx: int, state, ws: int):
         """The ``(order, q_token_len)`` scatter map — memoized per window epoch.

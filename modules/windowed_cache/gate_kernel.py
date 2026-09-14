@@ -109,7 +109,7 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         BOUND, EST, LOGM,
         qb, qh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah, ob, oh,
         NW, REP, SCALE,
-        HEAD_DIM: tl.constexpr, WS: tl.constexpr,
+        HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr,
     ):
         """One program per ``(batch, KV head)``; streams windows in BLOCK_W tiles.
@@ -117,12 +117,20 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         The card vectors are streamed through registers and never staged: only
         three scalars per window (bound, est, logmass) leave the loop, so the
         program's shared footprint is O(BLOCK_W), not O(NW * HEAD_DIM).
+
+        ``BLOCK_WS`` is ``WS`` rounded up to a power of two, because
+        ``tl.arange`` admits nothing else. The surplus lanes are masked out of
+        the ``t``/``eps`` loads **and** forced to ``-inf`` in ``x``: a padding
+        lane that merely loaded zero would still carry the real ``SCALE * m``
+        into the max and the logsumexp, so a ``ws`` of 12 would score every
+        window as if it held a 13th token sitting exactly at its mean.
         """
         b = tl.program_id(0)
         kv = tl.program_id(1)
         d = tl.arange(0, BLOCK_D)
         dm = d < HEAD_DIM
-        w = tl.arange(0, WS)
+        w = tl.arange(0, BLOCK_WS)
+        wm = w < WS
 
         # This KV head's query group, and the anchor term that is constant in w.
         # Accumulated per query head into registers; REP is small (4 on Llama-3.1-8B).
@@ -151,15 +159,19 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
                 g = vs * tl.sum(vv * q_v[None, :], axis=1)              # [BLOCK_W]
 
                 tt = tl.load(T + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                             mask=cm[:, None], other=0).to(tl.float32)
+                             mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
                 ts = tl.load(TS + b * sb + cols * sn + kv * sh,
                              mask=cm, other=0.0).to(tl.float32)
                 ee = tl.load(E + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                             mask=cm[:, None], other=0).to(tl.float32)
+                             mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
                 es = tl.load(ES + b * sb + cols * sn + kv * sh,
                              mask=cm, other=0.0).to(tl.float32)
 
                 x = SCALE * (m[:, None] + (ts[:, None] * tt) * g[:, None])
+                # A padding lane must not exist for the reductions below. Zeroing
+                # its `t` is not enough: x would still be SCALE * m, a plausible
+                # logit for a token that is not there.
+                x = tl.where(wm[None, :], x, -float("inf"))
                 bd = tl.max(x + SCALE * qn * (es[:, None] * ee), axis=1)
                 es_max = tl.max(x, axis=1)
                 # logsumexp, written out: the online-softmax form the decode
@@ -195,7 +207,7 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
         anchor.stride(0), anchor.stride(1),
         bound.stride(0), bound.stride(1),
         NW, HQ // HKV, scaling,
-        HEAD_DIM=D, WS=ws,
+        HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
         BLOCK_D=triton.next_power_of_2(D),
         BLOCK_W=min(64, triton.next_power_of_2(NW)),
         num_warps=4,
