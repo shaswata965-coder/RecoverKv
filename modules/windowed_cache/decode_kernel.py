@@ -444,9 +444,10 @@ if _HAS_TRITON:
         KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
         VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
+        SEL,                       # gate selection: int32 [B, H_kv, n_sel] per-head active-order indices
         OUT, WSUM, WMAX,
         scale,
-        H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+        H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
         sqb, sqh, sqd,
         kfb, kfh, kfs, kfd,
         vfb, vfh, vfs, vfd,
@@ -515,6 +516,9 @@ if _HAS_TRITON:
         vsn = H_kv * WS
         vsh = WS
         cob = n_active * WS * HALF
+        # SEL strides: [B, H_kv, n_sel] contiguous
+        seb = H_kv * n_sel
+        seh = n_sel
 
         # ---- 1. sink prologue: softmax only, emits no window score -----------
         # Sinks are not represented in window scores (the scorer strips them
@@ -567,13 +571,19 @@ if _HAS_TRITON:
                 tl.store(WMAX + b * wsb + hq * wsh + w, m_new, mask=keep)
 
         # ---- 3. Q tier: int2 dequant + RoPE in registers, whole-window tiles ---
+        # SEL[b, kv, s] is the physical active-order index of the s-th selected
+        # window for this (batch, KV head). n_sel <= n_active windows are read;
+        # the caller maps the n_sel scores back to n_active using the same SEL.
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
-        for w0 in range(0, n_active, BLOCK_NW):
-            widx = w0 + t_win                                # [BLOCK_T] window ids
-            qmask = in_tile & (widx < n_active)
+        for w0 in range(0, n_sel, BLOCK_NW):
+            sel_idx = w0 + t_win                             # [BLOCK_T] indices into SEL
+            qmask = in_tile & (sel_idx < n_sel)
+            # Translate selection index → physical active-order window index.
+            widx = tl.load(SEL + b * seb + kv * seh + sel_idx,
+                           mask=qmask, other=0)              # [BLOCK_T] int32
             ks_lo = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
                             + offs_hl[:, None],
                             mask=qmask[None, :], other=0.0).to(tl.float32)
@@ -617,14 +627,16 @@ if _HAS_TRITON:
             acc = acc * corr[:, None] + tl.dot(p, vv)
             l = l * corr + tl.sum(p, axis=1)
             m = m_new
+            # Score column w0+j in output maps to the (w0+j)-th selected window.
+            # The caller scatters these n_sel scores back to n_active positions.
             for j in tl.static_range(BLOCK_NW):
                 w = w0 + j
-                sel = (t_win == j) & qmask
-                pj = tl.sum(tl.where(sel[None, :], p, 0.0), axis=1)
-                keep = r_mask & (w < n_active)
+                tok_sel = (t_win == j) & qmask
+                pj = tl.sum(tl.where(tok_sel[None, :], p, 0.0), axis=1)
+                w_keep = r_mask & (w < n_sel)
                 col = n_body_win + w
-                tl.store(WSUM + b * wsb + hq * wsh + col, pj, mask=keep)
-                tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=keep)
+                tl.store(WSUM + b * wsb + hq * wsh + col, pj, mask=w_keep)
+                tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=w_keep)
 
         out = acc / l[:, None]
         lse = m + tl.log2(l)
@@ -717,6 +729,7 @@ def _decode_triton(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -748,6 +761,22 @@ def _decode_triton(
     else:
         n_active, ws = 0, 4  # WS is a constexpr; the Q loop runs 0 times
 
+    # SEL: [B, H_kv, n_sel] int32. None → identity (process all n_active windows).
+    # sel[b, h, s] = physical active-order index of the s-th selected window for
+    # (batch b, KV head h). n_sel ≤ n_active; n_sel == n_active is the no-op.
+    dev = q.device
+    if sel is not None:
+        assert sel.shape == (B, H_kv, sel.shape[2]), \
+            f"sel must be [B={B}, H_kv={H_kv}, n_sel] int32, got {tuple(sel.shape)}"
+        n_sel = int(sel.shape[2])
+        SEL = sel.to(dtype=torch.int32).contiguous()
+    else:
+        # Identity selection: process every active window in order.
+        n_sel = n_active
+        SEL = (torch.arange(n_active, dtype=torch.int32, device=dev)
+               .unsqueeze(0).unsqueeze(0)
+               .expand(B, H_kv, n_active).contiguous())
+
     body = max(Sfp - num_sink, 0)
     if n_body_win is None:
         n_body_win = -(-body // ws)
@@ -758,15 +787,16 @@ def _decode_triton(
             "must fall inside a scored window or its attention mass would be "
             "dropped from the eviction scores."
         )
-    W_phys = n_body_win + n_active
+    # W_phys covers the body windows + selected Q windows (n_sel, not n_active).
+    # The caller maps the n_sel Q scores back to n_active via SEL.
+    W_phys = n_body_win + n_sel
 
     out = torch.empty((B, H_q, D), device=q.device, dtype=q.dtype)
     wsum = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
     wmax = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
 
     # Dummies for the empty-Q case: valid tensors so the pointers exist; never
-    # indexed (the Q loop runs only while w0 < n_active == 0).
-    dev = q.device
+    # indexed (the Q loop runs only while w0 < n_sel == 0).
     if qtier is None:
         kc = torch.zeros((B, 1, H_kv, D, max(ws // 4, 1)), dtype=torch.uint8, device=dev)
         ksz = torch.zeros((B, 1, H_kv, D), dtype=torch.float16, device=dev)
@@ -789,7 +819,7 @@ def _decode_triton(
     # silently non-contiguous tensor would read garbage rather than fail.
     for name, t in (("k_codes", KC), ("k_scale", KS), ("k_zero", KZ),
                     ("v_codes", VC), ("v_scale", VS), ("v_zero", VZ),
-                    ("cos", COS), ("sin", SIN)):
+                    ("cos", COS), ("sin", SIN), ("sel", SEL)):
         if not t.is_contiguous():
             raise RuntimeError(
                 f"fused decode requires a contiguous {name}; its strides are "
@@ -827,7 +857,7 @@ def _decode_triton(
     # the pipeline depth differ -- and the winner is cached per geometry so the
     # search runs once. If no rung fits, it raises with the whole ladder, because
     # a decode kernel that cannot launch must fail loudly (invariant 3).
-    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0))
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), int(n_sel > 0))
     rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
     last: Optional[BaseException] = None
     for target_keys, num_stages in rungs:
@@ -835,9 +865,10 @@ def _decode_triton(
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
         try:
             _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
+                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL,
+                out, wsum, wmax,
                 scaling,
-                H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+                H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
                 q.stride(0), q.stride(1), q.stride(2),
                 k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
                 v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
@@ -878,6 +909,7 @@ def fused_two_tier_decode(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -888,9 +920,16 @@ def fused_two_tier_decode(
     n_body_win : scored windows the fp body spans. Defaults to
         ``ceil((S_fp - num_sink) / ws)``; pass it when the caller already knows
         it, so the kernel's window axis matches the caller's score axis exactly.
+    sel : ``[B, H_kv, n_sel]`` int32 per-head window selection indices, or ``None``
+        for all windows. Each ``sel[b, h, s]`` is a physical active-order index into
+        the Q tier; the kernel reads only those windows and emits ``n_sel`` scores.
+        The caller maps the ``n_sel`` scores back to ``n_active`` positions and
+        fills skipped windows with estimated scores (:func:`fill_skipped_window_scores`).
+        When ``None``, an identity table processes all ``n_active`` windows in order
+        — byte-identical to the pre-gating path.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
-    physical order (body windows, then Q windows).
+    physical order (body windows, then Q windows in SEL order, ``W_phys = n_body_win + n_sel``).
     """
     if not (_HAS_TRITON and q.is_cuda):
         reason = "triton not installed" if not _HAS_TRITON else "not on CUDA"
@@ -899,4 +938,4 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
-    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win)
+    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win, sel)

@@ -1069,6 +1069,8 @@ class WindowedCache(_HFCacheBase):
                     "window_size": ws,
                     "scaling": self._attn_scaling,
                     "cache": self,
+                    "store": store,
+                    "gate_ratio": self.resolved.quant_gate_ratio,
                 })
                 # The patch writes window_scores; the score forward-hook skips this
                 # step. Clear the materialize stashes so no stale effective-K leaks.
@@ -1469,6 +1471,8 @@ class WindowedCache(_HFCacheBase):
                 "window_size": ws,
                 "scaling": self._attn_scaling,
                 "cache": self,
+                "store": store,
+                "gate_ratio": self.resolved.quant_gate_ratio,
             })
             self._last_effective_k[layer_idx] = None
             self._last_score_meta[layer_idx] = None

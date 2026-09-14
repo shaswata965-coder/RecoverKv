@@ -142,6 +142,11 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     ``q_flash`` is ``[B, 1, H_q, D]``; ``k_flash``/``v_flash`` are the fp tier
     ``[B, S_fp, H_kv, D]`` (seqlen-major, as flash receives them). The Q tier and
     the score-scatter map come from ``ctx`` (heads-major, built by the cache).
+
+    Gated path: when ``ctx["store"]`` carries sketch cards and ``gate_ratio < 1``,
+    the gate runs here (where the query is available) and passes a per-head SEL
+    buffer to the kernel. Only the selected windows are dequantized; skipped
+    windows receive estimated scores via ``fill_skipped_window_scores``.
     """
     q_hd = q_flash.transpose(1, 2)[:, :, 0, :]        # [B, H_q, D]
     k_fp = k_flash.transpose(1, 2)                    # [B, H_kv, S_fp, D]
@@ -155,9 +160,52 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     # usually partial and still owns a column).
     n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
 
+    store = ctx.get("store")
+    gate_ratio = ctx.get("gate_ratio", 1.0)
+    qtier = ctx["qtier"]
+    n_active = int(qtier["k_codes"].shape[1]) if qtier is not None else 0
+
+    # ---- Gated path: run the gate where the query is available ---------------
+    # The gate lives here, not in update(), because update() never sees the query.
+    sel_buf = None    # None → identity SEL (process all n_active windows)
+    logmass = None    # [B, H_q, n_active] estimated log-mass for every window
+    keep = None       # [B, H_kv, n_active] bool — which windows were selected
+    n_sel = n_active
+
+    if (store is not None and getattr(store, "sketch_enabled", False)
+            and n_active > 0 and gate_ratio < 1.0):
+        from .scorer import expand_keep_to_query_heads, fill_skipped_window_scores
+        result = store.gate_and_select(q_hd, ctx["scaling"], ratio=gate_ratio)
+        if result is not None:
+            keep, logmass, _slots = result
+            n_sel = int(keep[0, 0].sum())
+            # pick[b, h, s] = physical active-order index of the s-th selected window
+            pick = torch.argsort(~keep, dim=-1, stable=True)[..., :n_sel]
+            sel_buf = pick.to(dtype=torch.int32).contiguous()  # [B, H_kv, n_sel]
+
     out, wsum = fused_two_tier_decode(
-        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win
-    )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+        q_hd, k_fp, v_fp, qtier, ctx["scaling"], num_sink, n_body_win, sel_buf
+    )                                     # out [B,H_q,D], wsum [B,H_q,n_body_win+n_sel]
+
+    # ---- Map n_sel Q scores → n_active, fill skipped -------------------------
+    if sel_buf is not None and n_sel < n_active:
+        from .scorer import expand_keep_to_query_heads, fill_skipped_window_scores
+        B, H_q = q_hd.shape[0], q_hd.shape[1]
+        H_kv = k_fp.shape[1]
+        rep = H_q // H_kv
+
+        body_wsum = wsum[..., :n_body_win]              # [B, H_q, n_body_win]
+        q_sel_wsum = wsum[..., n_body_win:]             # [B, H_q, n_sel]
+
+        # Expand per-KV-head pick to per-query-head for the scatter.
+        pick_q = sel_buf.to(torch.long).repeat_interleave(rep, dim=1)  # [B, H_q, n_sel]
+        q_exact = torch.zeros(B, H_q, n_active,
+                              dtype=q_sel_wsum.dtype, device=q_sel_wsum.device)
+        q_exact.scatter_(-1, pick_q, q_sel_wsum)
+        keep_q = expand_keep_to_query_heads(keep, H_q)  # [B, H_q, n_active]
+        q_all = fill_skipped_window_scores(q_exact, keep_q, logmass)
+
+        wsum = torch.cat([body_wsum, q_all], dim=-1)    # [B, H_q, n_body_win + n_active]
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is
     # the physical -> merged-id permutation. This replaces
@@ -166,9 +214,10 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     if order.shape[1] != wsum.shape[-1]:
         raise RuntimeError(
             f"score_meta permutes {order.shape[1]} windows but the kernel emitted "
-            f"{wsum.shape[-1]} (n_body_win={n_body_win}, S_fp={k_fp.shape[2]}, "
-            f"num_sink={num_sink}, ws={ws}). These are derived from the same store "
-            "and must agree; a mismatch would scatter scores onto the wrong windows."
+            f"{wsum.shape[-1]} (n_body_win={n_body_win}, n_sel={n_sel}, "
+            f"n_active={n_active}, S_fp={k_fp.shape[2]}, num_sink={num_sink}, ws={ws}). "
+            "These are derived from the same store and must agree; a mismatch would "
+            "scatter scores onto the wrong windows."
         )
     idx = order.unsqueeze(1).expand(wsum.shape[0], wsum.shape[1], order.shape[1])
     ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = torch.gather(
