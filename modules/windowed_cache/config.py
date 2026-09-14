@@ -63,9 +63,14 @@ class ResolvedConfig:
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
-    # Rank-1 gate (modules/quant/sketch.py). Off by default; `inf` margin makes
-    # an enabled gate a provable no-op, which is how it goes in dark.
+    # Rank-1 read gate (modules/quant/sketch.py). This field is already RESOLVED
+    # -- `resolve()` has turned the tri-state knob into a bool, so readers here
+    # never re-derive it. `quant_gate_ratio` is the fraction of each step's
+    # active Q windows that get dequantized; the per-step cap is derived from it
+    # against the live `n_active`, not pinned to an integer, because `N_q` moves
+    # with the shape and a fixed count would not be the same fraction anywhere.
     quant_sketch_enabled: bool = False
+    quant_gate_ratio: float = 0.25
     quant_gate_margin: float = float("inf")
     quant_gate_max_windows: Optional[int] = None
 
@@ -261,15 +266,25 @@ class WindowedCacheConfig:
     # -- rank-1 read gate (modules/quant/sketch.py) -------------------------
     # Each int2 window carries a card written once at demotion; the decode step
     # scans the cards and dequantizes only the windows whose UPPER BOUND clears
-    # a per-head threshold. Off by default.
-    quant_sketch_enabled: bool = False
-    # Delta. A window survives when its bound is within Delta of its head's best
-    # bound -- a top-p in log space, so a peaked head keeps few windows and a
-    # flat head keeps many, with no calibration and no sort. `inf` keeps
-    # everything: an enabled-but-inf gate is a provable no-op, which is how the
-    # feature ships dark and how its own overhead gets priced.
+    # the bar. Because the bound is a bound, a skipped window provably carries no
+    # logit above it: the gate can over-select, it cannot miss.
+    #
+    # None (default) = AUTO: on wherever there is a Q tier to gate (quant_ratio >
+    # 0), off at q=0 where there is nothing to skip. Mirrors quant_memoize_read's
+    # tri-state. An explicit True at q=0 is a config error, not a silent no-op.
+    quant_sketch_enabled: Optional[bool] = None
+    # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
+    # operating point the efficiency arithmetic is costed on: the card is 26.5%
+    # of a window, so break-even sits at ~0.735 and 0.25 leaves real headroom.
+    # 1.0 dequantizes everything and makes the gate a provable no-op.
+    quant_gate_ratio: float = 0.25
+    # Delta, in log space. A window also survives when its bound is within Delta
+    # of its head's best bound -- a top-p, so a peaked head keeps few windows and
+    # a flat head keeps many, with no calibration and no sort. The default `inf`
+    # makes the RATIO the only selector (a deterministic top-k by bound); set a
+    # finite Delta to get the adaptive rule capped by the ratio.
     quant_gate_margin: float = float("inf")
-    # Hard cap on windows dequantized per head per step; None = no cap.
+    # Absolute cap, overriding the ratio when set. Diagnostics; prefer the ratio.
     quant_gate_max_windows: Optional[int] = None
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
@@ -346,20 +361,29 @@ class WindowedCacheConfig:
             )
 
         # -- rank-1 read gate --
-        if self.quant_sketch_enabled:
+        if self.quant_sketch_enabled is True:
+            # Explicit, so a contradiction is an error rather than a quiet
+            # downgrade. AUTO (None) resolves silently and never lands here.
             if self.quant_ratio <= 0.0:
                 raise ValueError(
-                    "quant_sketch_enabled needs quant_ratio > 0: the gate only "
-                    "decides which int2 windows to read, and at q=0 there are none."
+                    "quant_sketch_enabled=True needs quant_ratio > 0: the gate only "
+                    "decides which int2 windows to read, and at q=0 there are none. "
+                    "Leave it None (auto) to have it switch itself off at q=0."
                 )
-            if self.quant_memoize_read:
+            if self.quant_memoize_read is True:
                 raise ValueError(
                     "quant_sketch_enabled and quant_memoize_read are alternatives, "
                     "not companions. The memo caches the WHOLE dequantized Q tier "
                     "keyed on store.version; the gate's selected set changes every "
                     "step while version does not, so the memo would either be dead "
-                    "weight or serve a set the gate did not choose."
+                    "weight or serve a set the gate did not choose. Auto-memo "
+                    "yields to the gate on its own; only an explicit True clashes."
                 )
+        if not (0.0 < self.quant_gate_ratio <= 1.0):
+            raise ValueError(
+                f"quant_gate_ratio must be in (0, 1], got {self.quant_gate_ratio}. "
+                "1.0 dequantizes every window, i.e. a no-op gate."
+            )
         if self.quant_gate_margin != float("inf") and self.quant_gate_margin < 0:
             raise ValueError(
                 f"quant_gate_margin must be >= 0 or inf, got {self.quant_gate_margin}"
@@ -597,7 +621,12 @@ class WindowedCacheConfig:
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
-            quant_sketch_enabled=self.quant_sketch_enabled,
+            # AUTO settles here: on wherever there is a Q tier to gate.
+            quant_sketch_enabled=(
+                q > 0.0 if self.quant_sketch_enabled is None
+                else bool(self.quant_sketch_enabled)
+            ),
+            quant_gate_ratio=self.quant_gate_ratio,
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,
             first_eviction_step=self.first_eviction_step,

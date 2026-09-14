@@ -728,6 +728,13 @@ class WindowedCache(_HFCacheBase):
         self._memoization_resolved = True
         pref = self.resolved.quant_memoize_read
         memo = (batch_size == 1) if pref is None else pref
+        # The gate and the whole-tier memo are alternatives (config validates the
+        # explicit clash). When AUTO-memo would have switched on at B=1 but the
+        # gate is live, the gate wins: its selected set changes every step while
+        # store.version -- the memo's key -- does not, so a memo here would serve
+        # a set the gate did not choose.
+        if self.resolved.quant_sketch_enabled and pref is None:
+            memo = False
         for store in self._stores:
             if store is not None:
                 store.memoize_read = memo

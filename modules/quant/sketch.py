@@ -101,6 +101,7 @@ __all__ = [
     "decode_sketch",
     "gate_and_score",
     "select_windows",
+    "group_max",
 ]
 
 
@@ -244,7 +245,11 @@ def gate_and_score(
     Returns
     -------
     bound : ``[B, Hq, Nw]`` upper bound on ``max_i scaling * q.k_i``.
-    logmass : ``[B, Hq, Nw]`` ``logsumexp_i(scaling * q.k_i_hat)``.
+    logmass : ``[B, Hq, Nw]`` ``logsumexp_i(scaling * q.k_i_hat)`` -- what a
+        skipped window contributes to ``window_scores``.
+    est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``, i.e. the
+        bound without its slack term. The cap ranks on this; see
+        :func:`select_windows` for why the two are not the same quantity.
 
     Both live in the log domain, so they are comparable across windows and cannot
     overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield **both**: ``t`` and
@@ -282,34 +287,65 @@ def gate_and_score(
     # so the reference and the kernel share a shape as well as a result.
     xmax = x.amax(dim=-1, keepdim=True)
     logmass = (xmax + (x - xmax).exp().sum(dim=-1, keepdim=True).log()).squeeze(-1)
-    return flat((x + slack).amax(-1)), flat(logmass)
+    return flat((x + slack).amax(-1)), flat(logmass), flat(x.amax(-1))
+
+
+def group_max(bound: Tensor, num_kv_heads: int) -> Tensor:
+    """``[B, Hq, Nw]`` -> ``[B, Hkv, Nw]``: the GQA group's union, as a bound.
+
+    One kernel program owns a KV head and every query head sharing it, so a
+    window is loaded once for the whole group and the group's cost is one window
+    either way. Taking the **max** bound over the group before selecting is what
+    makes that true: whatever any member of the group needs, the group keeps.
+
+    This reduction MUST come before any cap. Capping per query head and unioning
+    afterwards lets a ratio of ``r`` turn into as much as ``r * rep`` windows
+    actually read -- at ``rep = 4`` (Llama-3.1-8B) a 25% cap becomes 100% loaded
+    and the gate buys nothing. ``tests/test_sketch_store.py`` pins this.
+    """
+    B, Hq, Nw = bound.shape
+    return bound.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).amax(2)
 
 
 def select_windows(
     bound: Tensor,
     margin: float,
     max_windows: Optional[int] = None,
+    rank_by: Optional[Tensor] = None,
 ) -> Tensor:
-    """``[B, Hq, Nw]`` keep-mask from ``[B, Hq, Nw]`` bounds.
+    """Keep-mask with the same shape as ``bound``.
+
+    Call it on **KV-head** bounds (i.e. after :func:`group_max`), not on query-
+    head bounds: the KV head is the unit of work, so it is the unit the cap has
+    to bind on.
 
     The threshold is relative to **each head's own maximum**, so it is a top-p in
     log space: a peaked head admits few windows, a flat head admits many, with no
     calibration, no sort, no host sync and no data-dependent shape. ``margin =
     inf`` selects everything, which is how the feature ships dark.
+
+    ``bound`` and ``rank_by`` play different roles and that split is deliberate.
+    The margin thresholds on the **bound**, where "cannot miss" is a real
+    guarantee: every window is kept whose logit could possibly exceed
+    ``best - margin``. The cap top-k's on ``rank_by`` -- the point **estimate**,
+    with no slack term -- because a cap has no safety guarantee from either
+    quantity (it keeps ``k`` windows whatever their bounds say), so the right
+    criterion is simply the more accurate one. Measured on a shape-C tier
+    (271 windows, Llama-3.1-8B GQA), ranking by estimate holds 100.0% of the
+    attention mass at a 0.15 ratio against the bound's 99.7% worst-head, and
+    costs less: the ranking path never touches ``eps``.
+
+    ``rank_by`` defaults to ``bound`` so a caller that has only the bound still
+    gets sane behaviour.
     """
     top = bound.amax(dim=-1, keepdim=True)
     keep = torch.ones_like(bound, dtype=torch.bool) if margin == float("inf") \
         else (bound >= top - margin)
     keep = keep | (bound == top)                            # always the best one
     if max_windows is not None and max_windows < bound.shape[-1]:
-        rank = torch.argsort(torch.argsort(bound, dim=-1, descending=True), dim=-1)
+        crit = bound if rank_by is None else rank_by
+        rank = torch.argsort(torch.argsort(crit, dim=-1, descending=True), dim=-1)
         keep = keep & (rank < max_windows)
     return keep
 
 
-def group_union(keep: Tensor, num_kv_heads: int) -> Tensor:
-    """``[B, Hq, Nw]`` -> ``[B, Hkv, Nw]``: a window any query head in the GQA
-    group needs is loaded once for the group (Tactic §4.5's union, except the
-    kernel gets it for free because one program owns the whole group)."""
-    B, Hq, Nw = keep.shape
-    return keep.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).any(2)

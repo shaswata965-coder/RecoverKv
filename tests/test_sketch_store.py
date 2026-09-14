@@ -109,7 +109,7 @@ def test_bound_holds_through_the_store():
     q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(7)) * 1.5
     slots = st.table.active_order(st._n_active)
     card = Sketch(*st.table.gather_sketch(slots))
-    bound, _ = gate_and_score(q, card, st._anchor, SCALING)
+    bound, _, _ = gate_and_score(q, card, st._anchor, SCALING)
 
     order = st.table.slot_wid.gather(1, slots)
     kk = _true_max_logit(k_post, order)
@@ -207,3 +207,72 @@ def test_join_layers_carries_the_anchor_row_major():
     assert joint._anchor.shape == (3 * B, H, D)
     assert torch.equal(joint._anchor[B:2 * B], stores[1]._anchor)
     assert joint.table.sk_mu_q.shape[0] == 3 * B
+
+
+# ---------------------------------------------------------------------------
+# the shipped operating point: gate on by default, 25% of windows read
+# ---------------------------------------------------------------------------
+
+
+def test_ratio_caps_windows_as_a_fraction_of_the_live_tier():
+    """The cap is derived per step, not pinned: N_q moves with the shape."""
+    st = _store(n_slots=64)
+    _demote(st, n=16)
+    q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(11))
+    keep, _, _ = st.gate_and_select(q, SCALING, ratio=0.25)
+    assert keep.sum(-1).max().item() <= 4           # ceil(0.25 * 16)
+    assert keep.sum(-1).min().item() >= 1
+
+
+def test_ratio_never_starves_a_tiny_tier():
+    """ceil, and a floor of one: a 3-window tier at 25% still reads one."""
+    st = _store()
+    _demote(st, n=3)
+    keep, _, _ = st.gate_and_select(torch.randn(B, H * 2, D), SCALING, ratio=0.25)
+    assert keep.sum(-1).min().item() == 1
+
+
+def test_ratio_of_one_is_a_no_op():
+    st = _store()
+    _demote(st)
+    keep, _, _ = st.gate_and_select(torch.randn(B, H * 2, D), SCALING, ratio=1.0)
+    assert keep.all()
+
+
+def test_ratio_keeps_the_window_holding_the_true_best_key():
+    """What a capped gate must not do: drop the window the query actually wants.
+
+    Selection ranks by BOUND, not by true logit -- a window whose bound carries
+    more slack can outrank one with a higher true logit, and that is the gate
+    being conservative rather than wrong. The property that has to hold is the
+    safety one: the window containing the globally hottest key survives.
+    """
+    st = _store()
+    k_post = _demote(st)
+    q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(12)) * 1.5
+    for ratio in (0.5, 0.75):
+        keep, _, slots = st.gate_and_select(q, SCALING, ratio=ratio)
+        order = st.table.slot_wid.gather(1, slots)
+        kk = k_post[torch.arange(B)[:, None], order]
+        qg = q.reshape(B, H, 2, D)
+        true = torch.einsum("bnhwd,bhrd->bhrnw", kk, qg).amax(-1)      # [B,H,r,n]
+        best = true.amax(2).argmax(-1)                                 # [B,H]
+        assert keep.gather(-1, best.unsqueeze(-1)).all(), f"dropped it at {ratio}"
+
+
+def test_default_config_turns_the_gate_on_where_there_is_a_tier():
+    from modules.windowed_cache.config import WindowedCacheConfig
+
+    class _Model:
+        num_key_value_heads, num_attention_heads = 8, 32
+        hidden_size, head_dim = 4096, 128
+
+    base = dict(window_size=8, num_sink_tokens=5, local_window_size=64,
+                cache_budget=0.2)
+    on = WindowedCacheConfig(**base, quant_ratio=0.7).resolve(
+        4096, _Model(), torch.float16, 256)
+    assert on.quant_sketch_enabled and on.quant_gate_ratio == 0.25
+    # q=0 has no Q tier, so AUTO switches itself off rather than erroring.
+    off = WindowedCacheConfig(**base, quant_ratio=0.0).resolve(
+        4096, _Model(), torch.float16, 256)
+    assert not off.quant_sketch_enabled

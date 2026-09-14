@@ -33,6 +33,8 @@ eviction to learn the true max.
 
 from __future__ import annotations
 
+import math
+
 from typing import Optional, Tuple
 
 import torch
@@ -342,7 +344,8 @@ class QuantizedStore:
         self,
         query: Tensor,
         scaling: float,
-        margin: float,
+        margin: float = float("inf"),
+        ratio: Optional[float] = None,
         max_windows: Optional[int] = None,
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Which active Q windows this step must dequantize, and what the rest score.
@@ -355,7 +358,11 @@ class QuantizedStore:
             of its head's best bound -- a top-p in log space, so a peaked head
             keeps few windows and a flat head keeps many, with no calibration and
             no sort. ``inf`` keeps everything and makes this a no-op.
-        max_windows : hard cap, for a worst-case work bound.
+        ratio : fraction of this step's ACTIVE windows to dequantize. Resolved
+            against the live ``n_active`` rather than a fixed count, because
+            ``N_q`` moves with the shape and a pinned integer would not be the
+            same fraction anywhere. At least one window always survives.
+        max_windows : absolute cap; overrides ``ratio`` when given.
 
         Returns
         -------
@@ -376,13 +383,24 @@ class QuantizedStore:
                 "gate_and_select needs sketch cards; construct the store with "
                 "sketch_enabled=True and demote at least once."
             )
-        from .sketch import Sketch, gate_and_score, group_union, select_windows
+        from .sketch import Sketch, gate_and_score, group_max, select_windows
+
+        cap = max_windows
+        if cap is None and ratio is not None and ratio < 1.0:
+            cap = max(1, math.ceil(ratio * self._n_active))
 
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
-        bound, logmass = gate_and_score(query, card, self._anchor, scaling)
-        keep = select_windows(bound, margin, max_windows)
-        return group_union(keep, self.num_kv_heads), logmass, slots
+        bound, logmass, est = gate_and_score(query, card, self._anchor, scaling)
+        # Union the GQA group FIRST, then select. The KV head is the unit of
+        # work -- one program loads a window once for every query head sharing
+        # it -- so the cap has to bind there. Capping per query head and unioning
+        # afterwards would let ratio r read up to r*rep windows (see group_max).
+        keep = select_windows(
+            group_max(bound, self.num_kv_heads), margin, cap,
+            rank_by=group_max(est, self.num_kv_heads),
+        )
+        return keep, logmass, slots
 
     def effective_q_tier(
         self, rope_module: torch.nn.Module, out_dtype: torch.dtype

@@ -23,7 +23,7 @@ from modules.quant.sketch import (
     build_sketch,
     decode_sketch,
     gate_and_score,
-    group_union,
+    group_max,
     select_windows,
     sketch_bytes_per_head,
 )
@@ -72,7 +72,7 @@ def test_bound_never_misses(hot, spread):
     s = _batched(build_sketch(k, a), 3)
     q = torch.randn(3, HKV * 2, D, generator=torch.Generator().manual_seed(1)) * 1.5
     scaling = 1.0 / math.sqrt(D)
-    bound, _ = gate_and_score(q, s, a, scaling)
+    bound, _, _ = gate_and_score(q, s, a, scaling)
     true = (scaling * _true_logits(k, q)).amax(-1)
     assert (true - bound).amax() <= 1e-4, f"violated by {(true - bound).amax():.6f}"
 
@@ -85,7 +85,7 @@ def test_bound_holds_when_every_token_is_identical():
     for f in decode_sketch(s, a):
         assert torch.isfinite(f).all()
     q = torch.randn(1, HKV, D, generator=torch.Generator().manual_seed(2))
-    bound, logmass = gate_and_score(q, _batched(s, 1), a, 1.0 / math.sqrt(D))
+    bound, logmass, _ = gate_and_score(q, _batched(s, 1), a, 1.0 / math.sqrt(D))
     assert torch.isfinite(bound).all() and torch.isfinite(logmass).all()
     true = (_true_logits(k, q) / math.sqrt(D)).amax(-1)
     assert (true - bound).amax() <= 1e-4
@@ -174,7 +174,7 @@ def test_logmass_tracks_true_mass():
     k, a = _fixture(n=128)
     q = torch.randn(4, HKV, D, generator=torch.Generator().manual_seed(3))
     scaling = 1.0 / math.sqrt(D)
-    _, logmass = gate_and_score(q, _batched(build_sketch(k, a), 4), a, scaling)
+    _, logmass, _ = gate_and_score(q, _batched(build_sketch(k, a), 4), a, scaling)
     true = torch.logsumexp(scaling * _true_logits(k, q), dim=-1)
     err = (logmass - true).abs()
     assert err.mean() < 0.35 and err.max() < 3.0
@@ -218,19 +218,35 @@ def test_peaked_head_selects_fewer_than_flat_head():
     assert select_windows(peaked, 2.0).sum() < select_windows(flat, 2.0).sum()
 
 
-def test_group_union_is_the_gqa_contract():
-    """A window any query head in the group needs is loaded once for the group."""
-    keep = torch.zeros(1, 8, 5, dtype=torch.bool)
-    keep[0, 3, 2] = True                      # one query head of group 1 wants w2
-    u = group_union(keep, num_kv_heads=4)
-    assert u.shape == (1, 4, 5) and u[0, 1, 2] and u.sum() == 1
+def test_group_max_is_the_gqa_contract():
+    """A window any query head in the group wants survives for the whole group."""
+    b = torch.full((1, 8, 5), -10.0)
+    b[0, 3, 2] = 5.0                          # one query head of group 1 wants w2
+    g = group_max(b, num_kv_heads=4)
+    assert g.shape == (1, 4, 5) and g[0, 1, 2] == 5.0
+    assert select_windows(g, margin=1.0)[0, 1, 2]
+
+
+def test_cap_must_bind_after_the_group_union_not_before():
+    """Capping per query head then unioning inflates the ratio by up to `rep`.
+
+    At rep=4 a 25% cap would become 100% of windows actually loaded, and the gate
+    would buy nothing. Pins the ordering that prevents it.
+    """
+    g = torch.Generator().manual_seed(21)
+    bound = torch.randn(1, 8, 40, generator=g)          # Hq=8, Hkv=2 -> rep=4
+    wrong = select_windows(bound, float("inf"), max_windows=10)
+    wrong = wrong.reshape(1, 2, 4, 40).any(2)           # cap-then-union
+    right = select_windows(group_max(bound, 2), float("inf"), max_windows=10)
+    assert right.sum(-1).max() == 10
+    assert wrong.sum(-1).max() > 10
 
 
 def test_gate_selects_the_window_holding_the_true_argmax():
     """End to end: the window containing the globally hottest key is never cut."""
     k, a = _fixture(n=96)
     q = torch.randn(4, HKV, D, generator=torch.Generator().manual_seed(5)) * 1.5
-    bound, _ = gate_and_score(q, _batched(build_sketch(k, a), 4), a, 1.0 / math.sqrt(D))
+    bound, _, _ = gate_and_score(q, _batched(build_sketch(k, a), 4), a, 1.0 / math.sqrt(D))
     true_win = _true_logits(k, q).amax(-1).argmax(-1)          # [B, Hq]
     for margin in (0.5, 2.0, 8.0):
         keep = select_windows(bound, margin)
@@ -246,3 +262,70 @@ def test_card_size_is_what_the_plan_is_costed_on():
     assert sketch_bytes_per_head(128, 8) == 280               # 2240 B/window at H=8
     b_q = (8 * 128 * 8) // 2 + 4 * 8 * 128 + 4 * 8 * 8        # config.py resolve()
     assert abs(280 * 8 / b_q - 0.265) < 0.002
+
+
+# ---------------------------------------------------------------------------
+# the default operating point
+# ---------------------------------------------------------------------------
+
+
+def test_recall_at_the_shipped_25_percent_ratio():
+    """What justifies ``quant_gate_ratio = 0.25`` as a default.
+
+    Built at the real shape-C geometry -- 271 active Q windows, Llama-3.1-8B GQA
+    (32 query heads over 8 KV heads, rep=4) -- and measured as **attention mass
+    recall per KV head**, which is the quantity a quality loss would come out of.
+    Deliberately the worst head, not the mean: a mean hides the head that breaks.
+    """
+    hkv, hq, nw = 8, 32, 271
+    g = torch.Generator().manual_seed(31)
+    a = torch.randn(hkv, D, generator=g) * 0.4
+    a[:, 3] += 40.0
+    a[:, 17] -= 25.0
+    k = a[None, :, None, :] + torch.randn(nw, hkv, WS, D, generator=g)
+    k[:, :, 0, :] += torch.randn(nw, hkv, D, generator=g) * 6.0
+    q = torch.randn(1, hq, D, generator=g) * 1.5
+    scaling = 1.0 / math.sqrt(D)
+
+    card = _batched(build_sketch(k, a), 1)
+    bound, _, est = gate_and_score(q, card, a, scaling)
+    true = scaling * torch.einsum(
+        "nhwd,bhrd->bhrnw", k, q.reshape(1, hkv, hq // hkv, D)).reshape(1, hq, nw, WS)
+    mass_kv = true.logsumexp(-1).reshape(1, hkv, hq // hkv, nw).logsumexp(2).exp()
+
+    for ratio, floor in ((0.15, 0.99), (0.25, 0.995), (0.50, 0.999)):
+        keep = select_windows(group_max(bound, hkv), float("inf"),
+                              max_windows=math.ceil(ratio * nw),
+                              rank_by=group_max(est, hkv))
+        assert keep.sum(-1).max() <= math.ceil(ratio * nw)
+        recall = (mass_kv * keep).sum(-1) / mass_kv.sum(-1)
+        assert recall.min() >= floor, f"ratio {ratio}: worst head {recall.min():.4f}"
+
+
+def test_ranking_by_estimate_beats_ranking_by_bound():
+    """Pins why the cap ranks on the estimate and not on the bound.
+
+    The bound carries a per-window slack term, so a loosely-bounded window can
+    outrank a tighter one with a higher true logit. The estimate has no slack
+    term and tracks truth more closely -- and costs less, since the ranking path
+    never loads ``eps``.
+    """
+    hkv, hq, nw = 8, 32, 271
+    g = torch.Generator().manual_seed(32)
+    a = torch.randn(hkv, D, generator=g) * 0.4
+    a[:, 3] += 40.0
+    k = a[None, :, None, :] + torch.randn(nw, hkv, WS, D, generator=g)
+    k[:, :, 0, :] += torch.randn(nw, hkv, D, generator=g) * 6.0
+    q = torch.randn(1, hq, D, generator=g) * 1.5
+    scaling = 1.0 / math.sqrt(D)
+    bound, _, est = gate_and_score(q, _batched(build_sketch(k, a), 1), a, scaling)
+    true = scaling * torch.einsum(
+        "nhwd,bhrd->bhrnw", k, q.reshape(1, hkv, hq // hkv, D)).reshape(1, hq, nw, WS)
+    mass_kv = true.logsumexp(-1).reshape(1, hkv, hq // hkv, nw).logsumexp(2).exp()
+
+    cap = math.ceil(0.15 * nw)
+    bm = group_max(bound, hkv)
+    def recall(rank):
+        keep = select_windows(bm, float("inf"), max_windows=cap, rank_by=rank)
+        return ((mass_kv * keep).sum(-1) / mass_kv.sum(-1)).min().item()
+    assert recall(group_max(est, hkv)) >= recall(bm)

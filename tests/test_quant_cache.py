@@ -275,10 +275,11 @@ class TestReadMemoization:
     halves the batch that fits — and batch capacity is the entire thesis.
     """
 
-    def _cache(self, memo, q=0.5):
+    def _cache(self, memo, q=0.5, gate=False):
         cfg = WindowedCacheConfig(
             window_size=4, num_sink_tokens=0, local_window_size=4,
             cache_budget=0.5, quant_ratio=q, quant_memoize_read=memo,
+            quant_sketch_enabled=gate,
         )
         return WindowedCache(
             config=cfg, prefill_len=16, model_config=_FakeModelConfig(),
@@ -287,15 +288,34 @@ class TestReadMemoization:
         )
 
     def test_auto_default_is_on_at_b1_off_above(self):
-        c = self._cache(None)
+        c = self._cache(None, gate=False)
         c._resolve_memoization(1)
         assert c._stores[0].memoize_read is True
-        c = self._cache(None)
+        c = self._cache(None, gate=False)
         c._resolve_memoization(4)
         assert c._stores[0].memoize_read is False, (
             "the memo must default OFF at B>1 — it costs ~149 MB/row and halves "
             "max batch, which is what the method exists to raise"
         )
+
+    def test_auto_memo_yields_to_the_read_gate(self):
+        """The gate and the whole-tier memo are alternatives, not companions.
+
+        The memo is keyed on ``store.version``, which only moves at eviction; the
+        gate's selected set moves every step. So a memo alongside a live gate
+        would be serving a set the gate did not choose. Config rejects the
+        explicit clash; this is the AUTO side, where the gate simply wins — and
+        it matters because the gate is now the default wherever q > 0, so B=1
+        would otherwise silently get both.
+        """
+        c = self._cache(None, gate=True)
+        c._resolve_memoization(1)
+        assert c._stores[0].memoize_read is False
+        # An explicit False is already off; an explicit True is a config error,
+        # so AUTO is the only path that could have collided.
+        c = self._cache(None, gate=False)
+        c._resolve_memoization(1)
+        assert c._stores[0].memoize_read is True
 
     def test_explicit_setting_overrides_the_batch_heuristic(self):
         c = self._cache(True)
