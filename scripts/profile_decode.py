@@ -83,7 +83,14 @@ def main() -> None:
     ap.add_argument("--fused", type=int, choices=(0, 1), default=None,
                     help="STICKYKV_FUSED_DECODE. 0 = materialize path (A/B the "
                          "Triton decode kernel out of the picture)")
-    ap.add_argument("--compile-evict", type=int, choices=(0, 1), default=None)
+    # Defaults to 1 to MATCH scripts/run_perf_table.sh, which exports
+    # STICKYKV_COMPILE_EVICT=1. The library default is 0, so leaving this unset
+    # used to profile the eviction path EAGER while the benchmarked table ran it
+    # compiled — a different method, and the difference is not small: compiling
+    # the eviction moved TPOT 101.6 -> 85 ms (DECODE_HISTORY.md §1). The whole
+    # point of this script is to attribute the table's time, so it has to
+    # profile the table's configuration. Pass 0 deliberately to A/B it.
+    ap.add_argument("--compile-evict", type=int, choices=(0, 1), default=1)
     ap.add_argument("--trace", default=None, help="write a chrome trace here")
     ap.add_argument("--top", type=int, default=15)
     args = ap.parse_args()
@@ -208,6 +215,11 @@ def main() -> None:
     print(f"DECODE PROFILE  batch={args.batch} prefill={args.prefill} "
           f"steps={n}  fused={os.environ.get('STICKYKV_FUSED_DECODE', '1')} "
           f"compile_evict={os.environ.get('STICKYKV_COMPILE_EVICT', '0')}")
+    if os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip() != "1":
+        print("  !! eviction is EAGER here but run_perf_table.sh exports "
+              "STICKYKV_COMPILE_EVICT=1, so this profiles a different method\n"
+              "     than the table. The elementwise/copy/cat kernels below are "
+              "inflated accordingly.")
     print("=" * 74)
     print(f"  wall            {wall_us / n / 1000:8.2f} ms/step")
     print(f"  CUDA kernels    {gpu_us / n / 1000:8.2f} ms/step")
