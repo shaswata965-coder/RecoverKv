@@ -1686,9 +1686,15 @@ class WindowedCache(_HFCacheBase):
     def _gate_ctx(self, store, idx: Tensor, n: int) -> Optional[Dict]:
         """The read gate's hand-off — the cards, the anchor, and how many to keep.
 
-        ``None`` disables the gate and reads the whole tier, which is what a store
-        without sketch cards (``quant_sketch_enabled=False``, or nothing demoted
-        yet) must do: there is nothing to select on.
+        ``None`` only when the store has **no cards** — ``quant_sketch_enabled``
+        off, or nothing demoted yet. That is a capability fact, not a setting:
+        there is nothing to select on.
+
+        The ratio does **not** get its own path. ``1.0`` used to return ``None``
+        and skip the gate entirely, which meant the shipped config and the
+        control arm ran different code and a reader had to know which. Now every
+        ratio takes the same route and ``1.0`` simply selects every window — the
+        no-op proof, on the one implementation, rather than a second one.
 
         Memoized with the tier for the same reason the tier is (design §10): cards
         are written once when a window is sealed and reactivated unchanged on
@@ -1701,8 +1707,6 @@ class WindowedCache(_HFCacheBase):
         ratio = self.resolved.quant_gate_ratio
         if not (store.sketch_enabled and store._anchor is not None
                 and getattr(store.table, "sketch", False)):
-            return None
-        if ratio >= 1.0:
             return None
         # The fused gate ranks by a plain top-k on the card estimate; it has no
         # margin term. At the default `inf` margin the two agree exactly (an inf

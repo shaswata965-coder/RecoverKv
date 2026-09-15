@@ -416,11 +416,11 @@ def test_without_a_gate_context_nothing_is_selected_and_nothing_is_filled(monkey
 
 @pytest.mark.parametrize("margin,ratio,expect", [
     (float("inf"), 0.25, "gate"),
-    (float("inf"), 1.0, None),      # ratio 1.0 reads everything; no gate to run
+    (float("inf"), 1.0, "gate"),    # one path: 1.0 gates, selecting everything
     (2.0, 0.25, "raise"),
 ])
 def test_gate_context_is_built_only_when_it_would_mean_something(margin, ratio, expect):
-    """``_gate_ctx``'s three outcomes.
+    """``_gate_ctx``'s outcomes. The ratio never selects a different code path.
 
     A finite ``quant_gate_margin`` raises rather than being accepted: the fused
     gate is a top-k on the card estimate with no margin term, so honouring the
@@ -442,11 +442,12 @@ def test_gate_context_is_built_only_when_it_would_mean_something(margin, ratio, 
             WindowedCache._gate_ctx(stub, store, idx, n)
         return
     got = WindowedCache._gate_ctx(stub, store, idx, n)
-    if expect is None:
-        assert got is None
-    else:
-        assert got["n_sel"] == max(1, math.ceil(ratio * n)) < n
-        assert len(got["card"]) == 8 and got["anchor"] is store._anchor
+    assert got["n_sel"] == max(1, math.ceil(ratio * n))
+    assert len(got["card"]) == 8 and got["anchor"] is store._anchor
+    if ratio >= 1.0:
+        assert got["n_sel"] == n, (
+            "ratio 1.0 must select every window on the SAME path, not skip the "
+            "gate — one implementation, no second route for the control arm")
 
 
 # ---------------------------------------------------------------------------
