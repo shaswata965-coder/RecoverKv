@@ -146,17 +146,33 @@ def main() -> None:
         num_layers=model.config.num_hidden_layers, max_tokens=total_steps)
     hooks = install_score_hooks(model, cache, cache_config)
 
+    # cache_position must be passed EXPLICITLY and advanced monotonically. Left
+    # to itself, transformers derives it from `past_key_values.get_seq_length()`,
+    # which for an evicting cache is the RETAINED key count, not the absolute
+    # token index — so it jumps backwards after the first eviction and the store
+    # ends up with duplicated, non-monotonic positions. `generate()` does this
+    # for us, which is why every quality runner is unaffected and only this
+    # hand-written decode loop trips the cache's position contract.
+    device = input_ids.device
+    pos = 0                      # absolute token index, advanced by _step
+
+    def _step(ids, past, n_new):
+        nonlocal pos
+        o = model(input_ids=ids, past_key_values=past, use_cache=True,
+                  return_dict=True,
+                  cache_position=torch.arange(pos, pos + n_new, device=device))
+        pos += n_new
+        return o
+
     try:
         with torch.no_grad():
-            out = model(input_ids=input_ids, past_key_values=cache,
-                        use_cache=True, return_dict=True)
+            out = _step(input_ids, cache, input_ids.shape[1])
             pkv = out.past_key_values
             nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
             # Warm up past compile / autotune / the first eviction.
             for _ in range(args.warmup):
-                out = model(input_ids=nxt, past_key_values=pkv,
-                            use_cache=True, return_dict=True)
+                out = _step(nxt, pkv, 1)
                 pkv = out.past_key_values
                 nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             torch.cuda.synchronize()
@@ -166,8 +182,7 @@ def main() -> None:
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
             ) as prof:
                 for _ in range(args.steps):
-                    out = model(input_ids=nxt, past_key_values=pkv,
-                                use_cache=True, return_dict=True)
+                    out = _step(nxt, pkv, 1)
                     pkv = out.past_key_values
                     nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 torch.cuda.synchronize()
