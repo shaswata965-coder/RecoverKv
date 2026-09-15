@@ -267,12 +267,14 @@ def _oracle_kernel(store, rope):
     """
     seen = []
 
-    def fake(q, k_fp, v_fp, qtier, scaling, num_sink=0, n_body_win=None, sel=None):
+    def fake(q, k_fp, v_fp, qtier, scaling, num_sink=0, n_body_win=None,
+             sel=None, logmass=None):
         seen.append(sel)
         k_q, v_q, _ = store.effective_q_tier(rope, k_fp.dtype)
         return two_tier_window_reference(
             q, torch.cat([k_fp, k_q], 2), torch.cat([v_fp, v_q], 2),
-            scaling, num_sink, WS, n_body_win, k_fp.shape[2], sel=sel)
+            scaling, num_sink, WS, n_body_win, k_fp.shape[2], sel=sel,
+            logmass=logmass)
 
     return fake, seen
 
@@ -342,6 +344,11 @@ def test_the_fused_gate_picks_the_same_windows_as_gate_and_select():
     the threshold keeps everything, so the cap decides alone and the two are the
     same operation. This pins that, because a finite margin would make them differ
     silently — which is why ``_gate_ctx`` refuses one.
+
+    Compared as **sets**: the gate no longer sorts its pick, because the decode
+    kernel places each window's score by its own column id and so cannot care
+    what order the selection arrives in. Which windows are chosen is the claim;
+    their order is not.
     """
     from modules.windowed_cache.gate_kernel import fused_gate
 
@@ -354,7 +361,8 @@ def test_the_fused_gate_picks_the_same_windows_as_gate_and_select():
                             SCALING, n_sel)
         keep, _, _ = store.gate_and_select(q, SCALING, float("inf"), ratio=ratio)
         ref = torch.argsort(~keep, dim=-1, stable=True)[..., :n_sel].sort(-1).values
-        assert torch.equal(sel.long(), ref), f"selections diverge at ratio={ratio}"
+        assert torch.equal(sel.long().sort(-1).values, ref), (
+            f"selections diverge at ratio={ratio}")
 
 
 def test_every_window_gets_a_score_so_the_gate_cannot_evict_its_own_tier(monkeypatch):
@@ -488,3 +496,104 @@ def test_the_ungated_path_compiles_the_indirection_away():
     body = _kernel_src()
     assert "GATED: tl.constexpr" in body
     assert "widx = w0 + t_win" in body
+
+
+# ---------------------------------------------------------------------------
+# E. The skipped-window fill, moved into the kernel
+# ---------------------------------------------------------------------------
+
+
+def test_the_kernels_fill_equals_the_host_side_one_it_replaced():
+    """Scoring skipped windows moved into the kernel; the numbers must not move.
+
+    It was 22 torch ops per layer per step — 704 launches per token at 32 layers
+    — to reshape a small tensor, on a decode path bound by launch count. The
+    kernel now does it inside an epilogue pass that already runs, using a max and
+    a sum instead of ``fill_skipped_window_scores``'s explicit normalisation
+    (the offset cancels in the ratio, so no logarithm is needed). Different
+    arithmetic, same answer — which is what this pins, against the original.
+    """
+    from modules.windowed_cache.scorer import (
+        expand_keep_to_query_heads, fill_skipped_window_scores)
+
+    ws, num_sink, n_act = 4, 2, 6
+    q, k, v, sc, body_end = _geom(ws, num_sink, n_act=n_act, seed=21)
+    b, h_kv, h_q = q.shape[0], k.shape[1], q.shape[1]
+    sel = (torch.tensor([4, 1, 5], dtype=torch.int32)
+           .view(1, 1, -1).expand(b, h_kv, 3).contiguous())
+    logmass = torch.randn(b, h_q, n_act) * 2.0
+
+    _, sparse = two_tier_window_reference(
+        q, k, v, sc, num_sink, ws, NBODY, body_end, sel=sel)
+    _, filled = two_tier_window_reference(
+        q, k, v, sc, num_sink, ws, NBODY, body_end, sel=sel, logmass=logmass)
+
+    keep = torch.zeros((b, h_kv, n_act), dtype=torch.bool)
+    keep.scatter_(-1, sel.to(torch.long), True)
+    want = fill_skipped_window_scores(
+        sparse[..., NBODY:], expand_keep_to_query_heads(keep, h_q), logmass)
+
+    torch.testing.assert_close(filled[..., NBODY:], want, rtol=1e-5, atol=1e-7)
+    torch.testing.assert_close(filled[..., :NBODY], sparse[..., :NBODY]), (
+        "the fp body is never gated and must be untouched")
+    assert (filled[..., NBODY:] > 0).all(), "a skipped window still scored zero"
+
+
+def test_the_fill_leaves_read_windows_exactly_as_they_were():
+    """Only skipped columns are written. A read window's score is measured, not
+    estimated, and overwriting it with its card would silently degrade eviction
+    for the windows the gate was most confident about."""
+    ws, num_sink, n_act = 8, 0, 6
+    q, k, v, sc, body_end = _geom(ws, num_sink, n_act=n_act, seed=33)
+    b, h_kv = q.shape[0], k.shape[1]
+    sel = (torch.tensor([0, 3], dtype=torch.int32)
+           .view(1, 1, -1).expand(b, h_kv, 2).contiguous())
+    logmass = torch.randn(b, q.shape[1], n_act)
+
+    _, sparse = two_tier_window_reference(
+        q, k, v, sc, num_sink, ws, NBODY, body_end, sel=sel)
+    _, filled = two_tier_window_reference(
+        q, k, v, sc, num_sink, ws, NBODY, body_end, sel=sel, logmass=logmass)
+
+    for c in (0, 3):
+        torch.testing.assert_close(filled[..., NBODY + c], sparse[..., NBODY + c])
+
+
+# ---------------------------------------------------------------------------
+# F. Gate occupancy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rows,nw,sm", [(8, 271, 108), (8, 64, 108),
+                                        (256, 271, 108), (16, 1000, 80)])
+def test_gate_tiles_are_a_legal_power_of_two(rows, nw, sm):
+    from modules.windowed_cache.gate_kernel import gate_window_tiles
+    bw = gate_window_tiles(rows, nw, sm)
+    assert bw in (16, 32, 64), bw
+    assert bw & (bw - 1) == 0
+
+
+def test_gate_splits_finely_at_small_batch_and_coarsely_at_large():
+    """The point of splitting the window axis: fill the machine at ``B=1``.
+
+    One program per ``(row, KV head)`` is 8 programs on Llama-3.1-8B at batch 1,
+    which leaves 93% of a 108-SM A100 idle while one serial loop walks the whole
+    card set. At batch 32 the rows already fill it, so the tile stays coarse and
+    the per-program prologue is not paid 17 times over.
+    """
+    from modules.windowed_cache.gate_kernel import gate_window_tiles
+
+    nw, sm = 271, 108
+    small = 1 * 8                                   # B=1, H_kv=8
+    large = 32 * 8                                  # B=32
+
+    bw_s = gate_window_tiles(small, nw, sm)
+    blocks_s = small * -(-nw // bw_s)
+    assert blocks_s > sm, (
+        f"batch-1 gate would use {blocks_s} blocks on {sm} SMs; the split has to "
+        "fill the machine or it has not fixed anything")
+    assert small < sm, "fixture is wrong: un-split batch 1 should underfill"
+
+    bw_l = gate_window_tiles(large, nw, sm)
+    assert bw_l >= bw_s, "large batch should not split more finely than small"
+    assert bw_l == 64, "rows already fill the machine; keep the coarse tile"

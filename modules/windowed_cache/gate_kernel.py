@@ -89,7 +89,9 @@ def gate_reference(
 
     Returns
     -------
-    sel : ``[B, H_kv, n_sel]`` int32 column indices, ascending.
+    sel : ``[B, H_kv, n_sel]`` int32 column indices, in top-k order (**not**
+        sorted — the decode kernel places each window's score by its own column
+        id, so the order is free and a sort is a launch for nothing).
     logmass : ``[B, H_q, Nw]`` the estimate for every window.
     """
     from modules.quant.sketch import Sketch, gate_and_score, group_max
@@ -98,32 +100,77 @@ def gate_reference(
     _, logmass, est = gate_and_score(q, card, anchor, scaling)
     hkv = mu_q.shape[2]
     top = group_max(est, hkv).topk(n_sel, dim=-1).indices          # [B,Hkv,n_sel]
-    return top.sort(dim=-1).values.to(torch.int32), logmass
+    return top.to(torch.int32), logmass
+
+
+def gate_window_tiles(rows: int, n_windows: int, sm_count: int) -> int:
+    """``BLOCK_W`` — how many windows one gate program owns.
+
+    The gate used to run one program per ``(row, KV head)`` and walk every window
+    inside it. At ``B=1`` on Llama-3.1-8B that is **8 programs**, which on a
+    108-SM A100 leaves 93% of the machine idle while a single serial loop grinds
+    through the whole card set. Splitting the window axis across programs costs
+    nothing in coordination — each program owns disjoint output columns and the
+    top-k runs afterwards on the host — so the only question is how finely.
+
+    Small enough to fill the machine, large enough that the per-program prologue
+    (the query, the anchor) is not the whole cost: aim for roughly two waves of
+    programs, then clamp to a power of two in ``[16, 64]``.
+
+    ``rows`` is ``B * H_kv``, the programs a single tile already gives.
+    """
+    if n_windows <= 0:
+        raise ValueError(f"n_windows must be positive, got {n_windows}")
+    want = max(1, -(-2 * max(sm_count, 1) // max(rows, 1)))
+    for bw in (64, 32, 16):
+        if -(-n_windows // bw) >= want:
+            return bw
+    return 16
 
 
 if _HAS_TRITON:  # pragma: no cover - GPU-only
 
     @triton.jit
     def _gate_kernel(
-        Q, MU, MUS, V, VS, T, TS, E, ES, ANCH,
-        BOUND, EST, LOGM,
-        qb, qh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah, ob, oh,
+        Q, MU, MUS, V, VS, T, TS, ANCH,
+        EST, LOGM,
+        qb, qh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah,
+        lb, lh, eb, eh,
         NW, REP, SCALE,
         HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr,
     ):
-        """One program per ``(batch, KV head)``; streams windows in BLOCK_W tiles.
+        """One program per ``(row, KV head, window tile)``.
 
-        The card vectors are streamed through registers and never staged: only
-        three scalars per window (bound, est, logmass) leave the loop, so the
-        program's shared footprint is O(BLOCK_W), not O(NW * HEAD_DIM).
+        Three things about the shape of this loop are load-bearing.
 
-        ``BLOCK_WS`` is ``WS`` rounded up to a power of two, because
-        ``tl.arange`` admits nothing else. The surplus lanes are masked out of
-        the ``t``/``eps`` loads **and** forced to ``-inf`` in ``x``: a padding
-        lane that merely loaded zero would still carry the real ``SCALE * m``
-        into the max and the logsumexp, so a ``ws`` of 12 would score every
-        window as if it held a 13th token sitting exactly at its mean.
+        **The cards are loaded once, outside the query-head loop.** One program
+        owns a whole GQA group precisely so a window's card is read once for all
+        ``REP`` query heads sharing it; reading it inside the ``r`` loop instead
+        would multiply the card traffic by ``REP`` (4x on Llama-3.1-8B) and throw
+        away the only reason the group is grouped.
+
+        **The window axis is split across programs**, not walked serially inside
+        one. See :func:`gate_window_tiles`.
+
+        **``est`` leaves as the GQA group's max**, already reduced over ``r``, so
+        the output is ``[B, H_kv, NW]`` rather than ``[B, H_q, NW]`` — a quarter
+        of the write traffic, and it saves the host a reshape and an ``amax``
+        before the top-k. ``logmass`` stays per query head because every query
+        head's skipped windows need their own estimate.
+
+        ``BLOCK_WS`` is ``WS`` rounded up to a power of two, because ``tl.arange``
+        admits nothing else. The surplus lanes are masked out of the ``t`` load
+        **and** forced to ``-inf`` in ``x``: a padding lane that merely loaded
+        zero would still carry the real ``SCALE * m`` into the max and the
+        logsumexp, so a ``ws`` of 12 would score every window as if it held a
+        13th token sitting exactly at its mean.
+
+        No ``bound`` is computed. The margin rule that needed it has no caller on
+        this path (``WindowedCache._gate_ctx`` refuses a finite margin), so the
+        bound cost a ``[B, H_q, NW]`` fp32 store and the whole ``eps`` field of
+        every card, to be discarded by :func:`_gate_triton`. The cap ranks on the
+        estimate; see :func:`modules.quant.sketch.select_windows`.
         """
         b = tl.program_id(0)
         kv = tl.program_id(1)
@@ -132,89 +179,90 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         w = tl.arange(0, BLOCK_WS)
         wm = w < WS
 
-        # This KV head's query group, and the anchor term that is constant in w.
-        # Accumulated per query head into registers; REP is small (4 on Llama-3.1-8B).
+        cols = tl.program_id(2) * BLOCK_W + tl.arange(0, BLOCK_W)
+        cm = cols < NW
+
+        # ---- the cards for this tile: read ONCE for the whole query group ----
+        mu = tl.load(MU + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
+                     mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
+        mus = tl.load(MUS + b * sb + cols * sn + kv * sh,
+                      mask=cm, other=0.0).to(tl.float32)
+        vv = tl.load(V + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
+                     mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
+        vs = tl.load(VS + b * sb + cols * sn + kv * sh,
+                     mask=cm, other=0.0).to(tl.float32)
+        tt = tl.load(T + b * tb + cols[:, None] * tn + kv * th + w[None, :],
+                     mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
+        ts = tl.load(TS + b * sb + cols * sn + kv * sh,
+                     mask=cm, other=0.0).to(tl.float32)
+
+        # The anchor is indexed by KV head alone, so it is constant in r too.
+        anc = tl.load(ANCH + b * ab + kv * ah + d, mask=dm, other=0.0).to(tl.float32)
+
+        est_g = tl.full([BLOCK_W], -float("inf"), tl.float32)
         for r in range(0, REP):
             hq = kv * REP + r
             q_v = tl.load(Q + b * qb + hq * qh + d, mask=dm, other=0.0).to(tl.float32)
-            qn = tl.sqrt(tl.sum(q_v * q_v, axis=0))
-            anc = tl.load(ANCH + b * ab + kv * ah + d, mask=dm, other=0.0).to(tl.float32)
             base = tl.sum(q_v * anc, axis=0)
 
-            for w0 in range(0, NW, BLOCK_W):
-                cols = w0 + tl.arange(0, BLOCK_W)
-                cm = cols < NW
+            m = base + mus * tl.sum(mu * q_v[None, :], axis=1)       # [BLOCK_W]
+            g = vs * tl.sum(vv * q_v[None, :], axis=1)               # [BLOCK_W]
 
-                # mu, v: int8 [BLOCK_W, D] with a per-(window, head) fp16 scale.
-                mu = tl.load(MU + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
-                             mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
-                mus = tl.load(MUS + b * sb + cols * sn + kv * sh,
-                              mask=cm, other=0.0).to(tl.float32)
-                vv = tl.load(V + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
-                             mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
-                vs = tl.load(VS + b * sb + cols * sn + kv * sh,
-                             mask=cm, other=0.0).to(tl.float32)
+            x = SCALE * (m[:, None] + (ts[:, None] * tt) * g[:, None])
+            x = tl.where(wm[None, :], x, -float("inf"))
+            xm = tl.max(x, axis=1)
+            # logsumexp, written out: the online-softmax form the decode kernel
+            # uses, and `torch.logsumexp(` must stay unique in modules/ for
+            # audit_e2e.py's attribution (tests/test_audit_e2e.py).
+            lm = xm + tl.log(tl.sum(tl.exp(x - xm[:, None]), axis=1))
+            tl.store(LOGM + b * lb + hq * lh + cols,
+                     tl.where(cm, lm, -float("inf")), mask=cm)
+            est_g = tl.maximum(est_g, xm)
 
-                m = base + mus * tl.sum(mu * q_v[None, :], axis=1)      # [BLOCK_W]
-                g = vs * tl.sum(vv * q_v[None, :], axis=1)              # [BLOCK_W]
+        tl.store(EST + b * eb + kv * eh + cols,
+                 tl.where(cm, est_g, -float("inf")), mask=cm)
 
-                tt = tl.load(T + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                             mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
-                ts = tl.load(TS + b * sb + cols * sn + kv * sh,
-                             mask=cm, other=0.0).to(tl.float32)
-                ee = tl.load(E + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                             mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
-                es = tl.load(ES + b * sb + cols * sn + kv * sh,
-                             mask=cm, other=0.0).to(tl.float32)
 
-                x = SCALE * (m[:, None] + (ts[:, None] * tt) * g[:, None])
-                # A padding lane must not exist for the reductions below. Zeroing
-                # its `t` is not enough: x would still be SCALE * m, a plausible
-                # logit for a token that is not there.
-                x = tl.where(wm[None, :], x, -float("inf"))
-                bd = tl.max(x + SCALE * qn * (es[:, None] * ee), axis=1)
-                es_max = tl.max(x, axis=1)
-                # logsumexp, written out: the online-softmax form the decode
-                # kernel uses, and `torch.logsumexp(` must stay unique in modules/
-                # for audit_e2e.py's attribution (tests/test_audit_e2e.py).
-                lm = es_max + tl.log(tl.sum(tl.exp(x - es_max[:, None]), axis=1))
-
-                o = b * ob + hq * oh + cols
-                tl.store(BOUND + o, tl.where(cm, bd, -float("inf")), mask=cm)
-                tl.store(EST + o, tl.where(cm, es_max, -float("inf")), mask=cm)
-                tl.store(LOGM + o, tl.where(cm, lm, -float("inf")), mask=cm)
+def _sm_count(device) -> int:  # pragma: no cover - GPU-only
+    try:
+        return int(torch.cuda.get_device_properties(device).multi_processor_count)
+    except Exception:
+        return 64
 
 
 def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-only
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
-    mu_q, mu_s, v_q, v_s, t_q, t_s, e_q, e_s = card
+    mu_q, mu_s, v_q, v_s, t_q, t_s, _e_q, _e_s = card
     B, NW, HKV, D = mu_q.shape
     HQ = q.shape[1]
     ws = t_q.shape[-1]
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
-    out = [torch.empty((B, HQ, NW), dtype=torch.float32, device=q.device)
-           for _ in range(3)]
-    bound, est, logm = out
-    _gate_kernel[(B, HKV)](
-        q, mu_q, mu_s, v_q, v_s, t_q, t_s, e_q, e_s, anchor,
-        bound, est, logm,
+    logm = torch.empty((B, HQ, NW), dtype=torch.float32, device=q.device)
+    est = torch.empty((B, HKV, NW), dtype=torch.float32, device=q.device)
+    block_w = gate_window_tiles(B * HKV, NW, _sm_count(q.device))
+    _gate_kernel[(B, HKV, -(-NW // block_w))](
+        q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
+        est, logm,
         q.stride(0), q.stride(1),
         mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
         mu_s.stride(0), mu_s.stride(1), mu_s.stride(2),
         t_q.stride(0), t_q.stride(1), t_q.stride(2),
         anchor.stride(0), anchor.stride(1),
-        bound.stride(0), bound.stride(1),
+        logm.stride(0), logm.stride(1),
+        est.stride(0), est.stride(1),
         NW, HQ // HKV, scaling,
         HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
         BLOCK_D=triton.next_power_of_2(D),
-        BLOCK_W=min(64, triton.next_power_of_2(NW)),
+        BLOCK_W=block_w,
         num_warps=4,
     )
-    from modules.quant.sketch import group_max
-    top = group_max(est, HKV).topk(n_sel, dim=-1).indices
-    return top.sort(dim=-1).values.to(torch.int32), logm
+    # `est` already carries the group max, so this is a bare top-k. Not sorted:
+    # the decode kernel places each window's score by its own column id, so the
+    # order `sel` arrives in cannot matter (tests/test_gated_fused_path.py pins
+    # it), and a sort here is a kernel launch per layer per step for nothing.
+    return est.topk(n_sel, dim=-1).indices.to(torch.int32), logm
 
 
 def fused_gate(
@@ -225,13 +273,31 @@ def fused_gate(
     n_sel: int,
     force_reference: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Dispatch: Triton on CUDA, the reference elsewhere.
+    """Dispatch: Triton on CUDA (**required**), the reference on CPU.
 
-    Unlike ``decode_kernel``'s Triton-or-raise contract, this one falls back,
-    because the reference is not a *degraded* path -- it is the same arithmetic
-    at the same selectivity, just without the fused launch. Nothing silently
-    changes what gets read.
+    This used to fall back silently on CUDA, on the argument that the reference
+    is not a *degraded* path -- same arithmetic, same selectivity, just without
+    the fused launch. That argument is wrong about cost, and the cost is the
+    entire point of the gate. Measured at the benchmarked shape, the reference is
+    **62 torch ops per layer per step** against the kernel's one launch, and it
+    materialises a ``[B, Nw, H_kv, rep, ws]`` intermediate the kernel never
+    builds. A silent fallback therefore turns a read-traffic optimisation into a
+    large decode regression, while every number downstream still looks like the
+    gate ran -- exactly the "timed against a method it is not running" failure
+    ``flash_decode.FusedDecodeNotReached`` exists to refuse.
+
+    So on CUDA it raises, like ``fused_two_tier_decode``. ``force_reference``
+    remains for tests that want the oracle on purpose.
     """
-    if force_reference or not (_HAS_TRITON and q.is_cuda):
+    if force_reference or not q.is_cuda:
         return gate_reference(*( (q,) + tuple(card) + (anchor, scaling, n_sel) ))
+    if not _HAS_TRITON:
+        raise RuntimeError(
+            "the read gate requires the Triton kernel on CUDA and triton is not "
+            "installed. There is no CUDA fallback: the PyTorch reference costs "
+            "~62 ops per layer per step against the kernel's one launch, so "
+            "falling back would silently replace the optimisation with a "
+            "regression. Install triton, or set STICKYKV_FUSED_DECODE=0 to run "
+            "the materialize path (which does not gate at all)."
+        )
     return _gate_triton(q, card, anchor, scaling, n_sel)

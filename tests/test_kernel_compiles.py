@@ -50,14 +50,13 @@ _DECODE_PTRS = {
     **{n: "*fp16" for n in ("Q", "KFP", "VFP", "KS", "KZ", "VS", "VZ",
                             "COS", "SIN", "OUT")},
     "KC": "*u8", "VC": "*u8", "SEL": "*i32",
-    "WSUM": "*fp32", "WMAX": "*fp32", "scale": "fp32",
+    "WSUM": "*fp32", "WMAX": "*fp32", "LOGM": "*fp32", "scale": "fp32",
 }
 
 _GATE_PTRS = {
-    **{n: "*fp16" for n in ("Q", "MUS", "VS", "TS", "ES", "ANCH")},
+    **{n: "*fp16" for n in ("Q", "MUS", "VS", "TS", "ANCH")},
     **{n: "*i8" for n in ("MU", "V", "T")},
-    "E": "*u8", "BOUND": "*fp32", "EST": "*fp32", "LOGM": "*fp32",
-    "SCALE": "fp32",
+    "EST": "*fp32", "LOGM": "*fp32", "SCALE": "fp32",
 }
 
 #: One ``ws`` per structural case in :func:`window_tiling`, not a sweep — each

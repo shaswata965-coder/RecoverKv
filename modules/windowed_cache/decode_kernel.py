@@ -341,6 +341,7 @@ def two_tier_window_reference(
     Sfp: Optional[int] = None,
     exp2: bool = False,
     sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -552,6 +553,24 @@ def two_tier_window_reference(
     live = wmax > NEG
     wsum = torch.where(live, wsum * (torch.exp2 if exp2 else torch.exp)(wmax - lse.unsqueeze(-1)),
                        torch.zeros_like(wsum))
+
+    # Skipped windows get their card's estimate, scaled onto the same footing as
+    # the real scores — mirroring the kernel's GATED epilogue. `live` over the Q
+    # columns IS the read set (a skipped column was never written, so its wmax is
+    # still the -inf sentinel), which is why neither this nor the kernel consults
+    # `sel` again. The offset in `fill_skipped_window_scores` cancels in the
+    # ratio, so a max and a sum suffice and no logarithm is taken.
+    if sel is not None and logmass is not None:
+        read = live[..., n_body_win:]                          # [B,H_q,n_active]
+        num = (wsum[..., n_body_win:] * read).sum(-1, keepdim=True)
+        gmx = torch.where(read, logmass, torch.full_like(logmass, NEG)).amax(
+            -1, keepdim=True)
+        rel = (logmass - gmx).exp()
+        gsm = (rel * read).sum(-1, keepdim=True).clamp_min(1e-30)
+        wsum = torch.cat([
+            wsum[..., :n_body_win],
+            torch.where(read, wsum[..., n_body_win:], num * rel / gsm),
+        ], dim=-1)
     return out.to(v_eff.dtype), wsum
 
 
@@ -568,7 +587,8 @@ if _HAS_TRITON:
         KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
         VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
-        SEL,                       # gate's pick: int32 [B, H_kv, n_sel], ascending
+        SEL,                       # gate's pick: int32 [B, H_kv, n_sel]
+        LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -579,7 +599,7 @@ if _HAS_TRITON:
         HEAD_DIM: tl.constexpr, HALF: tl.constexpr, WS: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_NW: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
-        GATED: tl.constexpr,
+        GATED: tl.constexpr, LOG2E: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -654,6 +674,8 @@ if _HAS_TRITON:
         # Derived strides -- contiguous by contract (see the dispatcher's check).
         wsb = H_q * W_phys
         wsh = W_phys
+        lgb = H_q * n_active
+        lgh = n_active
         ob = H_q * HEAD_DIM
         kcb = n_active * H_kv * HEAD_DIM * PACK_K
         kcn = H_kv * HEAD_DIM * PACK_K
@@ -824,7 +846,20 @@ if _HAS_TRITON:
 
         # ---- 4. epilogue: rescale each window from its tile max to the LSE ----
         # Runs over W_phys values, not S. That is the whole of §5.1's traffic cut.
+        #
+        # Under GATED this pass also accumulates what the skipped windows need,
+        # so their scores never leave the kernel. Doing it on the host cost 22
+        # torch ops per layer per step -- 704 launches per token at L=32 -- to
+        # shuffle a [B, H_q, W] tensor, on a decode path that is bound by launch
+        # count. The two reductions ride along in a pass that already runs.
+        #
+        # `smax > -inf` IS the selected set: the GATED prologue seeded every Q
+        # column to -inf and only the visited ones were written, so no SEL lookup
+        # is needed here.
         offs_w = tl.arange(0, BLOCK_W)
+        num = tl.zeros([BLOCK_R], tl.float32)          # mass the read windows hold
+        gmx = tl.full([BLOCK_R], -float("inf"), tl.float32)   # running max of logmass
+        gsm = tl.zeros([BLOCK_R], tl.float32)          # sum exp(logmass - gmx)
         for w0 in range(0, W_phys, BLOCK_W):
             cols = w0 + offs_w
             cmask = cols < W_phys
@@ -836,6 +871,52 @@ if _HAS_TRITON:
             scaled = tl.where(smax > -float("inf"),
                               ssum * tl.exp2(smax - lse[:, None]), 0.0)
             tl.store(ptr, scaled, mask=sm)
+            if GATED:
+                live = sm & (smax > -float("inf")) & (cols[None, :] >= n_body_win)
+                num += tl.sum(tl.where(live, scaled, 0.0), axis=1)
+                qc = tl.maximum(cols - n_body_win, 0)
+                lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
+                             mask=live, other=-float("inf"))
+                gmx_new = tl.maximum(gmx, tl.max(tl.where(live, lg, -float("inf")),
+                                                 axis=1))
+                # `gmx` is -inf until the first selected column is seen, and a
+                # tile of body columns alone sees none; exp(-inf - -inf) is NaN,
+                # so the first-tile case is selected away rather than computed.
+                corr = tl.where(gmx == -float("inf"), 0.0, tl.exp2(
+                    (gmx - gmx_new) * LOG2E))
+                gsm = gsm * corr + tl.sum(
+                    tl.where(live, tl.exp2((lg - gmx_new[:, None]) * LOG2E), 0.0),
+                    axis=1)
+                gmx = gmx_new
+
+        # ---- 5. GATED only: score the windows this step did not read ----------
+        # A skipped window credited with zero would rank last and be evicted, so
+        # the gate would destroy the tier it exists to read less often. It gets
+        # its card's estimate instead, put on the same footing as the real scores
+        # by the ratio the read windows give for free:
+        #
+        #     score_i = (mass the read windows hold) * softmax(logmass)_i
+        #
+        # over the read set. The arbitrary offset in `fill_skipped_window_scores`
+        # cancels in that ratio, which is why only a max and a sum are needed and
+        # no logarithm is taken. `LOG2E` keeps the base-e logmass exact while
+        # every exponential in this kernel stays base 2.
+        if GATED:
+            gsm = tl.maximum(gsm, 1e-30)
+            for w0 in range(n_body_win, W_phys, BLOCK_W):
+                cols = w0 + offs_w
+                cmask = cols < W_phys
+                ptr = WSUM + b * wsb + hq[:, None] * wsh + cols[None, :]
+                mptr = WMAX + b * wsb + hq[:, None] * wsh + cols[None, :]
+                sm = r_mask[:, None] & cmask[None, :]
+                smax = tl.load(mptr, mask=sm, other=0.0)
+                skipped = sm & (smax == -float("inf"))
+                qc = tl.maximum(cols - n_body_win, 0)
+                lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
+                             mask=skipped, other=-float("inf"))
+                fill = (num[:, None]
+                        * tl.exp2((lg - gmx[:, None]) * LOG2E) / gsm[:, None])
+                tl.store(ptr, fill, mask=skipped)
 
 
 def _pow2_at_least(x: int, floor: int = 16) -> int:
@@ -909,6 +990,7 @@ def _decode_triton(
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
     sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -998,10 +1080,25 @@ def _decode_triton(
     gated = n_sel > 0
     if gated:
         SEL, selb, selh = sel, sel.stride(0), sel.stride(1)
+        if logmass is None:
+            raise RuntimeError(
+                "a gated fused decode needs the gate's logmass: the kernel scores "
+                "the windows it skipped from their cards, and without it they "
+                "would leave as zeros, rank last, and be evicted.")
+        if logmass.shape != (B, H_q, n_active) or logmass.dtype != torch.float32:
+            raise RuntimeError(
+                f"logmass must be fp32 [B, H_q, n_active] = [{B}, {H_q}, "
+                f"{n_active}]; got {tuple(logmass.shape)} {logmass.dtype}.")
+        if not logmass.is_contiguous():
+            raise RuntimeError(
+                "fused decode requires a contiguous logmass; its strides are "
+                "derived from its shape inside the kernel.")
+        LOGM = logmass
     else:
-        # A valid pointer the kernel never dereferences: the Q loop runs while
+        # Valid pointers the kernel never dereferences: the Q loop runs while
         # w0 < n_sel == 0, and the GATED blocks are compiled out entirely.
         SEL = torch.zeros((1,), dtype=torch.int32, device=dev)
+        LOGM = torch.zeros((1,), dtype=torch.float32, device=dev)
         selb = selh = 0
 
     BLOCK_R = _pow2_at_least(rep)
@@ -1045,7 +1142,7 @@ def _decode_triton(
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
         try:
             _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL,
+                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL, LOGM,
                 out, wsum, wmax,
                 scaling,
                 H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -1057,7 +1154,7 @@ def _decode_triton(
                 BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
                 BLOCK_W=BLOCK_W,
                 PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
-                GATED=gated,
+                GATED=gated, LOG2E=_LOG2E,
                 num_stages=num_stages,
             )
         except BaseException as exc:                     # noqa: BLE001
@@ -1092,6 +1189,7 @@ def fused_two_tier_decode(
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
     sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -1119,4 +1217,5 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
-    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win, sel)
+    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
+                          sel, logmass)
