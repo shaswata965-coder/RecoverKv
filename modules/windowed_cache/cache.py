@@ -127,9 +127,35 @@ def reset_evict_path_stats() -> None:
 
 
 def _compile_evict_enabled() -> bool:
-    """Whether to run the eviction through ``torch.compile`` (default OFF)."""
-    v = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    """Whether to run the eviction through ``torch.compile`` (default **ON**).
+
+    The default used to be OFF while ``scripts/run_perf_table.sh`` exported
+    ``1``, so the library and the benchmark harness disagreed about what the
+    method *is*. Anything that did not go through that script — the profiler
+    above all — measured the eager eviction against a table produced with it
+    compiled, and the gap is not small: compiling moved TPOT 101.6 -> 85 ms
+    (DECODE_HISTORY.md §1), landing almost entirely in the elementwise/copy/cat
+    kernels a profile is read to attribute.
+
+    So the **device** decides now, not a setting, exactly as it does for the
+    decode path: with nothing set, CUDA gets the compiled eviction and CPU gets
+    the eager one. That is one production eviction, and it is the same one
+    whether or not the run went through the benchmark script.
+
+    Compiling on CPU would be pointless anyway — what it buys is launch
+    coalescing — and doing it anyway cost the test suite 4x its runtime.
+
+    An explicit value still wins, for the compile-failure bisection the
+    diagnostics below document and for the tests that exercise it.
+    """
+    raw = os.environ.get("STICKYKV_COMPILE_EVICT")
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
 
 
 def _compile_evict_backend() -> Optional[str]:

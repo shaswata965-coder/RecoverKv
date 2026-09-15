@@ -14,6 +14,20 @@ venv/
 
 # Run outputs
 outputs/
+results/
+scores/
+logs/
+*.npz
+
+# Downloaded eval corpora / dataset caches. `data/` itself is source (loaders);
+# only the fetched payloads are ignored, which is where a work tree quietly
+# grows by thousands of files after a LongBench or RULER run.
+data/longbench/
+data/ruler/
+data/wikitext*/
+data/pg19/
+.cache/
+.triton/
 
 # Harness state (worktrees, agent metadata)
 .claude/

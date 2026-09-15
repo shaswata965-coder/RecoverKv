@@ -83,26 +83,56 @@ def test_dispatcher_is_triton_or_error_on_cpu():
         fused_two_tier_decode(q, k, v, None, 8 ** -0.5)   # qtier=None (empty Q)
 
 
-def test_fused_decode_enabled_default_and_off(monkeypatch):
-    """Fused decode is ON by default and honours STICKYKV_FUSED_DECODE=0."""
+def test_there_is_no_switch_that_selects_a_different_decode(monkeypatch):
+    """One decode on the flash backend; the device picks it, not an env var.
+
+    STICKYKV_FUSED_DECODE used to route a production run to the materialize
+    path — a second, slower implementation of the same method, chosen by a
+    variable nobody reads back when quoting a number. The materialize path
+    survives as the CPU oracle; it is not reachable as an alternative.
+    """
+    import inspect
+
+    from modules.windowed_cache import decode_kernel as dk
+
     monkeypatch.delenv("STICKYKV_FUSED_DECODE", raising=False)
     assert fused_decode_enabled() is True
     monkeypatch.setenv("STICKYKV_FUSED_DECODE", "0")
-    assert fused_decode_enabled() is False
+    assert fused_decode_enabled() is True, (
+        "the off-switch must be gone, not merely defaulted on")
+    assert "os.environ" not in inspect.getsource(dk.fused_decode_enabled)
 
 
-def test_gate_raises_without_triton():
-    """The flash-backend gate refuses to run without a launchable decode kernel."""
+def test_gate_raises_without_triton(monkeypatch):
+    """The flash-backend gate refuses to run without a launchable decode kernel.
+
+    Triton is forced absent rather than assumed absent: torch ships it as a
+    dependency on Linux, so a box that has torch usually has triton and this
+    test asserted a fact about the machine instead of one about the code.
+    """
+    from modules.windowed_cache import decode_kernel as dk
+
+    monkeypatch.setattr(dk, "_HAS_TRITON", False)
     with pytest.raises(RuntimeError, match="fused two-tier decode Triton kernel"):
-        assert_decode_kernel_available(True)   # CPU box: triton absent
+        assert_decode_kernel_available(True)
     assert "WILL ERROR" in describe_decode_backend(True)
 
 
-def test_gate_is_noop_when_fused_disabled(monkeypatch):
-    """With fused decode disabled, the gate does not raise (materialize fallback)."""
+def test_the_backend_gate_cannot_be_talked_out_of_requiring_the_kernel(monkeypatch):
+    """No env value makes the flash backend accept a missing decode kernel.
+
+    It used to: STICKYKV_FUSED_DECODE=0 turned the Triton-or-error contract
+    into a silent materialize run.
+    """
+    from modules.windowed_cache import decode_kernel as dk
+
+    # Force the kernel unavailable regardless of what this box has installed —
+    # the point is that the env var can no longer wave the requirement away.
+    monkeypatch.setattr(dk, "_HAS_TRITON", False)
     monkeypatch.setenv("STICKYKV_FUSED_DECODE", "0")
-    assert_decode_kernel_available(True)        # must not raise
-    assert "disabled" in describe_decode_backend(True)
+    with pytest.raises(RuntimeError, match="fused two-tier decode Triton kernel"):
+        assert_decode_kernel_available(True)
+    assert "disabled" not in describe_decode_backend(True)
 
 
 # NOTE: the Triton kernel (_two_tier_decode_kernel) has no CPU test by construction

@@ -119,15 +119,27 @@ def refresh_rope_dtype_latch() -> bool:
 
 
 def fused_decode_enabled() -> bool:
-    """Whether the fused two-tier decode path is active (default ON).
+    """Always ``True``. There is one decode on the flash backend.
 
-    Off only when ``STICKYKV_FUSED_DECODE`` is explicitly falsey. ON by default
-    because the fused kernel is the intended decode path for the flash backend;
-    the materialize path is kept for the eager backend and CPU tests (which never
-    install the flash monkeypatch, so they never reach this kernel).
+    This used to read ``STICKYKV_FUSED_DECODE``, so a production run could be
+    quietly served by the materialize path instead — a second, slower, entirely
+    different implementation of the same method, selected by an environment
+    variable nobody reads back when quoting a number.
+
+    What decides the path now is the machine, not a setting: the score hook
+    computes ``fused_decode_enabled() and cuda``, so CUDA runs the fused gated
+    kernel and CPU runs :meth:`WindowedCache._materialize`. The materialize path
+    is kept for exactly that — it is the CPU oracle 13 test files check the
+    kernel against, and without it nothing here is verifiable off a GPU. It is
+    not reachable as a production alternative.
+
+    The varlen case (a padding ``attention_mask`` reaching
+    ``_flash_attention_forward``) is the one thing that used to justify the
+    switch. It still cannot be served fused, and it still fails loudly —
+    :class:`~modules.windowed_cache.flash_decode.FusedDecodeNotReached` — rather
+    than silently routing to different code. Use equal-length prompts.
     """
-    v = os.environ.get("STICKYKV_FUSED_DECODE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return True
 
 
 # ---------------------------------------------------------------------------
