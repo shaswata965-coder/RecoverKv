@@ -223,6 +223,26 @@ def main() -> None:
     else:
         print("  -> MIXED. Both terms are real; fix the larger one first.")
 
+    # Which method was actually profiled. The fused kernel running does not mean
+    # the read gate ran: a store with no sketch cards reads the whole tier,
+    # correctly, and looks identical in every number above.
+    try:
+        from modules.windowed_cache import flash_decode
+        st = flash_decode.stats()
+        if st["armed"] or st["fired"]:
+            rf = st["read_fraction"]
+            print(f"\n  path        armed={st['armed']} fired={st['fired']} "
+                  f"gated={st['gated']}"
+                  + (f"  read_fraction={rf:.3f}" if rf is not None else ""))
+            if st["fired"] and not st["gated"]:
+                print("  -> the gate NEVER RAN: this profile is the ungated "
+                      "tier (no sketch cards, or quant_gate_ratio >= 1.0).")
+            elif st["gated"] and st["gated"] != st["fired"]:
+                print(f"  -> the gate ran on only {st['gated']}/{st['fired']} "
+                      "fused steps; the rest read the whole tier.")
+    except Exception:  # pragma: no cover - diagnostics must never fail a run
+        pass
+
     if syncs:
         print("\n  host stalls (each drains the queue and exposes downstream "
               "launch cost):")
