@@ -67,12 +67,16 @@ class QuantizedStore:
         num_kv_heads: int,
         n_slots: int,
         memoize_read: bool = True,
+        store_digest: bool = False,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
         self.memoize_read = memoize_read
+        # Whether slots carry a post-RoPE AABB for the decode gate
+        # (DIGEST_GATED_DECODE_PLAN.md §3.1). Off => nothing is allocated.
+        self.store_digest = store_digest
 
         # Allocated on first use: the row count and device are not known until
         # the first forward pass reaches the cache.
@@ -105,6 +109,7 @@ class QuantizedStore:
                 head_dim=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
                 device=device,
+                store_digest=self.store_digest,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -138,8 +143,10 @@ class QuantizedStore:
                     f"join_layers: layer {i} has {s._n_active} active Q windows, "
                     f"layer 0 has {ref._n_active} — layers must stay in lockstep"
                 )
-            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots) != (
-                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots):
+            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots,
+                    s.store_digest) != (
+                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots,
+                    ref.store_digest):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s store geometry differs from layer 0's"
                 )
@@ -157,6 +164,7 @@ class QuantizedStore:
             num_kv_heads=ref.num_kv_heads,
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
+            store_digest=ref.store_digest,
         )
         if ref.table is not None:
             joint.table = QuantSlotTable.join_layers([s.table for s in stores])
@@ -225,6 +233,7 @@ class QuantizedStore:
         keys_pre_rope: Tensor,
         values: Tensor,
         position_ranges: Tensor,
+        key_digest: Tuple[Tensor, Tensor] = None,
     ) -> None:
         """First-time demotion of up to ``n`` windows per row, in one quantize.
 
@@ -240,6 +249,11 @@ class QuantizedStore:
         wid : ``[B, n]`` int64 window ids (``-1`` on invalid lanes).
         keys_pre_rope, values : ``[B, n, H_kv, window, D]``.
         position_ranges : ``[B, n, window]`` int64 original absolute positions.
+        key_digest : ``(lo, hi)``, each ``[B, n, H_kv, D]``, optional
+            The window's **post-RoPE** AABB — built by the caller from the same
+            keys it passes here *before* it un-rotates them, because a bound in
+            the pre-RoPE frame bounds nothing about post-RoPE dot products.
+            Required exactly when the slot table stores digests.
         """
         self._invalidate()
         B, n = slot_idx.shape
@@ -253,11 +267,13 @@ class QuantizedStore:
         k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
         v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
 
+        lo, hi = key_digest if key_digest is not None else (None, None)
         self.table.write(
             slot_idx, valid, wid,
             k_codes, k_scale, k_zero,
             v_codes, v_scale, v_zero,
             position_ranges.to(torch.long),
+            k_digest_lo=lo, k_digest_hi=hi,
         )
 
     # -- promotion -----------------------------------------------------------
@@ -282,7 +298,7 @@ class QuantizedStore:
         B, n = slot_idx.shape
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
-        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(slot_idx)
+        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos, _, _ = self.table.gather(slot_idx)
         keys = dequantize_key_windows(
             k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
         )
@@ -345,7 +361,7 @@ class QuantizedStore:
         B, n = idx.shape
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
-        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(idx)
+        k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos, _, _ = self.table.gather(idx)
 
         # Keys: dequant + RoPE fused into one (optionally compiled) kernel — the
         # ~20-launch elementwise chain that dominates the per-step read path

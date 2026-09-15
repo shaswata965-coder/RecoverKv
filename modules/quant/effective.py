@@ -292,6 +292,24 @@ def compute_score_meta(
     return order, q_pos_flat.shape[1]
 
 
+def invert_order(order: Tensor) -> Tensor:
+    """``inv[b, p] = j`` such that ``order[b, j] == p`` — merged slot of a column.
+
+    ``order`` answers "which physical column belongs at merged position j"; the
+    digest gate needs the converse, "where does physical column p land", because
+    it scatters the columns the kernel emitted rather than gathering a full row.
+    Depends only on ``order``, so it is memoized on the same window epoch and
+    costs nothing per step.
+    """
+    inv = torch.empty_like(order)
+    inv.scatter_(
+        1, order,
+        torch.arange(order.shape[1], device=order.device)
+        .unsqueeze(0).expand_as(order),
+    )
+    return inv
+
+
 def materialize_effective_kv(
     fp_keys: Tensor,
     fp_values: Tensor,

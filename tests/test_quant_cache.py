@@ -240,7 +240,7 @@ def test_fused_ctx_dequant_matches_effective_q_tier():
 
     # Mirror cache.update()'s fused-branch gather (raw int2, no dequant).
     idx = store.table.active_order(n)
-    kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)      # flat [B*n, ...]
+    kc, ks, kz, vc, vs, vz, qpos, _, _ = store.table.gather(idx)      # flat [B*n, ...]
     qpos_flat = qpos.reshape(B, n * ws)
     cos_h, sin_h = rope_cos_sin_halves(cache.rope_module, qpos_flat)  # [B, n*ws, half]
 
@@ -862,7 +862,7 @@ def _fresh_fused_ctx(cache, layer_idx=0):
     B = state.key_states.shape[0]
     ws = cache.resolved.window_size
     idx = store.table.active_order(n)
-    kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
+    kc, ks, kz, vc, vs, vz, qpos, _, _ = store.table.gather(idx)
     qtier = {
         "k_codes": kc.reshape(B, n, *kc.shape[1:]),
         "k_scale": ks.reshape(B, n, *ks.shape[1:]),

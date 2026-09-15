@@ -18,6 +18,19 @@ Layout (one layer, ``B`` rows, ``N`` slots)::
     slot_active [B, N]                  bool    active vs dormant (§10)
     slot_pos    [B, N, ws]              int64   frozen original positions
 
+Optionally (``store_digest``, DIGEST_GATED_DECODE_PLAN.md §3.1)::
+
+    key_digest_lo [B, N, H_kv, D]       fp16    post-RoPE AABB, low corner
+    key_digest_hi [B, N, H_kv, D]       fp16    post-RoPE AABB, high corner
+
+The digest summarizes the same window the codes encode, but in the **post-RoPE**
+frame the codes are deliberately *not* in (``key_codes`` is un-rotated at
+demotion and re-rotated at read time against a frozen ``position_range``). It is
+a selector, never a substitute: the corners are not real keys and must never
+enter an attention computation. Allocated only when asked for, because at
+``H_kv=8, D=128`` it is 4 KB per slot per layer of resident GPU memory that
+``cache_budget`` does not account for.
+
 **Slots are addressed by rank, not by window id.** A window id is unbounded
 (generation keeps minting them) so it cannot index a fixed table; instead every
 lookup resolves a window id to a slot through a ``[B, W, N]`` equality match.
@@ -87,6 +100,7 @@ class QuantSlotTable:
         head_dim: int,
         num_kv_heads: int,
         device: torch.device,
+        store_digest: bool = False,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -104,6 +118,19 @@ class QuantSlotTable:
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)
+
+        # Post-RoPE AABB per slot, or None when the digest gate is off — in which
+        # case nothing here is allocated and the table is byte-for-byte what it
+        # was before the feature existed.
+        self.store_digest = store_digest
+        self.key_digest_lo = (
+            torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
+            if store_digest else None
+        )
+        self.key_digest_hi = (
+            torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
+            if store_digest else None
+        )
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
         # ws//2] index tensor would allocate an int64 index the size of the codes
@@ -134,8 +161,9 @@ class QuantSlotTable:
         ref = tables[0]
         for i, t in enumerate(tables):
             if (t.n_slots, t.window_size, t.head_dim, t.num_kv_heads,
-                    t.batch_size) != (ref.n_slots, ref.window_size, ref.head_dim,
-                                      ref.num_kv_heads, ref.batch_size):
+                    t.batch_size, t.store_digest) != (
+                        ref.n_slots, ref.window_size, ref.head_dim,
+                        ref.num_kv_heads, ref.batch_size, ref.store_digest):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s slot table geometry differs from "
                     "layer 0's; every layer resolves the same config, so this "
@@ -147,9 +175,15 @@ class QuantSlotTable:
         joint.window_size = ref.window_size
         joint.head_dim = ref.head_dim
         joint.num_kv_heads = ref.num_kv_heads
-        for field in ("key_codes", "key_scale", "key_zero",
-                      "val_codes", "val_scale", "val_zero",
-                      "slot_wid", "slot_active", "slot_pos"):
+        joint.store_digest = ref.store_digest
+        fields = ["key_codes", "key_scale", "key_zero",
+                  "val_codes", "val_scale", "val_zero",
+                  "slot_wid", "slot_active", "slot_pos"]
+        if ref.store_digest:
+            fields += ["key_digest_lo", "key_digest_hi"]
+        else:
+            joint.key_digest_lo = joint.key_digest_hi = None
+        for field in fields:
             setattr(joint, field, torch.cat(
                 [getattr(t, field) for t in tables], dim=0
             ).contiguous())
@@ -219,6 +253,8 @@ class QuantSlotTable:
         v_scale: Tensor,
         v_zero: Tensor,
         pos: Tensor,
+        k_digest_lo: Tensor = None,
+        k_digest_hi: Tensor = None,
     ) -> None:
         """Write ``n`` fresh entries per row, masked by ``valid``.
 
@@ -240,7 +276,28 @@ class QuantSlotTable:
         wid : ``[B, n]`` int64 — window ids (``-1`` on invalid lanes).
         k_codes .. v_zero : ``[B, n, ...]`` quantized fields.
         pos : ``[B, n, ws]`` int64 frozen positions.
+        k_digest_lo, k_digest_hi : ``[B, n, H_kv, D]`` post-RoPE AABB corners.
+            Required when the table stores digests, rejected when it does not —
+            silently dropping them would leave the gate ranking against zeros.
+
+        The digest is written here and nowhere else, which is what makes it
+        write-once in the same sense as the record (design §10). Reactivation
+        flips a bit (:meth:`set_active`) and never reaches this method, so a
+        window that cycles Q -> fp -> Q keeps the digest built from its original
+        post-RoPE keys — the only keys it has ever had, since its positions are
+        frozen.
         """
+        if self.store_digest and (k_digest_lo is None or k_digest_hi is None):
+            raise ValueError(
+                "this slot table stores digests (store_digest=True) but write() "
+                "was called without k_digest_lo/k_digest_hi; the gate would then "
+                "rank this window against an all-zero box"
+            )
+        if not self.store_digest and (k_digest_lo is not None or k_digest_hi is not None):
+            raise ValueError(
+                "write() got a digest but this slot table has no digest storage "
+                "(store_digest=False); it would be dropped silently"
+            )
         fi = self._flat(slot_idx)
         v = valid.reshape(-1)
 
@@ -259,6 +316,9 @@ class QuantSlotTable:
         put(self.slot_pos, pos)
         put(self.slot_wid, wid)
         put(self.slot_active, torch.ones_like(valid))
+        if self.store_digest:
+            put(self.key_digest_lo, k_digest_lo)
+            put(self.key_digest_hi, k_digest_hi)
 
     def set_active(self, slot_idx: Tensor, valid: Tensor, value: bool) -> None:
         """Flip ``slot_active`` on the given slots where ``valid`` (§10).
@@ -283,6 +343,11 @@ class QuantSlotTable:
         consume (they treat leading ``N`` as opaque and reduce only over the
         quant-group axis), so the (row, slot) pair rides through them untouched
         and the numerics are identical to the per-window singular form.
+
+        Returns ``(k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos,
+        digest_lo, digest_hi)``. The last two are ``None`` unless the table
+        stores digests — they are always present in the tuple so a caller that
+        wants them cannot get them by accident from a table that has none.
         """
         fi = self._flat(slot_idx)
 
@@ -294,6 +359,8 @@ class QuantSlotTable:
             take(self.key_codes), take(self.key_scale), take(self.key_zero),
             take(self.val_codes), take(self.val_scale), take(self.val_zero),
             take(self.slot_pos),
+            take(self.key_digest_lo) if self.store_digest else None,
+            take(self.key_digest_hi) if self.store_digest else None,
         )
 
     def active_order(self, n_active: int) -> Tensor:
