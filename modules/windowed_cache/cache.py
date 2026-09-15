@@ -48,7 +48,8 @@ from modules.quant import (
     materialize_effective_kv,
     unrotate_key_window,
 )
-from modules.quant.effective import rotate_key_window
+from modules.quant.effective import invert_order, rotate_key_window
+from modules.quant.digest import build_aabb, prepare_aabb
 from modules.quant.slots import QuantSlotTable, n_slots_for
 
 
@@ -252,9 +253,15 @@ class _ReadOnlySlotTableView(QuantSlotTable):
         self.window_size = parent.window_size
         self.head_dim = parent.head_dim
         self.num_kv_heads = parent.num_kv_heads
-        for field in ("key_codes", "key_scale", "key_zero",
-                      "val_codes", "val_scale", "val_zero",
-                      "slot_wid", "slot_active", "slot_pos"):
+        self.store_digest = parent.store_digest
+        fields = ["key_codes", "key_scale", "key_zero",
+                  "val_codes", "val_scale", "val_zero",
+                  "slot_wid", "slot_active", "slot_pos"]
+        if parent.store_digest:
+            fields += ["key_digest_lo", "key_digest_hi"]
+        else:
+            self.key_digest_lo = self.key_digest_hi = None
+        for field in fields:
             setattr(self, field, getattr(parent, field)[r0:r0 + rows])
         self._row_base = (
             torch.arange(rows, device=parent.slot_wid.device) * parent.n_slots
@@ -297,6 +304,10 @@ class _LayerStoreView:
     @property
     def version(self) -> int:
         return self._joint.version
+
+    @property
+    def store_digest(self) -> bool:
+        return self._joint.store_digest
 
     @property
     def memoize_read(self) -> bool:
@@ -539,6 +550,11 @@ class WindowedCache(_HFCacheBase):
                     # Provisional: `None` means auto, resolved from the real batch
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
+                    # Post-RoPE AABBs for the decode gate. Allocated only when
+                    # the gate is configured: they are ~4 KB/window/layer of
+                    # resident memory `cache_budget` does not count, so with the
+                    # gate off the store is exactly what it was before.
+                    store_digest=self.resolved.digest_gate_frac is not None,
                 )
                 for _ in range(num_layers)
             ]
@@ -1051,6 +1067,9 @@ class WindowedCache(_HFCacheBase):
                     "layer_idx": layer_idx,
                     "qtier": qtier,
                     "score_meta": score_meta,
+                    "inv_order": self._fused_ctx[layer_idx]["inv_order"],
+                    "q_win_ids": self._fused_ctx[layer_idx]["q_win_ids"],
+                    "epoch": store.version,
                     "num_sink": self.resolved.num_sink_tokens,
                     "window_size": ws,
                     "scaling": self._attn_scaling,
@@ -1451,6 +1470,9 @@ class WindowedCache(_HFCacheBase):
                 "layer_idx": layer_idx,
                 "qtier": qtier,
                 "score_meta": score_meta,
+                "inv_order": self._fused_ctx[layer_idx]["inv_order"],
+                "q_win_ids": self._fused_ctx[layer_idx]["q_win_ids"],
+                "epoch": store.version,
                 "num_sink": self.resolved.num_sink_tokens,
                 "window_size": ws,
                 "scaling": self._attn_scaling,
@@ -1483,24 +1505,34 @@ class WindowedCache(_HFCacheBase):
 
         L = self.num_layers
         idx = store.table.active_order(n)                       # [R, n] slots
-        kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)  # [R*n, …]
+        kc, ks, kz, vc, vs, vz, qpos, dlo, dhi = store.table.gather(idx)  # [R*n, …]
         fields = [t.reshape(L, B, n, *t.shape[1:]) for t in (kc, ks, kz, vc, vs, vz)]
+        d_lo = dlo.reshape(L, B, n, *dlo.shape[1:]) if dlo is not None else None
+        d_hi = dhi.reshape(L, B, n, *dhi.shape[1:]) if dhi is not None else None
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
         cos_h, sin_h = rope_cos_sin_halves(self.rope_module, qpos_flat)
         self._joint_qpos = qpos_flat
 
         key = (store.version, n, B)
         kc, ks, kz, vc, vs, vz = fields
+        top_k = self.resolved.digest_top_k
         for i in range(L):
             r0 = i * B
+            qtier_i = {
+                "k_codes": kc[i], "k_scale": ks[i], "k_zero": kz[i],
+                "v_codes": vc[i], "v_scale": vs[i], "v_zero": vz[i],
+                "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
+                "window_size": ws,
+            }
+            if d_lo is not None:
+                lo_t, hi_t = prepare_aabb(d_lo[i], d_hi[i])
+                qtier_i["digest_lo_t"] = lo_t
+                qtier_i["digest_hi_t"] = hi_t
+                qtier_i["digest_top_k"] = top_k
+                qtier_i["digest_gate_mode"] = self.resolved.digest_gate_mode
             self._fused_ctx[i] = {
                 "qkey": key,
-                "qtier": {
-                    "k_codes": kc[i], "k_scale": ks[i], "k_zero": kz[i],
-                    "v_codes": vc[i], "v_scale": vs[i], "v_zero": vz[i],
-                    "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
-                    "window_size": ws,
-                },
+                "qtier": qtier_i,
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
             }
@@ -1536,11 +1568,15 @@ class WindowedCache(_HFCacheBase):
         order, q_token_len = compute_score_meta(
             self._joint.position_ids, self._joint_qpos, num_sink, ws,
         )
+        inv = invert_order(order)
         for i in range(self.num_layers):
             s = self._fused_ctx[i]
             s["mkey"] = (s["qkey"], n_body_win)
             r0 = i * B
             s["score_meta"] = (order[r0:r0 + B], q_token_len)
+            s["inv_order"] = inv[r0:r0 + B]
+            s["q_win_ids"] = (
+                (self._joint_qpos[r0:r0 + B, ::ws].to(torch.long) - num_sink) // ws)
         return slot["score_meta"]
 
     def _joint_qtier_read(self):
@@ -1616,7 +1652,7 @@ class WindowedCache(_HFCacheBase):
         # unpacks + dequants + RoPEs in registers), plus the RoPE halves
         # (position-only) the kernel applies in registers.
         idx = store.table.active_order(n)                     # [B, n] slots
-        kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
+        kc, ks, kz, vc, vs, vz, qpos, dlo, dhi = store.table.gather(idx)
         kc = kc.reshape(B, n, *kc.shape[1:])
         ks = ks.reshape(B, n, *ks.shape[1:])
         kz = kz.reshape(B, n, *kz.shape[1:])
@@ -1630,6 +1666,17 @@ class WindowedCache(_HFCacheBase):
             "v_codes": vc, "v_scale": vs, "v_zero": vz,
             "cos": cos_h, "sin": sin_h, "window_size": ws,
         }
+        # The gate's ranking input, riding the same memo: digests are written
+        # once at demotion and the active set only moves at eviction, so they are
+        # as constant between evictions as the codes beside them. `None` when the
+        # gate is off — flash_decode reads its absence as "attend over all of it".
+        if dlo is not None:
+            lo_t, hi_t = prepare_aabb(dlo.reshape(B, n, *dlo.shape[1:]),
+                                      dhi.reshape(B, n, *dhi.shape[1:]))
+            qtier["digest_lo_t"] = lo_t
+            qtier["digest_hi_t"] = hi_t
+            qtier["digest_top_k"] = self.resolved.digest_top_k
+            qtier["digest_gate_mode"] = self.resolved.digest_gate_mode
         # A new Q tier invalidates the scatter map built against the old one.
         self._fused_ctx[layer_idx] = {
             "qkey": key, "qtier": qtier, "qpos": qpos_flat,
@@ -1666,6 +1713,14 @@ class WindowedCache(_HFCacheBase):
         )
         slot["mkey"] = key
         slot["score_meta"] = meta
+        # The gate scatters into merged space, so it needs order's inverse. Same
+        # epoch, same memo — never rebuilt per step.
+        slot["inv_order"] = invert_order(meta[0])
+        # Window IDS of the active Q tier, for selection tracing. Derived from
+        # the same frozen positions the memo already holds, so it costs nothing
+        # per step and is exact: `sel` indexes this axis.
+        slot["q_win_ids"] = (
+            (slot["qpos"][:, ::ws].to(torch.long) - num_sink) // ws)
         return meta
 
     # -----------------------------------------------------------------
@@ -1956,12 +2011,24 @@ class WindowedCache(_HFCacheBase):
             k_post = torch.gather(body_k, 2, idx_d)
             v_tok = torch.gather(body_v, 2, idx_d)
             prange = torch.gather(body_pos, 1, tok_f)
+            # The digest must be built HERE, from `k_post` — these are the keys
+            # as attention actually sees them. One line later they are un-rotated
+            # into the frame the Q tier stores, and a box around pre-RoPE keys
+            # bounds nothing about a post-RoPE q.k (RoPE turns each key by its own
+            # absolute position). Positions are frozen at demotion, so this box
+            # stays valid against every future query.
+            key_digest = None
+            if store.store_digest:
+                key_digest = build_aabb(
+                    k_post.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4)
+                )                                   # ([B,n_q,H_kv,D], same)
             k_pre_d = unrotate_key_window(k_post, prange, rope)
             store.demote_many(
                 store.table.free_slots(n_q), fresh_valid, fresh_wid,
                 k_pre_d.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
                 v_tok.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
                 prange.reshape(B, n_q, ws),
+                key_digest=key_digest,
             )
 
         # --- 4. Rebuild the fp store: [sink ‖ fp windows by id] -------------

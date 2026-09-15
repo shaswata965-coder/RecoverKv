@@ -364,16 +364,18 @@ if _HAS_TRITON:
         Q, KFP, VFP,
         KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
         VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
-        COS, SIN,                  # RoPE halves [B, n*ws, D//2]
+        COS, SIN,                  # RoPE halves [B, n_phys*ws, D//2]
+        SEL,                       # [B, n_active] int32 window ids, or dummy
         OUT, WSUM, WMAX,
         scale,
-        H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+        H_q, H_kv, n_active, n_phys, Sfp, rep, num_sink, n_body_win, W_phys,
         sqb, sqh, sqd,
         kfb, kfh, kfs, kfd,
         vfb, vfh, vfs, vfd,
         HEAD_DIM: tl.constexpr, HALF: tl.constexpr, WS: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_NW: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
+        HAS_SEL: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -388,6 +390,18 @@ if _HAS_TRITON:
         ``tests/test_window_scores.py``. **Keep the two in step**: that oracle is
         the only thing standing between this kernel and an unverified rewrite,
         because Triton cannot run on the CPU box this repo is developed on.
+
+        **The digest gate is an indirection, not a copy.** When ``HAS_SEL``, the
+        Q-tier arrays still hold all ``n_phys`` resident windows and ``SEL``
+        carries the ``n_active`` the gate admitted, so the loop reads the chosen
+        windows *in place*. Compacting them host-side instead costs eight
+        ``index_select`` copies per layer per step -- measured at +2723 kernel
+        launches and +26.7 ms of CUDA at B=8, against the ~16 ms the shorter loop
+        saves. The emitted score column stays in SELECTED space (``n_body_win +
+        w``, ``w`` the position within ``SEL``), which is the axis
+        ``flash_decode._run_fused`` scatters from. ``HAS_SEL=False`` reproduces
+        the ungated kernel exactly: ``n_active == n_phys`` and the indirection
+        compiles away.
 
         Strides for the Q-tier tensors, ``COS``/``SIN``, ``OUT``, ``WSUM`` and
         ``WMAX`` are DERIVED from shapes rather than passed (§5.2); the dispatcher
@@ -423,19 +437,19 @@ if _HAS_TRITON:
         wsb = H_q * W_phys
         wsh = W_phys
         ob = H_q * HEAD_DIM
-        kcb = n_active * H_kv * HEAD_DIM * PACK_K
+        kcb = n_phys * H_kv * HEAD_DIM * PACK_K
         kcn = H_kv * HEAD_DIM * PACK_K
         kch = HEAD_DIM * PACK_K
-        ksb = n_active * H_kv * HEAD_DIM
+        ksb = n_phys * H_kv * HEAD_DIM
         ksn = H_kv * HEAD_DIM
         ksh = HEAD_DIM
-        vcb = n_active * H_kv * WS * PACK_V
+        vcb = n_phys * H_kv * WS * PACK_V
         vcn = H_kv * WS * PACK_V
         vch = WS * PACK_V
-        vsb = n_active * H_kv * WS
+        vsb = n_phys * H_kv * WS
         vsn = H_kv * WS
         vsh = WS
-        cob = n_active * WS * HALF
+        cob = n_phys * WS * HALF
 
         # ---- 1. sink prologue: softmax only, emits no window score -----------
         # Sinks are not represented in window scores (the scorer strips them
@@ -493,8 +507,14 @@ if _HAS_TRITON:
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
         for w0 in range(0, n_active, BLOCK_NW):
-            widx = w0 + t_win                                # [BLOCK_T] window ids
-            qmask = in_tile & (widx < n_active)
+            wsel = w0 + t_win                                # [BLOCK_T] SELECTED ids
+            qmask = in_tile & (wsel < n_active)
+            # Resolve selected -> physical. Every Q-tier load below addresses the
+            # FULL resident axis through `widx`; only the score column uses `wsel`.
+            if HAS_SEL:
+                widx = tl.load(SEL + b * n_active + wsel, mask=qmask, other=0)
+            else:
+                widx = wsel
             ks_lo = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
                             + offs_hl[:, None],
                             mask=qmask[None, :], other=0.0).to(tl.float32)
@@ -539,7 +559,7 @@ if _HAS_TRITON:
             l = l * corr + tl.sum(p, axis=1)
             m = m_new
             for j in tl.static_range(BLOCK_NW):
-                w = w0 + j
+                w = w0 + j                                   # SELECTED index
                 sel = (t_win == j) & qmask
                 pj = tl.sum(tl.where(sel[None, :], p, 0.0), axis=1)
                 keep = r_mask & (w < n_active)
@@ -664,10 +684,15 @@ def _decode_triton(
     half = D // 2
 
     if qtier is not None:
-        n_active = int(qtier["k_codes"].shape[1])
+        # n_phys = windows RESIDENT in the code arrays; n_active = windows the
+        # gate admitted this step. Without a gate they are the same number and
+        # the kernel's indirection compiles away.
+        n_phys = int(qtier["k_codes"].shape[1])
+        sel = qtier.get("sel")
+        n_active = n_phys if sel is None else int(sel.shape[1])
         ws = int(qtier["window_size"])
     else:
-        n_active, ws = 0, 4  # WS is a constexpr; the Q loop runs 0 times
+        n_phys, n_active, ws, sel = 0, 0, 4, None  # WS constexpr; Q loop runs 0x
 
     body = max(Sfp - num_sink, 0)
     if n_body_win is None:
@@ -702,6 +727,23 @@ def _decode_triton(
         VC, VS, VZ = qtier["v_codes"], qtier["v_scale"], qtier["v_zero"]
         COS, SIN = qtier["cos"], qtier["sin"]
 
+    # SEL must be int32 and contiguous: the kernel indexes it with a raw pointer
+    # offset, so a wider dtype or a stride would silently read the wrong windows
+    # -- which is a WRONG-OUTPUT bug, not a crash, hence the hard check.
+    if sel is None:
+        SEL = torch.zeros(1, dtype=torch.int32, device=dev)
+    else:
+        if sel.dtype != torch.int32 or not sel.is_contiguous():
+            raise RuntimeError(
+                f"fused decode requires a contiguous int32 `sel`; got "
+                f"{sel.dtype} strides {tuple(sel.stride())}. The kernel offsets a "
+                "raw pointer by it, so a mismatch reads the wrong windows silently."
+            )
+        if sel.shape[0] != B:
+            raise RuntimeError(
+                f"`sel` has {sel.shape[0]} rows but the batch is {B}")
+        SEL = sel
+
     # §5.2 passes shapes instead of strides for these, so contiguity stops being
     # an assumption and becomes a checked contract. It holds by construction --
     # they come from `QuantSlotTable.gather` (a fresh index_select) reshaped, and
@@ -735,7 +777,7 @@ def _decode_triton(
     # the pipeline depth differ -- and the winner is cached per geometry so the
     # search runs once. If no rung fits, it raises with the whole ladder, because
     # a decode kernel that cannot launch must fail loudly (invariant 3).
-    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0))
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), sel is not None)
     rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
     last: Optional[BaseException] = None
     for target_keys, num_stages in rungs:
@@ -743,9 +785,10 @@ def _decode_triton(
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
         try:
             _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
+                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL,
+                out, wsum, wmax,
                 scaling,
-                H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+                H_q, H_kv, n_active, n_phys, Sfp, rep, num_sink, n_body_win, W_phys,
                 q.stride(0), q.stride(1), q.stride(2),
                 k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
                 v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
@@ -753,6 +796,7 @@ def _decode_triton(
                 BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
                 BLOCK_W=BLOCK_W,
                 PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+                HAS_SEL=sel is not None,
                 num_stages=num_stages,
             )
         except BaseException as exc:                     # noqa: BLE001

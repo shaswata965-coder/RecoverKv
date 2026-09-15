@@ -63,6 +63,29 @@ class ResolvedConfig:
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
+    # None → the digest gate is off entirely (no digest storage, no scoring, no
+    # gating; decode is bit-identical AND memory-identical to a build without
+    # it). See WindowedCacheConfig.digest_gate_frac.
+    digest_gate_frac: Optional[float] = None
+    # Which of the gate's two effects is active. See
+    # WindowedCacheConfig.digest_gate_mode.
+    digest_gate_mode: str = "both"
+
+    @property
+    def digest_top_k(self) -> Optional[int]:
+        """Q windows the decode gate admits per step, or ``None`` when off.
+
+        A fraction of ``N_q`` rather than an absolute count so the gate scales
+        with the budget: the same config at a bigger ``cache_budget`` retains
+        more Q windows and admits proportionally more of them. Rounded up and
+        clamped to ``[1, N_q]`` — a gate that admits zero windows would drop the
+        entire Q tier, which is an eviction policy, not a gate.
+        """
+        if self.digest_gate_frac is None or self.N_q <= 0:
+            return None
+        # ceil, with a float-noise guard so frac=1.0 lands on exactly N_q.
+        k = math.ceil(self.N_q * self.digest_gate_frac - 1e-9)
+        return max(1, min(self.N_q, k))
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -253,6 +276,48 @@ class WindowedCacheConfig:
     # first-eviction drop count so that case is visible rather than implied.
     quant_budget_mode: str = "bytes"
     quant_memoize_read: Optional[bool] = None
+    # Digest-gated decode (DIGEST_GATED_DECODE_PLAN.md). None = off: no AABB
+    # digests are allocated or computed and the fused decode attends over every
+    # active Q window, exactly as before. A float in (0, 1] turns the feature on
+    # and admits that fraction of `N_q` windows per decode step, chosen by an
+    # upper bound on q.k from each window's post-RoPE AABB.
+    #
+    # Two costs this knob does NOT show. (1) Memory: a per-window fp16 AABB is
+    # 2*H_kv*D*2 bytes = 4 KB at H_kv=8, D=128, resident for every slot of every
+    # layer and NOT counted by `cache_budget` — state it separately in any memory
+    # claim. (2) Accuracy: the bound is per-key, so it proves no INDIVIDUAL key
+    # in a skipped window scored high, but softmax normalizes over all keys, so
+    # dropping many individually-low windows still removes mass from the
+    # denominator and inflates every retained weight. This is approximate
+    # attention with measurable error; frac=1.0 admits everything and is the
+    # identity control that separates plumbing bugs from selection error.
+    #
+    # Fused decode path only. `materialize_effective_kv` (eager backend, CPU
+    # tests) stays ungated deliberately, so with this on the two backends compute
+    # different attention and legitimately diverge — an A/B must be flash vs
+    # flash, never flash-gated vs eager-ungated.
+    digest_gate_frac: Optional[float] = None
+    # DIAGNOSTIC (plan §4.1). The gate has TWO effects, and a quality delta
+    # cannot be attributed to the method without separating them:
+    #
+    #   1. ATTENTION — the step attends over k windows instead of N_q, so the
+    #      output is approximate.
+    #   2. EVICTION  — a skipped window accumulates no score that step, so the
+    #      relative ranking `compute_two_tier_retain` reads shifts and a
+    #      DIFFERENT SET OF WINDOWS SURVIVES. The gate is then partly an eviction
+    #      policy, and `k` is not merely a speed/accuracy dial.
+    #
+    #   "both"      — production: both effects, what a real run does.
+    #   "attention" — gate the attention, but emit eviction scores from an
+    #                 UNGATED pass, so eviction sees what the gate-off run would
+    #                 have shown it. Isolates effect 1. Costs a SECOND kernel run
+    #                 per layer per step — a diagnostic, never a production mode.
+    #   "eviction"  — attend UNGATED (exact output), but zero the skipped
+    #                 windows' score columns. Isolates effect 2. One kernel run.
+    #
+    # Run all three at one k against the gate-off baseline and the deltas
+    # decompose. Inert unless digest_gate_frac is set.
+    digest_gate_mode: str = "both"
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -365,6 +430,40 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_memoize_read must be None (auto) or bool, got "
                 f"{type(self.quant_memoize_read).__name__}"
+            )
+
+        # -- digest_gate_frac --
+        if self.digest_gate_frac is not None:
+            if isinstance(self.digest_gate_frac, bool) or not isinstance(
+                self.digest_gate_frac, (int, float)
+            ):
+                raise ValueError(
+                    f"digest_gate_frac must be None (off) or a float in (0, 1], "
+                    f"got {type(self.digest_gate_frac).__name__}"
+                )
+            if not (0.0 < float(self.digest_gate_frac) <= 1.0):
+                raise ValueError(
+                    f"digest_gate_frac must be in (0, 1] when set, got "
+                    f"{self.digest_gate_frac}"
+                )
+            if self.quant_ratio <= 0.0:
+                raise ValueError(
+                    "digest_gate_frac gates the int2 Q tier, but quant_ratio=0 "
+                    "means there is no Q tier to gate. Set quant_ratio > 0 or "
+                    "leave digest_gate_frac=None."
+                )
+
+        # -- digest_gate_mode --
+        if self.digest_gate_mode not in ("both", "attention", "eviction"):
+            raise ValueError(
+                f"digest_gate_mode must be 'both', 'attention' or 'eviction', "
+                f"got {self.digest_gate_mode!r}"
+            )
+        if self.digest_gate_mode != "both" and self.digest_gate_frac is None:
+            raise ValueError(
+                f"digest_gate_mode={self.digest_gate_mode!r} is a diagnostic that "
+                "splits the gate's two effects, but digest_gate_frac is None so "
+                "there is no gate to split."
             )
 
         # -- first_eviction_step (non-negative int; bool rejected before int) --
@@ -557,4 +656,9 @@ class WindowedCacheConfig:
             bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
             first_eviction_step=self.first_eviction_step,
+            digest_gate_frac=(
+                float(self.digest_gate_frac)
+                if self.digest_gate_frac is not None else None
+            ),
+            digest_gate_mode=self.digest_gate_mode,
         )

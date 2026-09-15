@@ -37,6 +37,8 @@ from typing import Any, Optional
 
 import torch
 
+from .digest_kernel import digest_select
+
 from .decode_kernel import fused_two_tier_decode
 
 
@@ -135,6 +137,133 @@ def _flash_utils_module():
         return None
 
 
+
+# ---------------------------------------------------------------------------
+# Digest gate (DIGEST_GATED_DECODE_PLAN.md §3.2, §3.3)
+# ---------------------------------------------------------------------------
+
+
+def _gate_qtier(qtier: dict, q_hd: torch.Tensor):
+    """Pick the top-``k`` Q windows by digest bound. Returns ``(qtier, sel)``.
+
+    ``sel`` is ``[B, k]`` int32, ascending, indexing the **resident** window axis
+    — or ``None`` when no gating happened (gate off, or ``k`` covers everything,
+    in which case the untouched ``qtier`` is handed on so the step stays
+    bit-identical to an ungated one rather than merely equal).
+
+    **This selects; it does not gather.** ``sel`` rides into the kernel, which
+    reads the chosen windows in place. The obvious alternative — compacting the
+    six code fields plus cos/sin host-side so "the kernel needs no changes" — was
+    implemented first and measured: eight ``index_select`` copies per layer per
+    step, +2723 kernel launches and +26.7 ms of CUDA at B=8, against the ~16 ms
+    the shorter kernel loop saves. Selection has to be an indirection, not a copy,
+    or the gate costs more than it recovers.
+    """
+    lo_t = qtier.get("digest_lo_t")
+    if lo_t is None:
+        return qtier, None
+    k = qtier.get("digest_top_k")
+    B, n = lo_t.shape[0], lo_t.shape[-1]
+    if k is None or k >= n:
+        return qtier, None
+
+    # One Triton launch for the bound AND the max-over-heads reduction, instead
+    # of ~20 host ops. See modules/windowed_cache/digest_kernel.py for why the
+    # selection lives here rather than inside the decode kernel.
+    #
+    # NOT sorted. Sorting `sel` ascending kept the selected axis chronological —
+    # cosmetic, and expensive: CUDA `sort` is a multi-kernel radix pass, and at 32
+    # layers x every decode step it was a measurable slice of the launches this
+    # path costs. Nothing needs the order: the kernel resolves each column through
+    # `sel` (pinned by tests/test_digest_gate_kernel.py, which includes an
+    # UNSORTED case), and `_run_fused`'s scatter map is built from `sel` itself.
+    sel = digest_select(q_hd, lo_t, qtier["digest_hi_t"], k)
+
+    gated = dict(qtier)
+    gated["sel"] = sel
+    return gated, sel
+
+
+
+# ---------------------------------------------------------------------------
+# Selection tracing — answers "how many DISTINCT windows matter over a run?"
+# ---------------------------------------------------------------------------
+#
+# The gate proves ~75% of the Q tier is unread on any GIVEN step. That is not the
+# same as 75% being unnecessary: if each step wants a different 110 of 439, every
+# window is still needed and nothing can be dropped. If the UNION over a
+# generation is small, the tier is genuinely oversized and `N_q` could shrink —
+# a real memory saving that needs no recall path (plan §1.3 forbids one).
+#
+# Keyed by (eviction epoch, layer), because eviction changes which windows are
+# resident: a union taken across epochs would grow for a trivial reason. Within an
+# epoch the resident set is frozen (design §10), so union / resident is meaningful.
+#
+# Off unless STICKYKV_DIGEST_TRACE is set, so production pays nothing.
+
+_TRACE: dict = {"on": False, "epochs": {}}
+
+
+def trace_enabled() -> bool:
+    import os
+    return bool(os.environ.get("STICKYKV_DIGEST_TRACE"))
+
+
+def trace_reset() -> None:
+    _TRACE["on"] = trace_enabled()
+    _TRACE["epochs"] = {}
+
+
+def _trace_selection(epoch, layer_idx, sel, q_win_ids) -> None:
+    """Record which WINDOW IDS this step admitted. Window ids are stable; the
+    positions in `sel` are not (they index the active axis, which is rebuilt at
+    every eviction), so recording raw `sel` across epochs would be meaningless."""
+    if not _TRACE["on"]:
+        return
+    # One sync per layer per step. Tracing runs are never timed — the whole point
+    # is to read the selection, which lives on device.
+    wids = torch.gather(q_win_ids, 1, sel.long()).flatten().tolist()
+    key = (int(epoch), int(layer_idx))
+    rec = _TRACE["epochs"].get(key)
+    if rec is None:
+        rec = {"selected": set(), "resident": int(q_win_ids.shape[1]),
+               "rows": int(q_win_ids.shape[0]), "steps": 0, "k": int(sel.shape[1])}
+        _TRACE["epochs"][key] = rec
+    rec["selected"].update(wids)
+    rec["steps"] += 1
+
+
+def trace_summary() -> dict:
+    """Per-epoch union sizes plus an aggregate. `union_frac` is the number to read.
+
+    ``union_frac = 1.0`` means every resident window was wanted by some step, so
+    none could have been dropped. A small value means the tier is oversized.
+    """
+    rows = []
+    for (epoch, layer), rec in sorted(_TRACE["epochs"].items()):
+        if rec["steps"] < 2:
+            continue          # a 1-step epoch cannot show reuse; union == k by construction
+        resident_total = rec["resident"] * rec["rows"]
+        rows.append({
+            "epoch": epoch, "layer": layer, "steps": rec["steps"],
+            "k_per_step": rec["k"], "resident": rec["resident"],
+            "union": len(rec["selected"]),
+            "union_frac": len(rec["selected"]) / max(rec["resident"], 1),
+            "k_frac": rec["k"] / max(rec["resident"], 1),
+        })
+    agg = {}
+    if rows:
+        agg = {
+            "n_epoch_layer": len(rows),
+            "mean_steps_per_epoch": sum(r["steps"] for r in rows) / len(rows),
+            "mean_k_frac": sum(r["k_frac"] for r in rows) / len(rows),
+            "mean_union_frac": sum(r["union_frac"] for r in rows) / len(rows),
+            "max_union_frac": max(r["union_frac"] for r in rows),
+            "min_union_frac": min(r["union_frac"] for r in rows),
+        }
+    return {"rows": rows, "aggregate": agg}
+
+
 def _run_fused(ctx: dict, q_flash: torch.Tensor,
                k_flash: torch.Tensor, v_flash: torch.Tensor) -> torch.Tensor:
     """Compute the fused decode output + score for one layer. Returns flash layout.
@@ -155,24 +284,102 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     # usually partial and still owns a column).
     n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
 
-    out, wsum = fused_two_tier_decode(
-        q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win
-    )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+    qtier = ctx["qtier"]
+    n_active = qtier["k_codes"].shape[1] if qtier is not None else 0
+    # §3.3: only the Q half of the window axis is gated. The `n_body_win` fp
+    # columns carry the sinks and the local window and are never touched — the
+    # kernel-level statement of §0.1.
+    if qtier is not None:
+        qtier, sel = _gate_qtier(qtier, q_hd)
+    else:
+        sel = None
+
+    # §4.1 decomposition. "both" is production: one gated run, its scores feed
+    # eviction, and the two effects are entangled — which is precisely why a
+    # quality delta measured under it cannot be attributed to either.
+    mode = ctx["qtier"].get("digest_gate_mode", "both") if sel is not None else "both"
+    if mode == "attention" and sel is not None:
+        # Gated OUTPUT, ungated SCORES: eviction sees exactly what it would have
+        # seen with the gate off, so any quality delta is the approximation in
+        # attention alone. Two kernel runs per layer per step — diagnostic only.
+        out, _ = fused_two_tier_decode(
+            q_hd, k_fp, v_fp, qtier, ctx["scaling"], num_sink, n_body_win)
+        _, wsum = fused_two_tier_decode(
+            q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win)
+        sel = None                        # scores are full-width; scatter normally
+    elif mode == "eviction" and sel is not None:
+        # Ungated OUTPUT (bit-identical to gate-off attention), gated SCORES: the
+        # quality delta is then entirely the changed eviction ranking.
+        out, wsum = fused_two_tier_decode(
+            q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win)
+    else:
+        out, wsum = fused_two_tier_decode(
+            q_hd, k_fp, v_fp, qtier, ctx["scaling"], num_sink, n_body_win
+        )                                 # out [B,H_q,D], wsum [B,H_q,W_emit]
+    if _TRACE["on"] and sel is not None:
+        _trace_selection(ctx.get("epoch", 0), ctx["layer_idx"], sel,
+                         ctx["q_win_ids"])
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is
     # the physical -> merged-id permutation. This replaces
     # `reduce_two_tier_scores`'s pad + reshape + sum + einops-reduce + cat (and
     # the [B,H_q,S] fp32 round trip that fed them) with one gather.
-    if order.shape[1] != wsum.shape[-1]:
+    #
+    # `order` always spans the FULL physical axis (every body window plus every
+    # active Q window), because `window_scores` must stay full-width: a gated-out
+    # window still owns a column in the running score, it just contributes
+    # nothing to it this step. Gating shortens what the KERNEL emits, not what the
+    # scorer is indexed by, so the two widths are checked separately.
+    n_phys = n_body_win + n_active
+    if order.shape[1] != n_phys:
         raise RuntimeError(
-            f"score_meta permutes {order.shape[1]} windows but the kernel emitted "
-            f"{wsum.shape[-1]} (n_body_win={n_body_win}, S_fp={k_fp.shape[2]}, "
-            f"num_sink={num_sink}, ws={ws}). These are derived from the same store "
-            "and must agree; a mismatch would scatter scores onto the wrong windows."
+            f"score_meta permutes {order.shape[1]} windows but the physical axis "
+            f"is {n_phys} (n_body_win={n_body_win}, n_active={n_active}, "
+            f"S_fp={k_fp.shape[2]}, num_sink={num_sink}, ws={ws}). These are "
+            "derived from the same store and must agree; a mismatch would scatter "
+            "scores onto the wrong windows."
         )
-    idx = order.unsqueeze(1).expand(wsum.shape[0], wsum.shape[1], order.shape[1])
-    ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = torch.gather(
-        wsum, -1, idx)
+    ungated_emit = sel is None or mode == "eviction"
+    n_emit = n_phys if ungated_emit else n_body_win + sel.shape[1]
+    if wsum.shape[-1] != n_emit:
+        raise RuntimeError(
+            f"the kernel emitted {wsum.shape[-1]} windows but the gate handed it "
+            f"{n_emit} (n_body_win={n_body_win}, "
+            f"n_selected={sel.shape[1] if sel is not None else n_active})."
+        )
+
+    B, H_q = wsum.shape[0], wsum.shape[1]
+    if sel is None:
+        idx = order.unsqueeze(1).expand(B, H_q, n_phys)
+        scores = torch.gather(wsum, -1, idx)
+    elif mode == "eviction":
+        # The kernel ran ungated, so every physical column exists; the gate's
+        # effect is applied here instead, by zeroing what it would have skipped.
+        idx = order.unsqueeze(1).expand(B, H_q, n_phys)
+        gathered = torch.gather(wsum, -1, idx)
+        kept_phys = torch.zeros(B, n_phys, dtype=torch.bool, device=wsum.device)
+        kept_phys[:, :n_body_win] = True
+        kept_phys.scatter_(1, n_body_win + sel.long(), True)
+        kept = torch.gather(kept_phys, 1, order)
+        scores = gathered * kept.unsqueeze(1).to(wsum.dtype)
+    else:
+        # Scatter the emitted columns straight into merged-id space, rather than
+        # building a physical->emitted map and gathering through it. `inv_order`
+        # (merged position of each physical column) depends only on `order`,
+        # which is memoized per window epoch, so the only per-step work is
+        # indexing it by `sel`. That took this branch from ~28 launches to ~4 —
+        # the scatter map was half the gate's host cost (§12.3).
+        inv_order = ctx["inv_order"]                          # [B, n_phys]
+        merged_q = torch.gather(inv_order, 1, n_body_win + sel.long())
+        merged = torch.cat([inv_order[:, :n_body_win], merged_q], dim=1)
+        scores = torch.zeros(B, H_q, n_phys, dtype=wsum.dtype, device=wsum.device)
+        # §4.1: a skipped window keeps its column and receives nothing. Under a
+        # decay-free `+=` accumulator that IS freezing it, and §12.1.1 measured
+        # the whole effect as null at this operating point anyway.
+        scores.scatter_(-1, merged.unsqueeze(1).expand(B, H_q, merged.shape[1]), wsum)
+        ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = scores
+        return out.unsqueeze(1)
+    ctx["cache"].cache_kwargs[ctx["layer_idx"]]["window_scores"] = scores
 
     return out.unsqueeze(1)                            # [B, 1, H_q, D] (flash layout)
 
