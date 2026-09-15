@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run_perf_table.sh — reproduce the 7-column decode table
-#   shape | batch | TTFT(s) | TPOT_steady(s) | throughput(tok/s) | peak_GB | steadyKV_GB
+# run_perf_table.sh — reproduce the decode table
+#   shape | batch | TTFT(s) | TPOT_steady(s) | dec tok/s | e2e tok/s | peak_GB | steadyKV_GB
+#
+# The two throughput columns are the two claims: dec tok/s = batch/TPOT_steady
+# (steady state, excludes the step-0 prompt compaction), e2e tok/s =
+# batch*gen_len/e2e_latency (includes prefill and the prefill->decode gap). This
+# table used to print ONE column, the npz's legacy throughput_tokps, which is
+# neither -- see THROUGHPUT below.
 #
 # One method, swept over the shapes and batch sizes you give it, printed in the
 # exact format of that table. Everything is configurable: model path, output
@@ -35,6 +41,12 @@
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
+#   THROUGHPUT      which throughput column(s) to print         (default: both)
+#                     both | decode | e2e | all | legacy
+#                     legacy = the old single throughput_tokps column, for
+#                     reproducing a table printed before this change. It is
+#                     prefill-inclusive AND omits the prefill->decode gap, so it
+#                     is neither claim; do not quote it.
 #   COMPILE_EVICT   1 | 0  torch.compile the eviction step      (default: 1)
 #   LSE_STRICT      1 | 0  hard-fail on an L-reuse miss         (default: 1)
 #                   1 raises AT the miss, naming the layer and the cause.
@@ -55,6 +67,10 @@
 #
 #   # the historic byte-budget behaviour (cache grows with q), for comparison
 #   scripts/run_perf_table.sh --model /models/llama --quant-mode bytes --quant-ratio 0.70
+#
+#   # reprint an existing run's npz -- no GPU, no re-measurement. The three
+#   # rates side by side, to reconcile an old table against the corrected ones:
+#   python scripts/print_perf_table.py --npz-dir outputs/perf_table --throughput all
 # ============================================================================
 set -euo pipefail
 
@@ -102,6 +118,7 @@ RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
+THROUGHPUT="${THROUGHPUT:-both}"
 COMPILE_EVICT="${COMPILE_EVICT:-1}"
 LSE_STRICT="${LSE_STRICT:-1}"
 
@@ -124,9 +141,10 @@ while [[ $# -gt 0 ]]; do
     --warmup)               WARMUP="$2"; shift 2;;
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
+    --throughput)           THROUGHPUT="$2"; shift 2;;
     --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
     --lse-strict)           LSE_STRICT="$2"; shift 2;;
-    -h|--help)              sed -n '2,57p' "$0"; exit 0;;
+    -h|--help)              sed -n '2,73p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
 done
@@ -251,7 +269,8 @@ YAML
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
   echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
   echo "window_size: $WINDOW_SIZE  num_sink: $NUM_SINK  local_window: $LOCAL_WINDOW"
-  echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE"
+  echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE  stat: $STAT"
+  echo "throughput_columns: $THROUGHPUT"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
@@ -267,4 +286,5 @@ echo "=== decode table ==="
 python "$PROJECT_ROOT/scripts/print_perf_table.py" \
     --npz-dir "$OUT_DIR" \
     --stat "$STAT" \
+    --throughput "$THROUGHPUT" \
     --out "$OUT_DIR/table.txt"
