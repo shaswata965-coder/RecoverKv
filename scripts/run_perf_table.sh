@@ -30,6 +30,7 @@
 #                     longbench:NAME / corpus:NAME  force a loader
 #   QUANT_RATIO     two-tier int2 split q in [0,1]              (default: 0.70)
 #   QUANT_MODE      tokens | bytes  (see config.py)             (default: tokens)
+#   GATE_RATIO      read-gate selectivity; 1.0 = ungated control (default: 0.25)
 #   CACHE_BUDGET    fraction of the context kept                (default: 0.50)
 #   SHAPES          space list of prefill/decode pairs          (default: "4096/256 2048/512 1048/1048")
 #   BATCHES         space list of batch sizes                   (default: "1 32")
@@ -107,6 +108,10 @@ OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
 DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
 QUANT_MODE="${QUANT_MODE:-tokens}"
+# The read gate's selectivity. 1.0 makes _gate_ctx hand over nothing, so the
+# fused decode runs UNGATED over the whole Q tier -- the control arm for pricing
+# the gate against itself at identical budget, shape and batch.
+GATE_RATIO="${GATE_RATIO:-0.25}"
 CACHE_BUDGET="${CACHE_BUDGET:-0.50}"
 SHAPES="${SHAPES:-4096/256 2048/512 1048/1048}"
 BATCHES="${BATCHES:-1 32}"
@@ -130,6 +135,7 @@ while [[ $# -gt 0 ]]; do
     --data-source|--dataset) DATA_SOURCE="$2"; shift 2;;
     --quant-ratio)          QUANT_RATIO="$2"; shift 2;;
     --quant-mode)           QUANT_MODE="$2"; shift 2;;
+    --gate-ratio)           GATE_RATIO="$2"; shift 2;;
     --cache-budget|--budget) CACHE_BUDGET="$2"; shift 2;;
     --shapes)               SHAPES="$2"; shift 2;;
     --batches)              BATCHES="$2"; shift 2;;
@@ -225,6 +231,7 @@ window:
 cache:
   quant_ratio: ${QUANT_RATIO}
   quant_budget_mode: ${QUANT_MODE}
+  quant_gate_ratio: ${GATE_RATIO}
   first_eviction_step: 0
 
 perf:
@@ -265,6 +272,7 @@ YAML
   echo "model: $MODEL_PATH"
   echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
+  echo "quant_gate_ratio: $GATE_RATIO"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
   echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
@@ -274,6 +282,7 @@ YAML
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
+echo "read gate: $GATE_RATIO$( [ "$GATE_RATIO" = "1.0" ] && echo '  (UNGATED control arm)' )"
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
 echo "config: $CONFIG_FILE"
