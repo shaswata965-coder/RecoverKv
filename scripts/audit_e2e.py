@@ -210,6 +210,12 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         "quant_memoize_read": c.get(
             "quant_memoize_read",
             getattr(cfg.cache, "quant_memoize_read", None)),
+        "digest_gate_frac": c.get(
+            "digest_gate_frac",
+            getattr(cfg.cache, "digest_gate_frac", None)),
+        "digest_gate_mode": c.get(
+            "digest_gate_mode",
+            getattr(cfg.cache, "digest_gate_mode", "both")),
         "first_eviction_step": c.get(
             "first_eviction_step",
             getattr(cfg.cache, "first_eviction_step",
@@ -224,10 +230,20 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
     unknown = set(kw) - fields
     for name in sorted(unknown):
         default = WCC.__dataclass_fields__.get(name)
-        # The eager package genuinely does not implement quant_budget_mode, so
-        # dropping the DEFAULT is correct. Dropping a value the config actually
-        # asked for would silently run a different method.
+        # The eager package genuinely does not implement these, so dropping a
+        # field the config left at its OFF value is correct. Dropping a value the
+        # config actually asked for would silently run a different method.
+        #
+        # digest_gate_frac is the sharper case: the gate lives in the fused decode
+        # path only (DIGEST_GATED_DECODE_PLAN.md §3.4), so the eager backend
+        # cannot honour it and would quietly attend over the whole Q tier. An
+        # eager rung asked for a gate must fail, not run ungated — that ungated
+        # reference is only useful while it is labelled as one.
         if name == "quant_budget_mode" and kw[name] in ("tokens", None):
+            continue
+        if name == "digest_gate_frac" and kw[name] is None:
+            continue
+        if name == "digest_gate_mode" and kw[name] == "both":
             continue
         raise ValueError(
             f"cache package {pkg!r} has no {name!r} field, but the config sets "

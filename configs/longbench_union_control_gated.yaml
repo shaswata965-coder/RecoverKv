@@ -1,0 +1,60 @@
+# THE DECISIVE ARM: does the gate still work once the slack is gone?
+#
+# Every gated result so far (§12.1) ran on an OVER-PROVISIONED cache. The union
+# control showed N_q=439 can drop to 181 with no detectable quality loss, so
+# skipping 75% of 439 was free partly because ~250 of those windows were never
+# needed at all. That makes the +0.90 at k=110 uninterpretable as evidence for
+# the gate: it may have been exploiting slack rather than finding structure.
+#
+# This arm gates the RIGHT-SIZED cache: N_q=181 (the measured union), k=46.
+#
+#   score ~= 47.24 (the ungated control)  -> the gate finds real per-step
+#       sparsity even with no slack to exploit. THAT is the result worth having,
+#       and it would make the mechanism worth optimising.
+#   score <<  47.24  -> the gate was only ever cashing in over-provisioning.
+#       Then the honest recommendation is "size the budget correctly" and the
+#       digest machinery earns nothing.
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: /home/ee/phd/eez228470/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.126
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.49
+  digest_gate_frac: 0.25
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+     - 2wikimqa
+  include_chinese: false
+  use_e_variants: false
+  max_length: null
+  num_samples: 200
+  output_dir: outputs/longbench/union_control_gated
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

@@ -359,6 +359,8 @@ class GSM8KRunner:
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_budget_mode", "bytes")),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            digest_gate_frac=getattr(cfg.cache, "digest_gate_frac", None),
+            digest_gate_mode=getattr(cfg.cache, "digest_gate_mode", "both"),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 

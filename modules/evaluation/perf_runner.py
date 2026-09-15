@@ -1330,6 +1330,10 @@ class PerfRunner:
                       quant_ratio=quant_ratio,
                       quant_budget_mode=quant_budget_mode,
                       quant_memoize_read=memoize,
+                      digest_gate_frac=c.get("digest_gate_frac", getattr(
+                          cfg.cache, "digest_gate_frac", None)),
+                      digest_gate_mode=c.get("digest_gate_mode", getattr(
+                          cfg.cache, "digest_gate_mode", "both")),
                       first_eviction_step=first_eviction_step)
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
@@ -1939,6 +1943,8 @@ class PerfRunner:
             "cache_defaults": {
                 "quant_ratio": getattr(cfg.cache, "quant_ratio", None),
                 "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
+                "digest_gate_frac": getattr(cfg.cache, "digest_gate_frac", None),
+                "digest_gate_mode": getattr(cfg.cache, "digest_gate_mode", "both"),
                 "first_eviction_step": getattr(cfg.cache, "first_eviction_step", None),
                 "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", None),
             },

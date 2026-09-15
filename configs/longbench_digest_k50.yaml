@@ -1,0 +1,39 @@
+# Quality arm: gate on, LARGE k (50% of N_q ~= 222 windows).
+_base_: base.yaml
+run:
+  mode: longbench
+  seed: 42
+model:
+  name: /home/ee/phd/eez228470/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+  digest_gate_frac: 0.50
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+telemetry:
+  track_scores: false
+longbench:
+  datasets:
+     - 2wikimqa
+  include_chinese: false
+  use_e_variants: false
+  max_length: null
+  num_samples: 200
+  output_dir: outputs/longbench/digest_k50
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

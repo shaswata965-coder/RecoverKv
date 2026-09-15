@@ -1,0 +1,54 @@
+# StickyKV — perf cell at the DIGEST_GATED_DECODE_PLAN.md §9 operating point.
+#
+# `scripts/profile_decode.py` and `perf_runner` both read `perf.configs[0]`, and
+# every other perf config puts a `full_cache` / dynamic-backend cell there — so
+# profiling them profiles the baseline, not this method. This file exists so
+# `configs[0]` IS the method: windowed + flash_attn + flash_attention_2, at the
+# budget and quant ratio the plan quotes throughout.
+#
+#   cache_budget=0.20, quant_ratio=0.70, window_size=8,
+#   num_sink_tokens=5, local_window_size=128, flash backend
+#
+# `local_window_size` is overridden back to 128 here: eval_perf_batched.yaml
+# lowers it to 64, and it is one of the six numbers the plan names, so inheriting
+# 64 would profile an adjacent operating point and quietly invalidate the
+# comparison against every figure already on record.
+#
+# The gate itself is OFF here (no `digest_gate_frac`), because this is the
+# BEFORE arm and the §7 question — is decode weight-bound at this operating
+# point? — has to be answered with the gate off before any k is worth sweeping.
+# Add `digest_gate_frac` under `cache:` for the after arm.
+_base_: eval_perf_batched.yaml
+
+model:
+  name: /home/ee/phd/eez228470/llama-3.1-8b-instruct
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+cache:
+  # eval_perf_batched.yaml sets `tokens`, which at this budget resolves to
+  # N_q=113. The plan's operating point — and the N_q=439 that §2 quotes as "90%
+  # of what the kernel reads every step" — is `bytes`. Profiling under `tokens`
+  # measures a Q tier ~4x smaller than the one the gate is meant to cut, so the
+  # mode has to be pinned here or the latency A/B answers a different question.
+  quant_budget_mode: bytes
+
+perf:
+  configs:
+    - name: digest_b20_q70
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.70
+      requires_flash_attn: true
+  grid:
+    - { prefill_len: 7105, gen_len: 32, batch_size: 1 }
+  num_warmup_runs: 1
+  num_measurement_runs: 3
+
+telemetry:
+  output_dir: outputs/perf_digest

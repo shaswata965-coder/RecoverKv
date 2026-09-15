@@ -508,6 +508,8 @@ class LongBenchRunner:
             # time, so the auto rule (memo on at B == 1) hides it — a config
             # asking for it OFF got it ON anyway.
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            digest_gate_frac=getattr(cfg.cache, "digest_gate_frac", None),
+            digest_gate_mode=getattr(cfg.cache, "digest_gate_mode", "both"),
             # Without this the knob was inert here: LongBench fell through to
             # WindowedCacheConfig's default whatever the YAML said, while the
             # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
@@ -751,6 +753,8 @@ class LongBenchRunner:
             # What the budget RESOLVED to, not just what was asked for.
             "resolved_geometry_first_example": self._resolved_sample,
             "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),
+            "digest_gate_frac": getattr(cfg.cache, "digest_gate_frac", None),
+            "digest_gate_mode": getattr(cfg.cache, "digest_gate_mode", "both"),
             "local_window_size": lws,
             # NOTE: resolved against `max_length` (upper bound), not the
             # per-example truncated prefill; the actual policy resolves

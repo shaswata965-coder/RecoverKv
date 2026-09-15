@@ -131,6 +131,16 @@ class CacheConfig:
     # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
     # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
     quant_memoize_read: Optional[bool] = None
+    # Digest-gated decode (DIGEST_GATED_DECODE_PLAN.md). None = off: no AABB
+    # digests are allocated or computed, and the fused decode attends over every
+    # active Q window. A float in (0, 1] admits that fraction of N_q per step.
+    # Requires quant_ratio > 0 (it gates the int2 tier) and the flash backend
+    # (the gate lives in the fused decode path only, plan §3.4).
+    digest_gate_frac: Optional[float] = None
+    # DIAGNOSTIC (plan §4.1): "both" (production), "attention" or "eviction".
+    # Splits the gate's attention effect from its eviction effect so a quality
+    # delta can be attributed. Inert unless digest_gate_frac is set.
+    digest_gate_mode: str = "both"
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:

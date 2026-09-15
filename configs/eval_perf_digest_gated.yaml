@@ -1,0 +1,28 @@
+# The GATE-ON arm of the §7 latency A/B. Paired with eval_perf_digest.yaml:
+# identical in every respect except `digest_gate_frac`, so a wall-time delta
+# between the two is attributable to the gate and nothing else.
+#
+# Measured expectation (recorded so the result can be judged, not rationalised
+# afterwards): this is predicted to be a REGRESSION at B=1 and roughly a wash at
+# B=8. The profile at this operating point shows `_two_tier_decode_kernel` taking
+# 7.485 ms/step at B=1 and 7.691 ms/step at B=8 — 8x the rows for +2.8% time, so
+# the kernel is latency-bound with ~8x headroom, and shortening its window axis
+# does not shorten it proportionally. Meanwhile the gate adds ~22 launches per
+# layer per step (~700 across 32 layers) against a ~2813 baseline, in a regime
+# that is host-bound at B=1. If this arm comes back FASTER, that expectation was
+# wrong and the kernel is more input-sensitive than the profile suggests.
+_base_: eval_perf_digest.yaml
+
+perf:
+  configs:
+    - name: digest_b20_q70_gated25
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.70
+      digest_gate_frac: 0.25
+      requires_flash_attn: true
+
+telemetry:
+  output_dir: outputs/perf_digest_gated
