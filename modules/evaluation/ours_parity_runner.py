@@ -318,7 +318,9 @@ class OursParityRunner:
                 local_window_size=w.local_window_size, cache_budget=budget,
                 rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                 quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
-                first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT))
+                first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
+                **quant_gate_ratio_kwargs(
+                    WCC, getattr(cfg.cache, "quant_gate_ratio", 0.25)))
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),

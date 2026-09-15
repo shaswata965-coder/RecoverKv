@@ -478,7 +478,8 @@ class LongBenchRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
-        from utils.cache_factory import quant_budget_mode_kwargs
+        from utils.cache_factory import (quant_budget_mode_kwargs,
+                                 quant_gate_ratio_kwargs)
 
         cfg = self.config
         model = self.model
@@ -508,6 +509,9 @@ class LongBenchRunner:
             # time, so the auto rule (memo on at B == 1) hides it — a config
             # asking for it OFF got it ON anyway.
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            **quant_gate_ratio_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_gate_ratio", 0.25)),
             # Without this the knob was inert here: LongBench fell through to
             # WindowedCacheConfig's default whatever the YAML said, while the
             # GSM8K/RULER/parity/perf runners all honoured it. At the default 0

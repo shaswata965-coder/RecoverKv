@@ -338,7 +338,8 @@ class GSM8KRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache + hooks. Returns ``(cache, hooks, resolved)``."""
-        from utils.cache_factory import quant_budget_mode_kwargs
+        from utils.cache_factory import (quant_budget_mode_kwargs,
+                                 quant_gate_ratio_kwargs)
 
         cfg = self.config
         model = self.model
@@ -359,6 +360,9 @@ class GSM8KRunner:
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_budget_mode", "bytes")),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            **quant_gate_ratio_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_gate_ratio", 0.25)),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 

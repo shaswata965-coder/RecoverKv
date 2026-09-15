@@ -228,3 +228,27 @@ def validate_backend_attn_pairing(
             f"attn_implementation in {allowed!r}, but got "
             f"{attn_implementation!r}.  Fix your config."
         )
+
+
+def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
+    """``{"quant_gate_ratio": requested}``, or ``{}`` if the backend lacks it.
+
+    The read gate lives on the fused flash decode path only: the eager package
+    dequantizes every active int2 window every step and has no gate to configure.
+    So the kwarg is omitted there rather than passed and rejected.
+
+    Unlike :func:`quant_budget_mode_kwargs`, dropping it does not silently change
+    the operating point — it changes how much of the tier is *read*, not what the
+    cache *keeps*, and eager's answer ("all of it") is the same at every ratio.
+    So this omits rather than raising: an eager run is correct at any ratio, just
+    ungated, and raising would break every existing eager config for a knob that
+    could never have applied to it.
+
+    What it does prevent is the reverse failure — the flash backend quietly
+    ignoring a configured ratio because the caller forgot to thread it through,
+    which is exactly how ``quant_budget_mode`` came to be inert in three runners
+    at once (ACCURACY_RECOVERY_PLAN.md §2).
+    """
+    if "quant_gate_ratio" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"quant_gate_ratio": requested}
+    return {}

@@ -131,6 +131,13 @@ class CacheConfig:
     # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
     # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
     quant_memoize_read: Optional[bool] = None
+    # Fraction of each step's ACTIVE int2 windows the read gate dequantizes.
+    # There is no on/off knob: the gate IS the read path wherever there is a Q
+    # tier. 1.0 selects every window, which makes the gate a provable no-op and
+    # is the control arm for pricing it (scripts/run_perf_table.sh --gate-ratio).
+    # Flash backend only — the eager package has no gate and always reads the
+    # whole tier. See modules/windowed_cache/config.py.
+    quant_gate_ratio: float = 0.25
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -188,6 +195,19 @@ class CacheConfig:
             raise ConfigValidationError(
                 f"quant_ratio must be a float in [0, 1], got {self.quant_ratio!r}"
             )
+        # Mirrors WindowedCacheConfig.__post_init__ so a bad value is rejected at
+        # load, not at the first decode step inside a benchmarked run.
+        if isinstance(self.quant_gate_ratio, bool):
+            raise ConfigValidationError(
+                "quant_gate_ratio must be a float in (0, 1], got bool")
+        if isinstance(self.quant_gate_ratio, int):
+            self.quant_gate_ratio = float(self.quant_gate_ratio)
+        if (not isinstance(self.quant_gate_ratio, float)
+                or not (0.0 < self.quant_gate_ratio <= 1.0)):
+            raise ConfigValidationError(
+                "quant_gate_ratio must be a float in (0, 1], got "
+                f"{self.quant_gate_ratio!r}. 1.0 reads every window (the gate's "
+                "no-op control arm); 0 would read none and is not a gate.")
         if self.quant_budget_mode not in ("tokens", "bytes"):
             raise ConfigValidationError(
                 f"quant_budget_mode must be 'tokens' or 'bytes', got "

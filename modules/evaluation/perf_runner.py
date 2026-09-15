@@ -1275,6 +1275,7 @@ class PerfRunner:
             from utils.cache_factory import (
                 assert_transformers_version_supported,
                 get_cache_classes,
+                quant_gate_ratio_kwargs,
                 validate_backend_attn_pairing,
             )
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
@@ -1359,7 +1360,13 @@ class PerfRunner:
                       quant_ratio=quant_ratio,
                       quant_budget_mode=quant_budget_mode,
                       quant_memoize_read=memoize,
-                      first_eviction_step=first_eviction_step)
+                      first_eviction_step=first_eviction_step,
+                      # Per-config override falling back to the shared cache
+                      # setting, like every other quant knob above. Routed
+                      # through the factory: the eager package has no gate.
+                      **quant_gate_ratio_kwargs(
+                          WCC, c.get("quant_gate_ratio",
+                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))))
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():

@@ -635,3 +635,71 @@ def test_stats_distinguish_a_gated_run_from_an_ungated_one(monkeypatch):
     assert s2["gated"] == 1, "an ungated run must not count as gated"
     flash_decode.reset_stats()
     assert flash_decode.stats()["gated"] == 0
+
+
+# ---------------------------------------------------------------------------
+# H. The YAML knob must not be inert
+# ---------------------------------------------------------------------------
+
+
+def test_quant_gate_ratio_survives_the_yaml_schema():
+    """It has to exist on the LOADER's CacheConfig, not just the cache's own.
+
+    These are two different dataclasses. `quant_gate_ratio` was added to
+    `modules.windowed_cache.config.WindowedCacheConfig` and written into the
+    generated perf config, but not to `utils.config.CacheConfig` — so every run
+    died at load with "unexpected keyword argument". Verifying against the wrong
+    schema is what let that through.
+    """
+    from utils.config import CacheConfig
+
+    assert "quant_gate_ratio" in CacheConfig.__dataclass_fields__
+    assert CacheConfig(cache_budget=0.2, quant_gate_ratio=1.0).quant_gate_ratio == 1.0
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.5, 1.5, True])
+def test_a_bad_gate_ratio_is_rejected_at_load_not_at_decode(bad):
+    """Rejected while reading the config, not on the first decode step of a
+    benchmarked run that has already spent minutes on prefill."""
+    from utils.config import CacheConfig, ConfigValidationError
+
+    with pytest.raises(ConfigValidationError, match="quant_gate_ratio"):
+        CacheConfig(cache_budget=0.2, quant_gate_ratio=bad)
+
+
+def test_the_gate_ratio_reaches_the_cache_config_and_is_not_dropped():
+    """The other half: present in the schema but never threaded through.
+
+    That is precisely how `quant_budget_mode` came to be silently inert in three
+    runners at once while the YAML said otherwise (ACCURACY_RECOVERY_PLAN.md §2).
+    The flash config must receive it; a backend with no gate must not be handed
+    a kwarg it cannot take.
+    """
+    import dataclasses
+
+    from modules.windowed_cache.config import WindowedCacheConfig
+    from utils.cache_factory import quant_gate_ratio_kwargs
+
+    assert quant_gate_ratio_kwargs(WindowedCacheConfig, 1.0) == {
+        "quant_gate_ratio": 1.0}, "the flash backend must receive the ratio"
+
+    @dataclasses.dataclass
+    class _EagerLike:
+        window_size: int = 8
+
+    assert quant_gate_ratio_kwargs(_EagerLike, 0.25) == {}, (
+        "a backend without a gate must not be handed the kwarg")
+
+
+def test_every_runner_threads_the_gate_ratio_through():
+    """Source check, because the failure is an OMISSION — there is nothing to
+    assert against at runtime when a kwarg simply is not passed."""
+    import pathlib
+
+    for name in ("perf_runner", "longbench_runner", "ruler_runner",
+                 "gsm8k_runner", "ours_parity_runner"):
+        src = pathlib.Path(f"modules/evaluation/{name}.py").read_text(
+            encoding="utf-8")
+        assert "quant_gate_ratio_kwargs" in src, (
+            f"{name} builds a cache config without threading quant_gate_ratio; "
+            "the YAML knob would be inert there")
