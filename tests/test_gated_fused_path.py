@@ -597,3 +597,41 @@ def test_gate_splits_finely_at_small_batch_and_coarsely_at_large():
     bw_l = gate_window_tiles(large, nw, sm)
     assert bw_l >= bw_s, "large batch should not split more finely than small"
     assert bw_l == 64, "rows already fill the machine; keep the coarse tile"
+
+
+# ---------------------------------------------------------------------------
+# G. Proof the gate ran
+# ---------------------------------------------------------------------------
+
+
+def test_stats_distinguish_a_gated_run_from_an_ungated_one(monkeypatch):
+    """``fired`` counts the kernel; ``gated`` counts the gate. They differ.
+
+    A store with no sketch cards hands over ``gate=None``: the fused kernel still
+    runs, still produces correct output, and reads the whole tier — a silent
+    return to the unoptimised path that no other measurement distinguishes from
+    success. This is the signal that does.
+    """
+    store, k_fp, v_fp, q = _setup()
+    rope = _RoPE(D)
+    n_act = store.num_active_windows
+    n_sel = max(1, math.ceil(0.25 * n_act))
+    w = NBODY + n_act
+    order = torch.arange(w).unsqueeze(0).expand(B, w).contiguous()
+
+    flash_decode.reset_stats()
+    assert flash_decode.stats()["read_fraction"] is None, "nothing has run yet"
+
+    _drive(_ctx(store, n_sel, order), q, k_fp, v_fp, store, rope, monkeypatch)
+    s = flash_decode.stats()
+    assert s["gated"] == 1
+    assert s["read_fraction"] == pytest.approx(n_sel / n_act)
+    assert 0.2 < s["read_fraction"] < 0.3, (
+        f"a 0.25 ratio realised as {s['read_fraction']:.3f}")
+
+    _drive(_ctx(store, 0, order, gated=False), q, k_fp, v_fp, store, rope,
+           monkeypatch)
+    s2 = flash_decode.stats()
+    assert s2["gated"] == 1, "an ungated run must not count as gated"
+    flash_decode.reset_stats()
+    assert flash_decode.stats()["gated"] == 0

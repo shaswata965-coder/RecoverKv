@@ -1040,7 +1040,12 @@ class TestFusedDecodeProofOfExecution:
             flash_decode._PENDING["ctx"] = None        # wrapper consumes
             flash_decode._STATS["fired"] += 1
         flash_decode.clear()
-        assert flash_decode.stats() == {"armed": 3, "fired": 3}
+        s = flash_decode.stats()
+        assert (s["armed"], s["fired"]) == (3, 3)
+        # Driving the hand-off by hand never reaches the gate, and the gate
+        # counters must not move on the strength of the kernel having run —
+        # telling those two apart is the whole point of counting them.
+        assert s["gated"] == 0 and s["read_fraction"] is None
 
     def test_wrapper_passes_through_and_counts_only_fused_calls(self):
         from modules.windowed_cache import flash_decode

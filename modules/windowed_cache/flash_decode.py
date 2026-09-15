@@ -59,18 +59,40 @@ _PENDING: dict = {"ctx": None}
 #: Proof-of-execution counters. ``armed`` counts cache.update() hand-offs,
 #: ``fired`` counts wrapper invocations that actually ran the kernel. They must
 #: stay equal; :func:`clear` raises the moment they diverge.
-_STATS: dict = {"armed": 0, "fired": 0}
+#:
+#: ``gated`` and the two window counters are the same idea one level down. The
+#: fused kernel running does NOT mean the gate ran: a store with no sketch cards
+#: hands over ``gate=None`` and reads the whole tier, correctly and slowly, with
+#: nothing in the output to say so. Counting is Python integer arithmetic on
+#: values already in hand (``n_sel`` from the context, ``n_active`` from a tensor
+#: SHAPE), so it costs no kernel launch and no device sync — the read fraction is
+#: readable without a ``.item()`` anywhere on the decode path.
+_STATS: dict = {"armed": 0, "fired": 0, "gated": 0,
+                "windows_read": 0, "windows_active": 0}
 
 
 def stats() -> dict:
-    """``{"armed": n, "fired": m}`` — hand-offs vs. actual kernel runs."""
-    return dict(_STATS)
+    """Hand-offs vs. kernel runs vs. gate runs, plus the realised read fraction.
+
+    ``armed`` == ``fired`` says the fused decode kernel served every layer it was
+    handed. ``gated`` == ``fired`` says the read gate ran on every one of those;
+    ``gated`` of 0 against a large ``fired`` is the silent no-cards case, which
+    looks exactly like success in every other measurement.
+
+    ``read_fraction`` is the windows actually dequantized over the windows
+    available — ``quant_gate_ratio`` as realised, not as configured. It is
+    ``None`` until the gate has run at least once.
+    """
+    s = dict(_STATS)
+    s["read_fraction"] = (s["windows_read"] / s["windows_active"]
+                          if s["windows_active"] else None)
+    return s
 
 
 def reset_stats() -> None:
     """Zero the counters (per-run harnesses; tests)."""
-    _STATS["armed"] = 0
-    _STATS["fired"] = 0
+    for k in _STATS:
+        _STATS[k] = 0
 
 
 class FusedDecodeNotReached(RuntimeError):
@@ -186,6 +208,10 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     if gate is not None:
         sel, logmass = fused_gate(
             q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+        # Shapes only — no device sync, no launch. See _STATS.
+        _STATS["gated"] += 1
+        _STATS["windows_read"] += int(sel.shape[-1])
+        _STATS["windows_active"] += int(logmass.shape[-1])
 
     # 2. Attend over [sink | fp body | selected Q], scoring as it goes. The
     #    kernel also scores the windows it skipped, from `logmass` — that used to
