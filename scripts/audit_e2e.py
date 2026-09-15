@@ -210,6 +210,13 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         "quant_memoize_read": c.get(
             "quant_memoize_read",
             getattr(cfg.cache, "quant_memoize_read", None)),
+        # The read gate's selectivity. Carried for the same reason as everything
+        # else here: without it the profile silently measures the 0.25 default,
+        # so profiling the --gate-ratio 1.0 control arm would report the GATED
+        # path under the ungated arm's name.
+        "quant_gate_ratio": c.get(
+            "quant_gate_ratio",
+            getattr(cfg.cache, "quant_gate_ratio", 0.25)),
         "first_eviction_step": c.get(
             "first_eviction_step",
             getattr(cfg.cache, "first_eviction_step",
@@ -228,6 +235,15 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         # dropping the DEFAULT is correct. Dropping a value the config actually
         # asked for would silently run a different method.
         if name == "quant_budget_mode" and kw[name] in ("tokens", None):
+            continue
+        # The eager package has no gate at all -- it dequantizes every active
+        # window every step -- so this is dropped at every ratio, matching
+        # utils.cache_factory.quant_gate_ratio_kwargs. Raising instead would
+        # break every existing eager config over a knob that could never have
+        # applied to it, and unlike quant_budget_mode the drop changes how much
+        # is READ, not what is KEPT. That it happened is visible at runtime:
+        # flash_decode.stats() reports gated == 0.
+        if name == "quant_gate_ratio":
             continue
         raise ValueError(
             f"cache package {pkg!r} has no {name!r} field, but the config sets "
