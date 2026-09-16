@@ -54,11 +54,12 @@ from modules.quant.slots import QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
-# Optional torch.compile of the eviction step (STICKYKV_COMPILE_EVICT).
-# Off by default: the eager _evict_two_tier_impl is the reference path and ships
-# GPU-unvalidated compilation OFF, mirroring the decode read path's convention
-# (modules/quant/effective.py). The compiled callable is process-global and
-# built lazily on first use so a run that never evicts never pays for it.
+# torch.compile of the eviction step. The DEVICE decides (CUDA compiles, CPU does
+# not) -- see _compile_evict_enabled; STICKYKV_COMPILE_EVICT only overrides it,
+# for the compile-failure bisection. The eager _evict_two_tier_impl stays the
+# reference path, and _emulating_precision_casts is what keeps the compiled one
+# numerically equal to it. The compiled callable is process-global and built
+# lazily on first use so a run that never evicts never pays for it.
 # ---------------------------------------------------------------------------
 
 _COMPILED_EVICT_FN = None
@@ -379,6 +380,53 @@ def _clamp_index(x: Tensor, hi) -> Tensor:
     return hi - (hi - x).clamp_min(0)
 
 
+def _emulating_precision_casts(fn):
+    """Wrap ``fn`` so Inductor keeps every narrowing cast in the eviction graph.
+
+    Inductor does not emulate intermediate precision casts by default: it drops
+    an ``fp32 -> fp16 -> fp32`` round trip and keeps the wider value in a
+    register. For most code that is a free accuracy win. In the eviction it is a
+    correctness bug, because three quantisers in that graph use the round trip
+    deliberately — they fit codes to the **fp16-stored** grid so the grid the
+    codes were fit to is bit-identical to the grid every later dequant reads
+    (``quant/quantizer.py`` module docstring, design §2):
+
+    - ``_affine_quantize`` (the int2 Q tier). Measured on 2.14 CPU Inductor over
+      24 seeds: without this flag the packed codes differ from eager on 11/24
+      seeds for keys and 14/24 for values — one int2 level, on elements whose
+      pre-round quantity straddles .5 because the two grids differ by an fp16
+      ulp. With it: 0/24.
+    - ``sketch._q_sym`` and ``sketch._q_up`` (the gate cards). Worse: 24/24 seeds
+      diverge, and ``_q_up``'s ``dequant >= x`` guarantee — which is what makes
+      the gate's Cauchy–Schwarz bound an upper bound at all — is violated 115
+      times in that sample. Its ``(1 + 2**-9)`` scale nudge is sized for the fp16
+      grid; against an un-narrowed one it is sized for the wrong grid. With this
+      flag: 0 divergences, 0 violations.
+
+    The sketch half is not new — those helpers were never behind a graph break,
+    so every compiled eviction since the cards landed has been building them on
+    the wrong grid. Tracing the int2 quantiser (removing its ``@_compile_disable``)
+    is what makes the flag load-bearing for the Q tier too.
+
+    Scoped, not global: ``config.patch`` is entered per call and restores the
+    process default on exit, so nothing else the host compiles is affected.
+    Inductor keys its code cache on config, so the wrapped callable compiles once
+    and the patch is a dict swap on every later call. A no-op when the backend is
+    not Inductor (``aot_eager`` runs eager kernels, which narrow by definition).
+    """
+    try:
+        from torch._inductor import config as inductor_config
+    except Exception:  # pragma: no cover - no Inductor on this build
+        return fn
+    if not hasattr(inductor_config, "emulate_precision_casts"):
+        # Then _quant_may_be_traced() is False and the int2 quantiser keeps its
+        # graph break, so the Q tier is safe. The sketch cards are NOT — they
+        # were never behind one — and on such a build there is no knob here that
+        # would protect them. That is the pre-existing behaviour, unchanged.
+        return fn  # pragma: no cover - torch-version dependent
+    return inductor_config.patch("emulate_precision_casts", True)(fn)
+
+
 def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
@@ -386,7 +434,8 @@ def _build_compiled_evict(dynamic: bool):
     backend = _compile_evict_backend()
     if backend is not None:
         kw["backend"] = backend
-    return torch.compile(WindowedCache._evict_two_tier_impl, **kw)
+    return _emulating_precision_casts(
+        torch.compile(WindowedCache._evict_two_tier_impl, **kw))
 
 
 _EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never silently runs the eager

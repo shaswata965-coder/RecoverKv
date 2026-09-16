@@ -96,7 +96,7 @@ CUDA_VISIBLE_DEVICES=0 STICKYKV_ROPE_STORE_DTYPE=0 scripts/run_perf_table.sh   #
 |---|---|---|
 | **Stage 0 profile** | yes — read-only | **do it** |
 | **Raise the shared-memory tile rung** | yes — a launch constant | **do it if capped** |
-| Close the `_affine_quantize` graph break | yes — byte-identical, test-pinned | only if Stage 0 says so |
+| Close the `_affine_quantize` graph break | yes — **once Inductor is made to keep the fp16 grid**, see §3 | **done** |
 | Split-K over the sequence | no — reassociates the softmax | **cut** (see below) |
 | `BLOCK_R` packing | — | **cut, it is not possible** |
 | `eviction_interval` | **no — changes which tokens survive** | **cut** |
@@ -147,12 +147,61 @@ work: `cos`/`sin` are now fp16 (which already halved theirs), and staging `vv` i
 fp16 for its `tl.dot` is the next candidate. A separate `BLOCK_T` for the fp and
 Q tiers would let the memory-hungry Q tier shrink alone.
 
-### 3. Close the `_affine_quantize` graph break — only if Stage 0 says so
+### 3. Close the `_affine_quantize` graph break — done, and it was not free
 
-If `STICKYKV_COMPILE_EVICT=1` versus `=0` shows little difference, the
-`torch._dynamo.disable` on `_affine_quantize` is still splitting the compiled
-eviction. Fixing it is byte-identical and the `aot_eager` test already pins that.
-Low value, no risk, entirely optional.
+Stage 0 said so: the eviction step costs ~195 ms against a ~72 ms steady step,
+~15.4 ms/step amortized (18% of GPU time), and it lands as sixteen separate
+multi-millisecond elementwise kernels — round, clamp, div, sub, where, scatter —
+which is the signature of a graph that traced and then fused nothing. The
+`torch._dynamo.disable` was the split. The Inductor lowering bug it worked around
+(`aten.amin` behind a data-dependent gather) is fixed upstream, so the decoration
+is gone for torch >= 2.7.
+
+**This section previously said the change was "byte-identical and the `aot_eager`
+test already pins that". That was wrong, and it was wrong in the direction that
+gets a corrupted cache shipped.** `aot_eager` traces and then runs eager kernels,
+so it can never observe a codegen difference. Under Inductor there is one, and it
+is not small:
+
+Inductor does not emulate intermediate precision casts by default — it drops an
+`fp32 -> fp16 -> fp32` round trip and keeps the wider value in a register. The
+eviction contains three quantisers that take that round trip **on purpose**, to
+fit codes to the fp16-stored grid so the fit grid is bit-identical to the grid
+every later dequant reads (design §2). Measured on 2.14, CPU Inductor, 24 seeds:
+
+| | diverges from eager |
+|---|---|
+| `quantize_key_windows` | 11 / 24 seeds |
+| `quantize_value_windows` | 14 / 24 seeds |
+| `sketch._q_sym` | 24 / 24 seeds |
+| `sketch._q_up` | 24 / 24 seeds, **and 115 violations of `dequant >= x`** |
+
+That last row is the serious one, and it is **not** caused by this change — the
+sketch helpers were never behind a graph break, so every compiled eviction since
+the cards landed has built them on the elided grid. `_q_up` rounds up precisely
+so `dequant >= x` holds, which is the only reason the card's Cauchy–Schwarz score
+is an *upper* bound and therefore the only reason the read gate may skip a window
+on a low score. Its `(1 + 2**-9)` scale nudge is sized for an fp16 grid; against
+an un-narrowed one it is sized for the wrong grid.
+
+The fix is one wrapper at the single compile site
+(`cache._emulating_precision_casts`): `torch._inductor.config.patch(
+"emulate_precision_casts", True)` around the compiled eviction, entered per call
+and restored on exit, so nothing else the host compiles is affected. With it, all
+four rows above go to zero, and a 14-step / 5-eviction end-to-end run compiled
+versus eager is identical tensor for tensor — int2 codes, scales, zeros, slot
+table and all eight card fields. Without it that same run already differed
+(2 elements of `sk_t_q`) on a deliberately tiny fixture.
+
+`quantizer._quant_may_be_traced()` therefore requires *both* conditions: torch
+>= 2.7 **and** the presence of `emulate_precision_casts`. On a build with no such
+knob the graph break stays, because the alternative is silently writing a
+different cache under `torch.compile` than without it.
+
+Pinned by `tests/test_compiled_eviction_numerics.py` (4 of its 5 tests fail if
+the wrapper is reduced to the identity). The GPU-side cost of the flag is
+unmeasured; the truncations it reinstates are pointwise and fuse into the same
+kernels, so it should be instructions, not launches.
 
 ## What was cut, and why
 

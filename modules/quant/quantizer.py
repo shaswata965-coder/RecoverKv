@@ -45,22 +45,73 @@ _LEVELS = 3.0  # int2 asymmetric: codes in [0, 3]
 _CODES_PER_BYTE = 4  # int2: 4 crumbs per uint8
 
 
-# Keep the quant range-reductions OUT of any torch.compile graph wrapping the
-# eviction. In the demote path _affine_quantize's input is a DATA-DEPENDENT gather
-# (searchsorted-derived indices into the fp body), and Inductor <= 2.6 cannot
-# lower a reduction whose read index is a StarDep: it fuses gather→amin and then
-# fails to schedule it ("StarDep does not have an index on aten.amin.default",
-# target aten.amin.default over the quant-group dim -- see the compiled-eviction
-# traceback). Running the quantizer EAGER via a graph break sidesteps it entirely:
-# the gather / scatter / fp-store rebuild that dominate the eviction's ~273-launch
-# budget still compile; only the ~10-op affine quant (per demoted window) runs
-# eager, so the launch win is essentially intact. A no-op outside torch.compile,
-# and semantically identical either way. torch.compiler.disable is the stable API
-# (torch 2.1+); fall back to the private one on older builds.
-try:  # pragma: no cover - torch-version dependent
-    _compile_disable = torch.compiler.disable
-except AttributeError:  # pragma: no cover
-    _compile_disable = torch._dynamo.disable
+# Whether the quant range-reductions may be traced into a torch.compile graph.
+#
+# They used to be unconditionally excluded. In the demote path this function's
+# input is a DATA-DEPENDENT gather (searchsorted-derived indices into the fp
+# body), and Inductor <= 2.6 could not lower a reduction whose read index is a
+# StarDep: it fused gather->amin and then failed to schedule it ("StarDep does
+# not have an index on aten.amin.default"). A graph break sidestepped that.
+#
+# The break was never free, and the cost was mis-sized when it was taken. It was
+# scored as "~10 ops per demoted window, the launch win is essentially intact",
+# but a decode profile at 4096/batch-32 says otherwise: the eviction step runs
+# ~195 ms against a ~72 ms steady step, and ~15 ms/step amortized sits in exactly
+# this chain -- round, clamp, div, sub, where, scatter -- as sixteen separate
+# multi-millisecond kernels, because the break stops Inductor fusing the one part
+# of the eviction worth fusing.
+#
+# The lowering bug is fixed upstream (>= 2.7, the boundary the original
+# workaround named). But tracing this function is only SAFE under a second
+# condition, and it is the more important one:
+#
+#   Inductor, by default, does not emulate intermediate precision casts. It
+#   drops an fp32 -> fp16 -> fp32 round trip and keeps the fp32 value in a
+#   register, because for most code that is a free accuracy win. Here it is not:
+#   the round trip below is the whole point. Codes are fit to the *fp16-stored*
+#   grid so the grid they were fit to is bit-identical to the grid every later
+#   dequant reads (see the module docstring). Elide it and the codes are fit to
+#   an fp32 grid and read back on an fp16 one.
+#
+# Measured on 2.14, CPU Inductor, 24 seeds: undecorated and without the flag,
+# the packed codes differ from eager on 11/24 seeds for keys and 14/24 for
+# values -- always a single int2 level, always on an element whose pre-round
+# quantity straddles .5 (the two grids differ by an fp16 ulp, ~1.7e-03 here).
+# With torch._inductor.config.emulate_precision_casts on: 0/24, both.
+#
+# So the compile site is responsible for turning that flag on, and this gate
+# refuses to trace on a build that has no such flag to turn on -- an older build
+# keeps the graph break and keeps working, rather than silently writing a
+# different cache under torch.compile than without it. The eviction's compile
+# site is modules/windowed_cache/cache.py:_emulating_precision_casts, which is
+# also where the same hazard in the sketch cards is handled.
+def _quant_may_be_traced() -> bool:
+    """True when Inductor can lower, AND be made to keep, this function."""
+    try:
+        major, minor = (int(p) for p in torch.__version__.split(".")[:2])
+    except Exception:  # pragma: no cover - unparseable version string
+        return False
+    if (major, minor) < (2, 7):  # pragma: no cover - torch-version dependent
+        return False  # gather -> amin StarDep lowering failure
+    try:
+        from torch._inductor import config as _inductor_config
+    except Exception:  # pragma: no cover - no Inductor on this build
+        return False
+    # No knob to preserve the fp16 grid round trip => do not trace.
+    return hasattr(_inductor_config, "emulate_precision_casts")
+
+
+if _quant_may_be_traced():
+    def _compile_disable(fn):
+        """Identity: the quantiser is traced and fused with the eviction body."""
+        return fn
+else:  # pragma: no cover - torch-version dependent
+    # torch.compiler.disable is the stable API (torch 2.1+); fall back to the
+    # private one on older builds.
+    try:
+        _compile_disable = torch.compiler.disable
+    except AttributeError:
+        _compile_disable = torch._dynamo.disable
 
 
 # ---------------------------------------------------------------------------
