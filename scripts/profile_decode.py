@@ -30,9 +30,22 @@ Then the A/B that names the kernel, if it is one:
     python scripts/profile_decode.py --config <cfg> --fused 1     # Triton path
     python scripts/profile_decode.py --config <cfg> --fused 0     # materialize
 
-Usage:
+What to read, in order:
+
+1. ``GPU busy %`` -- host-bound or kernel-bound. Everything else is secondary.
+2. ``WHERE THE STEP GOES`` -- the bucketed rollup. ``ours (cache)`` vs ``model``
+   is the split that decides whether more cache work is worth doing at all.
+   ``other`` is always listed by name; if it is large, the fix is a new pattern
+   in ``_BUCKETS``, never a subtraction.
+3. The flat top-N, for the individual kernel once the bucket says which one.
+
+Usage (the shape the perf table's 4096/256 batch-32 row runs at):
+
     python scripts/profile_decode.py --config configs/perf_ours.yaml \
-        --prefill 1048 --batch 1 --steps 20
+        --prefill 4096 --batch 32 --steps 24 --top 40
+
+Add ``--trace out.json`` to get a chrome trace; that is the only thing that can
+split the ``shared/other`` bucket, because it carries the launching stack.
 """
 
 from __future__ import annotations
@@ -59,6 +72,136 @@ def _self_device_us(ev) -> float:
         if v is not None:
             return float(v)
     return 0.0
+
+
+#: Ordered classification of CUDA kernel names into the buckets the decode
+#: question is actually about. FIRST MATCH WINS, so the specific patterns come
+#: before the generic ones -- our Triton kernels are named before "elementwise"
+#: can claim anything, and the model's GEMMs before "reduction" can.
+#:
+#: This exists because the flat top-N list below cannot answer "how much of the
+#: step is the cache?". Reading it, you subtract the rows you recognise from the
+#: total and call the remainder a tail -- which is how a 10.4 ms "unattributed"
+#: block got quoted in this repo that was never a block at all, just every kernel
+#: ranked below the cut. Hence the rule this table is built around: the `other`
+#: bucket is ALWAYS printed by name. A tail you cannot see is a tail you will
+#: eventually explain with a guess.
+#:
+#: Matching is on the kernel name, so it is a heuristic and can mis-file. Two
+#: consequences are called out in the output rather than hidden: `memory:` is
+#: shared between the cache and the model and is attributed to NEITHER, and
+#: anything unmatched is listed individually.
+_BUCKETS = (
+    # -- ours: the three Triton kernels this project owns ------------------
+    ("ours: two-tier decode", ("_two_tier_decode_kernel",)),
+    ("ours: read gate",       ("_gate_kernel",)),
+    ("ours: prefill score",   ("_score_kernel",)),
+    # Inductor names its generated kernels triton_{poi,red,tem,for,unk}_fused_*.
+    # Nothing else here is compiled, so these are the eviction body.
+    ("ours: compiled evict",  ("triton_poi_fused", "triton_red_fused",
+                               "triton_tem_fused", "triton_for_fused",
+                               "triton_unk_fused", "triton_mm_fused")),
+    # -- the model --------------------------------------------------------
+    ("model: attention",      ("flash_fwd", "flash::", "fmha", "mha_fwd",
+                               "attention", "scaled_dot")),
+    ("model: GEMM",           ("gemm", "gemv", "cutlass", "cublas", "xmma",
+                               "sm80_", "sm90_", "ampere_", "turing_",
+                               "volta_", "splitKreduce", "dot_kernel")),
+    ("model: norm/softmax",   ("layer_norm", "layernorm", "rms_norm",
+                               "rmsnorm", "softmax")),
+    ("model: activation",     ("silu", "gelu", "swiglu", "sigmoid")),
+    # -- shared: cannot be attributed to either side by name ---------------
+    ("memory: copy/cat",      ("copy_device_to_device", "direct_copy",
+                               "CatArrayBatched", "Memcpy", "Memset",
+                               "vectorized_copy")),
+    ("memory: index/gather",  ("indexSelect", "index_elementwise",
+                               "index_put", "gather", "scatter", "take_",
+                               "gatherTopK")),
+    ("sort/topk",             ("radix", "bitonic", "sort", "Sort", "topk",
+                               "TopK")),
+    ("elementwise",           ("elementwise_kernel", "unrolled_elementwise",
+                               "CUDAFunctor")),
+    ("reduction",             ("reduce_kernel", "ReduceOp", "cub::")),
+)
+
+#: Buckets whose time belongs to this project, for the headline split.
+_OURS = tuple(name for name, _ in _BUCKETS if name.startswith("ours:"))
+#: Buckets that are the model's own work.
+_MODEL = tuple(name for name, _ in _BUCKETS if name.startswith("model:"))
+
+
+def _bucket_of(key: str) -> str:
+    """Which bucket a CUDA kernel name falls in. ``"other"`` if none match."""
+    low = key.lower()
+    for name, pats in _BUCKETS:
+        for pat in pats:
+            if pat.lower() in low:
+                return name
+    return "other"
+
+
+def _print_buckets(evs, n: int, gpu_us: float) -> None:
+    """The rollup: where the step's GPU time and launches actually go."""
+    agg: dict = {}
+    for e in evs:
+        us = _self_device_us(e)
+        if us <= 0:
+            continue
+        b = _bucket_of(e.key)
+        rec = agg.setdefault(b, {"us": 0.0, "n": 0, "kernels": []})
+        rec["us"] += us
+        rec["n"] += e.count
+        rec["kernels"].append((us, e.count, e.key))
+
+    def share(rec):
+        return rec["us"] / max(gpu_us, 1.0) * 100
+
+    ours = sum(agg[b]["us"] for b in _OURS if b in agg)
+    model = sum(agg[b]["us"] for b in _MODEL if b in agg)
+    shared = gpu_us - ours - model
+
+    print("\n" + "-" * 74)
+    print("  WHERE THE STEP GOES")
+    print("-" * 74)
+    print(f"    {'bucket':<26} {'ms/step':>9} {'% GPU':>7} {'launches/step':>14}")
+    for b, _ in _BUCKETS:
+        if b not in agg:
+            continue
+        r = agg[b]
+        print(f"    {b:<26} {r['us']/n/1000:9.3f} {share(r):6.1f}% "
+              f"{r['n']/n:14.0f}")
+    if "other" in agg:
+        r = agg["other"]
+        print(f"    {'other':<26} {r['us']/n/1000:9.3f} {share(r):6.1f}% "
+              f"{r['n']/n:14.0f}")
+
+    print(f"\n    ours (cache)   {ours/n/1000:8.3f} ms/step  "
+          f"{ours/max(gpu_us,1)*100:5.1f}%")
+    print(f"    model          {model/n/1000:8.3f} ms/step  "
+          f"{model/max(gpu_us,1)*100:5.1f}%")
+    print(f"    shared/other   {shared/n/1000:8.3f} ms/step  "
+          f"{shared/max(gpu_us,1)*100:5.1f}%")
+    print("      ^ copy / index / sort / elementwise / reduction, issued by BOTH")
+    print("        sides. A kernel name alone cannot say which, so it is")
+    print("        attributed to neither. Shrinking it needs the chrome trace")
+    print("        (--trace), which carries the launching stack.")
+
+    # The rule this table exists for: `other` is never anonymous.
+    if "other" in agg:
+        ks = sorted(agg["other"]["kernels"], reverse=True)
+        plural = "kernel" if len(ks) == 1 else "kernels"
+        print(f"\n    'other' in full ({len(ks)} distinct {plural}) -- if this is "
+              "large, add a\n    pattern to _BUCKETS rather than calling it a tail:")
+        for us, cnt, key in ks[:12]:
+            print(f"      {us/n/1000:8.3f} ms/step  n={cnt/n:7.1f}  {key[:52]}")
+        if len(ks) > 12:
+            rest = sum(u for u, _, _ in ks[12:])
+            print(f"      {rest/n/1000:8.3f} ms/step  ... and {len(ks)-12} more")
+
+    total = sum(r["us"] for r in agg.values())
+    if abs(total - gpu_us) > 1.0:   # us; float noise only
+        print(f"\n    !! buckets sum to {total/n/1000:.3f} ms but CUDA self time "
+              f"is {gpu_us/n/1000:.3f} ms/step -- the rollup is dropping work.")
 
 
 def _perf_cell_quant(cfg) -> float:
@@ -259,6 +402,8 @@ def main() -> None:
               "launch cost):")
         for k, c, us in sorted(syncs, key=lambda r: -r[2])[:8]:
             print(f"    {k:<32} {c / n:7.1f} /step   {us / n / 1000:7.2f} ms/step")
+
+    _print_buckets(evs, n, gpu_us)
 
     print(f"\n  top {args.top} kernels by CUDA self time:")
     ranked = sorted(((e, _self_device_us(e)) for e in evs), key=lambda r: -r[1])
