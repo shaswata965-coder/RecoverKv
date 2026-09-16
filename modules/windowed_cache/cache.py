@@ -629,6 +629,16 @@ class WindowedCache(_HFCacheBase):
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
+                    # The card's `eps` residual is the Cauchy-Schwarz term, and
+                    # a finite `quant_gate_margin` is the only thing that reads
+                    # it. `_gate_ctx` raises on a finite margin (the fused gate
+                    # has no margin term), so at the default `inf` the field is
+                    # built every eviction -- a full [N, H, ws, D] fp32 `recon`,
+                    # the most expensive step in the card build -- and discarded
+                    # unread by `_gate_triton`. Derived from the resolved margin,
+                    # not hard-coded off: ask for a margin and you get the field.
+                    sketch_needs_eps=(
+                        self.resolved.quant_gate_margin != float("inf")),
                 )
                 for _ in range(num_layers)
             ]

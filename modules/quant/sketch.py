@@ -172,7 +172,7 @@ def _dq_up(codes: Tensor, scale: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
+def build_sketch(keys: Tensor, anchor: Tensor, need_eps: bool = True) -> Sketch:
     """One pass over a window's **post-RoPE** keys -> its card.
 
     Parameters
@@ -183,6 +183,33 @@ def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
         life because eviction never rebases positions (§5, §10).
     anchor : ``[H, D]`` float — the per-(layer, head) common mode, frozen at the
         first eviction.
+    need_eps : bool
+        Whether to compute the residual field. ``False`` returns ``e_q``/``e_s``
+        zero-filled at the right shapes and dtypes, and **skips the single most
+        expensive step in the card build**: ``recon`` materializes a full
+        ``[N, H, ws, D]`` fp32 tensor that exists only to be normed away.
+
+        The field has one consumer, and the production path is not it. A finite
+        ``quant_gate_margin`` is what ``eps`` exists for, and ``cache.py``'s
+        fused gate *refuses* a finite margin outright — it is a top-k on the card
+        estimate with no margin term, so the only code that reads a margin is
+        ``store.gate_and_select``, whose only caller is ``gated_decode_step``,
+        the CPU reference. ``_gate_triton`` unpacks the card as ``…, _e_q, _e_s``
+        and discards both; ``_gate_kernel``'s docstring already records its half
+        of this (*"the bound cost a [B, H_q, NW] fp32 store and the whole eps
+        field of every card, to be discarded by _gate_triton"*). The build side
+        was never followed through.
+
+        Zero-filling rather than dropping the fields keeps the ``Sketch``
+        contract and the slot table's eight columns exactly as they are, so
+        ``quant_gate_margin`` remains a real setting: a caller that wants the
+        bound asks for it and pays for it. What changes is that the default
+        configuration — the only one the fused path will accept — stops paying
+        for a field nothing will read.
+
+        **A zero eps is not a valid bound**, so this is a capability switch and
+        not a cheaper approximation of one. The caller owns that: ``demote_many``
+        derives it from the resolved margin, never from a guess.
     """
     k = keys.to(torch.float32)
     N, H, ws, D = k.shape
@@ -201,12 +228,22 @@ def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
     v_q, v_s = _q_sym(v)
     t_q, t_s = _q_sym(t)
 
-    # eps against what is ACTUALLY STORED, not against the ideal fit.
-    mu_h = anc + _dq_sym(mu_q, mu_s)
-    v_h = _dq_sym(v_q, v_s)
-    t_h = _dq_sym(t_q, t_s)
-    recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
-    e_q, e_s = _q_up((k - recon).norm(dim=-1))
+    if need_eps:
+        # eps against what is ACTUALLY STORED, not against the ideal fit.
+        mu_h = anc + _dq_sym(mu_q, mu_s)
+        v_h = _dq_sym(v_q, v_s)
+        t_h = _dq_sym(t_q, t_s)
+        recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
+        e_q, e_s = _q_up((k - recon).norm(dim=-1))
+    else:
+        # Same shapes and dtypes `_q_up` would have produced, so every consumer
+        # -- the slot table's columns, `decode_sketch`, `gather_sketch` -- is
+        # structurally unchanged. `_q_up` returns uint8 codes [N, H, ws] and an
+        # fp16 per-(window, head) scale [N, H]; a zero scale decodes to a zero
+        # residual, which is the honest encoding of "not computed": it makes the
+        # Cauchy-Schwarz term vanish rather than inventing a bound.
+        e_q = torch.zeros(N, H, ws, dtype=torch.uint8, device=k.device)
+        e_s = torch.zeros(N, H, dtype=torch.float16, device=k.device)
 
     return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, e_q, e_s)
 

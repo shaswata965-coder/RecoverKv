@@ -70,6 +70,7 @@ class QuantizedStore:
         n_slots: int,
         memoize_read: bool = True,
         sketch_enabled: bool = False,
+        sketch_needs_eps: bool = True,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
@@ -80,6 +81,15 @@ class QuantizedStore:
         # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
         # off nothing is allocated and every path below is the pre-gate one.
         self.sketch_enabled = sketch_enabled
+        # Whether those cards carry a REAL `eps` residual field. It is the card's
+        # Cauchy-Schwarz term and the only thing a finite `quant_gate_margin` can
+        # be computed from -- and the fused decode path refuses a finite margin
+        # (cache.py raises), so on every production configuration the field is
+        # built and then discarded by `_gate_triton`. Building it materializes a
+        # full [N, H, ws, D] fp32 `recon`, the most expensive step in the card.
+        # The caller sets this from the RESOLVED margin, so the capability is
+        # intact and only the unused work is skipped. See `sketch.build_sketch`.
+        self.sketch_needs_eps = sketch_needs_eps
         # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
         # be frozen, not running: a card is written once and never revisited
         # (§10), so a later anchor change would silently reinterpret every card
@@ -171,6 +181,7 @@ class QuantizedStore:
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
+            sketch_needs_eps=ref.sketch_needs_eps,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
@@ -292,7 +303,8 @@ class QuantizedStore:
                 # over (window, token) of this layer's keys, per row and head.
                 self._anchor = kp.reshape(B, n, H, S, D).mean(dim=(1, 3))
             anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
-            sketch = tuple(build_sketch(kp, anc))
+            sketch = tuple(build_sketch(kp, anc,
+                                        need_eps=self.sketch_needs_eps))
 
         self.table.write(
             slot_idx, valid, wid,
