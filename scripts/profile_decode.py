@@ -204,6 +204,39 @@ def _print_buckets(evs, n: int, gpu_us: float) -> None:
               f"is {gpu_us/n/1000:.3f} ms/step -- the rollup is dropping work.")
 
 
+def _is_device_event(ev) -> bool:
+    """True for a CUDA KERNEL event; false for the ATen op that launched it.
+
+    ``key_averages()`` returns BOTH, and both carry self device time. A leaf op's
+    self device time is the time of the kernels it launched, and those kernels
+    then report it again under their own names. Summing the lot double-counts
+    every kernel in the step.
+
+    This was live in every number this script has ever printed. It surfaced when
+    the rollup listed its `other` bucket by name and `aten::mm` came back at
+    11.052 ms / 225.0 launches per step against four `ampere_*gemm*` kernels
+    summing to 10.831 ms / **exactly** 225.0. Same launches, same time, counted
+    twice -- which inflated `CUDA kernels`, `kernel launches`, and therefore the
+    `GPU busy %` this whole script exists to report, by close to 2x.
+
+    ``device_type`` is the real signal. The name check is only a fallback for a
+    build that does not expose it: the operator view is namespaced (``aten::``,
+    ``autograd::``), device events are not. Memcpy/Memset are device events and
+    are deliberately NOT excluded by it.
+    """
+    dt = getattr(ev, "device_type", None)
+    if dt is not None:
+        try:
+            from torch.autograd import DeviceType
+            return dt == DeviceType.CUDA
+        except Exception:  # pragma: no cover - torch-version dependent
+            pass
+    return not str(ev.key).startswith(
+        ("aten::", "autograd::", "torch::", "nn.Module", "Optimizer",
+         "ProfilerStep", "cudaLaunch", "cudaMemcpy", "cudaStream",
+         "cudaDevice", "cudaEvent", "cudaHost"))
+
+
 def _perf_cell_quant(cfg) -> float:
     """quant_ratio as the benchmarked cell sets it (perf.configs[0] first)."""
     try:
@@ -340,8 +373,13 @@ def main() -> None:
         hooks.remove()
 
     evs = prof.key_averages()
-    gpu_us = sum(_self_device_us(e) for e in evs)
-    n_launch = sum(e.count for e in evs if _self_device_us(e) > 0)
+    kernels = [e for e in evs if _is_device_event(e) and _self_device_us(e) > 0]
+    gpu_us = sum(_self_device_us(e) for e in kernels)
+    n_launch = sum(e.count for e in kernels)
+    # The same work seen from the operator side. Reported, never added -- see
+    # _is_device_event for what adding it did to every number below.
+    op_us = sum(_self_device_us(e) for e in evs
+                if not _is_device_event(e) and _self_device_us(e) > 0)
 
     # Host-side stalls. A sync does not cost a launch's ~5 us -- it drains the
     # queue, so it converts every downstream launch's CPU cost from hidden to
@@ -365,6 +403,11 @@ def main() -> None:
     print("=" * 74)
     print(f"  wall            {wall_us / n / 1000:8.2f} ms/step")
     print(f"  CUDA kernels    {gpu_us / n / 1000:8.2f} ms/step")
+    if op_us > 0:
+        print(f"  (ATen op view   {op_us / n / 1000:8.2f} ms/step  -- the same "
+              "kernels seen from the\n                            operator side. "
+              "NOT added: key_averages()\n                            returns "
+              "both, and summing them double-counts.)")
     busy = gpu_us / max(wall_us, 1.0)
     print(f"  GPU busy        {busy * 100:8.1f} %   <-- THE number")
     print(f"  kernel launches {n_launch / n:8.0f} /step")
@@ -403,10 +446,11 @@ def main() -> None:
         for k, c, us in sorted(syncs, key=lambda r: -r[2])[:8]:
             print(f"    {k:<32} {c / n:7.1f} /step   {us / n / 1000:7.2f} ms/step")
 
-    _print_buckets(evs, n, gpu_us)
+    _print_buckets(kernels, n, gpu_us)
 
     print(f"\n  top {args.top} kernels by CUDA self time:")
-    ranked = sorted(((e, _self_device_us(e)) for e in evs), key=lambda r: -r[1])
+    ranked = sorted(((e, _self_device_us(e)) for e in kernels),
+                    key=lambda r: -r[1])
     for e, us in ranked[:args.top]:
         if us <= 0:
             break

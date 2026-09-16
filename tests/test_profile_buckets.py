@@ -122,3 +122,64 @@ def test_the_rollup_reconciles_and_never_leaves_other_anonymous(capsys):
         "an unmatched kernel was counted but not named — that is exactly the "
         "anonymous tail this rollup exists to remove")
     assert "ours (cache)" in out and "model" in out and "shared/other" in out
+
+
+# ---------------------------------------------------------------------------
+# kernel events vs the operator view that launched them
+# ---------------------------------------------------------------------------
+
+
+def test_aten_ops_are_not_counted_as_kernels():
+    """``key_averages()`` returns both views and both carry self device time.
+
+    A leaf op's self device time IS its kernels' time, reported again under the
+    op's name. Summing the lot double-counts every kernel in the step — which is
+    what every number this script printed had been doing: a real profile showed
+    ``aten::mm`` at 225.0 launches/step against four ``ampere_*gemm*`` kernels
+    summing to exactly 225.0.
+    """
+    from profile_decode import _is_device_event
+
+    for op in ("aten::mm", "aten::copy_", "aten::mul", "aten::topk",
+               "autograd::engine::evaluate_function", "ProfilerStep#42",
+               "cudaLaunchKernel", "cudaMemcpyAsync"):
+        assert not _is_device_event(_Ev(op, 1.0, 1)), f"{op} counted as a kernel"
+
+    for kern in ("ampere_fp16_s16816gemm_fp16_256x64_ldg8_f2f_stages_64x3_tn",
+                 "_two_tier_decode_kernel", "_gate_kernel",
+                 "void at::native::vectorized_elementwise_kernel<4, ...>",
+                 "Memcpy DtoD (Device -> Device)", "Memset (Device)",
+                 "triton_poi_fused_add_0"):
+        assert _is_device_event(_Ev(kern, 1.0, 1)), f"{kern} dropped"
+
+
+def test_device_type_wins_over_the_name_when_torch_exposes_it():
+    """The name check is a fallback. A device event keeps its name whatever it is."""
+    from torch.autograd import DeviceType
+
+    from profile_decode import _is_device_event
+
+    ev = _Ev("aten::mm", 1.0, 1)          # named like an op ...
+    ev.device_type = DeviceType.CUDA      # ... but tagged as a device event
+    assert _is_device_event(ev) is True
+
+    ev2 = _Ev("some_kernel_looking_name", 1.0, 1)
+    ev2.device_type = DeviceType.CPU
+    assert _is_device_event(ev2) is False
+
+
+def test_the_double_count_from_the_real_profile_is_removed():
+    """The exact rows from the 4096/batch-32 profile that exposed this."""
+    from profile_decode import _is_device_event
+
+    evs = [
+        _Ev("ampere_fp16_s16816gemm_fp16_256x64_ldg8_f2f_stages_64x3_tn", 5115.0, 64),
+        _Ev("ampere_fp16_s16816gemm_fp16_128x64_ldg8_f2f_stages_64x3_tn", 2657.0, 32),
+        _Ev("ampere_fp16_s16816gemm_fp16_64x64_sliced1x2_ldg8_f2f_stage", 2429.0, 65),
+        _Ev("ampere_s16816gemm_fp16_128x64_ldg8_stages_32x6_tn", 630.0, 64),
+        _Ev("aten::mm", 11052.0, 225),     # the same 225 launches, again
+    ]
+    kernels = [e for e in evs if _is_device_event(e)]
+    assert sum(e.count for e in kernels) == 225, (
+        "the op view is still being counted alongside its own kernels")
+    assert abs(sum(e.self_device_time_total for e in kernels) - 10831.0) < 1.0
