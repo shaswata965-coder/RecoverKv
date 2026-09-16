@@ -84,6 +84,38 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
+def _make_graph_runner(cache):
+    """A :class:`DecodeGraphRunner` for this cache, or ``None`` when off.
+
+    Off is the default. Anything unexpected about the cache -- no resolved
+    config, no window size -- RAISES rather than quietly returning ``None``,
+    because a graphed label over an eager run is the exact provenance bug both
+    ``0091e9c`` and ``1434b2c`` were fixing. The only way to get ``None`` is to
+    not ask for a graph.
+    """
+    from utils.config import FIRST_EVICTION_STEP_DEFAULT
+    from modules.windowed_cache.graph_decode import (
+        DecodeGraphRunner, EpochSchedule, graph_mode)
+    mode = graph_mode()
+    if mode == "off":
+        return None
+    res = getattr(cache, "resolved", None)
+    if res is None:
+        raise RuntimeError(
+            "STICKYKV_DECODE_GRAPH is set but this cache exposes no resolved "
+            "config, so the eviction cadence the capture schedule has to match "
+            "is unknown. A runner built on a guessed cadence would replay a "
+            "steady graph over an eviction step.")
+    return DecodeGraphRunner(
+        cache,
+        EpochSchedule(window_size=int(res.window_size),
+                      first_eviction_step=int(
+                          getattr(res, "first_eviction_step",
+                                  FIRST_EVICTION_STEP_DEFAULT))),
+        mode=mode,
+    )
+
+
 def _phase_mb(phase) -> float:
     """A phase's peak in MB — device-level if we have it, else torch allocated.
 
@@ -1785,13 +1817,40 @@ class PerfRunner:
                         if torch.cuda.is_available(): torch.cuda.synchronize()
                         t_step0 = time.perf_counter()
                     if n_decode >= 2:
+                        # CUDA-graph replay of the steady steps, opt-in via
+                        # STICKYKV_DECODE_GRAPH (default off). The runner decides
+                        # per step whether a replay is legal and falls back to
+                        # this same eager call whenever it is not -- see
+                        # modules/windowed_cache/graph_decode.py. Step 0 above is
+                        # never graphed: it is the prompt compaction.
+                        _graph = _make_graph_runner(pkv)
                         with probe.phase("decode_steady"):
-                            for _ in range(n_decode - 1):
-                                out = model(input_ids=next_tok, past_key_values=pkv,
-                                            use_cache=True, return_dict=True,
-                                            cache_position=_cache_pos(1), **gen_kwargs)
+                            for _i in range(n_decode - 1):
+                                _step = _i + 1
+                                if _graph is None:
+                                    out = model(input_ids=next_tok, past_key_values=pkv,
+                                                use_cache=True, return_dict=True,
+                                                cache_position=_cache_pos(1), **gen_kwargs)
+                                else:
+                                    # Both inputs MUST be the runner's own
+                                    # buffers: a graph records the addresses it
+                                    # reads, and a fresh `arange` per step would
+                                    # be captured once and then never re-read.
+                                    _ids = _graph.static_input("input_ids", next_tok)
+                                    _cp = _graph.static_input("cache_position",
+                                                              _cache_pos(1))
+                                    out = _graph.step(
+                                        _step,
+                                        lambda: model(input_ids=_ids,
+                                                      past_key_values=pkv,
+                                                      use_cache=True,
+                                                      return_dict=True,
+                                                      cache_position=_cp,
+                                                      **gen_kwargs))
                                 pkv = out.past_key_values
                                 next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                        if _graph is not None:
+                            print(f"[StickyKV] {_graph.report()}", flush=True)
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t3 = time.perf_counter()
                 gen_time = t3 - t2

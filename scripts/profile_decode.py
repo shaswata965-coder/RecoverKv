@@ -153,6 +153,8 @@ def _bucket_of(key: str) -> str:
 #: The cache this run built, so the rollup can read its counters. One process,
 #: one profiled cache; a dict rather than a global rebind keeps it importable.
 _PROFILED_CACHE: dict = {"cache": None}
+#: The decode-graph runner this run built, so the rollup can report it.
+_PROFILED_GRAPH: dict = {"runner": None}
 
 
 def _print_buckets(evs, n: int, gpu_us: float) -> None:
@@ -424,13 +426,46 @@ def main() -> None:
     device = input_ids.device
     pos = 0                      # absolute token index, advanced by _step
 
+    # CUDA-graph replay of the steady steps, opt-in via STICKYKV_DECODE_GRAPH.
+    # `_decode_step` counts only the decode steps, because the graph runner's
+    # schedule is the eviction cadence and that is indexed from the first decode
+    # step, not from the prefill.
+    _decode_step = [-1]
+    _graph = None
+    try:
+        from utils.config import FIRST_EVICTION_STEP_DEFAULT
+        from modules.windowed_cache.graph_decode import (
+            DecodeGraphRunner, EpochSchedule, graph_mode)
+        if graph_mode() != "off":
+            _graph = DecodeGraphRunner(
+                cache,
+                EpochSchedule(window_size=int(cache.resolved.window_size),
+                              first_eviction_step=int(getattr(
+                                  cache.resolved, "first_eviction_step",
+                                  FIRST_EVICTION_STEP_DEFAULT))),
+                mode=graph_mode())
+            _PROFILED_GRAPH["runner"] = _graph
+    except Exception as exc:
+        raise RuntimeError(
+            f"STICKYKV_DECODE_GRAPH is set but the runner could not be built: "
+            f"{exc}. It raises rather than profiling eagerly under a graphed "
+            "label -- see 1434b2c for why that matters here specifically."
+        ) from exc
+
     def _step(ids, past, n_new):
         nonlocal pos
-        o = model(input_ids=ids, past_key_values=past, use_cache=True,
-                  return_dict=True,
-                  cache_position=torch.arange(pos, pos + n_new, device=device))
+        cp = torch.arange(pos, pos + n_new, device=device)
         pos += n_new
-        return o
+        _decode_step[0] += 1
+        if _graph is None or n_new != 1 or _decode_step[0] < 1:
+            return model(input_ids=ids, past_key_values=past, use_cache=True,
+                         return_dict=True, cache_position=cp)
+        sid = _graph.static_input("input_ids", ids)
+        scp = _graph.static_input("cache_position", cp)
+        return _graph.step(
+            _decode_step[0],
+            lambda: model(input_ids=sid, past_key_values=past, use_cache=True,
+                          return_dict=True, cache_position=scp))
 
     try:
         with torch.no_grad():
@@ -615,6 +650,9 @@ def main() -> None:
                       "close to the real count.")
     except Exception:  # pragma: no cover - diagnostics must never fail a run
         pass
+
+    if _PROFILED_GRAPH["runner"] is not None:
+        print(f"\n  {_PROFILED_GRAPH['runner'].report()}")
 
     if syncs:
         print("\n  host stalls (each drains the queue and exposes downstream "
