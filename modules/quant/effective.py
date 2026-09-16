@@ -26,7 +26,6 @@ head count.
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -57,17 +56,19 @@ def _apply_rotary():
 # reshape/permute), so fusing it is numerically safe: torch.compile lowers it to
 # a single kernel that keeps the fp32 temporaries in registers.
 #
-# Opt-in via ``STICKYKV_COMPILE_READ`` (default off). The dev box has no GPU, so
-# compiling in the CPU test suite only buys first-call Inductor latency and
-# flakiness for no launch-count win; the perf runner sets it for GPU decode. The
-# eager path below is the op-for-op sequence the store used before this change,
-# so with the flag off the read path stays byte-identical.
-
-
-def _compile_read_enabled() -> bool:
-    return os.environ.get("STICKYKV_COMPILE_READ", "0").lower() in (
-        "1", "true", "yes", "on",
-    )
+# This chain no longer runs in production, and the torch.compile fork that used
+# to wrap it (``STICKYKV_COMPILE_READ``) is gone with this comment. On CUDA the
+# fused two-tier decode kernel hands raw int2 straight to Triton and dequantizes
+# inside the kernel, so ``dequant_rotate_q_keys`` is unreachable there by two
+# independent routes: ``update()`` only falls through to ``_materialize_joint``
+# when the Q tier is EMPTY, and ``effective_q_tier`` returns ``None`` on an empty
+# tier before reaching this. The flag was set to 1 on every CUDA perf run and
+# printed a banner naming a "decode read path" that the run was not taking.
+#
+# What is left is the CPU reference: ``_materialize_joint`` on a box with no
+# fused kernel builds the effective K through here, op for op, and every
+# accuracy test validates against it. That is worth keeping and is not worth
+# compiling -- on CPU a compile buys first-call Inductor latency and nothing else.
 
 
 def _dequant_rotate_flat(
@@ -105,60 +106,6 @@ def _dequant_rotate_flat(
     return k_rot.to(out_dtype)
 
 
-_COMPILED_READ_FN = None
-_READ_ANNOUNCED = {"done": False}
-
-
-def _announce_read_path_once(compiled: bool) -> None:
-    """Print, once per process, which decode read path is live."""
-    if _READ_ANNOUNCED["done"]:
-        return
-    _READ_ANNOUNCED["done"] = True
-    if compiled:
-        print(
-            "[StickyKV] decode read path: COMPILED fused dequant->RoPE kernel "
-            "ACTIVE [OK] (STICKYKV_COMPILE_READ=1)",
-            flush=True,
-        )
-    else:
-        print(
-            "[StickyKV] decode read path: eager dequant->RoPE chain "
-            "(STICKYKV_COMPILE_READ off)",
-            flush=True,
-        )
-
-
-def _read_fn():
-    """Return the fused dequant→RoPE callable, honouring kernel-or-error.
-
-    With ``STICKYKV_COMPILE_READ`` off (default) the eager op-for-op chain runs —
-    the CPU/reference path, byte-identical, always available. With it ON the fused
-    (compiled) kernel is REQUIRED: if ``torch.compile`` fails there is **no** silent
-    fallback to the ~20-launch eager chain, because that is the decode analog of
-    the prefill PyTorch fallback we removed — slower, and invisible in the numbers.
-    Compiles once, lazily, ``dynamic=True`` so the varying active-window count ``n``
-    does not recompile every eviction.
-    """
-    global _COMPILED_READ_FN
-    if not _compile_read_enabled():
-        _announce_read_path_once(compiled=False)
-        return _dequant_rotate_flat
-    if _COMPILED_READ_FN is None:
-        try:
-            _COMPILED_READ_FN = torch.compile(_dequant_rotate_flat, dynamic=True)
-        except Exception as e:
-            raise RuntimeError(
-                "STICKYKV_COMPILE_READ is set but torch.compile of the fused "
-                f"decode read path failed ({type(e).__name__}: {e}). The fused "
-                "read kernel is required when enabled — there is no silent "
-                "fallback to the eager dequant->RoPE chain (kernel-or-error, as "
-                "on the prefill score path). Unset STICKYKV_COMPILE_READ to run "
-                "the eager reference."
-            ) from e
-    _announce_read_path_once(compiled=True)
-    return _COMPILED_READ_FN
-
-
 def dequant_rotate_q_keys(
     k_codes: Tensor,
     k_scale: Tensor,
@@ -175,8 +122,7 @@ def dequant_rotate_q_keys(
     """Read-path Q-tier keys: dequantize + RoPE, fused.
 
     Equivalent to ``rotate_key_window(dequant(...).reshape/permute, pos_flat)`` in
-    the store, but routed through :func:`_dequant_rotate_flat` so the whole chain
-    can be a single compiled kernel. ``cos``/``sin`` depend only on the positions
+    the store. ``cos``/``sin`` depend only on the positions
     and the ``out_dtype``/device (not the key values), so we build them from a
     tiny reference tensor — bit-identical to computing them from the dequantized
     keys as the eager path did.
@@ -184,13 +130,7 @@ def dequant_rotate_q_keys(
     ref = torch.empty(1, 1, 1, dtype=out_dtype, device=pos_flat.device)
     cos, sin = _rope_cos_sin(rope_module, ref, pos_flat)
     apply_rotary = _apply_rotary()
-    fn = _read_fn()
-    # No silent fallback: with COMPILE_READ off, fn IS the eager chain; with it on,
-    # fn is the compiled kernel and any failure propagates (kernel-or-error, see
-    # _read_fn). The eager and compiled paths are the same op sequence, so a
-    # runtime failure in the compiled one is a real failure — not a reason to
-    # quietly run the slow path under the fast path's name.
-    return fn(
+    return _dequant_rotate_flat(
         k_codes, k_scale, k_zero, window, cos, sin,
         out_dtype, B, n, H, D, apply_rotary,
     )

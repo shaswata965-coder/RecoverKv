@@ -186,3 +186,33 @@ def test_eviction_is_compiled_on_cuda_and_eager_on_cpu_with_nothing_set():
         os.environ.pop("STICKYKV_COMPILE_EVICT", None)
         if prev is not None:
             os.environ["STICKYKV_COMPILE_EVICT"] = prev
+
+
+def test_the_decode_read_path_has_no_second_implementation():
+    """The Q-tier read chain is one function, not a flagged pair.
+
+    ``STICKYKV_COMPILE_READ`` selected between an eager dequant->RoPE chain and a
+    ``torch.compile``d copy of it, and the perf runner set it to 1 on every CUDA
+    run. It selected nothing: on CUDA the fused two-tier kernel takes raw int2
+    and dequantises inside Triton, so ``dequant_rotate_q_keys`` is unreachable —
+    ``update()`` only falls through to ``_materialize_joint`` when the Q tier is
+    EMPTY, and ``effective_q_tier`` returns ``None`` on an empty tier before it
+    gets there. What the flag did do was print a banner naming a "decode read
+    path" the run was not on, which is the same provenance bug as the eviction's
+    compile_evict split: a label that survives its own method.
+    """
+    import inspect
+
+    from modules.quant import effective
+
+    src = inspect.getsource(effective)
+    assert "STICKYKV_COMPILE_READ" not in src.replace(
+        "``STICKYKV_COMPILE_READ``", ""), (
+        "the read path grew a second implementation behind a flag again")
+    for gone in ("_read_fn", "_compile_read_enabled", "_COMPILED_READ_FN",
+                 "_announce_read_path_once"):
+        assert not hasattr(effective, gone), f"{gone} is back"
+    # The eager chain itself STAYS: it is what the CPU reference materialises
+    # through, and every accuracy test validates against that.
+    assert callable(effective._dequant_rotate_flat)
+    assert callable(effective.dequant_rotate_q_keys)

@@ -1304,17 +1304,18 @@ class PerfRunner:
             # measured the eager eviction. Verify it with the dynamo counters and
             # evict_path_stats() below rather than trusting the flag.
             #
-            # STICKYKV_COMPILE_READ, by contrast, is INERT on the fused decode
-            # path: _read_fn is only reachable through QuantizedStore.
-            # effective_q_tier, and the fused path (default on CUDA since the
-            # decode kernel landed) hands raw int2 straight to Triton and never
-            # materializes the Q tier. It is left enabled because it is still the
-            # fast path whenever the fused kernel is off (STICKYKV_FUSED_DECODE=0,
-            # or an empty Q tier), not because it does anything for the rows below.
-            for _flag in ("STICKYKV_COMPILE_READ", "STICKYKV_COMPILE_EVICT"):
-                if torch.cuda.is_available() and os.environ.get(_flag) is None:
-                    os.environ[_flag] = "1"
-                    log.info("enabled %s=1 for CUDA windowed decode", _flag)
+            # STICKYKV_COMPILE_READ used to be set here too, on the reasoning
+            # that it was "still the fast path whenever the fused kernel is off
+            # (STICKYKV_FUSED_DECODE=0, or an empty Q tier)". Neither case
+            # survives: the fused kernel can no longer be turned off, and on an
+            # empty Q tier effective_q_tier returns None before reaching the read
+            # chain. It was setting a flag that selected nothing and printing a
+            # banner naming a read path the run was not taking, so the flag and
+            # its fork are gone (modules/quant/effective.py).
+            if torch.cuda.is_available() and os.environ.get(
+                    "STICKYKV_COMPILE_EVICT") is None:
+                os.environ["STICKYKV_COMPILE_EVICT"] = "1"
+                log.info("enabled STICKYKV_COMPILE_EVICT=1 for CUDA windowed decode")
             # Fair measurement: reject a backend/attn mismatch up front, exactly
             # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
             # it, cache_package='eager' paired with flash attention (or vice
