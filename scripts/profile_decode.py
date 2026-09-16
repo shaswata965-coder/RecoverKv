@@ -66,6 +66,15 @@ import sys
 import time
 from pathlib import Path
 
+# The project root, so `utils` / `modules` import when this file is run as a
+# path -- `python scripts/profile_decode.py`, the usage the docstring above
+# gives. sys.path[0] is then scripts/, not the root, and the `from utils.config
+# import ...` inside main() raises ModuleNotFoundError before anything loads.
+# The insert inside main() adds scripts/ for the audit_e2e sibling import: a
+# different directory, and it runs after that import, so it never covered this.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
 
 def _self_device_us(ev) -> float:
     """Per-event CUDA self time. The attribute was renamed in torch 2.x."""
