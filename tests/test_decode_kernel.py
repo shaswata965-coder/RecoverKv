@@ -212,3 +212,87 @@ def test_every_ladder_rung_is_a_legal_tiling(ws):
         assert nw >= 1, f"ws={ws} target={target_keys} produced {nw} windows/tile"
         assert nw * ws <= t
         assert t & (t - 1) == 0
+
+
+# ---------------------------------------------------------------------------
+# The tile ladder (D3): the missing (64, 1) rung, and pinning one to measure it
+# ---------------------------------------------------------------------------
+
+
+def test_the_ladder_can_drop_a_stage_before_it_drops_the_tile():
+    """``num_stages`` is shared memory too, so it is the cheaper thing to give up.
+
+    Triton's software pipeliner allocates ``num_stages`` copies of the loop's
+    shared-memory operands, so 2 -> 1 roughly halves the staging at the SAME
+    tile. Without a ``(64, 1)`` rung a kernel that just missed ``(64, 2)`` fell
+    straight to ``target_keys=32`` and doubled its serial Q-tier iterations --
+    23 -> 45 at ``ws=8`` -- to buy memory one fewer stage would also have bought.
+
+    The GATED variant is the one at risk: ``GATED`` is a ``constexpr`` so it is a
+    separate compile, and it stages strictly more than the ungated kernel (the
+    ``SEL`` loads, ``LOGM``, the prologue, the §5 fill).
+    """
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER
+
+    keys = [k for k, _ in _FIT_LADDER]
+    assert keys == sorted(keys, reverse=True), "rungs must be widest-first"
+    top_keys = _FIT_LADDER[0][0]
+    at_top = [s for k, s in _FIT_LADDER if k == top_keys]
+    assert len(at_top) > 1, (
+        f"the ladder offers only num_stages={at_top} at target_keys={top_keys}, "
+        "so a kernel that misses the top rung halves its tile instead of "
+        "dropping a pipeline stage first"
+    )
+    assert at_top == sorted(at_top, reverse=True), "stages must descend"
+
+
+def test_every_rung_is_distinct():
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER
+    assert len(set(_FIT_LADDER)) == len(_FIT_LADDER)
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("64x2", (64, 2)), ("32x1", (32, 1)), ("16X2", (16, 2)), ("64", (64, 1)),
+])
+def test_the_tile_override_parses(raw, want, monkeypatch):
+    """``STICKYKV_DECODE_TILE`` is the arm that prices the ladder's ordering.
+
+    The ladder falls on ``OutOfResources`` and never benchmarks, so "the first
+    rung that fits is the fastest" is a claim, not a measurement. Pinning two
+    rungs and running the table twice is how it gets checked -- and every rung is
+    bit-identical, so the comparison is pure speed.
+    """
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", raw)
+    assert _tile_override() == want
+
+
+def test_no_override_means_the_ladder(monkeypatch):
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.delenv("STICKYKV_DECODE_TILE", raising=False)
+    assert _tile_override() is None
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", "  ")
+    assert _tile_override() is None
+
+
+@pytest.mark.parametrize("raw", ["sixty-four", "64x", "0x2", "64x0", "64xx2"])
+def test_a_malformed_override_raises_rather_than_being_ignored(raw, monkeypatch):
+    """A pin that silently did nothing would report the ladder's rung under the
+    pinned rung's label -- the exact failure mode this repo keeps finding."""
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", raw)
+    with pytest.raises(ValueError):
+        _tile_override()
+
+
+def test_fit_choice_is_readable_and_a_copy():
+    """The chosen rung has to be ASKABLE, not caught in warmup scrollback."""
+    from modules.windowed_cache import decode_kernel as dk
+    dk._FIT_CHOICE[("probe",)] = (64, 2)
+    try:
+        got = dk.fit_choice()
+        assert got[("probe",)] == (64, 2)
+        got.clear()
+        assert ("probe",) in dk._FIT_CHOICE, "fit_choice must return a copy"
+    finally:
+        dk._FIT_CHOICE.pop(("probe",), None)

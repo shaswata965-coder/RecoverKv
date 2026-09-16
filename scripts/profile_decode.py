@@ -554,6 +554,31 @@ def main() -> None:
             elif st["gated"] and st["gated"] != st["fired"]:
                 print(f"  -> the gate ran on only {st['gated']}/{st['fired']} "
                       "fused steps; the rest read the whole tier.")
+    except Exception:
+        pass
+
+    # The tile rung, asked for rather than caught. The kernel prints its choice
+    # once per geometry, which happens in warmup and scrolls away above whatever
+    # is being read -- so the one line DECODE_NEXT.md §5 step 1 says to read was
+    # the one line a profile did not carry.
+    try:
+        from modules.windowed_cache.decode_kernel import _FIT_LADDER, fit_choice
+        chosen = fit_choice()
+        if chosen:
+            print("\n  decode tiling (target_keys x num_stages), per geometry:")
+            top = _FIT_LADDER[0]
+            for sig, rung in sorted(chosen.items()):
+                ws, hd, block_r, has_q, gated = sig
+                where = "" if rung == top else (
+                    f"   <- NOT the top rung {top[0]}x{top[1]}; "
+                    f"{top[0] / rung[0]:.0f}x the serial Q-tier iterations")
+                print(f"    ws={ws} head_dim={hd} BLOCK_R={block_r} "
+                      f"q_tier={bool(has_q)} gated={gated}"
+                      f"  ->  {rung[0]}x{rung[1]}{where}")
+            if any(r != top for r in chosen.values()):
+                print("    A lower rung is a shared-memory fact, not a verdict: "
+                      "pin rungs with\n    STICKYKV_DECODE_TILE=64x1 (etc.) and "
+                      "re-run the table to price them.")
     except Exception:  # pragma: no cover - diagnostics must never fail a run
         pass
 

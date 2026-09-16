@@ -944,11 +944,78 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
 
 #: ``(target_keys, num_stages)`` rungs, fastest first. Bigger tiles mean fewer
 #: serial iterations (§5.3's whole point) but more ``tl.dot`` operand staging in
-#: shared memory; more pipeline stages hide more latency at the same cost. An
-#: A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands before staging,
-#: so the top rung does not fit everywhere -- hence a ladder rather than a
-#: constant. Every rung is numerically identical; only speed differs.
-_FIT_LADDER = [(64, 2), (32, 2), (32, 1), (16, 2), (16, 1)]
+#: shared memory. An A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands
+#: before staging, so the top rung does not fit everywhere -- hence a ladder
+#: rather than a constant. Every rung is numerically identical; only speed
+#: differs.
+#:
+#: ``(64, 1)`` is the rung this ladder was missing. ``num_stages`` is not free:
+#: Triton's software pipeliner allocates that many copies of the loop's
+#: shared-memory operands, so dropping 2 -> 1 roughly halves the staging at the
+#: SAME tile. Without it a kernel that just missed ``(64, 2)`` fell straight to
+#: ``target_keys=32`` and **doubled its serial Q-tier iterations** -- 23 -> 45 at
+#: ``ws=8`` -- to buy shared memory one fewer stage would also have bought.
+#:
+#: That is not hypothetical for the GATED variant, which is the shipped one:
+#: ``GATED`` is a ``constexpr``, so it is a separate compile, and it stages
+#: strictly more than the ungated kernel (the ``SEL`` loads, ``LOGM``, the
+#: prologue and the §5 fill). It is exactly the variant most likely to have been
+#: pushed off the top rung.
+#:
+#: The order asserts that a full tile at one stage beats a half tile at two --
+#: i.e. that serial iteration count dominates latency hiding here, which is what
+#: an 8.8x-off-roofline kernel looks like when it is not bandwidth-bound. The
+#: ladder only falls on ``OutOfResources``, it never benchmarks, so that ordering
+#: is a claim. ``STICKYKV_DECODE_TILE`` is how it gets checked: pin two rungs,
+#: run the table twice, compare.
+_FIT_LADDER = [(64, 2), (64, 1), (32, 2), (32, 1), (16, 2), (16, 1)]
+
+
+def _tile_override() -> Optional[Tuple[int, int]]:
+    """``STICKYKV_DECODE_TILE=<target_keys>x<num_stages>``, or ``None``.
+
+    A measurement arm, not a setting. The ladder picks the first rung that
+    *fits*, which is a shared-memory fact; whether that rung is the *fastest* is
+    a separate question no fit test can answer. Pinning a rung and re-running the
+    perf table answers it, and every rung is bit-identical, so the comparison is
+    pure speed.
+
+    A pinned rung that does not fit raises rather than stepping down -- the whole
+    point is to measure the rung named, and a silent fall would report one rung's
+    number under another's label.
+    """
+    raw = os.environ.get("STICKYKV_DECODE_TILE", "").strip().lower()
+    if not raw:
+        return None
+    try:
+        keys, sep, stages = raw.partition("x")
+        # A bare "64" means one stage; "64x" is a typo, not a shorthand, and
+        # letting it through would report the ladder's rung under a pinned label.
+        if sep and not stages:
+            raise ValueError("trailing 'x' with no num_stages")
+        rung = (int(keys), int(stages) if sep else 1)
+    except ValueError:
+        raise ValueError(
+            f"STICKYKV_DECODE_TILE={raw!r} is not '<target_keys>x<num_stages>' "
+            f"(e.g. '64x2'). Known rungs: {_FIT_LADDER}"
+        ) from None
+    if rung[0] < 1 or rung[1] < 1:
+        raise ValueError(f"STICKYKV_DECODE_TILE={raw!r}: both parts must be >= 1")
+    return rung
+
+
+def fit_choice() -> dict:
+    """The rung chosen per geometry signature, as a plain dict.
+
+    The kernel prints its choice once per geometry, which happens during warmup
+    and scrolls away above whatever is being read. This is the same fact, asked
+    for rather than caught -- so a profile or a perf run can report the tiling it
+    actually ran at instead of a reader hoping to have seen the line.
+
+    Keys are ``(ws, head_dim, BLOCK_R, has_q_tier, gated)``; values are
+    ``(target_keys, num_stages)``.
+    """
+    return dict(_FIT_CHOICE)
 
 #: Winning rung per geometry signature, so the search runs once per process.
 _FIT_CHOICE: dict = {}
@@ -1147,7 +1214,13 @@ def _decode_triton(
     # separate compiles with different register and staging pressure, and a rung
     # that fit one is not evidence about the other.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated))
-    rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
+    pinned = _tile_override()
+    if pinned is not None:
+        rungs = [pinned]
+    elif _FIT_CHOICE.get(sig) is not None:
+        rungs = [_FIT_CHOICE[sig]]
+    else:
+        rungs = _FIT_LADDER
     last: Optional[BaseException] = None
     for target_keys, num_stages in rungs:
         BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
@@ -1179,6 +1252,15 @@ def _decode_triton(
             _announce_fit(sig, target_keys, num_stages, BLOCK_NW, BLOCK_T)
         return out, wsum
 
+    if pinned is not None:
+        raise RuntimeError(
+            f"STICKYKV_DECODE_TILE pinned target_keys={pinned[0]} "
+            f"num_stages={pinned[1]} and it does not fit for ws={ws}, "
+            f"head_dim={D}, BLOCK_R={BLOCK_R}, gated={gated}. This raises rather "
+            "than stepping down: a pinned rung exists to be MEASURED, and a "
+            "silent fall would report one rung's number under another's label. "
+            f"Unset it to use the ladder {_FIT_LADDER}. Last error: {last}"
+        )
     raise RuntimeError(
         "fused decode could not fit in shared memory at any tile size. Tried "
         f"(target_keys, num_stages) = {_FIT_LADDER} for ws={ws}, head_dim={D}, "
