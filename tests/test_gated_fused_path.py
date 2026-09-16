@@ -345,10 +345,12 @@ def test_the_fused_gate_picks_the_same_windows_as_gate_and_select():
     same operation. This pins that, because a finite margin would make them differ
     silently — which is why ``_gate_ctx`` refuses one.
 
-    Compared as **sets**: the gate no longer sorts its pick, because the decode
-    kernel places each window's score by its own column id and so cannot care
-    what order the selection arrives in. Which windows are chosen is the claim;
-    their order is not.
+    Compared as **sets**, because which windows are chosen is the claim here and
+    their order is not: the decode kernel places each window's score by its own
+    column id and cannot care what order the selection arrives in. (The gate does
+    sort its pick ascending, but for memory locality in the Q-tier gathers, not
+    for correctness — see ``gate_kernel._sorted_pick``. Sorting both sides keeps
+    this assertion about the selection rather than about the sort.)
     """
     from modules.windowed_cache.gate_kernel import fused_gate
 

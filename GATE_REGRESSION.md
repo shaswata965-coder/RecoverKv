@@ -216,15 +216,17 @@ run is identical tensor-for-tensor compiled vs eager.
 
 ## 7. Open — in priority order
 
-1. **`--gate-ratio 1.0` control arm.** Keeps `GATED`, `SEL`, the epilogue and the
-   cards; removes only the selection. If 1.0 beats 0.25, the machinery costs more
-   than the selection saves. Decisive and cheap. **Run this first.**
+1. ~~**`--gate-ratio 1.0` control arm.**~~ **Run. See §8.1 — it ties, which is the
+   "machinery costs more than the selection saves" branch.**
 2. **Profile `fbcf368` vs HEAD** with the fixed bucketed profiler; diff the
-   `ours:` rows. Confirms 2a–2c quantitatively.
-3. **Re-run the four stale cells** before comparing anything.
+   `ours:` rows. Confirms 2a–2c quantitatively. **Still open, and now blocked on
+   §8.2** — the two commits are not at the same operating point.
+3. ~~**Re-run the four stale cells** before comparing anything.~~ Done; §8.1 is a
+   fresh pair of full-table runs.
 4. If the gate is confirmed net-negative, the design question is whether a gate
    over an int2 tier can pay at all — the codes are already 8× smaller than fp16,
    so the tier is 38% of the ungated read and half of *that* is the grid.
+   **§8.1 confirms it; the question is live.**
 5. Grid → int8. Park until 1–2 land; it is a memory change, not a speed one.
 
 ### Not measured, do not assume
@@ -238,3 +240,175 @@ run is identical tensor-for-tensor compiled vs eager.
   pointwise and should fuse into the same kernels — instructions, not launches.
 - The `elementwise`/`copy`/`reduce` 60% has not been split between the model and
   the cache. Only a chrome trace (`--trace`) can do that.
+
+---
+
+## 8. The control arm ran — and what it exposed
+
+Three findings. The first answers §7.1. The second and third say that two of the
+numbers this document reasons from were measured against the wrong reference.
+
+### 8.1 gate 1.0 vs 0.25: the selection is worth ~0.8%
+
+Two full table runs, identical but for `GATE_RATIO`. TPOT_steady, seconds:
+
+| shape | B | gate 1.0 | gate 0.25 | Δ | e2e 1.0 | e2e 0.25 |
+|---|---|---|---|---|---|---|
+| 4096/257 | 1 | 0.0575 | 0.0566 | **−1.6%** | 16.6 | 16.8 |
+| 4096/257 | 32 | 0.0770 | 0.0763 | **−0.9%** | 257.5 | 259.3 |
+| 2048/513 | 1 | 0.0578 | 0.0574 | −0.7% | 17.0 | 17.1 |
+| 2048/513 | 32 | 0.0645 | 0.0644 | −0.2% | 421.2 | 421.6 |
+| 1024/1025 | 1 | 0.0576 | 0.0573 | −0.5% | 17.2 | 17.3 |
+| 1024/1025 | 32 | 0.0590 | 0.0586 | −0.7% | 516.0 | 519.6 |
+
+**Validity check first:** TTFT agrees across the two runs to within 0.1% in every
+cell (11.820/11.812, 5.577/5.576, 2.714/2.707). A decode read gate cannot touch
+prefill, so matching TTFT is what says these are the same configuration differing
+in one variable. Without that the table would be two runs, not a control arm.
+
+**Reading 25% of the windows instead of 100% is worth 0.2–1.6% of TPOT.** §2a
+predicted it: 0.23 ms of traffic on a ~76 ms step is 0.3%, and the measurement
+comes out the same order. The byte accounting was right, and what it was right
+about is that there is nothing there.
+
+**Memory does not move either.** `peak_GB` is identical in all six cells;
+`steadyKV_GB` is identical in four and within 0.5% in the other two. That is
+correct and expected — this is a *read* gate, not a residency gate; it changes
+what a step dequantizes, never what the cache keeps. It was never going to buy
+memory and it does not.
+
+**So §7.1's decision rule fires.** 1.0 does not beat 0.25 — it ties it, and a tie
+is the same verdict: the machinery costs essentially everything the selection
+saves. Every millisecond of §2b's gathers and §2c's extra full-tier pass is being
+paid for a ~0.8% return.
+
+### 8.2 §1's baseline comparison is confounded — the operating point moved
+
+`ecc0792` *"Adjust CACHE_BUDGET and LOCAL_WINDOW parameters"* (2026-09-15) sits
+**inside** the `fbcf368..HEAD` window and changes `scripts/run_perf_table.sh`:
+
+| | before | after |
+|---|---|---|
+| `CACHE_BUDGET` | 0.50 | **0.20** |
+| `LOCAL_WINDOW` | 64 | **128** |
+
+§1 says *"Everything between `fbcf368` and HEAD is the read-gate work. The
+regression is the gate."* That is not true of `ecc0792`. It is not gate work at
+all — it is a change to the benchmark's own operating point, and the published
+artifact §1 compares against was produced at budget 0.50 / local 64.
+
+It also moves precisely the term §2a identifies as dominant. `LOCAL_WINDOW` sizes
+the fp tier, and §2a measures the fp tier at **87% of what the gated kernel
+reads**. Doubling it is, to first order, doubling the dominant term.
+`CACHE_BUDGET` 0.50 → 0.20 shrinks the *quantized* tier — the other 13%. The
+current table therefore reads less int2 and roughly twice as much fp16 as the
+baseline it is being scored against.
+
+That is on its own a candidate explanation for "reading less got slower", and it
+has nothing to do with the gate. **The 24% in §1 is not attributable to the gate
+until this is re-run at the published operating point:**
+
+```bash
+CACHE_BUDGET=0.50 LOCAL_WINDOW=64 GATE_RATIO=0.25 CUDA_VISIBLE_DEVICES=0 scripts/run_perf_table.sh
+CACHE_BUDGET=0.50 LOCAL_WINDOW=64 GATE_RATIO=1.0  CUDA_VISIBLE_DEVICES=0 scripts/run_perf_table.sh
+```
+
+### 8.3 `GPU busy` was divided by a wall the profiler had inflated
+
+§3a fixed the numerator — `key_averages()` double-counting every kernel — and
+left the denominator wrong in the same direction.
+
+`wall_us` was measured **inside** the `with profile(...)` block. The profiler's
+per-event cost is charged to that wall and to nothing else, so it lands wholly in
+the denominator and drives `busy` down:
+
+| | ms/step |
+|---|---|
+| CUDA kernel self time (numerator) | 48.05 |
+| wall, profiler **ON** | 147.34 |
+| `tpot_steady_ms` at the same cell, profiler **OFF** | **76.3** |
+| difference = 71.0 ms over 1,656 launches | **43 µs/launch** |
+
+- 48.05 / 147.34 = **32.6% → "HOST-BOUND"**
+- 48.05 / 76.3 = **63% → "MIXED"**
+
+The two are comparable: `tpot_steady_ms` is `(t3 − t_step0) / (n_decode − 1)`,
+which includes eviction steps exactly as the profiled window does.
+
+**This flips the instrument's verdict, and the verdict is what the priority list
+keys off.** "Host-bound" says collapse launches. "63%, mixed" says the GPU is busy
+two-thirds of the step and the kernels are at least as large a lever as the host —
+so `DECODE_SPEED_PLAN.md`'s standing premise that decode is host-bound does not
+survive the corrected denominator, and neither does §4's reading of it here.
+
+Fixed: `profile_decode.py` now times `steps` steps with the profiler **off**,
+reports `GPU busy` against that, and prints the profiled wall beside it labelled
+as overhead.
+
+### 8.4 `sel` is sorted again — the one change §2b's mechanism asks for
+
+§2b names the mechanism: under `SEL` the Q-tier loop's `widx` stops being affine,
+`KS`/`KZ`/`KC`/`VC`/`VS`/`VZ`/`COS`/`SIN` all become gathers, and the kernel runs
+**7.03 ms against a 0.58 ms roofline — 12× off**.
+
+`e7bc158` had dropped the ascending sort on the gate's pick, correctly reasoning
+that the decode kernel places each window's score at its own column so the order
+cannot change the result, and therefore that the sort was "a launch for nothing".
+The result is not what the order was buying. `topk` returns indices in descending
+*score* order, which is arbitrary in *column* space — a tile of `BLOCK_NW` windows
+then touches `BLOCK_NW` segments scattered across the whole tier:
+
+```
+unsorted topk : [14, 13, 19,  6, 15]
+sorted        : [ 6, 13, 14, 15, 19]
+```
+
+Same set, same scores, same eviction decisions — monotone addresses instead of
+random ones, with a mean stride of `1/ratio` windows. Restored in
+`gate_kernel._sorted_pick`, which carries the argument.
+
+Cost is one sort of `[B, H_kv, n_sel]` per layer per step (~11.5k int32 at the
+headline cell) against a cache-side launch budget §4 measures at 8.6% of the
+step. **Unmeasured on GPU** — it is a memory-locality argument, and §2b's 12× is
+the only evidence that locality is what the kernel is losing to.
+
+### 8.5 The scratch round trip — checked, and too small to chase
+
+`WSUM`/`WMAX` are `[B, H_q, W_phys]` fp32 in **global** memory, and the kernel
+makes about five passes over them: the `GATED` prologue seeds the Q columns, the
+body loop writes, the Q loop writes, the §4 epilogue reads and rewrites all of
+them, and the §5 fill reads and rewrites the skipped ones. At `W_phys ≈ 200`
+(`DECODE_SPEED_PLAN.md`'s `n_active` at the 4096 cell) that is 2 × 32 × 32 × 200 ×
+4 B ≈ 1.6 MB per layer per pass, ~256 MB/step across 32 layers — **~0.13 ms/step
+at A100 bandwidth**, against the 1,186 MB/step of the gated read.
+
+Real, and 0.2% of the step. Written down so nobody spends a week on it.
+
+---
+
+## 9. Revised priority
+
+| # | item | kind | why it is here |
+|---|---|---|---|
+| 1 | Re-run at budget 0.50 / local 64 (§8.2) | measurement | nothing in §1 is attributable until this lands |
+| 2 | Re-profile with the fixed denominator (§8.3) | measurement | decides whether kernels or host lead |
+| 3 | Measure `sel` ascending (§8.4) | landed, unverified | the only change §2b's mechanism directly asks for |
+| 4 | Split the `elementwise`/`copy`/`reduce` block | measurement | ~24 ms of 48 ms — bigger than the GEMMs, bigger than our kernel, and still unattributed. Needs `--trace` |
+| 5 | Decide the gate on §8.1 | design | a ~0.8% return does not pay for §2b + §2c |
+| 6 | Grid → int8 (§5) | memory | 1.35× Q tokens at the same bytes; not a speed item |
+
+Items 1–4 are measurements, and they come first because the three findings above
+are all the same failure: a number was compared against a reference that had
+moved. The remaining speed question is genuinely open — §8.3 means the 7.03 ms
+two-tier kernel is 14.6% of GPU time on a step that is 63% GPU, i.e. ~9% of TPOT,
+and the 24 ms elementwise block is three times that and still belongs to nobody.
+
+### Added to "do not assume"
+
+- **§8.4 is unmeasured on GPU.** Sorting `sel` is an argument about coalescing and
+  L2, pinned on CPU only for what it must not change (the selected set, the column
+  each score lands on). It reorders an online-softmax accumulation, so `out` moves
+  in the last bits exactly as any tile-order change does.
+- **§8.2 is a confound, not a result.** It says the 24% is not attributable as
+  claimed. It does **not** say the gate is innocent, and it does not predict the
+  size or even the sign of what the re-run will show.

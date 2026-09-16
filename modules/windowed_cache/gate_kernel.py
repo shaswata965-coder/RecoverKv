@@ -89,9 +89,9 @@ def gate_reference(
 
     Returns
     -------
-    sel : ``[B, H_kv, n_sel]`` int32 column indices, in top-k order (**not**
-        sorted — the decode kernel places each window's score by its own column
-        id, so the order is free and a sort is a launch for nothing).
+    sel : ``[B, H_kv, n_sel]`` int32 column indices, **ascending**. See
+        :func:`_sorted_pick` for why the order is free to the result and not
+        free to the memory system.
     logmass : ``[B, H_q, Nw]`` the estimate for every window.
     """
     from modules.quant.sketch import Sketch, gate_and_score, group_max
@@ -100,7 +100,37 @@ def gate_reference(
     _, logmass, est = gate_and_score(q, card, anchor, scaling)
     hkv = mu_q.shape[2]
     top = group_max(est, hkv).topk(n_sel, dim=-1).indices          # [B,Hkv,n_sel]
-    return top.to(torch.int32), logmass
+    return _sorted_pick(top), logmass
+
+
+def _sorted_pick(top: Tensor) -> Tensor:
+    """Top-k indices as an ascending int32 ``sel``.
+
+    The decode kernel places each window's score at ``n_body_win + widx``, its
+    own column, so **the result cannot depend on this order** — that is what
+    ``test_selection_order_does_not_change_the_result`` pins, and it is why the
+    sort was dropped as "a launch for nothing".
+
+    The launch was for something, and it was not the arithmetic. ``GATE_REGRESSION.md``
+    §2b: under ``SEL`` the Q-tier loop's ``widx`` stops being affine, so ``KS``,
+    ``KZ``, ``KC``, ``VC``, ``VS``, ``VZ`` and ``COS``/``SIN`` all become gathers,
+    and the kernel runs **7.03 ms against a 0.58 ms roofline — 12x off**, which is
+    the signature of a gather-bound kernel and nothing else in that measurement
+    explains it. ``topk`` returns indices in descending *score* order, which is
+    arbitrary in *column* space: each tile of ``BLOCK_NW`` windows then touches
+    ``BLOCK_NW`` segments scattered across the whole tier. Ascending order makes
+    the same segments monotone and locally clustered (mean stride ``1/ratio``
+    windows at ratio ``r``), which is what L2, the TLB and the coalescer are
+    built for.
+
+    Cost is one small sort per layer per step — ``[B, H_kv, n_sel]``, ~11.5k int32
+    at the headline cell — against a cache-side launch budget the same document
+    measures at 8.6% of the step's total. It does reorder an online-softmax
+    accumulation, so ``out`` moves in the last bits exactly as any tile-order
+    change does; it does not move *which* windows are read or *which* column each
+    score lands on, so no eviction decision is reassociated.
+    """
+    return top.sort(dim=-1).values.to(torch.int32)
 
 
 def gate_window_tiles(rows: int, n_windows: int, sm_count: int) -> int:
@@ -258,11 +288,10 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
         BLOCK_W=block_w,
         num_warps=4,
     )
-    # `est` already carries the group max, so this is a bare top-k. Not sorted:
-    # the decode kernel places each window's score by its own column id, so the
-    # order `sel` arrives in cannot matter (tests/test_gated_fused_path.py pins
-    # it), and a sort here is a kernel launch per layer per step for nothing.
-    return est.topk(n_sel, dim=-1).indices.to(torch.int32), logm
+    # `est` already carries the group max, so this is a bare top-k. Sorted
+    # ascending -- free to the result, not free to the memory system; the whole
+    # argument is in `_sorted_pick`.
+    return _sorted_pick(est.topk(n_sel, dim=-1).indices), logm
 
 
 def fused_gate(

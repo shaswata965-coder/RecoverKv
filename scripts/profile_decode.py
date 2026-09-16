@@ -18,12 +18,22 @@ path is batch-invariant -- e.g. one launched on a ``B * H_kv`` grid, which is 8
 blocks on a 108-SM A100 at B=1 -- produces the identical signature. The two
 hypotheses are distinguished by exactly one number, printed first below:
 
-    GPU busy fraction = (CUDA kernel self time) / wall time
+    GPU busy fraction = (CUDA kernel self time) / UNPROFILED wall time
 
   << 1.0   host-bound. The launch/sync path is the budget; the dispatch-count
            argument was right and the remaining launches are the target.
   ~= 1.0   kernel-bound. The GPU is saturated and the kernels themselves are
            slow. No amount of launch collapsing can help; fix the kernel.
+
+The denominator is load-bearing and was wrong until it was measured separately.
+Kernel time comes from the profiler, so the obvious thing is to take the wall
+from the same block -- but the profiler charges tens of microseconds per event,
+and a decode step that issues ~1,650 launches pays that ~1,650 times. The cost
+lands wholly in the denominator (the kernels themselves are unchanged), so it
+pushes `busy` down by close to 2x and turns a mixed step into a host-bound
+verdict. This script therefore times `steps` steps with the profiler OFF, uses
+that as the denominator, and prints the profiled wall beside it as overhead.
+Anything comparing `busy` against TPOT must use the unprofiled figure.
 
 Then the A/B that names the kernel, if it is one:
 
@@ -315,6 +325,14 @@ def main() -> None:
             rope = mod
             break
 
+    # Deliberately counts ONE window of `steps`, not the two that actually run.
+    # `max_tokens` is not a capacity: the buffers are sized to the eviction
+    # budget (cache.py's "Sized to the EVICTION BUDGET" note), and the only thing
+    # this value reaches is `config.resolve`, where the budget is taken against
+    # `prefill_len + max_tokens`. Counting the second (unprofiled) window here
+    # would widen the budget by ~0.6% and quietly profile a different method than
+    # every earlier run of this script. The extra steps cost budget nothing --
+    # they evict against the same target like any other step.
     total_steps = args.warmup + args.steps + 1
     # Shared with audit_e2e: budget and quant settings live in perf.configs[0],
     # not cfg.cache, and first_eviction_step must be carried or this profiles a
@@ -359,6 +377,29 @@ def main() -> None:
                 nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             torch.cuda.synchronize()
 
+            # ---- window 1: the STEADY wall, with the profiler OFF ------------
+            # `GPU busy` is kernel time over wall time, and the only wall that
+            # answers the question is the one the step costs when nothing is
+            # watching. Timing it inside the `profile` block instead charges the
+            # denominator for the profiler's own per-event cost -- which on this
+            # workload is not a rounding error: CPU+CUDA activity tracing pays
+            # roughly tens of microseconds per launch, and a step that issues
+            # ~1,650 of them absorbs tens of milliseconds it does not otherwise
+            # spend. That lands entirely in the denominator and nowhere in the
+            # numerator, so it drives `busy` DOWN and makes a mixed step read as
+            # host-bound -- the one reading this script exists to rule on.
+            t0 = time.perf_counter()
+            for _ in range(args.steps):
+                out = _step(nxt, pkv, 1)
+                pkv = out.past_key_values
+                nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            torch.cuda.synchronize()
+            steady_us = (time.perf_counter() - t0) * 1e6
+
+            # ---- window 2: the attribution, with the profiler ON -------------
+            # Same length as window 1 so the two see the same number of eviction
+            # steps, which are ~2.7x a steady step and would otherwise bias
+            # whichever window held more of them.
             t0 = time.perf_counter()
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
@@ -401,15 +442,22 @@ def main() -> None:
               "default run. The elementwise/copy\n     kernels below are "
               "inflated accordingly.")
     print("=" * 74)
-    print(f"  wall            {wall_us / n / 1000:8.2f} ms/step")
+    print(f"  wall            {steady_us / n / 1000:8.2f} ms/step   "
+          "(profiler OFF -- the real step)")
+    print(f"  wall, profiled  {wall_us / n / 1000:8.2f} ms/step   "
+          f"({(wall_us - steady_us) / n / 1000:+.2f} ms of profiler overhead, "
+          "NOT the step's cost)")
     print(f"  CUDA kernels    {gpu_us / n / 1000:8.2f} ms/step")
     if op_us > 0:
         print(f"  (ATen op view   {op_us / n / 1000:8.2f} ms/step  -- the same "
               "kernels seen from the\n                            operator side. "
               "NOT added: key_averages()\n                            returns "
               "both, and summing them double-counts.)")
-    busy = gpu_us / max(wall_us, 1.0)
+    busy = gpu_us / max(steady_us, 1.0)
     print(f"  GPU busy        {busy * 100:8.1f} %   <-- THE number")
+    print(f"  (against the profiled wall it would read "
+          f"{gpu_us / max(wall_us, 1.0) * 100:.1f}% -- that figure is an "
+          "artifact\n   of the measurement and must not be quoted.)")
     print(f"  kernel launches {n_launch / n:8.0f} /step")
     if busy < 0.5:
         print("  -> HOST-BOUND. The GPU idles most of the step; launches and "
