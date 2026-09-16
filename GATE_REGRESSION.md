@@ -297,15 +297,38 @@ regression is the gate."* That is not true of `ecc0792`. It is not gate work at
 all — it is a change to the benchmark's own operating point, and the published
 artifact §1 compares against was produced at budget 0.50 / local 64.
 
-It also moves precisely the term §2a identifies as dominant. `LOCAL_WINDOW` sizes
-the fp tier, and §2a measures the fp tier at **87% of what the gated kernel
-reads**. Doubling it is, to first order, doubling the dominant term.
-`CACHE_BUDGET` 0.50 → 0.20 shrinks the *quantized* tier — the other 13%. The
-current table therefore reads less int2 and roughly twice as much fp16 as the
-baseline it is being scored against.
+**The direction is the opposite of what "LOCAL_WINDOW doubled" suggests, and it
+matters.** `CACHE_BUDGET` is the outer term: `config.resolve` computes
+`remaining = cache_budget * (prefill + max_tokens) - num_sink - local_tokens`
+and splits *that* between the tiers, so a 2.5× budget cut shrinks the fp body and
+the int2 tier together, and swamps the +64 tokens `LOCAL_WINDOW` adds. Worked
+through for the 4096 cell at `quant_mode=tokens`, `q=0.70`:
 
-That is on its own a candidate explanation for "reading less got slower", and it
-has nothing to do with the gate. **The 24% in §1 is not attributable to the gate
+| | published 0.50 / 64 | current 0.20 / 128 |
+|---|---|---|
+| `total_budget_tokens` | 2,176 | 870 |
+| `top_k_windows` | 263 | 92 |
+| `N_q` (int2 windows) | **184** | **64** |
+| `top_k_fp` (fp windows) | 79 | 28 |
+| `S_fp` (fp tokens/row) | **701** | **357** |
+| read/step, gated 0.25 | **3,338 MB** | **1,636 MB** |
+
+(`N_q = 184` against `DECODE_SPEED_PLAN.md`'s `n_active ≈ 179`, and
+`b_q = 8,448 B` against §2a's window — two independent checks that this is the
+right arithmetic.)
+
+So the fp tier did not double, it **halved**, and the int2 tier fell to a third.
+**The current table reads 2.04× LESS than the baseline it is scored against and
+is 22% slower.** Which retires "reading less got slower" as a traffic story
+altogether — see §8.6 — and makes the regression *larger* than §1 states rather
+than smaller, because the baseline was carrying twice the bytes when it posted
+0.0626.
+
+Prediction for the re-run, worth writing down before it is made: at 0.50/64 the
+Q-tier loop visits 46 selected windows instead of 16 and the body loop 79 fp
+windows instead of 28, so HEAD should land **slower** than its own 0.0763 — call
+it 0.080–0.085 — and the true matched-config regression against 0.0626 is then
+~30%, not 24%. **The 24% in §1 is not attributable to the gate
 until this is re-run at the published operating point:**
 
 ```bash
@@ -371,6 +394,43 @@ Cost is one sort of `[B, H_kv, n_sel]` per layer per step (~11.5k int32 at the
 headline cell) against a cache-side launch budget §4 measures at 8.6% of the
 step. **Unmeasured on GPU** — it is a memory-locality argument, and §2b's 12× is
 the only evidence that locality is what the kernel is losing to.
+
+### 8.6 The ceiling on every read-side optimisation is ~1% of the step
+
+The single number that reorders this whole document. At the 4096/B=32 cell the
+gated read is **1,636 MB/step**; an A100 moves that in **0.80 ms**. The step is
+**76.3 ms**.
+
+> **The entire KV read — both tiers, every byte the gate exists to avoid — is
+> 1.05% of TPOT.**
+
+At the published operating point it is 1.64 ms of 62.6 ms, i.e. 2.6%. Neither is
+a budget anything can be won back from.
+
+That bounds, by construction and regardless of implementation:
+
+| claim | what it is really worth |
+|---|---|
+| §2a's 0.23 ms gate saving | 0.30% of TPOT |
+| §5's int8 grid, gated | 0.24 ms → 0.31% |
+| §5's int8 grid, ungated | 0.68 ms → 0.89% |
+| a *perfect* gate (`n_sel = 0`, vs **ungated**) | 0.27 ms → **0.35%** |
+| the headroom left from `ratio = 0.25` | 0.07 ms → **0.09%** |
+
+And it explains why §8.1 measured 0.8% for the gate and §2a predicted 0.3%: both
+are right, and both are noise against the step. It also explains the 12×: the
+two-tier kernel spends **7.03 ms moving 0.80 ms of bytes**, so it is not
+bandwidth-limited at all — the gathers cost latency and issue slots, not
+bandwidth, and "bytes saved" was never the unit that predicted its time.
+
+**The corollary is the useful part.** The fp body loop covers `top_k_fp * ws +
+local + sink` = 357 tokens against the Q loop's 128 (at `n_sel=16`), so **73% of
+the kernel's token work is in the tier the gate cannot touch.** No setting of
+`quant_gate_ratio` reaches it.
+
+Everything worth having is therefore in the other two places: the **48.05 ms of
+kernels** and the **28.25 ms of host gap** (§8.3). `DECODE_PLAN`-style byte
+accounting should not be used to size decode work again.
 
 ### 8.5 The scratch round trip — checked, and too small to chase
 
