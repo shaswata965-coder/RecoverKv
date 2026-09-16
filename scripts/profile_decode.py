@@ -150,6 +150,11 @@ def _bucket_of(key: str) -> str:
     return "other"
 
 
+#: The cache this run built, so the rollup can read its counters. One process,
+#: one profiled cache; a dict rather than a global rebind keeps it importable.
+_PROFILED_CACHE: dict = {"cache": None}
+
+
 def _print_buckets(evs, n: int, gpu_us: float) -> None:
     """The rollup: where the step's GPU time and launches actually go."""
     agg: dict = {}
@@ -405,6 +410,9 @@ def main() -> None:
         kv_dtype=dtype, rope_module=rope,
         num_layers=model.config.num_hidden_layers, max_tokens=total_steps)
     hooks = install_score_hooks(model, cache, cache_config)
+    # The rollup is printed by a module-level function, so it needs a handle to
+    # the live cache to read its eviction-width counters.
+    _PROFILED_CACHE["cache"] = cache
 
     # cache_position must be passed EXPLICITLY and advanced monotonically. Left
     # to itself, transformers derives it from `past_key_values.get_seq_length()`,
@@ -579,6 +587,32 @@ def main() -> None:
                 print("    A lower rung is a shared-memory fact, not a verdict: "
                       "pin rungs with\n    STICKYKV_DECODE_TILE=64x1 (etc.) and "
                       "re-run the table to price them.")
+    except Exception:  # pragma: no cover - diagnostics must never fail a run
+        pass
+
+    # What the eviction's worst-case width actually bought (DECODE_NEXT.md D1).
+    # Printed here, after both timed windows, because reading it syncs once.
+    try:
+        from modules.windowed_cache.cache import evict_width_stats
+        w = evict_width_stats(_PROFILED_CACHE["cache"])
+        if w:
+            print(f"\n  eviction widths over {w['evictions']} evictions "
+                  f"(n_q={w['n_q']}, W_retained={w['W_retained']}):")
+            print(f"    fresh (quantize+sketch)  max={w['fresh_max']:4d}  "
+                  f"mean={w['fresh_mean']:6.2f}  of n_q={w['n_q']}"
+                  + (f"   fill={w['fresh_fill']:.1%}"
+                     if w["fresh_fill"] is not None else ""))
+            print(f"    promote (dequant+RoPE)   max={w['promote_max']:4d}  "
+                  f"mean={w['promote_mean']:6.2f}")
+            print(f"    reactivate (free)        max={w['react_max']:4d}")
+            fill = w["fresh_fill"]
+            if fill is not None and fill < 0.5:
+                print(f"    -> D1 is live: the demote path un-rotates, quantizes "
+                      f"and sketches\n       [L*B, {w['n_q']}, H_kv, ws, D] and "
+                      f"masks away {1 - fill:.0%} of it.")
+            elif fill is not None:
+                print("    -> D1 is worth little here: the width is already "
+                      "close to the real count.")
     except Exception:  # pragma: no cover - diagnostics must never fail a run
         pass
 

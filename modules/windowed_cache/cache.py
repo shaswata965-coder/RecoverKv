@@ -99,6 +99,45 @@ def evict_path_stats() -> dict:
     return dict(_EVICT_STATS)
 
 
+def evict_width_stats(cache) -> Optional[dict]:
+    """What ``_compact``'s worst-case width bought, per eviction. Syncs once.
+
+    ``None`` until an eviction has run. Otherwise::
+
+        {"evictions", "n_q", "W_retained",
+         "fresh_max", "fresh_mean", "promote_max", "promote_mean", "react_max",
+         "fresh_fill", "promote_fill"}
+
+    ``fresh_fill`` is ``fresh_max / n_q`` -- **the number that sizes D1.** The
+    demote path un-rotates, quantizes and sketches ``[L*B, n_q, H_kv, ws, D]``
+    every eviction, and everything beyond a row's real count is masked away. A
+    fill of 0.05 says 95% of that payload is discarded and D1 is worth doing; a
+    fill near 1.0 says the width is already about right and D1 is worth nothing.
+
+    ``DECODE_NEXT.md`` §7 records this as the risk the D1 estimate rests on --
+    *"If the real count is routinely close to n_q, D1 is worth little"* -- and it
+    has never been printed. Read it AFTER a timed window, never inside one: the
+    single ``.item()`` here is the host sync the counters exist to avoid on the
+    eviction path itself.
+    """
+    buf = getattr(cache, "_evict_widths", None)
+    bound = getattr(cache, "_evict_width_bound", None)
+    if buf is None or bound is None:
+        return None
+    ev, fmax, pmax, rmax, fsum, psum = (int(x) for x in buf.tolist())
+    if ev == 0:
+        return None
+    n_q, W = bound
+    return {
+        "evictions": ev, "n_q": n_q, "W_retained": W,
+        "fresh_max": fmax, "fresh_mean": fsum / ev,
+        "promote_max": pmax, "promote_mean": psum / ev,
+        "react_max": rmax,
+        "fresh_fill": (fmax / n_q) if n_q else None,
+        "promote_fill": (pmax / n_q) if n_q else None,
+    }
+
+
 def evict_compile_failed() -> Optional[str]:
     """The eviction's torch.compile failure (``"Type: msg"``), or ``None``.
 
@@ -1882,6 +1921,52 @@ class WindowedCache(_HFCacheBase):
             out_dtype=state.key_states.dtype,
         )
 
+    def _record_evict_widths(self, fresh: Tensor, promote: Tensor,
+                             react: Tensor, n_q: int, W: int) -> None:
+        """How many lanes each eviction actually used, against the width it got.
+
+        ``_compact`` allocates by **rank into a worst-case width**, not by count:
+        the counts are ragged per row (*"row 0 may demote 4 windows while row 1
+        demotes none"*), so allocating by count would need the max, and the max
+        needs a host sync. ``DECODE_NEXT.md`` D1 proposes paying that sync -- one
+        per eviction -- to stop un-rotating, quantizing and sketching a
+        ``[L*B, n_q, H_kv, ws, D]`` tensor of which most lanes are masked away.
+
+        **D1's size is entirely this ratio, and nothing has ever printed it.**
+        DECODE_NEXT.md §7 lists it as the risk the estimate rests on: *"If the
+        real count is routinely close to n_q, D1 is worth little."* So measure
+        before rewriting, especially now that the eviction actually fuses (the
+        waste is pointwise work inside a fused kernel, not sixteen launches of
+        it, which is a different and un-sized quantity).
+
+        **This costs no sync and no graph break**, which is the whole reason it
+        is a running max in device memory rather than the ``.item()`` D1 wants.
+        A ``.item()`` here reintroduces exactly the break
+        ``tests/test_evict_graph_breaks.py`` pins at zero -- measured:
+        ``Unsupported Tensor.item() call with capture_scalar_outputs=False``.
+        The buffer hangs off ``self``, which is argument 0 of the compiled body,
+        so Inductor functionalizes the mutation like any other input mutation.
+
+        Read it with :func:`evict_width_stats`, which syncs once, on demand,
+        outside whatever window was being timed.
+        """
+        buf = getattr(self, "_evict_widths", None)
+        if buf is None or buf.device != fresh.device:
+            buf = torch.zeros(6, dtype=torch.long, device=fresh.device)
+            self._evict_widths = buf
+        f = fresh.sum(1).max()
+        p = promote.sum(1).max()
+        r = react.sum(1).max()
+        buf[0] += 1
+        buf[1] = torch.maximum(buf[1], f)
+        buf[2] = torch.maximum(buf[2], p)
+        buf[3] = torch.maximum(buf[3], r)
+        buf[4] += f                      # running sums -> a mean, not just a max
+        buf[5] += p
+        # n_q and W are Python ints (tier_counts is config arithmetic), so they
+        # are trace-time constants -- recorded on the host, never in the graph.
+        self._evict_width_bound = (int(n_q), int(W))
+
     @staticmethod
     def _compact(src: Tensor, mask: Tensor, width: int) -> Tuple[Tensor, Tensor]:
         """Gather ``src``'s masked lanes to the front of a ``[B, width]`` tensor.
@@ -2065,6 +2150,8 @@ class WindowedCache(_HFCacheBase):
         fresh = demote & ~has_entry        # never quantized → quantize now
         react = demote & has_entry         # dormant → reactivate, NO requant (§10)
         promote = ~is_q_new & is_q_cur     # currently Q, wants fp
+
+        self._record_evict_widths(fresh, promote, react, n_q, W)
 
         # --- 3a. Free dropped entries FIRST (§6) ----------------------------
         # Before allocating, not after: it is what makes n_slots_for's

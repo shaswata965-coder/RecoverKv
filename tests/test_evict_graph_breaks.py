@@ -130,3 +130,76 @@ def test_replace_body_still_refuses_an_aliasing_source_in_eager():
     with pytest.raises(RuntimeError, match="aliases the key buffer"):
         st.replace_body(1, body_k, torch.randn(1, 2, 3, 3),
                         torch.arange(1, 4).unsqueeze(0))
+
+
+# ---------------------------------------------------------------------------
+# D1's missing number: what the worst-case width actually bought
+# ---------------------------------------------------------------------------
+
+
+def _evict_and_read_widths(backend):
+    """Drive one eviction cycle and return the cache's width counters."""
+    from modules.windowed_cache.cache import evict_width_stats
+    from tests import test_quant_cache as T
+
+    orig, held = T._make_cache, {}
+
+    def keep(*a, **kw):
+        c = orig(*a, **kw)
+        held["c"] = c
+        return c
+
+    T._make_cache = keep
+    try:
+        T._run_decode_across_eviction(compile_backend=backend)
+    finally:
+        T._make_cache = orig
+    return evict_width_stats(held["c"])
+
+
+def test_the_eviction_records_what_its_padded_width_bought():
+    """``_compact`` allocates by rank into ``n_q``; this says how much was real.
+
+    ``DECODE_NEXT.md`` D1 proposes shrinking that width, and §7 records the risk
+    the estimate rests on: *"If the real count is routinely close to n_q, D1 is
+    worth little."* Nothing printed the ratio, so D1 has never been sized.
+    """
+    w = _evict_and_read_widths(None)
+    assert w is not None and w["evictions"] > 0
+    assert 0 <= w["fresh_max"] <= w["n_q"], (
+        "fresh_max above n_q means _compact's bound is not a bound and lanes "
+        "are being routed to its dump column -- work is being silently dropped"
+    )
+    assert 0 <= w["promote_max"] <= w["n_q"]
+    assert w["fresh_mean"] <= w["fresh_max"]
+    assert w["fresh_fill"] == pytest.approx(w["fresh_max"] / w["n_q"])
+
+
+def test_the_counters_agree_compiled_and_eager():
+    """It is a measurement, so it must not be a behaviour difference."""
+    eager = _evict_and_read_widths(None)
+    compiled = _evict_and_read_widths("inductor")
+    assert eager == compiled
+
+
+def test_reading_the_counters_is_the_only_sync_and_it_is_opt_in():
+    """The counters are a device-side running max precisely so the eviction
+    keeps zero syncs and zero graph breaks.
+
+    A ``.item()`` in the body would reintroduce the break this file exists to
+    pin -- measured on torch 2.14: *"Unsupported Tensor.item() call with
+    capture_scalar_outputs=False"*. So the sync lives in the reader, which runs
+    after a timed window rather than inside one.
+    """
+    breaks, _ = _evict_with_counters("inductor")
+    assert not breaks, "recording the widths must not cost a graph break"
+
+
+def test_no_eviction_means_no_stats_rather_than_zeros():
+    """Zeros would read as "the width was never used"; None says "not measured"."""
+    from modules.windowed_cache.cache import evict_width_stats
+
+    class Bare:
+        pass
+
+    assert evict_width_stats(Bare()) is None
