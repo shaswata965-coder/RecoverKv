@@ -332,9 +332,9 @@ def check_gate_selection(
             "must pick at least one and no more than the tier holds. A larger "
             "n_sel means sel was built against a different store version than "
             "qtier, which would index past the gathered codes.")
-    if sel.dtype != torch.int32:
+    if sel.dtype not in (torch.int32, torch.int64):
         raise RuntimeError(
-            f"fused decode gate requires an int32 sel, got {sel.dtype}.")
+            f"fused decode gate requires an int32 or int64 sel, got {sel.dtype}.")
     if not sel.is_contiguous():
         raise RuntimeError(
             "fused decode requires a contiguous sel; its innermost stride is "
@@ -599,7 +599,7 @@ if _HAS_TRITON:
         KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
         VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
-        SEL,                       # gate's pick: int32 [B, H_kv, n_sel]
+        SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
         OUT, WSUM, WMAX,
         scale,
@@ -931,6 +931,64 @@ if _HAS_TRITON:
                 tl.store(ptr, fill, mask=skipped)
 
 
+#: Per-(shape, dtype, device) scratch, reused across layers within a step.
+#:
+#: `DECODE_NEXT.md` D5 sized this against three allocations per layer per step
+#: and rated it the smallest item on its list. It counted the decode side only;
+#: the read gate brought two more (`est`, `logm`), and `topk`/`sort` two outputs
+#: each, so the fused path allocates ~11 per layer per step -- **352 per step at
+#: L=32**, on a path where the host gap is 37% of the step.
+#:
+#: Only tensors that are DEAD by the end of `_run_fused` live here. `out` does
+#: not: it is returned to the model as the attention output, so reusing it would
+#: let layer i+1 overwrite a tensor layer i's `o_proj` may still be reading. That
+#: is precisely the class of silent aliasing bug `CacheState.replace` guards
+#: against, and it is why this cache is opt-in per buffer rather than applied to
+#: everything allocated here.
+#:
+#: `bfbdb1f` -- *"revert the reusable ctx dict -- it caused the narrativeqa OOM"*
+#: -- is the standing precedent. A reused buffer holds memory the caching
+#: allocator would otherwise recycle, and the headline cell already peaks near
+#: 48 GB. Keying on the exact shape means a changed geometry allocates a new
+#: buffer rather than silently reusing a wrong-sized one; `STICKYKV_DECODE_SCRATCH=0`
+#: turns the whole thing off if `peak_GB` moves in the perf table.
+_SCRATCH: dict = {}
+
+_SCRATCH_ON = os.environ.get("STICKYKV_DECODE_SCRATCH", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+
+def _scratch(name: str, shape, dtype, device):
+    """A reusable buffer for ``name`` at this exact geometry.
+
+    Contents are undefined on entry, exactly as ``torch.empty`` leaves them, so
+    every caller must fully write what it later reads. The two-tier kernel does:
+    the body loop writes the fp columns, the ``GATED`` prologue seeds every Q
+    column, and the epilogue reads only what those two wrote.
+    """
+    if not _SCRATCH_ON:
+        return torch.empty(shape, dtype=dtype, device=device)
+    key = (tuple(shape), dtype, str(device))
+    held = _SCRATCH.get(name)
+    if held is not None and held[0] == key:
+        return held[1]
+    # ONE buffer per name, replaced when the geometry moves -- never accumulated.
+    # `W_phys` tracks `n_active`, which moves at every eviction, so a cache keyed
+    # on shape would keep a buffer per distinct window count for the whole
+    # generation. That is the `bfbdb1f` narrativeqa OOM with extra steps. Holding
+    # one means a changed shape costs exactly the allocation it costs today, and
+    # the steady state -- where every step has the same geometry -- still reuses.
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    _SCRATCH[name] = (key, buf)
+    return buf
+
+
+def release_decode_scratch() -> None:
+    """Drop every reused buffer. For tests and for a caller that has finished a
+    generation and wants the memory back before the next shape arrives."""
+    _SCRATCH.clear()
+
+
 def _pow2_at_least(x: int, floor: int = 16) -> int:
     v = floor
     while v < x:
@@ -1085,7 +1143,7 @@ def _decode_triton(
     ``[B, n*ws, D//2]`` and ``window_size`` — the int2 unpack + affine dequant +
     RoPE all happen inside the kernel, so no fp16 Q tensor is built.
 
-    ``sel`` is the gate's ``[B, H_kv, n_sel]`` int32 pick of active columns
+    ``sel`` is the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns
     (ascending). ``None`` reads the whole tier. ``qtier`` is the **full** tier
     either way — ``sel`` is an indirection inside the kernel, not a pre-gather,
     which is what keeps the skipped windows' bytes off the wire.
@@ -1118,9 +1176,13 @@ def _decode_triton(
         )
     W_phys = n_body_win + n_active
 
+    # `out` is NOT scratch: it leaves this function as the model's attention
+    # output and stays live until that layer's o_proj has consumed it.
     out = torch.empty((B, H_q, D), device=q.device, dtype=q.dtype)
-    wsum = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
-    wmax = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
+    # `wsum` is consumed by the score gather inside `_run_fused` and `wmax` is
+    # never read outside the kernel, so both are dead before the next layer runs.
+    wsum = _scratch("wsum", (B, H_q, W_phys), torch.float32, q.device)
+    wmax = _scratch("wmax", (B, H_q, W_phys), torch.float32, q.device)
 
     # Dummies for the empty-Q case: valid tensors so the pointers exist; never
     # indexed (the Q loop runs only while w0 < n_active == 0).
@@ -1294,7 +1356,7 @@ def fused_two_tier_decode(
     n_body_win : scored windows the fp body spans. Defaults to
         ``ceil((S_fp - num_sink) / ws)``; pass it when the caller already knows
         it, so the kernel's window axis matches the caller's score axis exactly.
-    sel : the gate's ``[B, H_kv, n_sel]`` int32 pick of active columns, or None
+    sel : the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns, or None
         to read the whole tier.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in

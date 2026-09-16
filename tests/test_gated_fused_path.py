@@ -225,7 +225,11 @@ def test_a_well_formed_selection_is_accepted():
     (torch.zeros((2, 2, 3), dtype=torch.int32), "sel \\[B, H_kv, n_sel\\]"),
     (torch.zeros((2, 4, 11), dtype=torch.int32), "selected 11 of 10"),
     (torch.zeros((2, 4, 0), dtype=torch.int32), "selected 0 of 10"),
-    (torch.zeros((2, 4, 3), dtype=torch.int64), "int32"),
+    # int64 is ACCEPTED since W6: `topk` returns int64 and casting it cost a
+    # kernel launch per layer per step to save 4 bytes per selected window.
+    # Triton's pointer arithmetic is in elements and the kernel already does
+    # `.to(tl.int32)` after the load, so an int64 SEL indexes identically.
+    (torch.zeros((2, 4, 3), dtype=torch.float32), "int32 or int64"),
 ])
 def test_a_malformed_selection_is_an_error_not_a_wrong_answer(bad, msg):
     """Every one of these would run happily on a GPU and index the wrong windows.

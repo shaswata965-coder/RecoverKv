@@ -123,14 +123,23 @@ def _sorted_pick(top: Tensor) -> Tensor:
     windows at ratio ``r``), which is what L2, the TLB and the coalescer are
     built for.
 
-    Cost is one small sort per layer per step — ``[B, H_kv, n_sel]``, ~11.5k int32
-    at the headline cell — against a cache-side launch budget the same document
-    measures at 8.6% of the step's total. It does reorder an online-softmax
-    accumulation, so ``out`` moves in the last bits exactly as any tile-order
-    change does; it does not move *which* windows are read or *which* column each
-    score lands on, so no eviction decision is reassociated.
+    Cost is one small sort per layer per step — ``[B, H_kv, n_sel]``, ~11.5k
+    elements at the headline cell — against a cache-side launch budget the same
+    document measures at 8.6% of the step's total. It does reorder an
+    online-softmax accumulation, so ``out`` moves in the last bits exactly as any
+    tile-order change does; it does not move *which* windows are read or *which*
+    column each score lands on, so no eviction decision is reassociated.
+
+    **The int32 cast is gone (W6).** ``topk`` returns int64 indices, so casting
+    cost a whole extra kernel launch per layer per step — 32 per step at L=32 —
+    to save 4 bytes per selected window, which at the headline cell is ~46 KB of
+    a 1,636 MB step. The kernel already does ``tl.load(SEL + ...).to(tl.int32)``
+    after the load, and Triton's pointer arithmetic is in elements, so an int64
+    ``SEL`` indexes identically; ``check_gate_selection`` now accepts either.
+    That trade was upside-down on a path where `DECODE_NEXT.md` §2 measures the
+    host gap at 37% of the step and ~17 us exposed per launch.
     """
-    return top.sort(dim=-1).values.to(torch.int32)
+    return top.sort(dim=-1).values
 
 
 def gate_window_tiles(rows: int, n_windows: int, sm_count: int) -> int:
@@ -269,8 +278,12 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     ws = t_q.shape[-1]
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
-    logm = torch.empty((B, HQ, NW), dtype=torch.float32, device=q.device)
-    est = torch.empty((B, HKV, NW), dtype=torch.float32, device=q.device)
+    # Both are dead by the end of `_run_fused`: `est` is consumed by the topk
+    # below, `logm` by the decode kernel's §5 fill in the same call. Reused
+    # across layers within a step -- see `decode_kernel._scratch` (W4/D5).
+    from .decode_kernel import _scratch
+    logm = _scratch("logm", (B, HQ, NW), torch.float32, q.device)
+    est = _scratch("est", (B, HKV, NW), torch.float32, q.device)
     block_w = gate_window_tiles(B * HKV, NW, _sm_count(q.device))
     _gate_kernel[(B, HKV, -(-NW // block_w))](
         q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
