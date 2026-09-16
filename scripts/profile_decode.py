@@ -208,10 +208,70 @@ def _print_buckets(evs, n: int, gpu_us: float) -> None:
             rest = sum(u for u, _, _ in ks[12:])
             print(f"      {rest/n/1000:8.3f} ms/step  ... and {len(ks)-12} more")
 
+    _print_evict_fusion_verdict(agg, n)
+
     total = sum(r["us"] for r in agg.values())
     if abs(total - gpu_us) > 1.0:   # us; float noise only
         print(f"\n    !! buckets sum to {total/n/1000:.3f} ms but CUDA self time "
               f"is {gpu_us/n/1000:.3f} ms/step -- the rollup is dropping work.")
+
+
+def _print_evict_fusion_verdict(agg, n: int) -> None:
+    """Say whether the eviction FUSED, not merely whether it compiled.
+
+    These are different claims and only the first one was ever reported.
+    ``_run_compiled_evict`` is kernel-or-error, so a run that finishes proves the
+    compiled callable ran -- and the banner duly prints ``COMPILED ... ACTIVE
+    [OK]``. It does not prove Inductor generated anything. A body that traces,
+    graph-breaks, and lowers each fragment back to stock ATen kernels satisfies
+    every check this repo had, reports itself as compiled, and delivers none of
+    what compiling is for.
+
+    That is what a 2026-09-16 GPU profile showed: ``ours (cache)`` came to
+    7.917 ms against ``_two_tier_decode_kernel`` 7.104 + ``_gate_kernel`` 0.813
+    -- the two hand-written Triton kernels to the milligram, so ``ours: compiled
+    evict`` contributed exactly 0.000. The eviction was landing as
+    ``at::native::elementwise_kernel`` and friends with fractional launch counts
+    (n < 5/step, i.e. one step in ``window_size``), which is the unfused
+    signature ``RECENT_CHANGES_AND_HYPOTHESES.md`` §4 describes.
+
+    Root cause was eight ``untyped_storage().data_ptr()`` graph breaks in
+    ``CacheState.replace`` / ``replace_body``; ``tests/test_evict_graph_breaks.py``
+    now pins the count at zero. This printer is the other half: the instrument
+    that would have said so at the time.
+    """
+    try:
+        from modules.windowed_cache.cache import evict_path_stats
+    except Exception:  # pragma: no cover - import-path dependent
+        return
+    stats = evict_path_stats()
+    compiled_runs, eager_runs = int(stats.get("compiled", 0)), int(stats.get("eager", 0))
+    if compiled_runs == 0 and eager_runs == 0:
+        print("\n    eviction: NO EVICTION RAN in the profiled window. Raise "
+              "--steps above window_size, or this profile is not measuring the "
+              "eviction at all.")
+        return
+
+    fused_us = agg.get("ours: compiled evict", {}).get("us", 0.0)
+    fused_n = agg.get("ours: compiled evict", {}).get("n", 0.0)
+    print(f"\n    eviction: {compiled_runs} compiled / {eager_runs} eager runs, "
+          f"Inductor kernels {fused_us/n/1000:.3f} ms/step over {fused_n/n:.0f} "
+          "launches/step")
+    if compiled_runs > 0 and fused_us <= 0.0:
+        print("      !! COMPILED BUT NOT FUSED. The compiled callable ran and "
+              "Inductor\n"
+              "         emitted no kernel this rollup can see. The eviction is "
+              "paying\n"
+              "         compile overhead for eager kernels. Check:\n"
+              "           python -m pytest tests/test_evict_graph_breaks.py -q\n"
+              "         and bound the cost with one --compile-evict 0 run: if "
+              "eager\n"
+              "         and 'compiled' tie, the compile is doing nothing either "
+              "way.")
+    elif eager_runs > 0 and compiled_runs > 0:
+        print("      !! MIXED eviction paths in one window -- the ms/step above "
+              "is an\n         average of two methods. Re-run with "
+              "--compile-evict pinned.")
 
 
 def _is_device_event(ev) -> bool:
@@ -400,6 +460,15 @@ def main() -> None:
             # Same length as window 1 so the two see the same number of eviction
             # steps, which are ~2.7x a steady step and would otherwise bias
             # whichever window held more of them.
+            #
+            # Zero the eviction path counters here, not at startup: the verdict
+            # printed with the rollup has to describe the window the kernels were
+            # measured in, and warmup alone runs several evictions.
+            try:
+                from modules.windowed_cache.cache import reset_evict_path_stats
+                reset_evict_path_stats()
+            except Exception:  # pragma: no cover - import-path dependent
+                pass
             t0 = time.perf_counter()
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]

@@ -183,3 +183,62 @@ def test_the_double_count_from_the_real_profile_is_removed():
     assert sum(e.count for e in kernels) == 225, (
         "the op view is still being counted alongside its own kernels")
     assert abs(sum(e.self_device_time_total for e in kernels) - 10831.0) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# "Compiled" and "fused" are different claims (_print_evict_fusion_verdict)
+# ---------------------------------------------------------------------------
+
+
+def _verdict(agg, n, compiled, eager, monkeypatch):
+    """Run the verdict printer against a synthetic rollup + path counters."""
+    import profile_decode as pd
+    from modules.windowed_cache import cache as cache_mod
+    monkeypatch.setattr(cache_mod, "_EVICT_STATS",
+                        {"compiled": compiled, "eager": eager})
+    pd._print_evict_fusion_verdict(agg, n)
+
+
+def test_compiled_with_no_inductor_kernels_is_called_out(capsys, monkeypatch):
+    """The 2026-09-16 GPU profile, reproduced: compiled runs, zero fused work.
+
+    `_run_compiled_evict` is kernel-or-error, so finishing the run proves the
+    compiled callable RAN. It does not prove Inductor generated anything, and
+    the eviction that traces, graph-breaks and lowers back to ATen satisfies
+    every other check in this repo while delivering none of the saving.
+    """
+    _verdict({"ours: two-tier decode": {"us": 7104.0, "n": 32.0}}, 1,
+             compiled=3, eager=0, monkeypatch=monkeypatch)
+    out = capsys.readouterr().out
+    assert "COMPILED BUT NOT FUSED" in out
+    assert "test_evict_graph_breaks.py" in out
+    assert "--compile-evict 0" in out
+
+
+def test_a_fused_eviction_reports_its_kernels_and_does_not_warn(capsys,
+                                                               monkeypatch):
+    _verdict({"ours: compiled evict": {"us": 9000.0, "n": 40.0}}, 1,
+             compiled=3, eager=0, monkeypatch=monkeypatch)
+    out = capsys.readouterr().out
+    assert "NOT FUSED" not in out
+    assert "9.000 ms/step" in out and "40 launches/step" in out
+
+
+def test_no_eviction_in_the_window_is_not_reported_as_fused_or_unfused(
+        capsys, monkeypatch):
+    """A window shorter than `window_size` measures the steady step only.
+
+    Reporting that as "not fused" would be a false alarm; reporting it as fused
+    would be worse. It is a profile that did not cover the eviction at all.
+    """
+    _verdict({}, 1, compiled=0, eager=0, monkeypatch=monkeypatch)
+    out = capsys.readouterr().out
+    assert "NO EVICTION RAN" in out
+    assert "NOT FUSED" not in out
+
+
+def test_a_window_that_mixed_both_paths_says_so(capsys, monkeypatch):
+    """An average over two methods is not a measurement of either."""
+    _verdict({"ours: compiled evict": {"us": 100.0, "n": 4.0}}, 1,
+             compiled=2, eager=1, monkeypatch=monkeypatch)
+    assert "MIXED eviction paths" in capsys.readouterr().out
