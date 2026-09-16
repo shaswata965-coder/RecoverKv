@@ -120,12 +120,15 @@ column is how you find out cheaply.
 | L3a | `sel` ascending *(landed, unmeasured)* | two-tier 7.03 | **−2 to −3** | 0.073–0.074 | med | re-profile `ours: two-tier decode` |
 | L3b | Drop the gate from the read path | two-tier + gate 7.84 | **−3 to −4.5** | 0.072–0.073 | med | pass `sel=None`; re-profile the same bucket |
 | L3b+ | …and the card build it deletes from the eviction | `build_sketch`, eviction-side | **−3 to −6** | 0.066–0.070 | low | `sketch_enabled=False`; time an eviction step |
-| L4 | A/B `emulate_precision_casts` | unknown | **0 to −8** | 0.068–0.076 | low | neuter the decorator, one table run |
+| L4a | A/B `emulate_precision_casts` alone | reduced tensors only | **0 to −1** | ~0.076 | low-med | neuter the decorator; see §4b for why it is small |
+| L4b | Did tracing `_affine_quantize` actually fuse? | eviction graph | **0 to −8** | 0.068–0.076 | low | `--compile-evict 0` first; it bounds both arms |
 | L5 | The two latched arms (`DECODE_SPEED_PLAN` §"Open") | ~5 ms constant | **0 to −5** | 0.071–0.076 | med | two env-var runs, already wired |
 | L6 | int8 scale/zero grid (`GATE_REGRESSION.md` §5) | Q bytes | **−0.2** | 0.076 | high | it is a memory item, not a speed one |
 
 **L3a and L3b are alternatives, not additive** — they target the same kernel.
-L2 and L4 overlap; L4 is a plausible *cause* of L2. **L3b+ overlaps L2's target 2**
+L2 and L4b overlap; L4b is a plausible *cause* of L2. **L4a is a price, not a
+saving** — the flag is a correctness fix, so the only legitimate way to stop
+paying it is to remove its clients, which L3b and L2's target 2 both do. **L3b+ overlaps L2's target 2**
 — both delete card work from the eviction, so count it once. See §4b for what each
 one actually does; L3b is the only lever here that is also expected to *improve*
 accuracy, and L2 is the largest one that is unambiguously ours.
@@ -134,7 +137,7 @@ Two combined paths:
 
 | path | levers | est. TPOT | vs now | vs published 0.0626 | vs FullKV 0.086 |
 |---|---|---|---|---|---|
-| **A — no CUDA graphs** | L3 + L2 + L4/L5 + L6 | **~0.062** | −19% | ties | 1.38× faster |
+| **A — no CUDA graphs** | L3 + L2 + L4b/L5 + L6 | **~0.062** | −19% | ties | 1.38× faster |
 | **B — with CUDA graphs** | A + L1 | **~0.043** | −44% | −31% | 2.0× faster |
 
 Path A roughly recovers the published number **at an operating point that reads
@@ -265,7 +268,7 @@ There is a sting in the tail: `_q_up` is exactly the function whose `dequant >= 
 guarantee `emulate_precision_casts` was turned on to protect (115 violations over
 24 seeds). **A flag whose GPU cost is unmeasured is guarding a field nothing
 reads.** Deleting `e_q`/`e_s` removes one of the four reasons that flag exists —
-which is also L4.
+which is also L4a.
 
 **Target 3 — whether the graph fuses at all.** `DECODE_SPEED_PLAN.md` §3 reports
 the eviction landing as *"sixteen separate multi-millisecond elementwise kernels —
@@ -279,10 +282,94 @@ fusion actually took is unknown, and the chrome trace (§5 step 3) answers it.
 the production path), then target 3 (a measurement), then target 1 (the real work,
 and the real win).
 
+### L4 — `emulate_precision_casts`, and what it is really asking
+
+**Revised down from the table's first draft.** Writing §4b forced a closer read of
+what the flag actually touches, and the honest estimate for the flag *alone* is
+much smaller than the `0 to −8 ms` first entered. The `0 to −8` belongs to a
+different question that landed in the same commit. Both are below.
+
+**What the flag does.** `cache._emulating_precision_casts` wraps the compiled
+eviction in `torch._inductor.config.patch("emulate_precision_casts", True)`.
+Inductor normally *elides* an `fp32 -> fp16 -> fp32` round trip and keeps the
+wider value in a register. Three quantisers in the eviction take that round trip
+**deliberately**, to fit codes to the fp16-**stored** grid so the grid the codes
+were fit to is bit-identical to the grid every later dequant reads (design §2).
+The flag forces Inductor to emit the truncation.
+
+**Why the direct cost is almost certainly near zero.** Every value the flag
+narrows is a **reduced** tensor, not a data tensor:
+
+| quantiser | narrowed tensor | shape | size vs its data |
+|---|---|---|---|
+| `_affine_quantize`, keys | `scale`, `zero` | `[N, H_kv, D]` | **1/8** (reduced over `ws`) |
+| `_affine_quantize`, values | `scale`, `zero` | `[N, H_kv, ws]` | **1/128** (reduced over `D`) |
+| `sketch._q_sym` ×3 | `scale` | `[N, H, 1]` | 1/D or 1/ws |
+| `sketch._q_up` | `scale` | `[N, H, 1]` | 1/ws |
+
+Two convert instructions on between 1/8 and 1/128 of the elements, pointwise, and
+they fuse into kernels that already run. The per-call overhead is a dict swap —
+Inductor keys its code cache on config, so the wrapped callable compiles once.
+**Estimate for the flag alone: 0 to −1 ms/step, low confidence but bounded.**
+
+**The real question in that commit is the other half.** `5186353` did two things.
+It turned the flag on, *and* it removed the `@_compile_disable` from
+`_affine_quantize` so the int2 quantiser is traced into the eviction graph instead
+of sitting behind a graph break. The second is the structural change — the graph
+got substantially bigger, and Inductor's fusion, scheduling and memory planning
+for the whole eviction changed with it. `DECODE_SPEED_PLAN.md` §3 predicted that
+would *help*, because the graph break was what split the eviction into "sixteen
+separate multi-millisecond elementwise kernels". The profile taken afterwards
+still shows `elementwise` at 14.20 ms. So either it did not help, or that block
+was never ours — which is exactly what the chrome trace decides.
+
+The two are coupled in one direction only: `quantizer._quant_may_be_traced()`
+requires `hasattr(inductor_config, "emulate_precision_casts")`, so the quantiser
+cannot be traced on a build without the knob. But the knob can be *neutered*
+while tracing continues, because that check is `hasattr`, not the value. So all
+four arms are reachable.
+
+**The four arms, and what each one answers:**
+
+| arm | how | answers |
+|---|---|---|
+| 1. current | — | baseline |
+| 2. flag off | `_emulating_precision_casts` → `return fn` | the flag's cost, alone |
+| 3. graph break back | force `_compile_disable = torch.compiler.disable` | whether tracing the quantiser helped |
+| 4. eager | `--compile-evict 0` | what compiling the eviction buys at all |
+
+Arm 4 is already wired and costs one flag. Run it first: it bounds arms 2 and 3
+together, and if compiled and eager are close, the whole compiled-eviction story
+needs revisiting rather than tuning.
+
+**Arm 2 is correctness-unsafe and is a speed measurement only.**
+`tests/test_compiled_eviction_numerics.py` fails (4 of 5) while the flag is
+neutered — that is the safety net working. Without it, `_affine_quantize`'s packed
+codes diverge from eager on 11/24 seeds (keys) and 14/24 (values), and
+`sketch._q_up`'s `dequant >= x` guarantee is violated 115 times in 24 seeds. That
+inequality is the only reason the card's Cauchy–Schwarz score is an **upper**
+bound, and therefore the only reason the gate may skip a window at all. **Measure
+speed, then revert. Draw no accuracy conclusion from that run**, and do not
+report its LongBench.
+
+**The status this lever really has.** `emulate_precision_casts` is a correctness
+fix, not an optimisation to be removed. If it costs time, that is a price, not a
+saving — the only legitimate ways to stop paying it are to remove its *clients*
+or to restore the graph break (arm 3). Which is where this connects to §4b:
+
+- **L2 target 2** (delete the dead `eps` field) removes `_q_up` — the client with
+  the 115 violations.
+- **L3b** (no gate → no cards) removes `_q_sym` and `_q_up` entirely, leaving
+  `_affine_quantize` as the flag's only remaining client.
+
+So doing §4b's work first **shrinks L4 rather than competing with it.** Run arm 4
+now because it is free; leave arms 2 and 3 until after the trace, which may make
+them unnecessary.
+
 ## 5. Do these in this order
 
 Steps 1–3 are measurements. They come first because §3.3 means nothing is
-attributable yet, and because L2/L4 — the second-largest lever — is currently a
+attributable yet, and because L2/L4b — the second-largest lever — is currently a
 guess.
 
 **1. Re-run at the published operating point.** Removes the §3.3 confound.
@@ -326,9 +413,11 @@ Open in `chrome://tracing` or Perfetto and split the 28.65 ms of
 (model's). **This decides whether L2 exists.** If that block is the model's
 unfused RMSNorm/RoPE, L2 is worth ~0 and Path A tops out around 0.070.
 
-**4. Then, cheapest first:** L5 (two env-var runs, already wired), L4 (one-line
-edit), L3 verdict from step 2, L2 if step 3 says it is ours, L1 last because it
-is the largest change.
+**4. Then, cheapest first:** L4b arm 4 (`--compile-evict 0`, one flag, and it
+bounds the whole compiled-eviction question), L5 (two env-var runs, already
+wired), L2's target 2 (delete the dead `eps` field), the L3 verdict from step 2,
+then L2's target 1. L1 last, because it is the largest change. L4a only if the
+trace says the eviction graph is still unfused — §4b explains why it is small.
 
 ### L5, exactly
 
@@ -340,7 +429,7 @@ CUDA_VISIBLE_DEVICES=0 STICKYKV_ROPE_STORE_DTYPE=0   scripts/run_perf_table.sh
 If the RoPE arm is the cause: **keep it anyway.** It is the fix that closed the
 9.5-point qasper regression (`DECODE_SPEED_PLAN.md` introduction). Record the cost.
 
-### L4, exactly
+### L4a, exactly
 
 There is no env latch. Neuter the decorator in `modules/windowed_cache/cache.py`:
 
