@@ -118,19 +118,23 @@ column is how you find out cheaply.
 | L1 | CUDA graphs on the steady step | host gap 28.25 | **−15 to −22** | 0.054–0.061 | med-high | capture one step; count launches |
 | L2 | Collapse the eviction's elementwise tail | ~15.4 amortized | **−5 to −10** | 0.066–0.071 | low-med | `--trace`, then eviction-step kernel count |
 | L3a | `sel` ascending *(landed, unmeasured)* | two-tier 7.03 | **−2 to −3** | 0.073–0.074 | med | re-profile `ours: two-tier decode` |
-| L3b | Drop the gate from the read path | two-tier + gate 7.84 | **−3 to −4.5** | 0.072–0.073 | med | `quant_ratio` unchanged, `sel=None` |
+| L3b | Drop the gate from the read path | two-tier + gate 7.84 | **−3 to −4.5** | 0.072–0.073 | med | pass `sel=None`; re-profile the same bucket |
+| L3b+ | …and the card build it deletes from the eviction | `build_sketch`, eviction-side | **−3 to −6** | 0.066–0.070 | low | `sketch_enabled=False`; time an eviction step |
 | L4 | A/B `emulate_precision_casts` | unknown | **0 to −8** | 0.068–0.076 | low | neuter the decorator, one table run |
 | L5 | The two latched arms (`DECODE_SPEED_PLAN` §"Open") | ~5 ms constant | **0 to −5** | 0.071–0.076 | med | two env-var runs, already wired |
 | L6 | int8 scale/zero grid (`GATE_REGRESSION.md` §5) | Q bytes | **−0.2** | 0.076 | high | it is a memory item, not a speed one |
 
 **L3a and L3b are alternatives, not additive** — they target the same kernel.
-L2 and L4 overlap; L4 is a plausible *cause* of L2.
+L2 and L4 overlap; L4 is a plausible *cause* of L2. **L3b+ overlaps L2's target 2**
+— both delete card work from the eviction, so count it once. See §4b for what each
+one actually does; L3b is the only lever here that is also expected to *improve*
+accuracy, and L2 is the largest one that is unambiguously ours.
 
 Two combined paths:
 
 | path | levers | est. TPOT | vs now | vs published 0.0626 | vs FullKV 0.086 |
 |---|---|---|---|---|---|
-| **A — no CUDA graphs** | L3 + L2 + L4/L5 + L6 | **~0.062** | −19% | ties | 1.39× faster |
+| **A — no CUDA graphs** | L3 + L2 + L4/L5 + L6 | **~0.062** | −19% | ties | 1.38× faster |
 | **B — with CUDA graphs** | A + L1 | **~0.043** | −44% | −31% | 2.0× faster |
 
 Path A roughly recovers the published number **at an operating point that reads
@@ -145,6 +149,135 @@ the floor: capture the baselines the same way and report both columns. L1 is the
 largest lever by a factor of two and the only one that reaches the stretch target.
 
 ---
+
+## 4b. L3b and L2, in detail
+
+These two are the ones worth understanding before touching anything, because
+they overlap: **L3b deletes a large part of L2's target as a side effect.**
+
+### L3b — drop the read gate from the decode path
+
+**What it is.** Stop passing `sel` to `_two_tier_decode_kernel`, so the Q-tier
+loop walks `n_active` windows with an affine `widx = w0 + t_win` instead of
+dereferencing `SEL`. The kernel already supports this: `GATED` is a
+`tl.constexpr`, and `sel=None` compiles the ungated variant that shipped before
+the gate existed. Nothing in the kernel has to be written.
+
+**What it removes.** Four separate things, only the first of which is obvious:
+
+1. **The `SEL` indirection.** `GATE_REGRESSION.md` §2b: gated, `KS`, `KZ`, `KC`,
+   `VC`, `VS`, `VZ` and `COS`/`SIN` all become gathers with an address dependency
+   on the `SEL` load. Ungated they are contiguous vector loads.
+2. **The `GATED` prologue** (`decode_kernel.py` §3): a pass over every Q column
+   seeding `WSUM = 0`, `WMAX = -inf` so the epilogue can detect what was skipped.
+3. **The §5 fill pass**: a second full-tier pass writing card-estimated scores
+   onto skipped windows. Ungated there are no skipped windows, so the epilogue's
+   `num`/`gmx`/`gsm` reductions and the whole `LOGM` tensor disappear too.
+4. **`build_sketch` from the eviction.** This is the one that is not on the decode
+   path at all. `store.sketch_enabled` gates the card build in
+   `cache._evict_two_tier_impl` §3c; with no gate there are no cards to build, and
+   `build_sketch` is a ~60-op chain (mean, deviation, norm, argmax, two gathers,
+   three `_q_sym`, three `_dq_sym`, a full `[N,H,ws,D]` `recon` outer product,
+   another norm, `_q_up`) running on the same padded width as the quantiser — see
+   L2. **The table's `−3 to −4.5 ms` for L3b counts only items 1–3.** Item 4 is
+   eviction-side and plausibly worth as much again.
+
+**What it costs.** The Q-tier loop visits 64 windows instead of 16, so the read
+grows by 405 MB/step — **0.20 ms** (§3.2). That is the entire downside on the
+traffic axis, and it is noise.
+
+**It should also be accuracy-positive**, which is the part that makes this more
+than a speed trade. The gate is an approximation in two places: skipped windows
+do not contribute to the attention output, and their eviction scores are the
+card's rescaled `logmass` estimate rather than the real softmax mass. Ungated,
+both are exact. Removing the gate removes approximation error; it does not add
+any. Nothing about the stored cache changes — the tier is quantized either way —
+so `peak_GB` and `steadyKV_GB` are untouched.
+
+**The real cost is structural, not numerical.** `676c781` deliberately collapsed
+this to one production path, and `config.py` derives
+`quant_sketch_enabled = q > 0.0` with the comment *"the gate IS the read path
+wherever there is a Q tier, and there is no way to ask for the ungated one."*
+L3b means reintroducing that choice — a config field threaded to
+`store.sketch_enabled` and `cache._gate_ctx`. Small and localized, but it is a
+second path returning, and that was removed on purpose.
+
+### L2 — the eviction, which is 20% of TPOT
+
+**What it is.** `EvictionPolicy.should_evict` fires every `window_size = 8` steps.
+`DECODE_SPEED_PLAN.md` §3 measured an eviction step at **~195 ms against a ~72 ms
+steady step** — so the eviction itself is ~123 ms of extra work, **~15.4 ms/step
+amortized, ~20% of TPOT**. That is more than twice the two-tier decode kernel,
+and it is not read traffic, so §3.2's 1% ceiling does not apply to it.
+
+It also shows up as launches: **493 on an eviction step against 80 steady**
+(`GATE_REGRESSION.md` §4).
+
+**Target 1 — the demote/promote width is the worst case, not the count.** This is
+the big one. In `_evict_two_tier_impl` §3b/§3c:
+
+```python
+p_max = min(self.resolved.N_q, n_fp)
+prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
+fresh_wid,  fresh_valid = self._compact(wids, fresh, n_q)   # n_q = 64 here
+```
+
+`_compact`'s own docstring says why: *"Allocating by count would therefore need a
+host sync to learn the max; allocating by rank into a worst-case-width tensor does
+not."* So every eviction quantizes, un-rotates and sketches a `[B, n_q, H_kv, ws,
+D]` tensor — `n_q = 64` at budget 0.20, **`n_q = 184` at the published 0.50** —
+when at steady state only a handful of windows per row are actually fresh (one new
+window is sealed every `ws` steps, plus whatever crosses the tier boundary on
+re-ranking). **The invalid lanes are dequantized, rotated, quantized and sketched,
+then masked away.** At `B=32` that is a 33.5 MB `k_post` gather per layer and
+~67 MB fp32 temporaries through a ~10-op quantiser and a ~60-op card build,
+roughly 1 GB of traffic per layer per eviction — of which ~98% is garbage.
+
+The fix is a bucketed width: sync once per eviction (1 step in 8) to learn
+`fresh.sum(1).max()`, round up to a small ladder of rungs so `torch.compile` sees
+a handful of shapes rather than a new one each time, and use that instead of
+`n_q`. One host sync every eighth step against a ~64× overcompute is a good trade;
+the "no host syncs" rule in that docstring was written against a per-layer
+`.tolist()` in the inner loop, which is a different thing. The first eviction,
+where everything genuinely is fresh, still takes the full width.
+
+**Target 2 — the `eps` field is computed every eviction and never read.**
+`build_sketch` ends with:
+
+```python
+recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
+e_q, e_s = _q_up((k - recon).norm(dim=-1))
+```
+
+That `recon` materializes a full `[N, H, ws, D]` fp32 tensor and is the single
+most expensive step in the card build. Nothing on the production path reads what
+it produces: `_gate_triton` unpacks the card as `…, _e_q, _e_s` and discards both,
+and `gate_reference` throws away `bound` (`_, logmass, est = gate_and_score(…)`).
+The only consumer is `store.gate_and_select`, which is called from
+`gated_decode.py` — the CPU reference, not the fused path — and even there
+`_gate_ctx` refuses a finite margin, so the threshold keeps everything and the cap
+decides on `est` alone. `gate_kernel._gate_kernel`'s docstring already says this
+about its own half of it: *"No `bound` is computed … the bound cost a
+`[B, H_q, NW]` fp32 store and the whole `eps` field of every card, to be discarded
+by `_gate_triton`."* The build side was never followed through.
+
+There is a sting in the tail: `_q_up` is exactly the function whose `dequant >= x`
+guarantee `emulate_precision_casts` was turned on to protect (115 violations over
+24 seeds). **A flag whose GPU cost is unmeasured is guarding a field nothing
+reads.** Deleting `e_q`/`e_s` removes one of the four reasons that flag exists —
+which is also L4.
+
+**Target 3 — whether the graph fuses at all.** `DECODE_SPEED_PLAN.md` §3 reports
+the eviction landing as *"sixteen separate multi-millisecond elementwise kernels —
+round, clamp, div, sub, where, scatter — which is the signature of a graph that
+traced and then fused nothing."* `5186353` removed the `torch._dynamo.disable` on
+`_affine_quantize` to fix that, but in the same commit added
+`emulate_precision_casts`, whose GPU cost has never been measured. Whether the
+fusion actually took is unknown, and the chrome trace (§5 step 3) answers it.
+
+**Order within L2:** target 2 first (a deletion, ~10 lines, no behaviour change on
+the production path), then target 3 (a measurement), then target 1 (the real work,
+and the real win).
 
 ## 5. Do these in this order
 
