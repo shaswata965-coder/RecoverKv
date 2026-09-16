@@ -11,9 +11,15 @@ about *scope*: `DECODE_NEXT.md` §4 sizes its envelope at one cell (4096 / B=32)
 and three of the six target cells are B=1, where the largest item on its list is
 worth approximately nothing.
 
-Every number below is arithmetic on a measurement already in this repo. **No new
-measurement was taken** — the dev box is CPU-only (`DECODE_NEXT.md` §8). Claims
-that rest on inference are labelled.
+Every number below is arithmetic on a measurement already in this repo, or on the
+2026-09-16 GPU profile read in §5. **Nothing here was measured from this
+session** — the dev box is CPU-only (`DECODE_NEXT.md` §8). Claims that rest on
+inference are labelled.
+
+§5 was added after a profile arrived. It corrects that profile's three headline
+numbers, which were produced by tooling predating `33ae5f9`, and it adds **D0** —
+the eviction appears not to be fusing at all, which is the largest single item at
+B=32 and is not on any existing list.
 
 ---
 
@@ -72,7 +78,7 @@ measurement:
   9.5 / 10.6 / 10.6 at B=1. A tile-rung or Q-loop-length story predicts a 4×
   spread across those columns. There is none.
 - **anything whose cost scales with rows**, which is most of the eviction — see
-  §5, D1.
+  §6, D1.
 
 What is left is per-layer fixed work: kernel launches, host-side Python between
 them, and any kernel whose critical path is invariant in both B and context.
@@ -195,17 +201,143 @@ default.
 
 ---
 
-## 5. What each direction is worth, per cell
+## 5. The first profile, read correctly
+
+A profile landed on 2026-09-16 at 4096 / B=32, `compile_evict=1`. **It was taken
+with tooling that predates `33ae5f9`**, so three of its headline numbers are the
+pre-fix ones and must not be quoted:
+
+| printed | real | why |
+|---|---|---|
+| `CUDA kernels 87.41 ms/step` | **50.57** | `key_averages()` returns the ATen operator view *and* the CUDA kernel events, and both carry self device time |
+| `kernel launches 3132 /step` | **1723** | same |
+| `GPU busy 59.3 %` | **~62%** | numerator inflated ~1.8×, denominator is a wall timed *inside* the profile block (`GATE_REGRESSION.md` §8.3) |
+
+The double count is visible in the output itself, exactly as `33ae5f9`'s message
+predicts: `aten::mm` at 11.055 ms / **n=225.0** against four `ampere_*gemm*`
+kernels summing to 10.828 ms / **n=225.0**. The whole `other` bucket — 36.835 ms,
+42.1% — is the operator view; its twelve named rows plus the 3.925 ms tail sum to
+36.835 to the milligram, and every one of them is an `aten::` row.
+
+**The verdict survives by luck.** Both errors run the same way and nearly cancel:
+87.41/147.34 = 59.3% against a corrected ~50.6/76.3 ≈ 62%. So **H-J resolves as
+MIXED** — both terms real, the GPU busy about two-thirds of the step — and
+`DECODE_SPEED_PLAN.md`'s standing premise that decode is host-bound does not
+survive. That can be banked now; it does not need the re-run.
+
+### 5.1 De-duplicated
+
+Real kernel time, 50.57 ms/step:
+
+| bucket | ms/step | % |
+|---|---|---|
+| elementwise | 14.210 | 28.1% |
+| model: GEMM | 11.038 | 21.8% |
+| memory: copy/cat | 7.517 | 14.9% |
+| **ours: two-tier decode** | **7.104** | 14.0% |
+| memory: index/gather | 6.326 | 12.5% |
+| reduction | 2.507 | 5.0% |
+| sort/topk | 0.820 | 1.6% |
+| **ours: read gate** | **0.813** | 1.6% |
+| model: activation | 0.235 | 0.5% |
+
+The two Triton kernels are single-counted (no `aten::` op wraps them), so 7.104
+and 0.813 are **real as printed** and match `GATE_REGRESSION.md` §4's corrected
+7.03 / 0.81. Host gap is then 76.3 − 50.6 ≈ 26 ms over ~1,723 launches, ~15 µs
+each — unchanged.
+
+### 5.2 The eviction is not fusing, and it is the largest item on the board
+
+`_BUCKETS` carries an **`ours: compiled evict`** bucket matching
+`triton_{poi,red,tem,for,unk,mm}_fused` (`profile_decode.py:109–113`). It does
+not appear in the rollup, and `ours (cache)` is **7.917 = 7.104 + 0.813 to the
+milligram**. Inductor contributed **exactly zero** kernel time.
+
+What is there instead, in the top 40, are kernels with **fractional launch
+counts** — `n < 5/step`, i.e. work that runs about one step in eight, which is
+`window_size = 8`, which is the eviction:
+
+| kernel | ms/step | n/step |
+|---|---|---|
+| `elementwise_kernel<128, 2, …>` | 1.848 | 0.8 |
+| `_scatter_gather_elementwise_kernel` | 1.614 | 0.9 |
+| `elementwise_kernel<128, 2, …>` | 0.938 | 0.9 |
+| `index_elementwise_kernel` | 0.875 | 2.1 |
+| `elementwise_kernel<128, 4, …>` ×2 | 1.604 | 1.2, 1.2 |
+| `vectorized_elementwise_kernel` ×3 | 1.875 | 1.4, 0.6, 0.6 |
+| `unrolled_elementwise_kernel` | 0.590 | 0.5 |
+| **total, top 40 only** | **9.344** | |
+
+**9.34 ms/step — 18.5% of real kernel time — and none of it is attributed to
+`ours (cache)`.** More sits below the cut, and the figure reconciles with
+`DECODE_SPEED_PLAN.md` §3's ~15.4 ms/step amortized eviction.
+
+The operator view names them: `aten::sub` (n=3.1), `aten::where` (n=4.2),
+`aten::div` (n=1.8), `aten::round` (n=0.6), `aten::clamp` (n=0.2), `aten::index`
+(n=5.1), plus the scatter. That is, verbatim, the list
+`RECENT_CHANGES_AND_HYPOTHESES.md` §4 gives for an unfused eviction — *"sixteen
+separate multi-millisecond elementwise kernels — round, clamp, div, sub, where,
+scatter … the signature of a graph that traced and then fused nothing."*
+
+**Why this is the headline.** `1434b2c` records compiling the eviction as worth
+**TPOT 101.6 → 85 ms**. The gap at this cell is 13.7 ms. If the eviction is
+running unfused in a build that asked for `compile_evict=1`, that is not one item
+on a list of six — it is most of the B=32 gap on its own, and it is a regression
+against the published run, whose table always exported `COMPILE_EVICT=1`.
+
+**Two checks, both in the run's own stdout, above the block that was pasted:**
+
+```
+[StickyKV] eviction path: COMPILED two-tier eviction ACTIVE [OK] ...   <- or "eager"
+[StickyKV] fused decode tiling: target_keys=... num_stages=...         <- D3 / H-F
+```
+
+If the first says `eager`, the compile is not firing and that is the bug. If it
+says `COMPILED`, the compile fires and fuses nothing, and the first suspect is
+`5186353`: `_emulating_precision_casts` patches
+`torch._inductor.config.emulate_precision_casts` **per call**, entered and
+restored around every eviction. A config mutation inside the call is exactly the
+kind of thing that invalidates a code cache or forces a fallback. Bound it with
+one run at `--compile-evict 0`: if eager and "compiled" are the same speed, the
+compile is doing nothing either way.
+
+The second line is the whole of D3 and is still unread — it is not in the pasted
+output because it prints once, at the first call, during warmup.
+
+### 5.3 Banked, and one risk retired
+
+- **The gate is doing what it is configured to do.** `armed=1152 fired=1152
+  gated=1152 read_fraction=0.250` — every step, every layer, at the configured
+  ratio. H-G's precondition is met, so gate numbers are now attributable.
+- **Host syncs are free, which de-risks D1.** `cudaDeviceSynchronize` 0.1/step at
+  0.02 ms, `cudaMemcpyAsync` 1.5/step at 0.02 ms. `DECODE_NEXT.md` §4b's one
+  stated concern about D1 is the `.item()` it needs per eviction; against a
+  measured 0.02 ms of total sync cost, adding 0.125 syncs/step is not a trade,
+  it is a rounding error. **D1's only objection is now priced and cheap.**
+- **D4 is still unmeasured.** This build predates `130de24`, so
+  `_sorted_pick`'s ascending sort is not in it. The 7.104 ms is the *unsorted*
+  kernel, and it is the number D4 has to beat.
+- **`sort/topk` is 0.820 ms/step over 66 launches**, about the same as the gate
+  kernel itself. Part is the operator view (`aten::topk`, n=32.0), so the real
+  figure is smaller and the fixed build will say by how much. Worth noting only
+  because the gate's true cost is the kernel *plus* its pick, not the kernel
+  alone.
+
+---
+
+## 6. What each direction is worth, per cell
 
 `DECODE_NEXT.md` §4's estimates are all taken at 4096 / B=32. The column that
 matters for this table is the one it does not have: **B=1**, which is three of
 the six cells and needs −9.5 to −10.6 ms of its own.
 
-Scaling is inference from each item's mechanism, not measurement.
+Scaling is inference from each item's mechanism, not measurement. **D0 is new
+with §5** and is not on `DECODE_NEXT.md`'s list at all.
 
 | | direction | B=32 (§4) | B=1 | why it scales that way |
 |---|---|---|---|---|
-| **D1** | eviction demote/promote width | −4 to −8 | **~0 to −1** | the waste is a `[L·B, n_q, H_kv, ws, D]` gather plus fp32 temporaries — pure bytes, and `L·B` is 1024 at B=32 against 32 at B=1. The op *count* is unchanged, so the launch-bound B=1 eviction keeps its cost |
+| **D0** | **make the eviction actually fuse (§5.2)** | **−4 to −12** | **~0 to −2** | `1434b2c` prices compiling the eviction at TPOT 101.6 → 85 ms. Measured as ≥9.34 ms/step of unfused ATen kernels at B=32; the eviction's tensors scale with `L·B`, so B=1 keeps only the launch count |
+| **D1** | eviction demote/promote width | −4 to −8 | **~0 to −1** | the waste is a `[L·B, n_q, H_kv, ws, D]` gather plus fp32 temporaries — pure bytes, and `L·B` is 1024 at B=32 against 32 at B=1. The op *count* is unchanged, so the launch-bound B=1 eviction keeps its cost. §5.3 prices its one objection — the `.item()` — at a rounding error |
 | **D2** | the card's dead `eps` field | −1 to −3 | **~0 to −0.5** | `recon` is a `[N, H, ws, D]` fp32 materialization; same 32× argument |
 | **D3** | tile rung, if the gated kernel was capped | 0 to −4 | **0 to −4** | serial iterations per program, invariant in B. If anything worth *more* at B=1, where the kernel is latency-bound at 8–136 blocks on 108 SMs |
 | **D4** | `sel` ascending (landed, unmeasured) | −2 to −3 | −1 to −3 | gather locality; helps wherever the gathers are issued |
@@ -216,29 +348,42 @@ Scaling is inference from each item's mechanism, not measurement.
 Applying `DECODE_NEXT.md` §4's own overlap rules (D1+D2 together −5 to −10;
 D3+D4+D6 together −2 to −4):
 
-| | needed | D-series only | + Block A recovered |
-|---|---|---|---|
-| **B=32** | −9.8 to −13.7 | −7.5 to −15.5 | −11.8 to −20.4 |
-| **B=1** | −9.5 to −10.6 | **−2.5 to −6.0** | **−7.0 to −11.3** |
+| | needed | D-series only | + D0 | + D0 + Block A |
+|---|---|---|---|---|
+| **B=32** | −9.8 to −13.7 | −7.5 to −15.5 | −11.5 to −27.5 | −15.8 to −32.4 |
+| **B=1** | −9.5 to −10.6 | **−2.5 to −6.0** | −2.5 to −8.0 | **−7.0 to −13.3** |
 
-**The D-series alone cannot reach the B=1 rows.** Its two largest items, D1 and
-D2, are byte-scaled and are worth ~nothing at B=1, and what is left is short by
-4 to 8 ms — which is Block A, to within the precision of either estimate. This
-is the concrete consequence of §2's signature: a plan built at one batch size
-inherits that cell's cost structure.
+D0 and D1 overlap the same way D1 and D2 do — D1 shrinks the payload D0 fuses —
+so the ranges above are not additive at their tops.
 
-At B=32 the D-series alone *might* reach it, at the top of its range, if every
-estimate lands well. `DECODE_NEXT.md` §4 already says as much — *"ties at
-best"* — and that was before the operating-point confound (§3) made the true
-matched-config gap larger than the table's.
+**The D-series alone cannot reach the B=1 rows, and D0 does not change that.**
+The three largest items — D0, D1, D2 — are all eviction-side and all scale with
+`L·B`, so at B=1 they are worth close to nothing, and what is left is short by 4
+to 8 ms. That is Block A, to within the precision of either estimate. This is the
+concrete consequence of §2's signature: a plan built at one batch size inherits
+that cell's cost structure, and every item added since has been an eviction item.
+
+**B=32 now looks reachable and B=1 still does not.** With D0 the B=32 envelope
+comfortably covers −13.7 ms; the three B=1 cells need −9.5 to −10.6 ms from
+D3/D4/D5/D6 plus Block A, and those total −7.0 to −13.3 ms with everything
+landing at once. So the batch-1 rows, not the batch-32 headline, are what decides
+whether the published table can be reproduced.
 
 ---
 
-## 6. The order to do this in
+## 7. The order to do this in
 
-Steps 1–3 cost no code and decide what steps 4+ are worth. `DECODE_NEXT.md` §5
-has the same instinct and the same first two commands; this adds the arm from §4
-and reorders around §3's finding that 43% of the gap is not on its list.
+Steps 0–4 cost no code and decide what the rest is worth. `DECODE_NEXT.md` §5
+has the same instinct and the same two profiling commands; this adds the arm from
+§4, the fusion check from §5.2, and reorders around §3's finding that 43% of the
+gap is not on its list.
+
+**0. Read two lines already printed by the run you have, then re-run the profile
+on current HEAD.** Both lines sit above the summary block, in warmup:
+`[StickyKV] eviction path: …` settles §5.2 — the largest B=32 item — and
+`[StickyKV] fused decode tiling: target_keys=…` is the whole of D3. The profile
+itself must be re-taken because the one in hand predates `33ae5f9` and `130de24`
+(§5); it costs two minutes and its headline numbers are otherwise unquotable.
 
 **1. Run the bisect. One command, and it can end the project.**
 
@@ -274,11 +419,12 @@ waste is ~3× larger at the operating point the target was set at.
 
 | order | item | conditioned on |
 |---|---|---|
-| 1 | D2 (`eps`) | nothing — cheapest real change, and it shrinks D1's payload |
-| 2 | D3 (tile rung) | step 2's printed line; free if it says 64 |
-| 3 | D1 (demote width) | step 4's `n_q`; the largest item and the most work |
-| 4 | Block A disposition | step 1 |
-| 5 | D5 / D6 | the chrome trace pointing at them |
+| 1 | **D0** (eviction fusion) | step 0's banner; the largest B=32 item and possibly a plain bug |
+| 2 | D2 (`eps`) | nothing — cheapest real change, and it shrinks D0's and D1's payload |
+| 3 | D3 (tile rung) | step 0's second line; free if it says 64 |
+| 4 | D1 (demote width) | step 4's `n_q`; the largest remaining item and the most work |
+| 5 | Block A disposition | step 1 |
+| 6 | D5 / D6 | the chrome trace pointing at them |
 
 **6. Also fix, because they cost nothing and each one has already produced a
 wrong number once.**
@@ -298,7 +444,7 @@ wrong number once.**
 
 ---
 
-## 7. Confounds, and what was not checked
+## 8. Confounds, and what was not checked
 
 - **The target numbers here are the repo's own record, not the artifact.** The
   published artifact could not be read from this session (access denied to a
@@ -317,7 +463,13 @@ wrong number once.**
   `ecc0792` is 2026-09-15. Consistent, but the H-E run's own config was not
   recorded. If it was taken at 0.20/128, Block A and Block B swap some of their
   share and §5's B=1 conclusion gets *stronger*, not weaker.
-- **Nothing here was measured.** Every ms in §5 is arithmetic on
+- **§5 corrects a profile; it does not replace one.** The de-duplication in §5.1
+  is arithmetic on a printed rollup, not a re-measurement, and it assumes every
+  `aten::` row is the operator view of a kernel counted elsewhere — which is what
+  `33ae5f9` asserts and what the `other` bucket's contents show, but the fixed
+  build is the authority. The ≥9.34 ms eviction figure in §5.2 is a top-40 sum
+  and therefore a lower bound.
+- **Nothing else here was measured.** Every ms in §6 is arithmetic on
   `DECODE_NEXT.md` §2's profile and §4's estimates, scaled by a mechanism
   argument. The batch-invariance finding in §2 is the exception: it is a ratio of
   measured table cells and rests on no model.
