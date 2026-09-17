@@ -18,7 +18,6 @@ kernel. **The two still produce identical caches**, which is not an assumption:
 ``tests/test_quant_cache.py::test_flash_eager_two_tier_parity`` runs both and
 compares K/V, active window ids and effective length every step, and
 ``tests/test_layer_major_evict.py`` pins the same equivalence within this twin
-against ``STICKYKV_LAYER_MAJOR_DECODE=0``.
 """
 
 from __future__ import annotations
@@ -189,7 +188,7 @@ def evict_width_stats(cache) -> Optional[dict]:
     Both paths are now sized by the measured max, so these read as *what the cap
     would have cost*, not as waste still being paid.
 
-    ``DECODE_NEXT.md`` §7 records this as the risk the D1 estimate rests on --
+    the design notes records this as the risk the D1 estimate rests on --
     *"If the real count is routinely close to n_q, D1 is worth little"* -- and it
     has never been printed. Read it AFTER a timed window, never inside one: the
     single ``.item()`` here is the host sync the counters exist to avoid on the
@@ -239,89 +238,6 @@ def reset_evict_path_stats() -> None:
     (that is a property of the build, not of one measured run)."""
     _EVICT_STATS["eager"] = 0
     _EVICT_STATS["compiled"] = 0
-
-
-def _compile_evict_enabled() -> bool:
-    """Whether to run the eviction through ``torch.compile`` (default **ON**).
-
-    The default used to be OFF while ``scripts/run_perf_table.sh`` exported
-    ``1``, so the library and the benchmark harness disagreed about what the
-    method *is*. Anything that did not go through that script — the profiler
-    above all — measured the eager eviction against a table produced with it
-    compiled, and the gap is not small: compiling moved TPOT 101.6 -> 85 ms
-    (DECODE_HISTORY.md §1), landing almost entirely in the elementwise/copy/cat
-    kernels a profile is read to attribute.
-
-    So the **device** decides now, not a setting, exactly as it does for the
-    decode path: with nothing set, CUDA gets the compiled eviction and CPU gets
-    the eager one. That is one production eviction, and it is the same one
-    whether or not the run went through the benchmark script.
-
-    Compiling on CPU would be pointless anyway — what it buys is launch
-    coalescing — and doing it anyway cost the test suite 4x its runtime.
-
-    An explicit value still wins, for the compile-failure bisection the
-    diagnostics below document and for the tests that exercise it.
-    """
-    raw = os.environ.get("STICKYKV_COMPILE_EVICT")
-    if raw is not None:
-        return raw.strip().lower() in ("1", "true", "yes", "on")
-    try:
-        import torch
-        return bool(torch.cuda.is_available())
-    except Exception:
-        return False
-
-
-def _compile_evict_backend() -> Optional[str]:
-    """Optional ``torch.compile`` backend override for the eviction.
-
-    ``None`` (unset) uses the default (Inductor), which is what fuses the
-    launches on GPU. Set ``STICKYKV_COMPILE_EVICT_BACKEND`` to pick another —
-    ``aot_eager`` traces + runs eager (no C++/Triton codegen, so it validates the
-    tracing and semantics on a box without a compiler), ``cudagraphs`` for the
-    graph backend, etc.
-    """
-    v = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND", "").strip()
-    return v or None
-
-
-def _layer_major_decode() -> bool:
-    """Whether decode uses the layer-major store (default **ON**).
-
-    This is DECODE_SPEED_PLAN §4.1 and it is the shipped path, not an experiment:
-    one eviction for all ``L`` layers instead of ``L`` of them, which is a 32x cut
-    on ~64% of the per-token launch budget.
-
-    ``STICKYKV_LAYER_MAJOR_DECODE=0`` restores the per-layer eviction. It exists
-    for two reasons and no others: it is the control arm of
-    ``tests/test_layer_major_evict.py``, which asserts the two paths produce
-    byte-identical caches, and it is how the same A/B is run on a GPU. It is not
-    a fallback — nothing selects it automatically, and no failure degrades into
-    it; a layer-major path that cannot run raises.
-    """
-    v = os.environ.get("STICKYKV_LAYER_MAJOR_DECODE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _prefill_layer_major() -> bool:
-    """Whether PREFILL also allocates layer-major (default OFF).
-
-    Decode is layer-major unconditionally — that is DECODE_SPEED_PLAN §4.1 and
-    it is the default path, not a flag. Prefill is not, and the reason is memory
-    rather than taste: a layer-major prompt buffer means the first compaction has
-    to hold the whole ``L*B``-row prompt AND the whole ``L*B``-row steady store at
-    once, where per-layer buffers compact one at a time and only ever hold a
-    single layer's steady store alongside the prompt. At 4096/batch-32 that is
-    about +4 GB of peak — roughly 8% of the cell, taken straight out of max
-    batch, which is the number the whole method exists to raise.
-
-    So prefill stays per-layer and this knob exists to MEASURE the other side on
-    a box where the peak has headroom. It changes allocation only; the eviction,
-    the retained set and the cache contents are identical either way.
-    """
-    v = os.environ.get("STICKYKV_PREFILL_LAYER_MAJOR", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
 
 
 class _LayerStateView:
@@ -545,7 +461,7 @@ def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
     kw: Dict[str, Any] = {"dynamic": dynamic}
-    backend = _compile_evict_backend()
+    backend = None
     if backend is not None:
         kw["backend"] = backend
     return _emulating_precision_casts(
@@ -923,7 +839,7 @@ class WindowedCache(_HFCacheBase):
         # cache at the END of each step is identical; only "append then compact"
         # becomes "compact then append". tests/test_layer_major_evict.py pins
         # that byte-for-byte against the per-layer path.
-        self._layer_major: bool = _layer_major_decode()
+        self._layer_major: bool = True
         self._joint: Optional[CacheState] = None
         self._joint_store: Optional[QuantizedStore] = None
         self._joint_step: int = 0
@@ -2061,7 +1977,7 @@ class WindowedCache(_HFCacheBase):
         ``_compact`` allocates by **rank into a worst-case width**, not by count:
         the counts are ragged per row (*"row 0 may demote 4 windows while row 1
         demotes none"*), so allocating by count would need the max, and the max
-        needs a host sync. ``DECODE_NEXT.md`` D1 proposes paying that sync -- one
+        needs a host sync. the design notesD1 proposes paying that sync -- one
         per eviction -- to stop un-rotating, quantizing and sketching a
         ``[L*B, n_q, H_kv, ws, D]`` tensor of which most lanes are masked away.
 
@@ -2152,7 +2068,6 @@ class WindowedCache(_HFCacheBase):
         rows instead of ``B``, so all ``L`` layers' 273 launching ops collapse
         into one set of 273 (§4.1).
 
-        Default (``STICKYKV_COMPILE_EVICT`` off) calls the eager implementation
         below — byte-for-byte the historic path, one extra function-pointer hop.
         With it ON, the body is run through a lazily-built, process-global
         ``torch.compile`` (``dynamic=True`` for the varying window count), which
@@ -2181,12 +2096,7 @@ class WindowedCache(_HFCacheBase):
         (the shape-derived control ints are made concrete, and the clamp is
         two-sided), so on a supported build it now compiles rather than raising.
         If a build still cannot lower it, the raised error names the failing op
-        and the steps to get numbers (``STICKYKV_COMPILE_EVICT=0`` runs eager).
         """
-        if not _compile_evict_enabled():
-            _announce_evict_path_once(compiled=False)
-            _EVICT_STATS["eager"] += 1
-            return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
         # Compile requested: compiled-or-raise. No eager fallback by design.
         _run_compiled_evict(self, layer_idx, step)
         return None

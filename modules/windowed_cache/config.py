@@ -124,7 +124,7 @@ class ResolvedConfig:
         reported at ``cache_budget=0.20`` is really holding 13.8% / 11.4% of the
         full cache. That gap is a silent accuracy cost, so it is a property
         rather than something each reader recomputes. Report it with every
-        quality row; ``ACCURACY_RECOVERY_PLAN.md`` §2 is why.
+        quality row; the design notes is why.
         """
         if self.total_budget_bytes <= 0:
             return 0.0

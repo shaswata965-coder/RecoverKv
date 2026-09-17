@@ -114,8 +114,7 @@ def _sorted_pick(top: Tensor) -> Tensor:
     ``test_selection_order_does_not_change_the_result`` pins, and it is why the
     sort was dropped as "a launch for nothing".
 
-    The launch was for something, and it was not the arithmetic. ``GATE_REGRESSION.md``
-    §2b: under ``SEL`` the Q-tier loop's ``widx`` stops being affine, so ``KS``,
+    The launch was for something, and it was not the arithmetic. the design notes: under ``SEL`` the Q-tier loop's ``widx`` stops being affine, so ``KS``,
     ``KZ``, ``KC``, ``VC``, ``VS``, ``VZ`` and ``COS``/``SIN`` all become gathers,
     and the kernel runs **7.03 ms against a 0.58 ms roofline — 12x off**, which is
     the signature of a gather-bound kernel and nothing else in that measurement
@@ -139,7 +138,7 @@ def _sorted_pick(top: Tensor) -> Tensor:
     a 1,636 MB step. The kernel already does ``tl.load(SEL + ...).to(tl.int32)``
     after the load, and Triton's pointer arithmetic is in elements, so an int64
     ``SEL`` indexes identically; ``check_gate_selection`` now accepts either.
-    That trade was upside-down on a path where `DECODE_NEXT.md` §2 measures the
+    That trade was upside-down on a path where the design notes measures the
     host gap at 37% of the step and ~17 us exposed per launch.
     """
     return top.sort(dim=-1).values

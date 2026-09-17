@@ -49,8 +49,9 @@ def _compile(fn, ptrs, consts):
 _DECODE_PTRS = {
     **{n: "*fp16" for n in ("Q", "KFP", "VFP", "KS", "KZ", "VS", "VZ",
                             "COS", "SIN", "OUT")},
-    "KC": "*u8", "VC": "*u8", "SEL": "*i32",
+    "KC": "*u8", "VC": "*u8", "SEL": "*i32", "VM": "*i8",
     "WSUM": "*fp32", "WMAX": "*fp32", "LOGM": "*fp32", "scale": "fp32",
+    "VMS": "*fp16", "VANC": "*fp32",
 }
 
 _GATE_PTRS = {

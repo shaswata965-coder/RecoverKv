@@ -58,7 +58,6 @@
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
-#   DECODE_GRAPH    on | off  CUDA-graph the steady decode steps (default: OFF).
 #                   An ABLATION, not the shipped path: the graph is wired into
 #                   this runner but not into model.generate(), which is what
 #                   LongBench and GSM8K use -- so `on` produces a speed number
@@ -134,7 +133,6 @@ QUANT_MODE="${QUANT_MODE:-bytes}"
 # (on under CUDA); "off" restores the pre-39f6be0 eager loop. Exported below so
 # the child inherits it -- the library default and this script must not disagree,
 # which is the 1434b2c lesson.
-DECODE_GRAPH="${DECODE_GRAPH:-${STICKYKV_DECODE_GRAPH:-}}"
 # The read gate's selectivity. 1.0 makes _gate_ctx hand over nothing, so the
 # fused decode runs UNGATED over the whole Q tier -- the control arm for pricing
 # the gate against itself at identical budget, shape and batch.
@@ -177,7 +175,6 @@ while [[ $# -gt 0 ]]; do
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
-    --graph|--decode-graph) DECODE_GRAPH="$2"; shift 2;;
     --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
     --lse-strict)           LSE_STRICT="$2"; shift 2;;
     -h|--help)              sed -n '2,73p' "$0"; exit 0;;
@@ -200,7 +197,6 @@ fi
 # (`((I)//ws)` guard, `aten.amin` StarDep) are fixed at the source in cache.py,
 # so a supported build compiles. If yours still cannot, the error names the op
 # and the fix; rerun with --compile-evict 0 for eager (launch-bound) numbers.
-export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 
 # L-reuse (a PREFILL optimization) hands the softmax normaliser L from the flash
 # forward to the score kernel instead of recomputing it. DEFAULT IS STRICT: a
@@ -214,7 +210,6 @@ export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 # [B, H_q, chunk, S] fp32 block that is 32 GB at 4096/batch-32 -- larger than the
 # model weights, and the reason that cell OOMs. Pass --lse-strict 0 only when you
 # knowingly want the recompute path.
-export STICKYKV_LSE_STRICT="$LSE_STRICT"
 
 case "$BACKEND" in
   flash_attn) ATTN_IMPL="flash_attention_2";;
@@ -303,17 +298,13 @@ YAML
   echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
   echo "quant_gate_ratio: $GATE_RATIO"
-  echo "decode_graph: ${DECODE_GRAPH:-off}"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
-  echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
-  echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
   echo "window_size: $WINDOW_SIZE  num_sink: $NUM_SINK  local_window: $LOCAL_WINDOW"
   echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE  stat: $STAT"
   echo "throughput_columns: $THROUGHPUT"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
-echo "decode graph: ${DECODE_GRAPH:-off (ablation; generate() cannot use it)}"
 
 # Say it out loud when a flag moves this run off the pinned operating point.
 # `--gate-ratio 1.0` is the case that matters: it is a legitimate ablation, and
@@ -348,16 +339,6 @@ if off:
     print("     scripts/check_operating_point.py prints the full comparison.")
     print("")
 PYEOF
-# Refuse the CUDA graph HERE, in the first second, rather than after minutes of
-# a sweep. The runner as built captures every steady decode step and replays
-# none of them (a slot is destroyed at the next eviction and each slot value
-# occurs once per epoch), so it costs capture time plus a per-epoch memory-pool
-# teardown and returns nothing -- and it eventually dies in the CUDA allocator,
-# which is how table_v5_graph came back with six ERROR rows and no number.
-if [ -n "$DECODE_GRAPH" ] && [ "$DECODE_GRAPH" != "off" ] && [ "$DECODE_GRAPH" != "0" ]; then
-  python "$PROJECT_ROOT/scripts/check_decode_graph.py" || exit 1
-fi
-if [ -n "$DECODE_GRAPH" ]; then export STICKYKV_DECODE_GRAPH="$DECODE_GRAPH"; fi
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
 echo "config: $CONFIG_FILE"

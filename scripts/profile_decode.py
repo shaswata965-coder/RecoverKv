@@ -67,14 +67,6 @@ import time
 from pathlib import Path
 
 
-def _env_gate(args) -> None:
-    """Set the path flags BEFORE anything reads them (hooks latch at install)."""
-    if args.fused is not None:
-        os.environ["STICKYKV_FUSED_DECODE"] = str(args.fused)
-    if args.compile_evict is not None:
-        os.environ["STICKYKV_COMPILE_EVICT"] = str(args.compile_evict)
-
-
 def _self_device_us(ev) -> float:
     """Per-event CUDA self time. The attribute was renamed in torch 2.x."""
     for attr in ("self_device_time_total", "self_cuda_time_total"):
@@ -240,10 +232,9 @@ def _print_evict_fusion_verdict(agg, n: int) -> None:
     evict`` contributed exactly 0.000. The eviction was landing as
     ``at::native::elementwise_kernel`` and friends with fractional launch counts
     (n < 5/step, i.e. one step in ``window_size``), which is the unfused
-    signature ``RECENT_CHANGES_AND_HYPOTHESES.md`` §4 describes.
+    signature the design notes describes.
 
     Root cause was eight ``untyped_storage().data_ptr()`` graph breaks in
-    ``CacheState.replace`` / ``replace_body``; ``tests/test_evict_graph_breaks.py``
     now pins the count at zero. This printer is the other half: the instrument
     that would have said so at the time.
     """
@@ -270,7 +261,6 @@ def _print_evict_fusion_verdict(agg, n: int) -> None:
               "         emitted no kernel this rollup can see. The eviction is "
               "paying\n"
               "         compile overhead for eager kernels. Check:\n"
-              "           python -m pytest tests/test_evict_graph_breaks.py -q\n"
               "         and bound the cost with one --compile-evict 0 run: if "
               "eager\n"
               "         and 'compiled' tie, the compile is doing nothing either "
@@ -333,21 +323,16 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=12,
                     help="decode steps before profiling; must exceed window_size "
                          "so at least one eviction is compiled/autotuned away")
-    ap.add_argument("--fused", type=int, choices=(0, 1), default=None,
-                    help="STICKYKV_FUSED_DECODE. 0 = materialize path (A/B the "
-                         "Triton decode kernel out of the picture)")
     # Defaults to 1, which is what the library itself picks on CUDA (the device
     # decides -- see _compile_evict_enabled). This used to be the one place the
     # two disagreed: the library defaulted to 0 while run_perf_table.sh exported
     # 1, so an unset profile attributed the EAGER eviction against a table that
     # ran it compiled -- a different method, and not by a little: compiling moved
     # TPOT 101.6 -> 85 ms (DECODE_HISTORY.md §1). Pass 0 deliberately to A/B it.
-    ap.add_argument("--compile-evict", type=int, choices=(0, 1), default=1)
     ap.add_argument("--trace", default=None, help="write a chrome trace here")
     ap.add_argument("--top", type=int, default=15)
     args = ap.parse_args()
 
-    _env_gate(args)
 
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -426,46 +411,15 @@ def main() -> None:
     device = input_ids.device
     pos = 0                      # absolute token index, advanced by _step
 
-    # CUDA-graph replay of the steady steps, opt-in via STICKYKV_DECODE_GRAPH.
-    # `_decode_step` counts only the decode steps, because the graph runner's
-    # schedule is the eviction cadence and that is indexed from the first decode
-    # step, not from the prefill.
     _decode_step = [-1]
-    _graph = None
-    try:
-        from utils.config import FIRST_EVICTION_STEP_DEFAULT
-        from modules.windowed_cache.graph_decode import (
-            DecodeGraphRunner, EpochSchedule, graph_mode)
-        if graph_mode() != "off" and getattr(cache, "resolved", None) is not None:
-            _graph = DecodeGraphRunner(
-                cache,
-                EpochSchedule(window_size=int(cache.resolved.window_size),
-                              first_eviction_step=int(getattr(
-                                  cache.resolved, "first_eviction_step",
-                                  FIRST_EVICTION_STEP_DEFAULT))),
-                mode=graph_mode())
-            _PROFILED_GRAPH["runner"] = _graph
-    except Exception as exc:
-        raise RuntimeError(
-            f"STICKYKV_DECODE_GRAPH is set but the runner could not be built: "
-            f"{exc}. It raises rather than profiling eagerly under a graphed "
-            "label -- see 1434b2c for why that matters here specifically."
-        ) from exc
 
     def _step(ids, past, n_new):
         nonlocal pos
         cp = torch.arange(pos, pos + n_new, device=device)
         pos += n_new
         _decode_step[0] += 1
-        if _graph is None or n_new != 1 or _decode_step[0] < 1:
-            return model(input_ids=ids, past_key_values=past, use_cache=True,
-                         return_dict=True, cache_position=cp)
-        sid = _graph.static_input("input_ids", ids)
-        scp = _graph.static_input("cache_position", cp)
-        return _graph.step(
-            _decode_step[0],
-            lambda: model(input_ids=sid, past_key_values=past, use_cache=True,
-                          return_dict=True, cache_position=scp))
+        return model(input_ids=ids, past_key_values=past, use_cache=True,
+                     return_dict=True, cache_position=cp)
 
     try:
         with torch.no_grad():
@@ -546,13 +500,7 @@ def main() -> None:
     n = max(args.steps, 1)
     print("\n" + "=" * 74)
     print(f"DECODE PROFILE  batch={args.batch} prefill={args.prefill} "
-          f"steps={n}  fused={os.environ.get('STICKYKV_FUSED_DECODE', '1')} "
-          f"compile_evict={os.environ.get('STICKYKV_COMPILE_EVICT', 'device')}")
-    if os.environ.get("STICKYKV_COMPILE_EVICT", "").strip() == "0":
-        print("  !! eviction is EAGER here. The library compiles it on CUDA with "
-              "nothing set,\n     so this profiles a different method than a "
-              "default run. The elementwise/copy\n     kernels below are "
-              "inflated accordingly.")
+          f"steps={n}")
     print("=" * 74)
     print(f"  wall            {steady_us / n / 1000:8.2f} ms/step   "
           "(profiler OFF -- the real step)")
@@ -620,7 +568,6 @@ def main() -> None:
                       f"  ->  {rung[0]}x{rung[1]}{where}")
             if any(r != top for r in chosen.values()):
                 print("    A lower rung is a shared-memory fact, not a verdict: "
-                      "pin rungs with\n    STICKYKV_DECODE_TILE=64x1 (etc.) and "
                       "re-run the table to price them.")
     except Exception:  # pragma: no cover - diagnostics must never fail a run
         pass

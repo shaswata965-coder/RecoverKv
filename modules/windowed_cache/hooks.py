@@ -35,7 +35,7 @@ import torch.nn as nn
 
 import os
 
-from . import flash_lse, flash_decode, flashinfer_lse
+from . import flash_lse, flash_decode
 from .decode_kernel import (
     assert_decode_kernel_available,
     describe_decode_backend,
@@ -53,151 +53,28 @@ from .scorer import (
 )
 
 
-def _prefill_score_chunk() -> int:
-    """Query-row block size for the prefill score pass.
-
-    The flash hook reconstructs ``softmax(q·kᵀ).sum(over queries)`` to score
-    keys. Doing it in one shot materializes the full ``[B, H_q, T, S]`` matrix —
-    tens of GiB per layer at full LongBench context (T up to ~18k). Because the
-    score is a sum over query rows, we accumulate it in blocks of this many rows
-    and never hold more than ``[B, H_q, chunk, S]``. Override with the env var
-    ``STICKYKV_PREFILL_SCORE_CHUNK`` (smaller = less memory, more iterations).
-    """
-    try:
-        v = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024"))
-        return v if v > 0 else 1024
-    except (TypeError, ValueError):
-        return 1024
-
-
-def _lse_from_forward() -> bool:
-    """Whether to reuse flash's ``softmax_lse`` instead of recomputing ``L``.
-
-    **On by default.** The flash forward is monkeypatched (:mod:`flash_lse`) to
-    hand out the softmax normaliser it already computes, so the Triton score path
-    skips its ``L`` recompute pass (:func:`score_kernel.compute_lse`) — and that
-    recompute is the ``[B, H, chunk, S]`` fp32 transient (~17 GB at prefill=4096,
-    batch=32) that OOMs the very shapes this method targets. Reusing L eliminates
-    it: the fused key-outer kernel never materialises the score matrix. This is
-    THE prefill-memory fix, so it is the default rather than an opt-in.
-
-    Degrades safely: :func:`flash_lse.enable` returns None if flash-attn is
-    absent, and the wrapper latches off if the installed build rejects
-    ``return_attn_probs`` — in either case the score path falls back to
-    recomputing L (and its transient) exactly as before. Set
-    ``STICKYKV_SCORE_LSE_FROM_FORWARD=0`` to force that recompute (e.g. for parity
-    against the pre-reuse numbers).
-    """
-    v = os.environ.get("STICKYKV_SCORE_LSE_FROM_FORWARD", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _lse_backend() -> str:
-    """Which L-source to install: ``flashinfer`` | ``flash`` | ``auto``.
-
-    ``STICKYKV_LSE_BACKEND`` selects it (default ``auto``):
-
-    * ``flash``      — ask the REAL ``flash_attn_func`` for the ``softmax_lse``
-                       it already computed (:mod:`flash_lse`). The attention
-                       output is bit-identical, because it is the same kernel.
-    * ``flashinfer`` — FlashInfer's prefill kernel, which returns ``L`` as a
-                       first-class output (:mod:`flashinfer_lse`). REQUIRED when
-                       named: raises at install if flashinfer is not importable,
-                       rather than silently degrading (kernel-or-error).
-    * ``auto``       — prefer ``flash``, fall back to ``flashinfer``.
-
-    **``auto`` used to prefer ``flashinfer`` and that was the wrong default**,
-    on two counts. Correctness: ``flashinfer`` REPLACES the attention call, so
-    the model's output comes from a different kernel with a different
-    accumulation order — a numerics change to the forward, not just to ``L``,
-    in a project whose requirement is identical scores. ``flash`` cannot
-    diverge that way. Practically: on the box this ships to, ``flashinfer``
-    imports (so ``auto`` always chose it) and then FAILS at the first call,
-    while ``flash`` works — so the default reliably selected the broken path
-    and the working one was never reached. Preferring ``flash`` makes the
-    safer option the one you get by not thinking about it.
-    """
-    return os.environ.get("STICKYKV_LSE_BACKEND", "auto").strip().lower()
-
-
 def _install_lse_source(handles: "HookHandles") -> Tuple[bool, str]:
-    """Install the selected L-source. Returns ``(capture_on, label)``.
+    """Install the L-source. Returns ``(capture_on, label)``.
 
-    ``label`` is for the banner: ``flashinfer`` / ``flash`` / ``off``. A named
-    ``flashinfer`` that cannot import is a hard error (kernel-or-error); ``auto``
-    falls back to ``flash`` and then to recompute.
+    One source. ``flash_lse`` captures the softmax normaliser L from the flash
+    forward the model already runs, so the score pass reuses it instead of
+    recomputing. There is no backend choice and no "off": recomputing L
+    materializes a ``[B, H_q, chunk, S]`` fp32 block that is 32 GB at
+    4096/batch-32 -- larger than the model weights, and the reason that cell
+    OOMed. A capture that cannot be installed is therefore an error, not a
+    degradation.
     """
-    if not _lse_from_forward():
-        return False, "off (STICKYKV_SCORE_LSE_FROM_FORWARD=0)"
-
-    backend = _lse_backend()
-    if backend == "flashinfer":
-        h = flashinfer_lse.enable()
-        if h is None:
-            raise RuntimeError(
-                "STICKYKV_LSE_BACKEND=flashinfer but FlashInfer (or transformers' "
-                "flash utils) is not importable. Install flashinfer on the CUDA "
-                "box, or use STICKYKV_LSE_BACKEND=flash / auto. This is "
-                "kernel-or-error: a named backend never silently degrades."
-            )
-        handles._cleanups.append(h.restore)
-        return True, "flashinfer"
-
-    # backend == "flash", or auto: the flash_lse capture FIRST. Same kernel,
-    # so the attention output is bit-identical; see _lse_backend for why this
-    # order was flipped.
     h = flash_lse.enable()
-    if h is not None:
-        handles._cleanups.append(h.restore)
-        return True, "flash"
+    if h is None:
+        raise RuntimeError(
+            "the L-capture could not be installed: transformers' flash "
+            "attention utils are not importable, so `flash_attn_func` has no "
+            "seam to patch. Recomputing L instead is not offered -- it is a "
+            "second O(N^2) pass per layer whose fp32 block OOMs 4096/batch-32."
+        )
+    handles._cleanups.append(h.restore)
+    return True, "flash"
 
-    if backend == "auto" and flashinfer_lse.available():
-        h = flashinfer_lse.enable()
-        if h is not None:
-            handles._cleanups.append(h.restore)
-            return True, "flashinfer"
-
-    return False, "off (no L source available; recomputing L)"
-
-
-def _lse_strict() -> bool:
-    """Whether an L-reuse MISS raises instead of degrading (default ON).
-
-    The prefill score path is otherwise already fail-loud: ``compute_token_scores``
-    is Triton-or-error for ``T > 1`` because the PyTorch reference OOMs the
-    shapes this method targets. The L-capture was the last piece that degraded
-    quietly, and it degrades into exactly that reference's transient — a second
-    ``O(N^2)`` pass and a ``[B, H_q, chunk, S]`` fp32 block (32 GB at 4096/32,
-    larger than the model weights). Paying that silently is how a whole campaign
-    of prefill numbers got recorded on the recompute path.
-
-    Read by both L sources and by the consumer below, so no part of the chain
-    can disagree about whether a miss is survivable. ``STICKYKV_LSE_STRICT=0``
-    restores the degrade for runs where only the output matters.
-    """
-    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
-def _score_softmax_dtype() -> torch.dtype:
-    """Dtype for the auxiliary-score softmax intermediate.
-
-    The softmax runs over the full ``[.., blk, S]`` logit block — the single
-    largest transient in the prefill score pass. ``bfloat16`` halves that tensor
-    versus ``float32`` while keeping fp32's exponent range (unlike ``float16``,
-    whose 5-bit exponent can overflow on large logits), so it is the memory-lean
-    default. Set ``STICKYKV_SCORE_SOFTMAX_DTYPE=float32`` to restore the exact
-    fp32 reduction (byte-identical scores) for parity checks.
-    """
-    name = os.environ.get("STICKYKV_SCORE_SOFTMAX_DTYPE", "bfloat16").lower()
-    return {
-        "float32": torch.float32,
-        "fp32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp16": torch.float16,
-    }.get(name, torch.bfloat16)
 
 try:
     from transformers.models.llama.modeling_llama import (
@@ -265,7 +142,7 @@ class HookHandles:
     _removed: bool = False
     #: True iff an L-source was installed (``L`` comes from the forward).
     lse_active: bool = False
-    #: ``flashinfer`` / ``flash`` / ``off (...)`` — the banner's label.
+    #: The L-source label for the banner. Always ``flash``.
     lse_label: str = "off (hooks not installed)"
     #: True iff the fused two-tier decode kernel path was armed.
     fused_decode: bool = False
@@ -293,6 +170,20 @@ class HookHandles:
 # Guards the one-per-process "which scoring path" banner (install runs per
 # sample in the runners, so an unguarded print would spam thousands of lines).
 _PATH_ANNOUNCED = [False]
+
+
+#: Query-row block size for the prefill score pass. The flash hook reconstructs
+#: ``softmax(q.k^T).sum(over queries)``; doing it in one shot materializes the
+#: full ``[B, H_q, T, S]`` matrix -- tens of GiB per layer at full LongBench
+#: context. The score is a sum over query rows, so it accumulates in blocks of
+#: this many and never holds more than ``[B, H_q, chunk, S]``.
+PREFILL_SCORE_CHUNK = 1024
+
+#: Dtype for the auxiliary-score softmax intermediate -- the single largest
+#: transient in the prefill score pass. bfloat16 halves it against float32 while
+#: keeping fp32's exponent range (float16's 5-bit exponent overflows on large
+#: logits).
+SCORE_SOFTMAX_DTYPE = torch.bfloat16
 
 
 def install_score_hooks(
@@ -375,7 +266,7 @@ def install_score_hooks(
     handles.lse_active, handles.lse_label = lse_capture, lse_label
     # The module whose clear()/pop() the per-layer hooks below must call — the
     # FlashInfer path and the flash-attn capture keep independent stashes.
-    lse_mod = flashinfer_lse if lse_label == "flashinfer" else flash_lse
+    lse_mod = flash_lse
 
     # Fused two-tier decode (decode_kernel + flash_decode). Choosing the flash
     # backend commits to the Triton path for BOTH the prefill score kernel and the
@@ -640,8 +531,8 @@ def install_score_hooks(
                     k_current,
                     scaling,
                     lse=lse,
-                    chunk=_prefill_score_chunk(),
-                    softmax_dtype=_score_softmax_dtype(),
+                    chunk=PREFILL_SCORE_CHUNK,
+                    softmax_dtype=SCORE_SOFTMAX_DTYPE,
                     out_dtype=q.dtype,
                 )                                                    # [B, H_q, S]
 

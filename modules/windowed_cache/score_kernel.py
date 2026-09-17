@@ -14,7 +14,7 @@ PyTorch pass (``hooks.py``) that rebuilds ``softmax(q·kᵀ)`` and sums it — a
 memory-bound bolt-on that round-trips a ~20 GB probability matrix through HBM
 per layer.
 
-The fix (Design B / ``SCORE_KERNEL_PLAN.md``)
+The fix (Design B / the design notes)
 ---------------------------------------------
 Our score has the *exact* shape of FlashAttention-2's **backward** pass output
 ``dV`` — a sum over queries, for each key — with the value replaced by a column
@@ -303,7 +303,7 @@ def compute_lse(
     already produces ``L`` and can hand it out (``softmax_lse``), making Stage B a
     single extra ``q·kᵀ`` pass instead of two. Until that handoff is wired, this
     provides ``L`` self-contained so the kernel is usable and testable in
-    isolation. See ``SCORE_KERNEL_PLAN.md`` §4 / Flag 2.
+    isolation. See the design notes / Flag 2.
     """
     _LSE_RECOMPUTE_COUNT[0] += 1
     q5, kt, B, H_q, H_kv, rep, T, S, D = _as_grouped(q, k)
@@ -407,7 +407,6 @@ if _HAS_TRITON:
         Mathematically identical; ``ex2.approx`` carries ~2 ulp against expf's
         ~1, and the scores are then summed over up to S terms and used for a
         ranking, so the perturbation only matters where two windows are already
-        tied to ~1e-6. ``STICKYKV_SCORE_EXP2=0`` restores ``expf`` for
         bit-comparison against the historic path.
         """
         pid_n = tl.program_id(0)        # key block
@@ -502,33 +501,8 @@ if _HAS_TRITON:
     )(_score_kernel)
 
 
-def _score_autotune_enabled() -> bool:
-    """Whether to autotune the score kernel's block/warp/stage (default ON).
-
-    Off (``STICKYKV_SCORE_AUTOTUNE=0``) pins the historic fixed 64x64 launch —
-    use it for byte-stable timing or if a Triton build's autotuner misbehaves.
-    """
-    v = os.environ.get("STICKYKV_SCORE_AUTOTUNE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
 #: log2(e). Folded into ``scaling`` so the base change costs nothing per element.
 LOG2E = 1.4426950408889634
-
-
-def _score_exp2_enabled() -> bool:
-    """Whether the score kernel uses ``ex2.approx`` instead of ``expf`` (default ON).
-
-    The kernel issues one exponential per (query, key) pair — 8.6e9 across the
-    model at 4096/batch-1 — which made the accurate ``expf`` the single largest
-    term in the score pass (~36 ms of a measured 46 ms). ``exp2`` is one hardware
-    instruction instead of roughly ten.
-
-    Off (``STICKYKV_SCORE_EXP2=0``) restores ``expf``, for bit-comparison against
-    the historic path when a parity run needs to attribute a score difference.
-    """
-    v = os.environ.get("STICKYKV_SCORE_EXP2", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
 
 
 def _token_scores_triton(
@@ -571,7 +545,7 @@ def _token_scores_triton(
         out.stride(0), out.stride(1), out.stride(2),
         T, S, S - T, H_q, num_groups,
     )
-    if _score_autotune_enabled():
+    if True:
         # BLOCK_N is chosen by the autotuner, so the grid must read it from the
         # winning config's meta at launch (Triton evaluates this lambda per config).
         grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)

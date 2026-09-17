@@ -84,45 +84,6 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
-def _make_graph_runner(cache):
-    """A :class:`DecodeGraphRunner` for this cache, or ``None`` when off.
-
-    Off is the default. Anything unexpected about the cache -- no resolved
-    config, no window size -- RAISES rather than quietly returning ``None``,
-    because a graphed label over an eager run is the exact provenance bug both
-    ``0091e9c`` and ``1434b2c`` were fixing. The only way to get ``None`` is to
-    not ask for a graph.
-    """
-    from utils.config import FIRST_EVICTION_STEP_DEFAULT
-    from modules.windowed_cache.graph_decode import (
-        DecodeGraphRunner, EpochSchedule, graph_mode, graph_mode_is_explicit)
-    mode = graph_mode()
-    if mode == "off":
-        return None
-    res = getattr(cache, "resolved", None)
-    if res is None:
-        # This same loop runs the FullKV and KIVI baselines, which have no
-        # eviction cadence to build a capture schedule from. Device-decided:
-        # not applicable, run eager. Asked for by name: an error, because the
-        # request could not be honoured and eager numbers under a graphed label
-        # are the provenance bug 0091e9c and 1434b2c were both fixing.
-        if not graph_mode_is_explicit():
-            return None
-        raise RuntimeError(
-            "STICKYKV_DECODE_GRAPH is set but this cache exposes no resolved "
-            "config, so the eviction cadence the capture schedule has to match "
-            "is unknown. A runner built on a guessed cadence would replay a "
-            "steady graph over an eviction step.")
-    return DecodeGraphRunner(
-        cache,
-        EpochSchedule(window_size=int(res.window_size),
-                      first_eviction_step=int(
-                          getattr(res, "first_eviction_step",
-                                  FIRST_EVICTION_STEP_DEFAULT))),
-        mode=mode,
-    )
-
-
 def _phase_mb(phase) -> float:
     """A phase's peak in MB — device-level if we have it, else torch allocated.
 
@@ -292,7 +253,6 @@ _DYNAMO_BREAK_SECTIONS = ("graph_break", "unimplemented", "unimplemented_with_re
 def _dynamo_counters() -> Dict[str, int]:
     """Normalized ``torch._dynamo`` counters, or ``{}`` if unavailable.
 
-    Used to verify that ``STICKYKV_COMPILE_EVICT`` actually *fused* the eviction
     rather than merely tracing it. ``torch.compile`` never fails loudly on a
     graph break — it silently splits the region and runs the pieces eagerly — so
     a compiled eviction that broke on every store mutation issues the same ~273
@@ -398,22 +358,6 @@ def _reset_lse_recompute_count() -> None:
             pass
 
 
-def _lse_strict() -> bool:
-    """Whether an L-reuse MISS is a hard error (default) or a loud warning.
-
-    ``STICKYKV_LSE_STRICT`` (default "1"): a run that asked for L from the forward
-    but recomputed it (``compute_lse`` ran) ERRORS the cell — the rigorous
-    contract, so a degraded TTFT / max-B never masquerades as the method's. Set
-    "0" to DOWNGRADE that to a warning and keep the cell: the run completes on the
-    recompute path, TTFT is flagged recompute-path in provenance, and the decode
-    columns (TPOT / throughput / memory) — which L-reuse does not touch, it is a
-    prefill-only optimization — are reported normally. That is the right default
-    for a decode-focused table; the run_perf_table.sh script sets it.
-    """
-    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def _lse_reuse_requested() -> bool:
     """Whether the run asked for L to come from the forward (the default)."""
     return os.environ.get(
@@ -426,7 +370,6 @@ def _lse_transient_gb(batch_size: int, model_config: Any, prefill_len: int) -> f
 
     Sized so the L-reuse failure below can say what it costs at THIS shape rather
     than quoting one example. ``chunk`` is the query-row block
-    (``STICKYKV_PREFILL_SCORE_CHUNK``, default 1024) and ``S`` is the prefill
     length, so the term is quadratic in context and linear in batch.
     """
     try:
@@ -1748,7 +1691,7 @@ class PerfRunner:
                         f"transient (~{tgb:.1f} GB here). {cause} A prefill-only "
                         f"issue; decode TPOT / memory are unaffected."
                     )
-                    if _lse_strict():
+                    if True:
                         from utils.config import ConfigValidationError
                         raise ConfigValidationError(
                             detail + " Refusing to report a TTFT/max-B that belong "
@@ -1824,40 +1767,14 @@ class PerfRunner:
                         if torch.cuda.is_available(): torch.cuda.synchronize()
                         t_step0 = time.perf_counter()
                     if n_decode >= 2:
-                        # CUDA-graph replay of the steady steps, opt-in via
-                        # STICKYKV_DECODE_GRAPH (default ON under CUDA). The runner decides
-                        # per step whether a replay is legal and falls back to
-                        # this same eager call whenever it is not -- see
-                        # modules/windowed_cache/graph_decode.py. Step 0 above is
-                        # never graphed: it is the prompt compaction.
-                        _graph = _make_graph_runner(pkv)
                         with probe.phase("decode_steady"):
                             for _i in range(n_decode - 1):
-                                _step = _i + 1
-                                if _graph is None:
-                                    out = model(input_ids=next_tok, past_key_values=pkv,
-                                                use_cache=True, return_dict=True,
-                                                cache_position=_cache_pos(1), **gen_kwargs)
-                                else:
-                                    # Both inputs MUST be the runner's own
-                                    # buffers: a graph records the addresses it
-                                    # reads, and a fresh `arange` per step would
-                                    # be captured once and then never re-read.
-                                    _ids = _graph.static_input("input_ids", next_tok)
-                                    _cp = _graph.static_input("cache_position",
-                                                              _cache_pos(1))
-                                    out = _graph.step(
-                                        _step,
-                                        lambda: model(input_ids=_ids,
-                                                      past_key_values=pkv,
-                                                      use_cache=True,
-                                                      return_dict=True,
-                                                      cache_position=_cp,
-                                                      **gen_kwargs))
+                                out = model(input_ids=next_tok, past_key_values=pkv,
+                                            use_cache=True, return_dict=True,
+                                            cache_position=_cache_pos(1), **gen_kwargs)
                                 pkv = out.past_key_values
-                                next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                        if _graph is not None:
-                            print(f"[StickyKV] {_graph.report()}", flush=True)
+                                next_tok = out.logits[:, -1, :].argmax(
+                                    dim=-1, keepdim=True)
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t3 = time.perf_counter()
                 gen_time = t3 - t2

@@ -42,7 +42,6 @@ the fixed prefill cost lands in that one gap, undivided, and the decode cost may
 too. The ladder would narrow decode to one of three buckets and prefill to a
 single bucket that is the whole overhead -- useful, not sufficient.
 
-An env A/B on L-reuse cannot fill that hole either: ``STICKYKV_SCORE_LSE_FROM_
 FORWARD=1`` currently MISSES, so both arms would recompute and the delta would
 be zero. There is no switch that isolates ``compute_lse``.
 
@@ -77,7 +76,6 @@ from typing import Any, Dict, List, Optional
 
 # --------------------------------------------------------------------------
 # Rung definitions. Env is applied BEFORE hooks install, which is when
-# STICKYKV_FUSED_DECODE and STICKYKV_SCORE_LSE_FROM_FORWARD are latched.
 # --------------------------------------------------------------------------
 RUNGS = [
     {"id": "0_baseline", "windowed": False, "q": 0.0, "env": {},
@@ -85,10 +83,8 @@ RUNGS = [
     {"id": "1_windowed_q0", "windowed": True, "q": 0.0, "env": {},
      "what": "+ cache bookkeeping, scoring, eviction (no quant, no fused kernel)"},
     {"id": "2_q70_materialize", "windowed": True, "q": 0.70,
-     "env": {"STICKYKV_FUSED_DECODE": "0"},
      "what": "+ int2 Q tier via the materialize path"},
     {"id": "3_q70_fused", "windowed": True, "q": 0.70,
-     "env": {"STICKYKV_FUSED_DECODE": "1"},
      "what": "+ the fused Triton decode kernel (as shipped)"},
 ]
 
@@ -549,7 +545,6 @@ def _report(results: List[Dict[str, Any]], batch: int) -> None:
 def _report_equivalence(results: List[Dict[str, Any]]) -> None:
     """Do the materialize and fused routes emit the same tokens?
 
-    Rungs 2 and 3 differ only by STICKYKV_FUSED_DECODE, so they are the same
     method computed two ways and MUST agree. The fused kernel is the default on
     CUDA and has never been checked against its reference on a GPU, so this is
     the first evidence either way.

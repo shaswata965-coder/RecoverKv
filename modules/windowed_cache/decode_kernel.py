@@ -68,60 +68,20 @@ _LOG2E = 1.4426950408889634
 """``log2(e)``. Folded into ``scale`` so the kernel's softmax runs in base 2."""
 
 
-def decode_exp2_enabled() -> bool:
-    """Whether the decode kernel's softmax runs in base 2 (default ON).
-
-    ``tl.exp`` lowers to the accurate ``expf`` (~ten SFU ops); ``exp2`` lowers to
-    a single ``ex2.approx.f32``, which is why every FlashAttention implementation
-    uses it. The change is exact in real arithmetic — folding ``log2(e)`` into
-    ``scale`` makes every logit a base-2 exponent, so ``m``, ``wmax`` and ``lse``
-    are all in base-2 units and ``p``, ``l``, ``acc`` and ``out`` are unchanged
-    quantities. ``ex2.approx`` carries ~2 ulp against ``expf``'s ~1.
-
-    ``STICKYKV_DECODE_EXP2=0`` restores ``expf`` — a control arm for A/B'ing the
-    numerical difference, matching the prefill kernel's ``STICKYKV_SCORE_EXP2``.
-    Not a fallback: both settings are correct, one is faster.
-    """
-    v = os.environ.get("STICKYKV_DECODE_EXP2", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def rope_store_dtype_enabled() -> bool:
-    """Whether the RoPE tables are built at the KV store's dtype (default ON).
-
-    ``STICKYKV_ROPE_STORE_DTYPE=0`` restores the historical fp32 tables. This is
-    a **control arm for bisection, not a tuning knob**: fp32 is the convention
-    that made a token's key depend on which tier held it (see
-    :func:`rope_cos_sin_halves`), so turning it off reinstates a known defect.
-    It exists so a perf regression can be attributed to this change in one run
-    rather than by reverting code.
-    """
-    v = os.environ.get("STICKYKV_ROPE_STORE_DTYPE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-#: Latched at import so the launch path never touches ``os.environ``. Tests that
-#: flip the variable call :func:`refresh_exp2_latch`.
-_EXP2 = [decode_exp2_enabled()]
-_ROPE_STORE_DTYPE = [rope_store_dtype_enabled()]
-
-
-def refresh_exp2_latch() -> bool:
-    """Re-read ``STICKYKV_DECODE_EXP2``. For tests that set it after import."""
-    _EXP2[0] = decode_exp2_enabled()
-    return _EXP2[0]
-
-
-def refresh_rope_dtype_latch() -> bool:
-    """Re-read ``STICKYKV_ROPE_STORE_DTYPE``. For tests that set it after import."""
-    _ROPE_STORE_DTYPE[0] = rope_store_dtype_enabled()
-    return _ROPE_STORE_DTYPE[0]
+#: The kernel's two numeric conventions, both fixed. Base-2 softmax: log2(e) is
+#: folded into `scale`, so every logit is already a base-2 exponent and the base
+#: change costs nothing per element. RoPE tables at the KV STORE's dtype, not
+#: fp32: every other RoPE in this cache runs at the store dtype, and an fp32
+#: table here made a token's key depend on which tier held it (max round-trip
+#: error 4.5e-01 -> 6.9e-04). Both were environment knobs; neither had a correct
+#: "off", so neither is a knob.
+_EXP2 = [True]
+_ROPE_STORE_DTYPE = [True]
 
 
 def fused_decode_enabled() -> bool:
     """Always ``True``. There is one decode on the flash backend.
 
-    This used to read ``STICKYKV_FUSED_DECODE``, so a production run could be
     quietly served by the materialize path instead — a second, slower, entirely
     different implementation of the same method, selected by an environment
     variable nobody reads back when quoting a number.
@@ -364,7 +324,6 @@ def two_tier_window_reference(
     and the epilogue that rescales each window by ``exp(m_tile - lse)`` — so that
     the parts of §5.1 that cannot be executed on a CPU-only box (the Triton
     lowering) are the *only* parts left unverified. The arithmetic, the tiling,
-    the masking and the rescale are all pinned by
     ``tests/test_window_scores.py`` against the plain
     ``softmax -> strip sink -> window-sum`` path.
 
@@ -637,7 +596,6 @@ if _HAS_TRITON:
         ``window_size`` -- see :func:`window_tiling`.
 
         The exact algorithm, tile for tile, is mirrored on CPU by
-        :func:`two_tier_window_reference` and pinned by
         ``tests/test_window_scores.py``. **Keep the two in step**: that oracle is
         the only thing standing between this kernel and an unverified rewrite,
         because Triton cannot run on the CPU box this repo is developed on.
@@ -1005,7 +963,7 @@ if _HAS_TRITON:
 
 #: Per-(shape, dtype, device) scratch, reused across layers within a step.
 #:
-#: `DECODE_NEXT.md` D5 sized this against three allocations per layer per step
+#: the design notesD5 sized this against three allocations per layer per step
 #: and rated it the smallest item on its list. It counted the decode side only;
 #: the read gate brought two more (`est`, `logm`), and `topk`/`sort` two outputs
 #: each, so the fused path allocates ~11 per layer per step -- **352 per step at
@@ -1022,12 +980,10 @@ if _HAS_TRITON:
 #: -- is the standing precedent. A reused buffer holds memory the caching
 #: allocator would otherwise recycle, and the headline cell already peaks near
 #: 48 GB. Keying on the exact shape means a changed geometry allocates a new
-#: buffer rather than silently reusing a wrong-sized one; `STICKYKV_DECODE_SCRATCH=0`
 #: turns the whole thing off if `peak_GB` moves in the perf table.
 _SCRATCH: dict = {}
 
-_SCRATCH_ON = os.environ.get("STICKYKV_DECODE_SCRATCH", "1").strip().lower() not in (
-    "0", "false", "no", "off")
+_SCRATCH_ON = True
 
 
 def _scratch(name: str, shape, dtype, device):
@@ -1096,56 +1052,9 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
 #: i.e. that serial iteration count dominates latency hiding here, which is what
 #: an 8.8x-off-roofline kernel looks like when it is not bandwidth-bound. The
 #: ladder only falls on ``OutOfResources``, it never benchmarks, so that ordering
-#: is a claim. ``STICKYKV_DECODE_TILE`` is how it gets checked: pin two rungs,
 #: run the table twice, compare.
 _FIT_LADDER = [(64, 2), (64, 1), (32, 2), (32, 1), (16, 2), (16, 1)]
 
-
-def _tile_override() -> Optional[Tuple[int, int]]:
-    """``STICKYKV_DECODE_TILE=<target_keys>x<num_stages>``, or ``None``.
-
-    A measurement arm, not a setting. The ladder picks the first rung that
-    *fits*, which is a shared-memory fact; whether that rung is the *fastest* is
-    a separate question no fit test can answer. Pinning a rung and re-running the
-    perf table answers it, and every rung is bit-identical, so the comparison is
-    pure speed.
-
-    A pinned rung that does not fit raises rather than stepping down -- the whole
-    point is to measure the rung named, and a silent fall would report one rung's
-    number under another's label.
-    """
-    raw = os.environ.get("STICKYKV_DECODE_TILE", "").strip().lower()
-    if not raw:
-        return None
-    try:
-        keys, sep, stages = raw.partition("x")
-        # A bare "64" means one stage; "64x" is a typo, not a shorthand, and
-        # letting it through would report the ladder's rung under a pinned label.
-        if sep and not stages:
-            raise ValueError("trailing 'x' with no num_stages")
-        rung = (int(keys), int(stages) if sep else 1)
-    except ValueError:
-        raise ValueError(
-            f"STICKYKV_DECODE_TILE={raw!r} is not '<target_keys>x<num_stages>' "
-            f"(e.g. '64x2'). Known rungs: {_FIT_LADDER}"
-        ) from None
-    if rung[0] < 1 or rung[1] < 1:
-        raise ValueError(f"STICKYKV_DECODE_TILE={raw!r}: both parts must be >= 1")
-    return rung
-
-
-def fit_choice() -> dict:
-    """The rung chosen per geometry signature, as a plain dict.
-
-    The kernel prints its choice once per geometry, which happens during warmup
-    and scrolls away above whatever is being read. This is the same fact, asked
-    for rather than caught -- so a profile or a perf run can report the tiling it
-    actually ran at instead of a reader hoping to have seen the line.
-
-    Keys are ``(ws, head_dim, BLOCK_R, has_q_tier, gated)``; values are
-    ``(target_keys, num_stages)``.
-    """
-    return dict(_FIT_CHOICE)
 
 #: Winning rung per geometry signature, so the search runs once per process.
 _FIT_CHOICE: dict = {}
@@ -1374,13 +1283,8 @@ def _decode_triton(
     # separate compiles with different register and staging pressure, and a rung
     # that fit one is not evidence about the other.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated))
-    pinned = _tile_override()
-    if pinned is not None:
-        rungs = [pinned]
-    elif _FIT_CHOICE.get(sig) is not None:
-        rungs = [_FIT_CHOICE[sig]]
-    else:
-        rungs = _FIT_LADDER
+    rungs = ([_FIT_CHOICE[sig]] if _FIT_CHOICE.get(sig) is not None
+             else _FIT_LADDER)
     last: Optional[BaseException] = None
     for target_keys, num_stages in rungs:
         BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
@@ -1413,15 +1317,6 @@ def _decode_triton(
             _announce_fit(sig, target_keys, num_stages, BLOCK_NW, BLOCK_T)
         return out, wsum
 
-    if pinned is not None:
-        raise RuntimeError(
-            f"STICKYKV_DECODE_TILE pinned target_keys={pinned[0]} "
-            f"num_stages={pinned[1]} and it does not fit for ws={ws}, "
-            f"head_dim={D}, BLOCK_R={BLOCK_R}, gated={gated}. This raises rather "
-            "than stepping down: a pinned rung exists to be MEASURED, and a "
-            "silent fall would report one rung's number under another's label. "
-            f"Unset it to use the ladder {_FIT_LADDER}. Last error: {last}"
-        )
     raise RuntimeError(
         "fused decode could not fit in shared memory at any tile size. Tried "
         f"(target_keys, num_stages) = {_FIT_LADDER} for ws={ws}, head_dim={D}, "

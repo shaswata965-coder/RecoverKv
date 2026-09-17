@@ -89,7 +89,7 @@ Caveat
 ``(event, window)`` lookback pair (so one long inactive run contributes many
 eligible pairs), accepts a rescue arbitrarily far in the future, applies no
 censoring, and simulates Sticky-K on ground truth with ``m = 3`` hard-wired.
-They are different estimators of related quantities (``EVALUATION_GUIDE.md``,
+They are different estimators of related quantities (the design notes,
 Observation III).  Dropping the horizon closes *one* of those differences and
 none of the others: this is still an **episode** count (one long cold run
 contributes one eligible unit, not many pairs), still measured over the real

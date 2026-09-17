@@ -64,7 +64,7 @@ def _perf_table_point() -> dict:
     Read rather than restated: a second copy of these numbers is exactly the
     drift this script exists to catch, and the script's header comment has
     already been wrong about two of them (it claimed budget 0.50 / local 64
-    while the body did 0.20 / 128 -- ``RECENT_CHANGES_AND_HYPOTHESES.md`` §7.1).
+    while the body did 0.20 / 128 -- the design notes).
     """
     import re
 

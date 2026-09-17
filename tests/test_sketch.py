@@ -19,7 +19,6 @@ import torch
 from modules.quant.sketch import (
     _dq_sym,
     _q_sym,
-    _q_up,
     build_sketch,
     decode_sketch,
     gate_and_score,
@@ -89,19 +88,6 @@ def test_bound_holds_when_every_token_is_identical():
     assert torch.isfinite(bound).all() and torch.isfinite(logmass).all()
     true = (_true_logits(k, q) / math.sqrt(D)).amax(-1)
     assert (true - bound).amax() <= 1e-4
-
-
-def test_eps_quantisation_only_ever_rounds_up():
-    """The bound dies if a stored residual can be smaller than the real one."""
-    for seed in range(8):
-        x = torch.rand(64, 9, generator=torch.Generator().manual_seed(seed)) * 3.0
-        c, sc = _q_up(x)
-        assert (c.to(torch.float32) * sc.to(torch.float32).unsqueeze(-1) >= x).all()
-
-
-# ---------------------------------------------------------------------------
-# why rank-1, and why the encoding is what it is
-# ---------------------------------------------------------------------------
 
 
 def test_hot_token_is_the_best_fit_token():

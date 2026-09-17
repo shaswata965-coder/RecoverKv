@@ -100,7 +100,6 @@ def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 # a single kernel that keeps the fp32 temporaries in registers.
 #
 # This chain no longer runs in production, and the torch.compile fork that used
-# to wrap it (``STICKYKV_COMPILE_READ``) is gone with this comment. On CUDA the
 # fused two-tier decode kernel hands raw int2 straight to Triton and dequantizes
 # inside the kernel, so ``dequant_rotate_q_keys`` is unreachable there by two
 # independent routes: ``update()`` only falls through to ``_materialize_joint``

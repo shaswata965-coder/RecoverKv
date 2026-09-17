@@ -156,6 +156,35 @@ class ModelConfig:
 @dataclass
 class CacheConfig:
 
+    backend: str = "dynamic"
+    backend_package: Optional[str] = None  # "flash_attn" | "eager" | None
+    cache_budget: Optional[float] = None  # float ratio in (0, 1]; None for baseline
+    window_size: int = 8
+    num_sink_tokens: int = 4
+    local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
+    rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
+    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1]; 0 disables the Q tier
+    # What quant_ratio divides between the fp16 and int2 tiers. "bytes"
+    # (default) splits the byte budget, so the retained cache costs exactly
+    # cache_budget of the full cache at every q and cheaper int2 keys buy more
+    # context -- the mode a memory-vs-quality claim is stated in. "tokens" splits
+    # the window count instead, holding the retained KEY count q-invariant; that
+    # is what a latency table needs (equal work per row) and what the perf suite
+    # pins explicitly, but it under-spends the budget it was granted (69% at
+    # q=0.5) and costs accuracy for memory nobody asked to save.
+    quant_budget_mode: str = "bytes"
+    # Decode step of the FIRST eviction, independent of window_size. 0 (default)
+    # compresses the prompt on decode step 0 -- before that step's query attends --
+    # so every generated token comes from the budgeted cache. A positive value
+    # delays it and leaves any answer finishing inside that window measured at
+    # FULL cache whatever cache_budget says. See modules/windowed_cache/policy.py.
+    first_eviction_step: int = FIRST_EVICTION_STEP_DEFAULT
+    # Fraction of each step's ACTIVE int2 windows the read gate dequantizes.
+    # There is no on/off knob: the gate IS the read path wherever there is a Q
+    # tier. 1.0 selects every window, which makes the gate a provable no-op and
+    # is the control arm for pricing it.
+    quant_gate_ratio: float = 0.25
+
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
             # Type guards mirror WindowedCacheConfig.__post_init__: reject
