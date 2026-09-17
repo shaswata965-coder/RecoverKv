@@ -55,12 +55,13 @@ from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
-# torch.compile of the eviction step. The DEVICE decides (CUDA compiles, CPU does
-# not) -- see _compile_evict_enabled; STICKYKV_COMPILE_EVICT only overrides it,
-# for the compile-failure bisection. The eager _evict_two_tier_impl stays the
-# reference path, and _emulating_precision_casts is what keeps the compiled one
-# numerically equal to it. The compiled callable is process-global and built
-# lazily on first use so a run that never evicts never pays for it.
+# torch.compile of the eviction step. ALWAYS -- there is no knob and no device
+# test: `_evict_two_tier` calls the compiled body on every backend and raises if
+# it cannot be lowered. `_evict_two_tier_impl` is still the reference the
+# compiled body must equal (tests call it directly), and
+# _emulating_precision_casts is what keeps them equal. The compiled callable is
+# process-global and built lazily on first use so a run that never evicts never
+# pays for it.
 # ---------------------------------------------------------------------------
 
 _COMPILED_EVICT_FN = None
@@ -71,9 +72,11 @@ _EVICT_COMPILE_TRIED_STATIC = False
 #: Proof-of-execution counters for the eviction path, same contract as
 #: :data:`modules.windowed_cache.flash_decode._STATS`: being *able* to compile is
 #: not the same as the compiled body actually running. ``compiled`` counts
-#: evictions that went through ``_COMPILED_EVICT_FN``, ``eager`` the ones that
-#: took the reference body. A benchmark that believes it enabled the compiled
-#: eviction and reports ``eager > 0`` measured the path it was trying to replace.
+#: evictions that went through ``_COMPILED_EVICT_FN``. ``eager`` is kept at zero
+#: and is now a TRIPWIRE rather than a measurement: since the compiled path
+#: became unconditional nothing increments it, so a nonzero value means an eager
+#: fallback was reintroduced somewhere and the run's numbers are not the
+#: compiled path's.
 _EVICT_STATS = {"eager": 0, "compiled": 0}
 
 #: Sticky record of a torch.compile failure on the eviction, process-global and
@@ -2077,8 +2080,7 @@ class WindowedCache(_HFCacheBase):
         rows instead of ``B``, so all ``L`` layers' 273 launching ops collapse
         into one set of 273 (§4.1).
 
-        below — byte-for-byte the historic path, one extra function-pointer hop.
-        With it ON, the body is run through a lazily-built, process-global
+        The body always runs through a lazily-built, process-global
         ``torch.compile`` (``dynamic=True`` for the varying window count), which
         fuses the eviction step's ~360 pointwise / gather / scatter / quantize
         launches into a handful of kernels. That step is ~89% of the fused-decode
@@ -2089,11 +2091,10 @@ class WindowedCache(_HFCacheBase):
         are identical to the eager path. It fires once per ``ws`` steps, so a
         compile / recompile amortizes.
 
-        **Kernel-or-error when enabled — it never falls back to eager.** A silent
-        (or even loud) eager run under a "compiled" label defeats the flag's
-        entire purpose, which is to MEASURE the compiled path; an eager run would
-        report eager numbers, and the ~81%-of-budget eviction step would look
-        cut when it was not. So if ``torch.compile`` cannot lower the body,
+        **Kernel-or-error — it never falls back to eager.** A silent (or even
+        loud) eager run under a "compiled" label would report eager numbers, and
+        the ~81%-of-budget eviction step would look cut when it was not. So if
+        ``torch.compile`` cannot lower the body,
         :func:`_run_compiled_evict` raises (:data:`_EVICT_COMPILE_FAILED` records
         the reason for provenance) rather than running eager — the perf runner
         then marks that cell ``errored``, loudly, instead of quietly mislabelling

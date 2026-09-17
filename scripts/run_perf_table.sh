@@ -41,12 +41,9 @@
 #   GATE_RATIO      read-gate SELECTIVITY (default: 0.25). 1.0 selects every
 #                   window -- a control for selectivity ONLY. It still runs the
 #                   gate kernel, its topk+sort, the SEL indirection, the GATED
-#                   prologue and fill pass, and builds a card every eviction.
-#                   machinery out of the decode kernel and stops issuing the
-#                   gate launch + its topk/sort. This is the control
-#                   GATE_RATIO=1.0 is not, and it is
-#                   the configuration the published numbers were taken at
-#                   (TARGET_GAP.md §4). NOT score-neutral -- run LongBench with
+#                   prologue and fill pass, and builds a card every eviction, so
+#                   it prices the SELECTION and not the machinery. There is no
+#                   arm that removes the machinery: the gate is the read path.
 #   CACHE_BUDGET    fraction of the context kept                (default: 0.20)
 #   SHAPES          space list of prefill/decode pairs          (default: "4096/256 2048/512 1048/1048")
 #   BATCHES         space list of batch sizes                   (default: "1 32")
@@ -58,22 +55,15 @@
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
-#                   An ABLATION, not the shipped path: the graph is wired into
-#                   this runner but not into model.generate(), which is what
-#                   LongBench and GSM8K use -- so `on` produces a speed number
-#                   no accuracy number describes. Report it as its own row or
-#                   not at all. Also --graph.
 #   THROUGHPUT      which throughput column(s) to print         (default: both)
 #                     both | decode | e2e | all | legacy
 #                     legacy = the old single throughput_tokps column, for
 #                     reproducing a table printed before this change. It is
 #                     prefill-inclusive AND omits the prefill->decode gap, so it
 #                     is neither claim; do not quote it.
-#   COMPILE_EVICT   1 | 0  torch.compile the eviction step      (default: 1)
-#   LSE_STRICT      1 | 0  hard-fail on an L-reuse miss         (default: 1)
-#                   1 raises AT the miss, naming the layer and the cause.
-#                   0 degrades to recompute: a second O(N^2) pass per layer
-#                   AND the fp32 block that OOMs 4096/batch-32.
+#   (No COMPILE_EVICT / LSE_STRICT. Both are unconditional now -- the eviction
+#   is compiled-or-raise and an L-reuse miss raises -- so the flags were parsed
+#   and then never read, which is worse than not having them.)
 #
 # ------------------------------------------------------------------- examples
 #   # the shipped table (q=0.70, the two default batch sizes)
@@ -129,16 +119,10 @@ OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
 DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
 QUANT_MODE="${QUANT_MODE:-bytes}"
-# CUDA-graph replay of the steady decode steps. Empty = let the device decide
-# (on under CUDA); "off" restores the pre-39f6be0 eager loop. Exported below so
-# the child inherits it -- the library default and this script must not disagree,
-# which is the 1434b2c lesson.
-# The read gate's selectivity. 1.0 makes _gate_ctx hand over nothing, so the
-# fused decode runs UNGATED over the whole Q tier -- the control arm for pricing
-# the gate against itself at identical budget, shape and batch.
+# The read gate's selectivity: the fraction of each step's active int2 windows
+# the decode kernel dequantizes. 1.0 selects every window -- the no-op proof on
+# the one read path, and the control for what the SELECTION is worth.
 GATE_RATIO="${GATE_RATIO:-0.25}"
-# The gate itself, as opposed to its selectivity. Empty = derive (on wherever
-# there is a Q tier), which is the shipped operating point.
 CACHE_BUDGET="${CACHE_BUDGET:-0.20}"
 SHAPES="${SHAPES:-4096/256 2048/512 1048/1048}"
 BATCHES="${BATCHES:-1 32}"
@@ -151,8 +135,6 @@ WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
 THROUGHPUT="${THROUGHPUT:-both}"
-COMPILE_EVICT="${COMPILE_EVICT:-1}"
-LSE_STRICT="${LSE_STRICT:-1}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -175,8 +157,6 @@ while [[ $# -gt 0 ]]; do
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
-    --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
-    --lse-strict)           LSE_STRICT="$2"; shift 2;;
     -h|--help)              sed -n '2,73p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
@@ -257,6 +237,12 @@ window:
 cache:
   quant_ratio: ${QUANT_RATIO}
   quant_budget_mode: ${QUANT_MODE}
+  # Written here, not only announced below: a knob this script prints into
+  # run_perf_table.env and checks against the operating point, but does not put
+  # in the config, is a knob whose two arms measure the same thing. That is the
+  # 6b8a188 bug (`quant_gate_ratio` inert in every runner) recurring in the
+  # runner that prices the gate.
+  quant_gate_ratio: ${GATE_RATIO}
   first_eviction_step: 0
 
 perf:
