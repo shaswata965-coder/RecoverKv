@@ -223,3 +223,59 @@ def test_no_eviction_means_no_stats_rather_than_zeros():
         pass
 
     assert evict_width_stats(Bare()) is None
+
+
+# ---------------------------------------------------------------------------
+# D1 for the PROMOTE side
+# ---------------------------------------------------------------------------
+
+
+def test_evict_widths_takes_one_bound_per_mask():
+    """The three widths have different caps and must still cost ONE host read.
+
+    Demote and reactivate are capped by ``n_q`` (the Q tier's window count);
+    promote by ``min(N_q, n_fp)`` (what the fp side can take back). Before this,
+    promote was not measured at all -- it was sized by its cap, which under
+    ``quant_budget_mode: bytes`` is ~250 windows, so every eviction dequantized,
+    RoPE'd and spliced ~250 windows to use the handful really promoted.
+    """
+    import torch
+    from modules.windowed_cache.cache import _evict_widths
+
+    # rows: 2 promoted, 5 fresh, 0 reactivated
+    prom = torch.zeros(2, 16, dtype=torch.bool); prom[0, :2] = True
+    fresh = torch.zeros(2, 16, dtype=torch.bool); fresh[1, :5] = True
+    react = torch.zeros(2, 16, dtype=torch.bool)
+
+    n_p, n_r, n_d = _evict_widths((prom, react, fresh), (250, 250, 250))
+    assert n_p == 2, n_p          # exact ladder rung
+    assert n_r == 0, n_r          # nothing to do => no width at all
+    assert n_d == 8, n_d          # 5 rounds up to the next rung
+
+    # A per-mask cap clips only its own mask.
+    n_p, n_r, n_d = _evict_widths((prom, react, fresh), (1, 250, 4))
+    assert (n_p, n_r, n_d) == (1, 0, 4)
+
+    # One int still means "same cap for all", the original contract.
+    assert _evict_widths((prom, react, fresh), 250) == [2, 0, 8]
+
+    # All caps zero short-circuits without touching the device.
+    assert _evict_widths((prom, react, fresh), 0) == [0, 0, 0]
+
+    with pytest.raises(ValueError, match="3 masks but 2 bounds"):
+        _evict_widths((prom, react, fresh), (1, 2))
+
+
+def test_the_promote_width_is_the_measured_count_not_the_bound():
+    """A real eviction cycle must record a promote width no larger than it used.
+
+    ``promote_max`` is the measured max over rows, and it is now what sizes the
+    promote payload. This asserts it is a genuine bound (never above ``n_q``,
+    or ``_compact`` would be routing lanes to its dump column and dropping
+    work) and that the first eviction -- where the Q tier is still empty, so
+    nothing can be promoted OUT of it -- records zero rather than the cap.
+    """
+    w = _evict_and_read_widths(None)
+    assert w is not None and w["evictions"] > 0
+    assert 0 <= w["promote_max"] <= w["n_q"], w
+    assert w["promote_mean"] <= w["promote_max"], w

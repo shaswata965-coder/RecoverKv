@@ -339,6 +339,15 @@ if off:
     print("     scripts/check_operating_point.py prints the full comparison.")
     print("")
 PYEOF
+# Refuse the CUDA graph HERE, in the first second, rather than after minutes of
+# a sweep. The runner as built captures every steady decode step and replays
+# none of them (a slot is destroyed at the next eviction and each slot value
+# occurs once per epoch), so it costs capture time plus a per-epoch memory-pool
+# teardown and returns nothing -- and it eventually dies in the CUDA allocator,
+# which is how table_v5_graph came back with six ERROR rows and no number.
+if [ -n "$DECODE_GRAPH" ] && [ "$DECODE_GRAPH" != "off" ] && [ "$DECODE_GRAPH" != "0" ]; then
+  python "$PROJECT_ROOT/scripts/check_decode_graph.py" || exit 1
+fi
 if [ -n "$DECODE_GRAPH" ]; then export STICKYKV_DECODE_GRAPH="$DECODE_GRAPH"; fi
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"

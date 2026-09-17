@@ -43,6 +43,49 @@ def _apply_rotary():
     return apply_rotary_pos_emb
 
 
+def _rotate_half():
+    """HF's own ``rotate_half``, from the same module as ``apply_rotary_pos_emb``.
+
+    Imported rather than restated so the RoPE convention stays HF's. The only
+    thing :func:`_apply_rotary_one` changes is *how many tensors get rotated*,
+    never which halves go where or with what sign.
+    """
+    try:
+        from transformers.models.llama.modeling_llama import rotate_half
+    except ImportError:  # pragma: no cover - depends on installed model families
+        from transformers.models.qwen2.modeling_qwen2 import rotate_half
+    return rotate_half
+
+
+def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """RoPE **one** tensor, in place where it is safe to.
+
+    ``apply_rotary_pos_emb(q, k, cos, sin)`` rotates two tensors and returns
+    both. Every caller here wants only the key, and passed the key as *both*
+    arguments -- so the function computed the identical result twice, threw one
+    copy away, and peaked at roughly five key-sized buffers to produce one.
+    At 2048/batch-32 the demote path asked for 3.62 GiB in exactly that spot and
+    the allocator refused (``cache.py`` demote, first eviction, full width).
+
+    This computes HF's expression once:
+
+        (k * cos) + (rotate_half(k) * sin)
+
+    with ``rotate_half`` imported from HF, and with the two adds done in place
+    on tensors this function allocated, so the peak is the input plus two
+    buffers instead of five. Every operation and its order is unchanged, so the
+    result is bit-for-bit what ``apply_rotary_pos_emb(k, k, cos, sin)[1]``
+    returns -- which is asserted directly in
+    ``test_apply_rotary_one_matches_huggingface``.
+    """
+    rotate_half = _rotate_half()
+    cos = cos.unsqueeze(1)    # HF's unsqueeze_dim default: the head axis
+    sin = sin.unsqueeze(1)
+    out = k * cos                         # allocation 1 (ours; safe in place)
+    tmp = rotate_half(k) * sin            # allocation 2 (ours)
+    return out.add_(tmp)
+
+
 # ---------------------------------------------------------------------------
 # Fused dequant → RoPE for the Q-tier read path (design.md §8, "Phase 2")
 # ---------------------------------------------------------------------------
@@ -163,11 +206,10 @@ def unrotate_key_window(
     position_range : ``[window]`` or ``[B, window]`` int64
         The window's original positions.
     """
-    apply_rotary_pos_emb = _apply_rotary()
     batched = key_post_rope.dim() == 4
     k = key_post_rope if batched else key_post_rope.unsqueeze(0)
     cos, sin = _rope_cos_sin(rope_module, k, position_range)
-    _, k_un = apply_rotary_pos_emb(k, k, cos, -sin)
+    k_un = _apply_rotary_one(k, cos, -sin)
     return k_un if batched else k_un.squeeze(0)
 
 
@@ -181,11 +223,10 @@ def rotate_key_window(
     Accepts ``[H_kv, window, D]`` with ``[window]`` positions, or
     ``[B, H_kv, window, D]`` with ``[B, window]``.
     """
-    apply_rotary_pos_emb = _apply_rotary()
     batched = key_pre_rope.dim() == 4
     k = key_pre_rope if batched else key_pre_rope.unsqueeze(0)
     cos, sin = _rope_cos_sin(rope_module, k, position_range)
-    _, k_rot = apply_rotary_pos_emb(k, k, cos, sin)
+    k_rot = _apply_rotary_one(k, cos, sin)
     return k_rot if batched else k_rot.squeeze(0)
 
 

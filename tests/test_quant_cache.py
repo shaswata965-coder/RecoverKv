@@ -1295,3 +1295,187 @@ def test_compile_failure_leaves_cache_state_untouched():
         else: os.environ["STICKYKV_COMPILE_EVICT"] = prev
         if prev_b is None: os.environ.pop("STICKYKV_COMPILE_EVICT_BACKEND", None)
         else: os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = prev_b
+
+
+def test_evict_oom_is_not_recorded_as_a_build_failure():
+    """An OOM in the eviction must not poison every later cell of a sweep.
+
+    `_EVICT_COMPILE_FAILED` is sticky on purpose: it means *this build cannot
+    lower the eviction body*, which is true of every later cell too, so re-trying
+    the compile per cell is waste. An out-of-memory condition is the opposite
+    kind of fact -- it is about THIS cell's shape and the allocator's
+    fragmentation at that moment, and the next cell may be half the size and
+    fine.
+
+    Conflating them turned one bad cell into a dead table: a 2048/batch-32 cell
+    ran out of memory, its OOM was filed as a build failure, and all six rows of
+    `table_v5_graph` then reported "already failed on this build" -- a claim that
+    was false for five of them and that also hid which cell actually ran out of
+    memory.
+
+    So: the OOM propagates as itself, and the sticky record stays clean.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _oom_boom(gm, example_inputs):
+        raise torch.cuda.OutOfMemoryError(
+            "CUDA out of memory. Tried to allocate 7.25 GiB")
+
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            _run_decode_across_eviction(compile_backend="_oom_boom")
+        assert evict_compile_failed() is None, (
+            "an OOM was recorded as a build-wide lowering failure; every later "
+            "cell in the sweep would now fail fast with someone else's reason"
+        )
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_wrapped_oom_is_re_raised_as_an_oom():
+    """torch.compile may deliver the OOM wrapped; the runner catches by TYPE.
+
+    `perf_runner` marks a cell `oom` (skipped, and legitimate max-B evidence) by
+    `except torch.cuda.OutOfMemoryError`, and everything else `errored` -- which
+    its own log line calls "NOT max-B evidence". Re-raising a Dynamo wrapper
+    around a genuine OOM would file it under the wrong one of those two, so the
+    cause chain is unwrapped and the OOM itself is what propagates.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _wrapped_oom_boom(gm, example_inputs):
+        try:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 3.62 GiB")
+        except torch.cuda.OutOfMemoryError as inner:
+            raise RuntimeError("backend compiler failed") from inner
+
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            _run_decode_across_eviction(compile_backend="_wrapped_oom_boom")
+        assert evict_compile_failed() is None
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_a_real_lowering_failure_is_still_sticky():
+    """The other half of the contract: a build failure MUST stay sticky.
+
+    Loosening the OOM case must not loosen this one -- a body torch.compile
+    cannot lower will fail identically on every remaining cell, and re-attempting
+    the compile each time costs minutes of a sweep for a known answer.
+    """
+    pytest.importorskip("torch")
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _plain_lowering_boom(gm, example_inputs):
+        raise RuntimeError("LoweringException: aten.amin.default did not lower")
+
+    try:
+        with pytest.raises(RuntimeError, match="KERNEL-OR-ERROR"):
+            _run_decode_across_eviction(compile_backend="_plain_lowering_boom")
+        reason = evict_compile_failed()
+        assert reason and "amin" in reason, reason
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_oom_keeps_the_compiled_fn_and_the_static_retry():
+    """An OOM must leave the dispatch state exactly as it found it.
+
+    Three globals decide what the NEXT cell does: `_EVICT_COMPILE_FAILED` (fail
+    fast with a recorded reason), `_COMPILED_EVICT_FN` (reuse the built graph),
+    and `_EVICT_COMPILE_TRIED_STATIC` (the one-shot `dynamic=False` retry). A
+    lowering failure legitimately consumes all three. An OOM must consume none
+    of them -- it says nothing about whether the body lowers, and spending the
+    static retry on it would mean a later, genuine lowering failure never gets
+    the retry that is there to rescue it.
+
+    Driven through `_run_compiled_evict` directly so the assertions can be made
+    before any fixture teardown resets the globals.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from modules.windowed_cache import cache as cache_mod
+
+    def _oom_fn(cache, layer_idx, step):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 7.25 GiB")
+
+    prev = (cache_mod._COMPILED_EVICT_FN, cache_mod._EVICT_COMPILE_FAILED,
+            cache_mod._EVICT_COMPILE_TRIED_STATIC)
+    try:
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+        cache_mod._COMPILED_EVICT_FN = _oom_fn
+        cache_mod._EVICT_ANNOUNCED["done"] = True
+
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            cache_mod._run_compiled_evict(object(), 0, 8)
+
+        assert cache_mod._EVICT_COMPILE_FAILED is None, (
+            "an OOM was filed as a build-wide lowering failure")
+        assert cache_mod._COMPILED_EVICT_FN is _oom_fn, (
+            "the compiled fn was discarded on an OOM; the next cell would pay a "
+            "fresh compile for a failure that was never about lowering")
+        assert cache_mod._EVICT_COMPILE_TRIED_STATIC is False, (
+            "an OOM burned the one-shot dynamic=False retry, which exists for "
+            "lowering failures")
+    finally:
+        (cache_mod._COMPILED_EVICT_FN, cache_mod._EVICT_COMPILE_FAILED,
+         cache_mod._EVICT_COMPILE_TRIED_STATIC) = prev
+
+
+def test_cuda_oom_cause_prefers_the_typed_exception_over_the_message():
+    """Unwrap by type across the whole chain, not by text depth-first.
+
+    Dynamo's `BackendCompilerFailed` repeats the inner error's message verbatim,
+    so a depth-first text match returns the WRAPPER -- the one type
+    `perf_runner` does not catch as an OOM. The chain is searched for a typed
+    OOM first, everywhere, before the message is consulted at all.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from modules.windowed_cache.cache import _cuda_oom_cause
+
+    assert _cuda_oom_cause(RuntimeError("LoweringException: amin")) is None
+
+    bare = torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 1 GiB")
+    assert _cuda_oom_cause(bare) is bare
+
+    try:
+        try:
+            raise bare
+        except torch.cuda.OutOfMemoryError as inner:
+            raise RuntimeError(f"backend='x' raised:\n{inner}") from inner
+    except RuntimeError as wrapped:
+        found = _cuda_oom_cause(wrapped)
+    assert found is bare, (
+        "returned the wrapper, whose text merely repeats the OOM message")
+
+    # A wrapper with no typed OOM anywhere still classifies as one, normalised
+    # to the type the runner catches, with the original kept as the cause.
+    textonly = RuntimeError("CUDA out of memory. Tried to allocate 3.62 GiB")
+    norm = _cuda_oom_cause(textonly)
+    assert isinstance(norm, torch.cuda.OutOfMemoryError)
+    assert norm.__cause__ is textonly

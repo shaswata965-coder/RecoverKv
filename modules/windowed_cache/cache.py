@@ -106,8 +106,13 @@ def evict_path_stats() -> dict:
 _EVICT_WIDTH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 
 
-def _evict_widths(masks, bound: int):
+def _evict_widths(masks, bounds):
     """Smallest ladder rung covering each mask's widest row. **One sync, total.**
+
+    ``bounds`` is one cap for every mask, or one per mask. They differ: the
+    demote and reactivate widths are capped by ``n_q`` (the Q tier's window
+    count) and the promote width by ``min(N_q, n_fp)`` (what the fp side can
+    take back). Passing them together is what keeps this to a single host read.
 
     ``_compact`` allocates by RANK into a worst-case width, because the counts
     are ragged per row. That width is ``n_q`` -- every window the Q tier can
@@ -134,16 +139,24 @@ def _evict_widths(masks, bound: int):
     one break against a payload up to 31x smaller. All the demote work sits
     AFTER the width is known, so it stays inside one fused region either way.
     """
-    if bound <= 0:
+    masks = tuple(masks)
+    if isinstance(bounds, int):
+        bounds = (bounds,) * len(masks)
+    else:
+        bounds = tuple(int(b) for b in bounds)
+        if len(bounds) != len(masks):
+            raise ValueError(
+                f"{len(masks)} masks but {len(bounds)} bounds")
+    if all(b <= 0 for b in bounds):
         return [0] * len(masks)
     # ONE `.item()` for every width this eviction needs. Two separate reads
     # would be two host syncs and two graph breaks per eviction, for the same
     # information; stacking them first makes it one of each.
     needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
     out = []
-    for need in needs:
+    for need, bound in zip(needs, bounds):
         need = int(need)
-        if need <= 0:
+        if need <= 0 or bound <= 0:
             out.append(0)
             continue
         for rung in _EVICT_WIDTH_LADDER:
@@ -164,11 +177,17 @@ def evict_width_stats(cache) -> Optional[dict]:
          "fresh_max", "fresh_mean", "promote_max", "promote_mean", "react_max",
          "fresh_fill", "promote_fill"}
 
-    ``fresh_fill`` is ``fresh_max / n_q`` -- **the number that sizes D1.** The
-    demote path un-rotates, quantizes and sketches ``[L*B, n_q, H_kv, ws, D]``
-    every eviction, and everything beyond a row's real count is masked away. A
-    fill of 0.05 says 95% of that payload is discarded and D1 is worth doing; a
-    fill near 1.0 says the width is already about right and D1 is worth nothing.
+    ``fresh_fill`` is ``fresh_max / n_q`` and ``promote_fill`` is
+    ``promote_max / n_q`` -- **the numbers that size D1.** Sized by their caps,
+    the demote path un-rotates, quantizes and sketches
+    ``[L*B, n_q, H_kv, ws, D]`` every eviction and the promote path dequantizes,
+    RoPEs and splices ``[L*B, min(N_q, n_fp), H_kv, ws, D]``, with everything
+    beyond a row's real count masked away. A fill of 0.05 says 95% of that
+    payload is discarded; a fill near 1.0 says the cap is about right and
+    measuring the width buys nothing.
+
+    Both paths are now sized by the measured max, so these read as *what the cap
+    would have cost*, not as waste still being paid.
 
     ``DECODE_NEXT.md`` §7 records this as the risk the D1 estimate rests on --
     *"If the real count is routinely close to n_q, D1 is worth little"* -- and it
@@ -553,6 +572,55 @@ and try STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen 
 if THAT works the failure is Inductor codegen, not the traced graph)."""
 
 
+def _cuda_oom_cause(exc: BaseException) -> Optional[BaseException]:
+    """The out-of-memory exception inside ``exc``'s cause chain, or ``None``.
+
+    Kept separate from the lowering-failure path because the two mean opposite
+    things. A lowering failure is a property of the BUILD -- it will fail the
+    same way on every later cell, so recording it once and failing fast is
+    right. An OOM is a property of THIS CELL's shape and the allocator's
+    fragmentation right now; the next cell may be half the size and fine.
+
+    Returns the exception rather than a bool so the caller can re-raise the OOM
+    *itself*. That matters: ``perf_runner`` catches ``torch.cuda.OutOfMemoryError``
+    by type to mark a cell ``oom`` (skipped, and legitimate max-B evidence) and
+    everything else to mark it ``errored`` (a code/config bug, explicitly NOT
+    max-B evidence). torch.compile may deliver the OOM wrapped in a Dynamo
+    ``BackendCompilerFailed``, and re-raising the wrapper would file a genuine
+    OOM under "errored". Unwrapping keeps the two categories meaning what the
+    runner's own log message says they mean.
+    """
+    chain: List[BaseException] = []
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+
+    # Typed first, and over the WHOLE chain before falling back to the message.
+    # Order matters: Dynamo's `BackendCompilerFailed` repeats the inner error's
+    # text, so a message test applied depth-first returns the wrapper -- which
+    # is precisely the type the perf runner does not catch.
+    for c in chain:
+        if isinstance(c, torch.cuda.OutOfMemoryError):
+            return c
+    for c in chain:
+        if type(c).__name__ in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+            return c
+    # Last resort: the phrase, but normalised to the type the runner catches.
+    # A wrapper that only *says* "out of memory" is still an OOM as far as the
+    # sweep is concerned, and filing it as a build failure is the bug this
+    # function exists to stop. The original is attached, so the autopsy and the
+    # traceback still show what actually happened.
+    for c in chain:
+        if "out of memory" in str(c).lower():
+            normalised = torch.cuda.OutOfMemoryError(str(c))
+            normalised.__cause__ = exc
+            return normalised
+    return None
+
+
 def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
     """Run one eviction through ``torch.compile``, or RAISE. Kernel-or-error: no
     eager fallback (a silent eager run under a compiled label defeats the whole
@@ -585,6 +653,18 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
         _EVICT_STATS["compiled"] += 1
         return
     except Exception as e_dyn:  # pragma: no cover - GPU/Inductor-build dependent
+        # An OOM is a RESOURCE condition, not a lowering failure, and the two
+        # must not be confused. `_EVICT_COMPILE_FAILED` is sticky by design --
+        # it means "this build cannot lower the body", so no later cell wastes
+        # a compile on it. Recording an OOM there poisons every remaining cell
+        # in the sweep: one 4096/batch-32 row that ran out of memory turned all
+        # six rows of a table into "already failed on this build", which is not
+        # what happened and is not max-B evidence either. Re-raise it as itself
+        # so the perf runner's own OOM handling (skip_if_oom, the max-B ladder)
+        # sees the exception it is written to catch.
+        oom = _cuda_oom_cause(e_dyn)
+        if oom is not None:
+            raise oom
         terminal = e_dyn
         if not _EVICT_COMPILE_TRIED_STATIC:
             _EVICT_COMPILE_TRIED_STATIC = True
@@ -595,6 +675,9 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
                 _EVICT_STATS["compiled"] += 1
                 return
             except Exception as e_static:
+                oom = _cuda_oom_cause(e_static)
+                if oom is not None:
+                    raise oom
                 terminal = e_static
         _EVICT_COMPILE_FAILED = f"{type(terminal).__name__}: {terminal}"[:400]
         # Capture the WHOLE Inductor stack before we lose it — it names the aten
@@ -2229,6 +2312,29 @@ class WindowedCache(_HFCacheBase):
         fp_slot = torch.gather(slot_of, 1, take)
         prom_rank = fp_prom.cumsum(1) - 1                              # [B, n_fp]
 
+        # --- D1, all three widths, ONE host read -----------------------------
+        # `_compact` allocates by RANK into a worst-case width because the counts
+        # are ragged per row, and everything past a row's real count is computed
+        # and then masked away. Promote was still sized by its BOUND
+        # (`min(N_q, n_fp)`), which under `quant_budget_mode: bytes` is ~250
+        # windows -- so `promote_many` dequantized, RoPE'd and spliced ~250
+        # windows per layer per eviction to use the handful that were really
+        # promoted. That is the same waste D1 removed from demote, on a payload
+        # that is larger, and it was the 7.25 GiB / 3.62 GiB the allocator
+        # refused at 2048/batch-32.
+        #
+        # Read here rather than in two places: the three masks are stacked into
+        # one `.item()`, so this is ONE host sync and ONE graph break for the
+        # whole eviction, exactly as before -- and now the promote block sits
+        # after the break with the demote block, in the same fused region.
+        # The measured max over rows is a true upper bound by construction,
+        # which is what `_compact` requires: a width that is ever too small
+        # routes overflow to a dump column and silently drops work.
+        n_p, n_r, n_d = _evict_widths(
+            (fp_prom, react, fresh),
+            (min(self.resolved.N_q, n_fp), n_q, n_q),
+        )
+
         body_k = state.key_states[:, :, num_sink:, :]
         body_v = state.value_states[:, :, num_sink:, :]
         body_pos = state.position_ids[:, num_sink:]
@@ -2239,11 +2345,12 @@ class WindowedCache(_HFCacheBase):
         body_wid = ((body_pos - num_sink) // ws).contiguous()          # [B, T_body]
 
         # --- 3b. Promote (Q→fp): ONE batched dequant + ONE RoPE -------------
-        # Width is the BOUND, not the count: promotions are ragged per row. The
-        # invalid lanes dequantize garbage from free slots and are dropped by the
-        # mask below — bit-identical for the valid ones, since every op here is
-        # per-window or per-token pointwise.
-        p_max = min(self.resolved.N_q, n_fp)
+        # Width is the measured MAX over rows (n_p above), not the bound:
+        # promotions are ragged per row, so lanes past a row's own count still
+        # dequantize garbage from free slots and are dropped by the mask below —
+        # bit-identical for the valid ones, since every op here is per-window or
+        # per-token pointwise. What changed is how many such lanes there are.
+        p_max = n_p              # D1: the MEASURED count, not min(N_q, n_fp)
         prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
         prom_k = prom_v = prom_pos = None
         if p_max > 0:
@@ -2261,14 +2368,8 @@ class WindowedCache(_HFCacheBase):
         # Must read the OLD fp store, so it runs before the rebuild below.
         # Reactivations are free — codes/grid/positions are frozen (§10) — so
         # they are a bit flip and never touch this path.
-        # D1: allocate by the MEASURED count, rounded up a ladder -- not by n_q.
-        # Under `bytes` n_q is 250 and the eviction is ~half the decode step;
-        # at steady state a handful of lanes are fresh and the rest are computed
-        # and masked away. `_evict_width` reads the real count (one .item(), one
-        # graph break) and is a true upper bound, which a guess would not be --
-        # `_compact` routes overflow to a dump column and would drop work.
-        n_r, n_d = _evict_widths((react, fresh), n_q)
-
+        # Widths (n_r, n_d) were measured with n_p above -- one read for all
+        # three, so the demote path costs no extra sync for its own bound.
         react_slot, react_valid = self._compact(slot_of, react, n_r)
         store.reactivate_many(react_slot, react_valid)
 

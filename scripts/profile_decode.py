@@ -638,16 +638,28 @@ def main() -> None:
                   + (f"   fill={w['fresh_fill']:.1%}"
                      if w["fresh_fill"] is not None else ""))
             print(f"    promote (dequant+RoPE)   max={w['promote_max']:4d}  "
-                  f"mean={w['promote_mean']:6.2f}")
+                  f"mean={w['promote_mean']:6.2f}"
+                  + (f"   fill={w['promote_fill']:.1%}"
+                     if w.get("promote_fill") is not None else ""))
             print(f"    reactivate (free)        max={w['react_max']:4d}")
-            fill = w["fresh_fill"]
-            if fill is not None and fill < 0.5:
-                print(f"    -> D1 is live: the demote path un-rotates, quantizes "
-                      f"and sketches\n       [L*B, {w['n_q']}, H_kv, ws, D] and "
-                      f"masks away {1 - fill:.0%} of it.")
-            elif fill is not None:
-                print("    -> D1 is worth little here: the width is already "
-                      "close to the real count.")
+            # Both sides are now sized by the measured max rather than by their
+            # cap, so these fills are what the OLD code wasted, not what the
+            # current one does. A low fill means the saving is large.
+            for label, fill, cap, work in (
+                ("demote", w["fresh_fill"], w["n_q"],
+                 "un-rotates, quantizes and sketches"),
+                ("promote", w.get("promote_fill"), w["n_q"],
+                 "dequantizes, RoPEs and splices"),
+            ):
+                if fill is None:
+                    continue
+                if fill < 0.5:
+                    print(f"    -> D1 ({label}) is live: sizing by the cap "
+                          f"would {work}\n       [L*B, {cap}, H_kv, ws, D] "
+                          f"per eviction and mask away {1 - fill:.0%} of it.")
+                else:
+                    print(f"    -> D1 ({label}) buys little here: the cap is "
+                          "already close to the real count.")
     except Exception:  # pragma: no cover - diagnostics must never fail a run
         pass
 

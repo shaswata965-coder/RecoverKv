@@ -27,7 +27,7 @@ torch = pytest.importorskip("torch")
 
 from modules.windowed_cache.graph_decode import (  # noqa: E402
     DecodeGraphRunner, EpochSchedule, GraphSignatureMismatch, HostDelta,
-    StepSignature, graph_mode,
+    StepSignature, graph_mode, replay_is_reachable,
 )
 from modules.windowed_cache.policy import EvictionPolicy  # noqa: E402
 
@@ -179,8 +179,13 @@ class _FakeCache:
 
 
 def _runner(mode="on", ws=8, warmup=1):
+    # require_replayable=False: these tests are about the capture/invalidate
+    # POLICY, which is pure Python and testable here. The guard they bypass is
+    # about whether capturing is WORTH it on a GPU, which is a different
+    # question and has its own tests below.
     return DecodeGraphRunner(_FakeCache(), EpochSchedule(window_size=ws),
-                             mode=mode, warmup_epochs=warmup)
+                             mode=mode, warmup_epochs=warmup,
+                             require_replayable=False)
 
 
 def test_off_never_captures_anything():
@@ -249,3 +254,144 @@ def test_a_typo_raises_rather_than_silently_disabling_the_graph(monkeypatch):
     monkeypatch.setenv("STICKYKV_DECODE_GRAPH", "yes-please")
     with pytest.raises(ValueError, match="on / off / verify"):
         graph_mode()
+
+
+# ---------------------------------------------------------------------------
+# Is a capture ever USED?  (the reason the graph is refused, not just off)
+# ---------------------------------------------------------------------------
+
+
+def _census(ws=8, first=0, n_steps=1024, warmup=1, monkeypatch=None):
+    """Count captures vs replays over a generation, with the CUDA half stubbed.
+
+    The stubs do exactly what the real ones do to the runner's bookkeeping --
+    capture records the signature, replay reads it back -- so what is being
+    counted is the POLICY, which is the thing in question. `signature_of` is
+    replaced with one whose only moving part is `store_versions`, ticking once
+    per eviction, because that is what the real store does.
+    """
+    import modules.windowed_cache.graph_decode as gd
+
+    sched = EpochSchedule(window_size=ws, first_eviction_step=first)
+    r = DecodeGraphRunner(_FakeCache(), sched, mode="on", warmup_epochs=warmup,
+                          require_replayable=False)
+
+    def fake_capture(slot, pre, runfn):
+        r._sigs[slot] = pre
+        r._graphs[slot] = object()
+        r._posts[slot] = pre
+        r._static_out[slot] = "out"
+        r.stats["captured"] += 1
+        return runfn()
+
+    def fake_replay(slot):
+        r.stats["replayed"] += 1
+        return r._static_out[slot]
+
+    r._capture = fake_capture
+    r._replay = fake_replay
+
+    seen = {"evictions": 0}
+
+    def sig_of(cache, slot):
+        return _sig(slot=slot, seq_lengths=(1024 + slot,),
+                    store_versions=(seen["evictions"],))
+
+    monkeypatch.setattr(gd, "signature_of", sig_of)
+    for step in range(n_steps):
+        if sched.evicts(step):
+            seen["evictions"] += 1
+        r.step(step, lambda: "eager")
+    return r.stats
+
+
+@pytest.mark.parametrize("ws,first", [(8, 0), (16, 0), (8, 32)])
+def test_the_capture_schedule_never_replays_anything(ws, first, monkeypatch):
+    """The headline fact: captures are never used, so capturing is pure cost.
+
+    A slot is destroyed at the next eviction and each slot value occurs exactly
+    once per epoch, so nothing captured survives to a step that could replay it.
+    This is what `replay_is_reachable` reports and what the construction guard
+    refuses on; if someone makes the graph actually replay, THIS test is the one
+    that should start failing first.
+    """
+    stats = _census(ws=ws, first=first, monkeypatch=monkeypatch)
+    assert stats["captured"] > 0, "the census did not exercise the capture path"
+    assert stats["replayed"] == 0, (
+        f"replay became reachable ({stats}); replay_is_reachable() and the "
+        "construction guard are now wrong and must be revisited together"
+    )
+
+
+def test_turning_the_graph_on_is_refused_with_the_reason():
+    """Refused at construction, not after minutes of a sweep.
+
+    The previous behaviour captured every steady step, replayed none, and died
+    in the CUDA allocator partway through -- which is how `table_v5_graph` came
+    back with six ERROR rows and no usable number.
+    """
+    with pytest.raises(RuntimeError) as ei:
+        DecodeGraphRunner(_FakeCache(), EpochSchedule(window_size=8), mode="on")
+    msg = str(ei.value)
+    assert "never replayed" in msg or "no capture is ever replayed" in msg
+    assert "STICKYKV_DECODE_GRAPH" in msg
+
+
+def test_mode_off_is_never_refused():
+    """The default path must not be reachable by this guard at all."""
+    r = DecodeGraphRunner(_FakeCache(), EpochSchedule(window_size=8), mode="off")
+    for step in range(40):
+        r.step(step, lambda: "eager")
+    assert r.stats["captured"] == 0 and r.stats["replayed"] == 0
+
+
+def test_invalidate_drops_pool_owned_tensors_before_the_pool():
+    """The order in `invalidate` is the `use_count > 0` allocator crash.
+
+    A captured graph's outputs are allocated inside the graph's memory pool.
+    Destroying the CUDAGraph objects releases the pool, and PyTorch asserts the
+    pool has no live blocks when it does. `_static_out` holds exactly those
+    blocks, so it has to go first -- and the pool handle has to be dropped after,
+    because once its last graph is gone the handle is dead and capturing into it
+    again is the other half of the same crash.
+    """
+    r = _runner()
+    order = []
+
+    class _Tracking(dict):
+        def __init__(self, label):
+            super().__init__()
+            self._label = label
+
+        def clear(self):
+            order.append(self._label)
+            super().clear()
+
+    r._static_out = _Tracking("static_out")
+    r._graphs = _Tracking("graphs")
+    r._static_out[1] = "pool-owned tensor"
+    r._graphs[1] = object()
+    r._pool = "pool-handle"
+
+    r.invalidate("test")
+
+    assert order.index("static_out") < order.index("graphs"), (
+        "pool-owned output tensors were still live when the graphs (and so the "
+        "pool) were destroyed")
+    assert r._pool is None, (
+        "the pool handle survived its last graph; the next capture would reuse "
+        "a torn-down pool")
+
+
+def test_no_caller_disables_the_replayability_guard():
+    """`require_replayable=False` is a test affordance, not a shipping flag."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in list(root.glob("modules/**/*.py")) + list(root.glob("scripts/**/*.py")):
+        if "require_replayable" in path.read_text(encoding="utf-8"):
+            if path.name != "graph_decode.py":
+                offenders.append(str(path.relative_to(root)))
+    assert not offenders, (
+        f"{offenders} set require_replayable outside tests/; that re-enables a "
+        "capture path that replays nothing")

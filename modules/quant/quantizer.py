@@ -153,8 +153,23 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     scale_grid = scale16.to(torch.float32)
     zero_grid = zero16.to(torch.float32)
 
-    q = torch.round((x32 - zero_grid) / scale_grid)  # round-half-even
-    q = torch.clamp(q, 0.0, _LEVELS)                 # clamp BEFORE uint cast
+    # In place, deliberately. The out-of-place form
+    #     q = torch.round((x32 - zero_grid) / scale_grid)
+    #     q = torch.clamp(q, 0.0, _LEVELS)
+    # holds three fp32 buffers of x's size live at its peak (the subtract's
+    # output, the divide's output, and x32 itself), which is 12 bytes per
+    # element to quantize a 2-byte one. At 2048/batch-32 the first eviction --
+    # unavoidably full width, because on the first eviction everything genuinely
+    # is fresh -- asked the allocator for 7.25 GiB here and did not get it.
+    # Chaining in place keeps exactly one, and every op and its order is
+    # unchanged, so the codes are bit-for-bit what the expression above
+    # produced (test_affine_quantize_inplace_matches_the_out_of_place_form).
+    if x32 is x:
+        # `.to()` is a no-op when x is already fp32, and mutating the caller's
+        # tensor would be a silent corruption rather than a slow path.
+        x32 = x32.clone()
+    q = x32.sub_(zero_grid).div_(scale_grid).round_()  # round-half-even
+    q = q.clamp_(0.0, _LEVELS)                         # clamp BEFORE uint cast
     codes = q.to(torch.uint8)
 
     return codes, scale16, zero16
@@ -171,7 +186,12 @@ def _affine_dequantize(
     """
     scale = scale16.to(torch.float32)
     zero = zero16.to(torch.float32)
-    x_hat = codes.to(torch.float32) * scale + zero
+    # Same reasoning as the quantiser: `codes.to(float32) * scale + zero` holds
+    # three fp32 buffers at its peak. The upcast allocates a fresh tensor
+    # (codes is uint8), so chaining in place onto it is safe and mutates nothing
+    # the caller owns. `scale` and `zero` broadcast into the already-larger
+    # codes shape, so the in-place output shape is unchanged.
+    x_hat = codes.to(torch.float32).mul_(scale).add_(zero)
     return x_hat.to(out_dtype)
 
 

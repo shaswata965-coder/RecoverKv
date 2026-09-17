@@ -106,6 +106,7 @@ import torch
 
 __all__ = [
     "graph_mode",
+    "replay_is_reachable",
     "EpochSchedule",
     "StepSignature",
     "HostDelta",
@@ -138,15 +139,13 @@ def graph_mode_is_explicit() -> bool:
 
 
 def graph_mode() -> str:
-    """``"on"`` | ``"off"``, from ``STICKYKV_DECODE_GRAPH``; the device decides.
+    """``"on"`` | ``"off"``, from ``STICKYKV_DECODE_GRAPH``. Default ``"off"``.
 
-    With nothing set this returns ``"on"`` on CUDA and ``"off"`` elsewhere --
-    the same rule ``_compile_evict_enabled`` uses, and for the same reason:
-    what a graph buys is launch coalescing, which does not exist on CPU, and a
-    library whose default disagrees with the benchmark script is how the
-    profiler came to measure an eager eviction against a compiled table
-    (``1434b2c``). One default, one path, whether or not the run went through
-    ``run_perf_table.sh``.
+    This docstring used to say the device decided and that CUDA got ``"on"``.
+    It did not: the body below has returned ``"off"`` unconditionally since
+    ``d7fcc55``, and a comment that describes the opposite of the code is worse
+    than no comment, because it is the thing a reader trusts instead of
+    reading. Corrected here rather than "clarified".
 
     ``verify`` is accepted as an alias for ``on``: the post-replay signature
     check it used to select is now unconditional, so there is nothing left for a
@@ -379,6 +378,59 @@ class HostDelta:
 
 
 # ---------------------------------------------------------------------------
+# Can a capture ever be USED?
+# ---------------------------------------------------------------------------
+
+
+def replay_is_reachable(schedule: "EpochSchedule") -> Optional[str]:
+    """``None`` if a capture can ever be replayed; else why it cannot.
+
+    This exists because the answer, for the runner as written, is **no** -- and
+    nothing in the design notes above says so. Counted rather than argued
+    (``scratch: graph_replay_census``): over a 1024-token generation at the
+    shipped operating point the runner performs **896 captures and 0 replays**.
+    Every steady step captures a slot it then never reads.
+
+    The reason is two design decisions that are individually sound and jointly
+    fatal:
+
+    1. :meth:`DecodeGraphRunner.step` calls :meth:`invalidate` on **every**
+       eviction, dropping all captured slots -- correct, because the eviction
+       rewrites the store.
+    2. A slot is ``step % window_size``, so within one epoch each slot value
+       ``1..ws-1`` occurs **exactly once**.
+
+    Together: a slot is captured, used once for its own (eager) capture step,
+    and destroyed at the next eviction before it can recur. Capture is pure
+    overhead, plus a per-epoch teardown of the graph memory pool.
+
+    The docstring at the top of this module assumed the opposite -- *"slot s of
+    epoch n has the same geometry as slot s of epoch n+1"*. That claim is true
+    about the **geometry** and false about the **replay contract**, because
+    :class:`StepSignature` also compares ``store_versions``, which ticks at
+    every eviction by definition. So even without (1), epoch ``n+1`` would
+    mismatch epoch ``n`` and fall back to eager.
+
+    Making this work is a real change, not a flag: the contract has to become
+    *addresses and shapes*, not *versions* (contents changing is exactly what a
+    graph is for), and ``buffer_ptrs`` then has to cover the **Q store's** code
+    and grid buffers too, which it currently does not -- it reads only
+    ``CacheState._key_buf``. Until it does, dropping ``store_versions`` would
+    replay kernels against a reallocated Q tier and emit plausible garbage.
+    That is the one failure mode this module is written to refuse, so it is not
+    a thing to try the night before numbers are due.
+    """
+    return (
+        "a captured slot is destroyed at the next eviction (step() invalidates "
+        "on every eviction) and each slot value occurs only once per epoch, so "
+        "no capture is ever replayed: measured 896 captures / 0 replays over "
+        "1024 steps at window_size=8. Capturing would cost the capture time and "
+        "a per-epoch CUDA memory-pool teardown, and return nothing. See "
+        "replay_is_reachable() for what would have to change."
+    )
+
+
+# ---------------------------------------------------------------------------
 # The mechanism (CUDA only; unexecutable on a CPU box by construction)
 # ---------------------------------------------------------------------------
 
@@ -398,9 +450,29 @@ class DecodeGraphRunner:
     """
 
     def __init__(self, cache, schedule: EpochSchedule, mode: str = "off",
-                 warmup_epochs: int = 1) -> None:
+                 warmup_epochs: int = 1, require_replayable: bool = True) -> None:
+        """``require_replayable=False`` is for exercising the capture/invalidate
+        POLICY on a box that cannot capture. It is not a production escape
+        hatch: with the schedule as it stands it buys a run that captures every
+        steady step and replays none of them. No caller outside ``tests/`` may
+        set it, and ``test_no_caller_disables_the_replayability_guard`` enforces
+        that by grepping the tree."""
         self.cache = cache
         self.schedule = schedule
+        if mode != "off" and require_replayable:
+            why = replay_is_reachable(schedule)
+            if why is not None:
+                raise RuntimeError(
+                    "STICKYKV_DECODE_GRAPH is on, but this runner cannot "
+                    f"replay anything: {why}\n"
+                    "Refused here, at construction, rather than after minutes "
+                    "of a sweep: the previous behaviour was to capture every "
+                    "steady step, replay none of them, and eventually die in "
+                    "the CUDA allocator -- which is what happened to "
+                    "table_v5_graph. Run without STICKYKV_DECODE_GRAPH (the "
+                    "default) to get the ordinary decode loop, which is also "
+                    "the loop every LongBench and GSM8K number is measured on."
+                )
         self.mode = mode
         #: Epochs to run eagerly before capturing. One is enough for the
         #: geometry to settle -- the first eviction releases the prompt-sized
@@ -449,14 +521,31 @@ class DecodeGraphRunner:
 
     # -- lifecycle ------------------------------------------------------
     def invalidate(self, reason: str) -> None:
-        """Drop every captured slot. Cheap, and always the safe answer."""
+        """Drop every captured slot. Cheap, and always the safe answer.
+
+        **Order matters here, and getting it wrong is an allocator crash.** A
+        captured graph's output tensors are allocated *inside* the graph's
+        memory pool. Destroying the ``CUDAGraph`` objects releases the pool, and
+        PyTorch asserts the pool has no live blocks when it does
+        (``it->second->use_count > 0 INTERNAL ASSERT FAILED`` at
+        ``CUDACachingAllocator.cpp``). ``_static_out`` holds exactly those
+        blocks, so it must be dropped first. That crash is what killed
+        ``table_v5_graph`` at ``4096/257 batch=1``, on slot 1 -- the second
+        capture, i.e. the first one taken after an invalidation.
+
+        The pool handle goes too. Once every graph sharing it is gone its
+        use count is zero and the pool is torn down; capturing into that same
+        stale handle afterwards is the other half of the same bug. A fresh
+        capture takes a fresh handle.
+        """
         if self._graphs:
             self.stats["invalidated"] += 1
-        self._graphs.clear()
+        self._static_out.clear()   # pool-owned tensors, before the pool's owner
+        self._graphs.clear()       # destroying these releases the pool
+        self._pool = None          # ...so the handle is dead; never reuse it
         self._sigs.clear()
         self._deltas.clear()
         self._posts.clear()
-        self._static_out.clear()
         self._last_invalidation = reason
 
     def _capturable(self, step: int) -> Optional[int]:
