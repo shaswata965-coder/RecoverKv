@@ -58,14 +58,16 @@ CPU-only box can exercise, which is why it is split out the way
 
 Modes (``STICKYKV_DECODE_GRAPH``)
 --------------------------------
-``on`` (**the default on CUDA**)
-    Capture and replay. The **device decides**, exactly as it does for the
-    compiled eviction (``_compile_evict_enabled``): with nothing set, CUDA gets
-    graphs and CPU does not, so the shipped path is the fast one and the whole
-    CPU suite keeps running the ordinary loop. An explicit value still wins.
-``off``
-    The ordinary eager decode loop. This is the escape hatch, and it restores
-    byte-for-byte the behaviour of every build before ``39f6be0``.
+``off`` (**the default, everywhere**)
+    The ordinary eager decode loop -- the same loop ``model.generate`` uses, and
+    therefore the same one every LongBench and GSM8K number is measured on.
+``on``
+    Capture and replay. This is an **ablation**, not the shipped configuration,
+    for one structural reason: the runner is wired into ``perf_runner``'s decode
+    loop and into ``profile_decode``, and **not** into ``model.generate``, which
+    is what the quality harnesses call. Turning it on by default would mean the
+    throughput table came from a path no accuracy number describes. Report it as
+    its own row, labelled, or not at all.
 ``verify`` (alias of ``on``, kept so scripts that set it keep working)
     The post-replay check it used to name is now **unconditional**: every
     replay re-reads the host signature and asserts it is exactly the post-state
@@ -161,10 +163,15 @@ def graph_mode() -> str:
     if raw:
         raise ValueError(
             f"STICKYKV_DECODE_GRAPH={raw!r} is not on / off / verify.")
-    try:
-        return "on" if torch.cuda.is_available() else "off"
-    except Exception:  # pragma: no cover - torch build dependent
-        return "off"
+    # Default OFF, and the reason is not caution -- it is that the graph is
+    # wired into perf_runner's decode loop and NOT into `model.generate`, which
+    # is the loop LongBench and GSM8K use. On by default therefore means the
+    # throughput table is produced by a code path no accuracy number describes,
+    # which is the same class of error as timing a compiled eviction against an
+    # eager profile (1434b2c) -- except it lands in a paper. One method, one
+    # path: until the graph covers `generate` too, it is an explicit opt-in and
+    # an ablation row, never the shipped configuration.
+    return "off"
 
 
 # ---------------------------------------------------------------------------

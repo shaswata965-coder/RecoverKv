@@ -100,7 +100,7 @@ cache:
   # The repo default is 'bytes' (the mode a memory-vs-quality claim is stated
   # in — see ACCURACY_RECOVERY_PLAN.md §2); 'tokens' is correct only here.
   # eval_perf_smoke.yaml inherits this file, so it inherits this too.
-  quant_budget_mode: tokens
+  quant_budget_mode: bytes
 
 perf:
   # Real long-context text, chunked to exactly prefill_len and sampled per row,

@@ -43,6 +43,60 @@ class ConfigValidationError(ValueError):
 FIRST_EVICTION_STEP_DEFAULT = 0
 
 
+#: **The shipped operating point — one definition, for speed AND for quality.**
+#:
+#: Every headline number should describe the same method. Before this existed
+#: they did not: ``configs/longbench_ours_flash_attn.yaml`` and
+#: ``configs/gsm8k_budget20.yaml`` scored the method at ``quant_ratio = 0.0``
+#: (no int2 tier, no read gate, pure fp16) while ``scripts/run_perf_table.sh``
+#: timed it at ``quant_ratio = 0.70`` in ``tokens`` mode. Those are two
+#: different caches. A table saying "1.37x faster than FullKV" and a table
+#: saying "42.4 on qasper" then describe methods that were never the same
+#: method, and no reader can tell.
+#:
+#: This is the reference the checker compares every shipped config against
+#: (``scripts/check_operating_point.py``). It does NOT override a config: a
+#: run is free to be somewhere else on purpose. What it removes is the case
+#: where nobody noticed.
+#:
+#: ``quant_budget_mode: bytes`` is the mode a memory-vs-quality claim can be
+#: stated in -- ``q`` splits the BYTE budget, so the retained cache costs
+#: ``cache_budget`` of the full cache at every ``q``. Under ``tokens`` the
+#: window COUNT is held fixed while the keys get cheaper, so a run reported at
+#: ``cache_budget 0.20`` is really holding ~11% of the full cache
+#: (``ResolvedConfig.budget_utilisation``: 0.57 at q=0.70).
+OPERATING_POINT = {
+    "cache_budget": 0.20,
+    "window_size": 8,
+    "num_sink_tokens": 5,
+    "local_window_size": 128,
+    "quant_ratio": 0.70,
+    "quant_budget_mode": "bytes",
+    "quant_gate_ratio": 0.25,
+    "first_eviction_step": FIRST_EVICTION_STEP_DEFAULT,
+}
+
+#: Configs that are deliberately NOT at the operating point, with the reason.
+#: Anything not listed here and not matching is a divergence the checker flags.
+OPERATING_POINT_EXEMPT = {
+    "base.yaml": "the schema's defaults, not a run",
+    "longbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "gsm8k_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "eval_parity_base.yaml": "parity harness; budget 0.25 is its own control",
+    "eval_parity_ours_eager.yaml": "parity harness; matched to the base arm",
+    "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",
+    "gsm8k_budget80.yaml": "the 0.80 arm of the budget sweep",
+    "eval_perf_smoke.yaml": "smoke test, not a reported number",
+    "eval_perf_cpu_e2e.yaml": "CPU smoke test, not a reported number",
+    "ruler_niah_mk3_omega16.yaml": "RULER uses int4, a different tier",
+    "eval_faithfulness.yaml": "no cache block",
+    "eval_qevict.yaml": "no cache block",
+    "eval_tier_study.yaml": "sweeps the tier on purpose",
+    "eval_visualize.yaml": "no cache block",
+    "longbench_ours_step0.yaml": "budget sweep arm at q=0.5, an ablation",
+}
+
+
 def log_operating_point(config, is_windowed: bool) -> None:
     """Log the full cache operating point at the start of a generation run.
 

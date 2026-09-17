@@ -19,18 +19,24 @@ model:
   attn_implementation: flash_attention_2   # MUST match cache.backend_package
 
 cache:
+  # Pinned to utils.config.OPERATING_POINT -- the ONE point speed and
+  # quality are both measured at. scripts/check_operating_point.py fails
+  # if this drifts. Before it was pinned, this file scored the method at
+  # quant_ratio 0.0 (no int2 tier, no read gate) while run_perf_table.sh
+  # timed it at 0.70: two different caches, one paper.
   backend: windowed
   backend_package: flash_attn
   cache_budget: 0.20        # fraction RETAINED (DefensiveKV compression_ratio = 0.80)
   window_size: 8
-  num_sink_tokens: 4
-  local_window_size: 0.25   # fraction of the budget — scales with short prompts
-  quant_ratio: 0.0
+  num_sink_tokens: 5
+  local_window_size: 128  # fraction of the budget — scales with short prompts
+  quant_ratio: 0.70
   # The mode a memory-vs-quality claim is stated in: q splits the BYTE
   # budget, so the retained cache costs exactly cache_budget of the full
   # cache at every q and cheaper int2 keys buy more context. Pinned, not
   # inherited — the default flipped underneath this suite once already
   # (f71fec0). See ACCURACY_RECOVERY_PLAN.md §2.
+  quant_gate_ratio: 0.25            # read-gate selectivity
   quant_budget_mode: bytes
   first_eviction_step: 0        # compress the prompt before the 2nd token (default)
 

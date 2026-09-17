@@ -180,7 +180,7 @@ cache:
   # be comparable, so the retained key count has to stay quant_ratio-invariant.
   # The repo default is 'bytes' (the mode a memory-vs-quality claim is stated
   # in — see ACCURACY_RECOVERY_PLAN.md §2); 'tokens' is correct only here.
-  quant_budget_mode: tokens
+  quant_budget_mode: bytes
 
 perf:
   protocol: standard         # provenance label only; selects no third-party code

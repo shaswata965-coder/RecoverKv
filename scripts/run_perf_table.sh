@@ -29,23 +29,33 @@
 #                     2wikimqa, qasper, ...       a LongBench dataset
 #                     longbench:NAME / corpus:NAME  force a loader
 #   QUANT_RATIO     two-tier int2 split q in [0,1]              (default: 0.70)
-#   QUANT_MODE      tokens | bytes  (see config.py)             (default: tokens)
+#
+#   The defaults above ARE utils.config.OPERATING_POINT -- the one point the
+#   quality configs are pinned to as well. Run scripts/check_operating_point.py
+#   before quoting a speed row and an accuracy row together.
+#   QUANT_MODE      tokens | bytes  (see config.py)             (default: bytes)
+#                   `bytes` is utils.config.OPERATING_POINT and is the mode a
+#                   memory-vs-quality claim can be stated in: q splits the BYTE
+#                   budget, so the cache costs cache_budget at every q. Under
+#                   `tokens` a run reported at 0.20 really holds ~11%.
 #   GATE_RATIO      read-gate selectivity; 1.0 = ungated control (default: 0.25)
-#   CACHE_BUDGET    fraction of the context kept                (default: 0.50)
+#   CACHE_BUDGET    fraction of the context kept                (default: 0.20)
 #   SHAPES          space list of prefill/decode pairs          (default: "4096/256 2048/512 1048/1048")
 #   BATCHES         space list of batch sizes                   (default: "1 32")
 #   BACKEND         flash_attn | eager                          (default: flash_attn)
 #   WINDOW_SIZE     eviction window (mult. of 4 for q>0)        (default: 8)
 #   NUM_SINK        sink tokens kept whole                      (default: 5)
-#   LOCAL_WINDOW    local region: int (mult of window) or float (default: 64)
+#   LOCAL_WINDOW    local region: int (mult of window) or float (default: 128)
 #   RUNS            measurement runs per cell (median reported)  (default: 3)
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
-#   DECODE_GRAPH    on | off  CUDA-graph the steady decode steps (default: on,
-#                   under CUDA -- the device decides, as for COMPILE_EVICT).
-#                   `off` restores the eager loop exactly; it is the first thing
-#                   to try if a number or a score looks wrong. Also --graph.
+#   DECODE_GRAPH    on | off  CUDA-graph the steady decode steps (default: OFF).
+#                   An ABLATION, not the shipped path: the graph is wired into
+#                   this runner but not into model.generate(), which is what
+#                   LongBench and GSM8K use -- so `on` produces a speed number
+#                   no accuracy number describes. Report it as its own row or
+#                   not at all. Also --graph.
 #   THROUGHPUT      which throughput column(s) to print         (default: both)
 #                     both | decode | e2e | all | legacy
 #                     legacy = the old single throughput_tokps column, for
@@ -111,7 +121,7 @@ MODEL_PATH="${MODEL_PATH:-}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
 DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
-QUANT_MODE="${QUANT_MODE:-tokens}"
+QUANT_MODE="${QUANT_MODE:-bytes}"
 # CUDA-graph replay of the steady decode steps. Empty = let the device decide
 # (on under CUDA); "off" restores the pre-39f6be0 eager loop. Exported below so
 # the child inherits it -- the library default and this script must not disagree,
@@ -283,7 +293,7 @@ YAML
   echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
   echo "quant_gate_ratio: $GATE_RATIO"
-  echo "decode_graph: ${DECODE_GRAPH:-device-default (on under CUDA)}"
+  echo "decode_graph: ${DECODE_GRAPH:-off}"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
   echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
@@ -294,7 +304,7 @@ YAML
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
 echo "read gate: $GATE_RATIO$( [ "$GATE_RATIO" = "1.0" ] && echo '  (UNGATED control arm)' )"
-echo "decode graph: ${DECODE_GRAPH:-device-default (ON under CUDA)}"
+echo "decode graph: ${DECODE_GRAPH:-off (ablation; generate() cannot use it)}"
 if [ -n "$DECODE_GRAPH" ]; then export STICKYKV_DECODE_GRAPH="$DECODE_GRAPH"; fi
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"

@@ -231,18 +231,18 @@ def test_an_explicit_mode_always_wins_over_the_device(monkeypatch):
         assert graph_mode() == want
 
 
-def test_the_device_decides_when_nothing_is_set(monkeypatch):
-    """Same rule as `_compile_evict_enabled`: CUDA gets it, CPU does not.
+def test_the_default_is_off_on_every_device(monkeypatch):
+    """One method, one path.
 
-    A library default that disagrees with the benchmark script is how the
-    profiler came to measure an eager eviction against a compiled table
-    (`1434b2c`), so there is one default and it is not the script's.
+    The runner is wired into perf_runner's decode loop, NOT into
+    `model.generate`, which is what LongBench and GSM8K call. On by default
+    would mean the throughput table came from a path no accuracy number
+    describes. It is an ablation you ask for, never the shipped default.
     """
     monkeypatch.delenv("STICKYKV_DECODE_GRAPH", raising=False)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    assert graph_mode() == "off"
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    assert graph_mode() == "on"
+    for available in (False, True):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda a=available: a)
+        assert graph_mode() == "off"
 
 
 def test_a_typo_raises_rather_than_silently_disabling_the_graph(monkeypatch):
