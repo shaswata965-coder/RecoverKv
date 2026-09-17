@@ -65,15 +65,31 @@ def test_compiled_eviction_has_no_graph_breaks():
     it — which is the entire saving the flag is set to collect.
     """
     breaks, _ = _evict_with_counters("inductor")
-    assert not breaks, (
-        "the compiled eviction graph-breaks, so it cannot fuse:\n"
+    # The ONE break this body is allowed: `_evict_widths` reading the real
+    # fresh/react counts. Torch words it as `item()` on some versions and as a
+    # data-dependent `_local_scalar_dense` on others, so match the cause rather
+    # than one version's phrasing.
+    DELIBERATE = ("item()", "_local_scalar_dense", "Data dependent")
+    unexpected = {r: n for r, n in breaks.items()
+                  if not any(d in r for d in DELIBERATE)}
+    assert not unexpected, (
+        "the compiled eviction graph-breaks somewhere new:\n"
         + "\n".join(f"  {n}x  {reason.splitlines()[0]}"
-                    for reason, n in breaks.items())
+                    for reason, n in unexpected.items())
         + "\n\nEach break splits _evict_two_tier_impl into a separate Inductor "
           "graph. If this is a new `data_ptr` / `untyped_storage` call, gate it "
           "on `modules.windowed_cache.state._tracing()` the way `replace` and "
           "`replace_body` do."
     )
+    # It is bought deliberately: `_evict_widths` reads the real fresh/react
+    # counts so the demote payload is allocated by COUNT instead of by `n_q`.
+    # Under `bytes` n_q is 250 and the eviction is ~half the decode step, so
+    # this trades a break for a payload up to 31x smaller. Both widths are read
+    # through ONE stacked tensor -- two separate reads would be two syncs and
+    # two breaks for the same information. All the demote work sits after the
+    # width is known, so it stays inside one fused region.
+    assert len(breaks) <= 1, (
+        f"the width read should be the only KIND of break; got {list(breaks)}")
 
 
 def test_compiled_eviction_is_a_small_number_of_graphs():
@@ -85,10 +101,12 @@ def test_compiled_eviction_is_a_small_number_of_graphs():
     refuses is the 7 that the `data_ptr` breaks produced.
     """
     _, graphs = _evict_with_counters("inductor")
-    assert graphs <= 3, (
-        f"the eviction lowered to {graphs} Inductor graphs; at most 3 are "
-        "expected (one per shape/path). More means the body is being split — "
-        "check for graph breaks with test_compiled_eviction_has_no_graph_breaks."
+    assert graphs <= 8, (
+        f"the eviction lowered to {graphs} Inductor graphs. Expected: one per "
+        "shape/path, doubled by `_evict_width`'s deliberate `.item()` break, "
+        "times the handful of ladder rungs the demote width can take. More "
+        "means the body is being split somewhere unintended — check "
+        "test_compiled_eviction_has_no_graph_breaks."
     )
 
 
@@ -192,7 +210,9 @@ def test_reading_the_counters_is_the_only_sync_and_it_is_opt_in():
     after a timed window rather than inside one.
     """
     breaks, _ = _evict_with_counters("inductor")
-    assert not breaks, "recording the widths must not cost a graph break"
+    assert all(any(d in r for d in ("item()", "_local_scalar_dense",
+                                    "Data dependent")) for r in breaks), (
+        f"recording the widths must not add a break of its own: {breaks}")
 
 
 def test_no_eviction_means_no_stats_rather_than_zeros():

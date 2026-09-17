@@ -99,6 +99,62 @@ def evict_path_stats() -> dict:
     return dict(_EVICT_STATS)
 
 
+#: Widths the demote / reactivate compacts may take. A count that varies per
+#: eviction gives ``torch.compile`` a new shape every time, so the measured
+#: count is rounded UP to one of these rungs. The first eviction, where
+#: everything genuinely is fresh, still lands on the top one.
+_EVICT_WIDTH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+
+def _evict_widths(masks, bound: int):
+    """Smallest ladder rung covering each mask's widest row. **One sync, total.**
+
+    ``_compact`` allocates by RANK into a worst-case width, because the counts
+    are ragged per row. That width is ``n_q`` -- every window the Q tier can
+    hold -- and at steady state only a handful of lanes are really fresh: one
+    window is sealed per ``window_size`` steps, plus whatever crosses the tier
+    boundary on re-ranking. Everything else is gathered, un-rotated, quantized
+    and sketched, then masked away.
+
+    It did not matter much under ``quant_budget_mode: tokens``, where ``n_q`` is
+    64. Under ``bytes`` -- the mode the budget is honestly spent in -- ``n_q`` is
+    **250**. Fitting DECODE_SPEED_PLAN.md §3's measured eviction cost against
+    the 2026-09-17 table reproduces every cell to within 2-13% only if the
+    eviction scales with ``n_q``, and it puts the eviction at **~60 ms of a
+    124 ms step** at 4096/B=32. About half. This width is now the largest single
+    item in the decode step, not a tidy-up.
+
+    **The bound has to come from the data.** ``_compact`` routes overflow lanes
+    to a dump column, so a width that is ever too small silently drops work. A
+    max over rows is a true upper bound by construction; config arithmetic is
+    not, which is why this pays a ``.item()`` rather than estimating one.
+
+    That ``.item()`` costs one graph break in the compiled eviction -- two
+    Inductor graphs instead of one. The trade is explicit and it is not close:
+    one break against a payload up to 31x smaller. All the demote work sits
+    AFTER the width is known, so it stays inside one fused region either way.
+    """
+    if bound <= 0:
+        return [0] * len(masks)
+    # ONE `.item()` for every width this eviction needs. Two separate reads
+    # would be two host syncs and two graph breaks per eviction, for the same
+    # information; stacking them first makes it one of each.
+    needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
+    out = []
+    for need in needs:
+        need = int(need)
+        if need <= 0:
+            out.append(0)
+            continue
+        for rung in _EVICT_WIDTH_LADDER:
+            if rung >= need:
+                out.append(min(rung, bound))
+                break
+        else:
+            out.append(bound)
+    return out
+
+
 def evict_width_stats(cache) -> Optional[dict]:
     """What ``_compact``'s worst-case width bought, per eviction. Syncs once.
 
@@ -2205,33 +2261,41 @@ class WindowedCache(_HFCacheBase):
         # Must read the OLD fp store, so it runs before the rebuild below.
         # Reactivations are free — codes/grid/positions are frozen (§10) — so
         # they are a bit flip and never touch this path.
-        react_slot, react_valid = self._compact(slot_of, react, n_q)
+        # D1: allocate by the MEASURED count, rounded up a ladder -- not by n_q.
+        # Under `bytes` n_q is 250 and the eviction is ~half the decode step;
+        # at steady state a handful of lanes are fresh and the rest are computed
+        # and masked away. `_evict_width` reads the real count (one .item(), one
+        # graph break) and is a true upper bound, which a guess would not be --
+        # `_compact` routes overflow to a dump column and would drop work.
+        n_r, n_d = _evict_widths((react, fresh), n_q)
+
+        react_slot, react_valid = self._compact(slot_of, react, n_r)
         store.reactivate_many(react_slot, react_valid)
 
-        fresh_wid, fresh_valid = self._compact(wids, fresh, n_q)
-        if n_q > 0 and T_body > 0:
-            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_q]
+        fresh_wid, fresh_valid = self._compact(wids, fresh, n_d)
+        if n_d > 0 and T_body > 0:
+            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_d]
             tok_f = _clamp_index(
                 (start_f.unsqueeze(-1) + torch.arange(ws, device=device))
-                .reshape(B, n_q * ws),
+                .reshape(B, n_d * ws),
                 T_body - 1,
             )
-            idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_q * ws, D)
+            idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_d * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
             v_tok = torch.gather(body_v, 2, idx_d)
             prange = torch.gather(body_pos, 1, tok_f)
             k_pre_d = unrotate_key_window(k_post, prange, rope)
             store.demote_many(
-                store.table.free_slots(n_q), fresh_valid, fresh_wid,
-                k_pre_d.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
-                v_tok.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
-                prange.reshape(B, n_q, ws),
+                store.table.free_slots(n_d), fresh_valid, fresh_wid,
+                k_pre_d.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4),
+                v_tok.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4),
+                prange.reshape(B, n_d, ws),
                 # The gate card is built from the ROTATED keys -- the tensor we
                 # already hold, one line above un-rotating it -- so it costs no
                 # extra RoPE, and positions are never rebased so it stays valid
                 # for the window's whole life (§5, §10).
                 keys_post_rope=(
-                    k_post.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4)
+                    k_post.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4)
                     if store.sketch_enabled else None
                 ),
             )
