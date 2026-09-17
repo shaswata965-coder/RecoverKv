@@ -63,5 +63,34 @@ def test_the_quality_configs_resolve_the_same_cache(name):
     block = yaml.safe_load((ROOT / "configs" / name).read_text())["cache"]
     for field, want in OPERATING_POINT.items():
         got = block.get(field)
+        if want is None:
+            # A `None` reference means "derive it" -- the knob is a tri-state ARM
+            # whose shipped value is the derivation, not a number. Requiring
+            # every config to spell `null` would not make anything safer: a
+            # config that sets it to anything OTHER than the derivation is still
+            # caught, both by the `got == want` line below and by
+            # check_operating_point.py. What must not happen is the reverse --
+            # the reference moving off None while these configs keep deriving --
+            # and `test_a_non_derived_reference_must_be_spelled_out` covers that.
+            assert got is None or got == want, (
+                f"{name}: {field}={got!r}, operating point is {want!r} (derive)")
+            continue
         assert got is not None, f"{name} does not set {field}"
         assert got == want, f"{name}: {field}={got!r}, operating point is {want!r}"
+
+
+def test_a_non_derived_reference_must_be_spelled_out():
+    """The escape hatch above is only safe while the reference IS the derivation.
+
+    If someone changes ``OPERATING_POINT["quant_read_gate"]`` to ``True`` or
+    ``False``, "unset means the shipped value" stops being true and every
+    quality config silently keeps deriving. This fails at that moment, naming
+    the field, so the change comes with the config edits it requires.
+    """
+    from utils.config import OPERATING_POINT
+
+    derived = {k for k, v in OPERATING_POINT.items() if v is None}
+    assert derived == {"quant_read_gate"}, (
+        f"{derived} are treated as 'derive it' by the loop above. If a field "
+        "left or joined that set, the quality configs need to be re-checked: a "
+        "field with a CONCRETE reference must be written into each of them.")

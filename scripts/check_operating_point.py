@@ -77,6 +77,7 @@ def _perf_table_point() -> dict:
         "quant_ratio": "QUANT_RATIO",
         "quant_budget_mode": "QUANT_MODE",
         "quant_gate_ratio": "GATE_RATIO",
+        "quant_read_gate": "READ_GATE",
     }
     out: dict = {"first_eviction_step": 0}   # the generated YAML hardcodes it
     for field, var in want.items():
@@ -87,11 +88,22 @@ def _perf_table_point() -> dict:
     return out
 
 
+#: How the shell spells "derive it" for a tri-state knob: unset.
+_UNSET_MEANS_NONE = {"", "derive", "derived"}
+
+
 def _norm(v):
     """Compare 0.2 and '0.20' and 0.20 as the same number."""
     if v is None:
         return None
     if isinstance(v, str):
+        low = v.strip().lower()
+        if low in _UNSET_MEANS_NONE:
+            return None
+        if low in ("off", "false", "no", "0"):
+            return False
+        if low in ("on", "true", "yes", "1"):
+            return True
         try:
             return round(float(v), 6)
         except ValueError:

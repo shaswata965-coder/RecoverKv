@@ -992,10 +992,21 @@ class WindowedCache(_HFCacheBase):
         self._memoization_resolved = True
         pref = self.resolved.quant_memoize_read
         memo = (batch_size == 1) if pref is None else pref
-        # The gate is the read path wherever there is a Q tier, and the
-        # whole-tier memo is keyed on store.version -- which only moves at
-        # eviction, while the gate's selected set moves every step. So a live
-        # gate means no memo, full stop; config rejects an explicit True.
+        # A LIVE gate means no memo, full stop; config rejects an explicit True.
+        # The memo is keyed on store.version -- which only moves at eviction --
+        # while the gate's selected set moves every step, so it would serve a
+        # set the gate did not choose.
+        #
+        # `quant_read_gate=False` makes the memo legitimate again -- ungated
+        # there is no per-step selected set -- so the auto rule above turns it
+        # back on at B=1, saving 7 of every 8 steps' whole-tier dequant.
+        #
+        # Scope, because this is easy to over-read: the memo covers
+        # `effective_q_tier`, which is reached only through `_joint_qtier_read`
+        # -> `_materialize_joint`. On CUDA the fused two-tier kernel takes raw
+        # int2 and dequantizes inside, so that path is not taken and this line
+        # changes nothing about a GPU decode step. It is the eager/materialize
+        # path -- CPU, and the eager backend -- that gets the 8x back.
         if self.resolved.quant_sketch_enabled:
             memo = False
         for store in self._stores:

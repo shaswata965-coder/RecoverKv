@@ -252,3 +252,24 @@ def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
     if "quant_gate_ratio" in getattr(cache_config_cls, "__dataclass_fields__", {}):
         return {"quant_gate_ratio": requested}
     return {}
+
+
+def quant_read_gate_kwargs(cache_config_cls: Type, requested) -> dict:
+    """``{"quant_read_gate": requested}``, or ``{}`` when it does not apply.
+
+    Same contract as :func:`quant_gate_ratio_kwargs`, and threaded through the
+    same call sites for the same reason: a knob the caller forgets to pass is a
+    knob that is silently inert, which is how ``quant_budget_mode`` came to do
+    nothing in three runners at once (ACCURACY_RECOVERY_PLAN.md §2).
+
+    ``None`` means "derive it", which is the default everywhere, so it is
+    omitted rather than passed -- a runner on an older backend keeps working
+    unchanged. A non-``None`` value on a backend without the field is dropped
+    the same way the ratio is: the eager package has no gate to disable, and its
+    answer ("read the whole tier") is already what ``False`` asks for.
+    """
+    if requested is None:
+        return {}
+    if "quant_read_gate" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"quant_read_gate": requested}
+    return {}

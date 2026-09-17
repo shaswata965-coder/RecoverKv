@@ -269,10 +269,42 @@ class WindowedCacheConfig:
     # the bar. Because the bound is a bound, a skipped window provably carries no
     # logit above it: the gate can over-select, it cannot miss.
     #
-    # There is NO on/off knob: the gate is the read path, not a variant of it.
-    # It is on wherever there is a Q tier to gate and off at q=0, where there is
-    # nothing to skip -- `ResolvedConfig.quant_sketch_enabled` carries that
-    # derivation so no reader repeats it.
+    # `quant_read_gate` is a tri-state ARM, not a production setting:
+    #
+    #   None  (default) -- derive it, exactly as before: on wherever there is a
+    #                      Q tier to gate, off at q=0 where there is nothing to
+    #                      skip. The shipped operating point.
+    #   True            -- same thing, said out loud.
+    #   False           -- the UNGATED read path. Every active window is
+    #                      dequantized and scored truly.
+    #
+    # It exists because the gate had no control arm. `e7bc158` deliberately made
+    # every ratio take the same route, so `quant_gate_ratio=1.0` still runs the
+    # fused_gate launch, its topk+sort, the `SEL` indirection in the Q loop, the
+    # `GATED` prologue over every Q column, the §5 fill pass, and `build_sketch`
+    # on every eviction. 1.0 is a control for SELECTIVITY; it is not a control
+    # for THE MACHINERY, and the machinery is what every remaining speed item
+    # accuses (TARGET_GAP.md §4).
+    #
+    # `False` is a control for the machinery, because `GATED` is a `constexpr`:
+    # `sel=None` compiles the indirection, the prologue and the fill pass out of
+    # the kernel entirely (`decode_kernel.py` :652, :1240), and the `fused_gate`
+    # launch with its `topk` + `sort` stops being issued at all.
+    #
+    # It also re-enables the whole-tier read memo, which a live gate disables
+    # unconditionally (`cache._resolve_memoization`). That part helps the EAGER
+    # / materialize path only: on CUDA the fused kernel dequantizes int2 inside
+    # itself and never calls `effective_q_tier`, so the memo is not what makes
+    # this faster on a GPU. Do not quote it as a GPU saving.
+    #
+    # It is NOT score-neutral, which is why it is an arm and not a default: the
+    # ungated path scores every window truly where the gate credits a skipped
+    # window with a rescaled estimate. The direction is more accuracy, not less,
+    # but it changes eviction decisions, so a speed number taken here may only
+    # be quoted beside an accuracy number taken here. `utils.config`'s
+    # OPERATING_POINT carries the field so `scripts/check_operating_point.py`
+    # says so rather than leaving it to be noticed.
+    quant_read_gate: Optional[bool] = None
     #
     # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
     # operating point the efficiency arithmetic is costed on: the card is 26.5%
@@ -362,13 +394,23 @@ class WindowedCacheConfig:
             )
 
         # -- rank-1 read gate --
-        if self.quant_ratio > 0.0 and self.quant_memoize_read is True:
+        if self.quant_read_gate is not None and not isinstance(
+            self.quant_read_gate, bool
+        ):
             raise ValueError(
-                "quant_memoize_read=True cannot be combined with a Q tier: the "
-                "gate is the only read path now, and the memo caches the WHOLE "
-                "dequantized tier keyed on store.version -- which only moves at "
-                "eviction, while the gate's selected set moves every step. It "
-                "would serve a set the gate did not choose. Leave it None."
+                f"quant_read_gate must be None (derive), True or False, got "
+                f"{type(self.quant_read_gate).__name__}"
+            )
+        gate_live = self.quant_ratio > 0.0 and self.quant_read_gate is not False
+        if gate_live and self.quant_memoize_read is True:
+            raise ValueError(
+                "quant_memoize_read=True cannot be combined with a LIVE read "
+                "gate: the memo caches the WHOLE dequantized tier keyed on "
+                "store.version -- which only moves at eviction, while the "
+                "gate's selected set moves every step. It would serve a set the "
+                "gate did not choose. Leave it None, or set "
+                "quant_read_gate=False to take the ungated path, which has no "
+                "per-step selected set and memoizes legitimately."
             )
         if not (0.0 < self.quant_gate_ratio <= 1.0):
             raise ValueError(
@@ -612,9 +654,13 @@ class WindowedCacheConfig:
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
             quant_memoize_read=self.quant_memoize_read,
-            # Derived, not configured: the gate IS the read path wherever there
-            # is a Q tier, and there is no way to ask for the ungated one.
-            quant_sketch_enabled=q > 0.0,
+            # Derived unless `quant_read_gate` overrides it. The derivation is
+            # unchanged at the default (None): the gate is the read path
+            # wherever there is a Q tier. `False` asks for the ungated one; it
+            # cannot conjure a gate where there is no Q tier, so `q > 0.0`
+            # remains a necessary condition either way.
+            quant_sketch_enabled=(q > 0.0) if self.quant_read_gate is None
+            else bool(self.quant_read_gate and q > 0.0),
             quant_gate_ratio=self.quant_gate_ratio,
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,

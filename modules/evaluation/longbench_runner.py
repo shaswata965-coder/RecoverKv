@@ -479,7 +479,8 @@ class LongBenchRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
-                                 quant_gate_ratio_kwargs)
+                                 quant_gate_ratio_kwargs,
+                                 quant_read_gate_kwargs)
 
         cfg = self.config
         model = self.model
@@ -512,6 +513,12 @@ class LongBenchRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # The gate itself. LongBench must be able to take the same arm the
+            # throughput table takes, or the two describe different methods --
+            # which is the exact defect 8ef579a fixed for quant_ratio.
+            **quant_read_gate_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_read_gate", None)),
             # Without this the knob was inert here: LongBench fell through to
             # WindowedCacheConfig's default whatever the YAML said, while the
             # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
