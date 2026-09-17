@@ -1825,7 +1825,7 @@ class PerfRunner:
                         t_step0 = time.perf_counter()
                     if n_decode >= 2:
                         # CUDA-graph replay of the steady steps, opt-in via
-                        # STICKYKV_DECODE_GRAPH (default off). The runner decides
+                        # STICKYKV_DECODE_GRAPH (default ON under CUDA). The runner decides
                         # per step whether a replay is legal and falls back to
                         # this same eager call whenever it is not -- see
                         # modules/windowed_cache/graph_decode.py. Step 0 above is
