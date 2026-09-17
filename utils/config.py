@@ -87,7 +87,6 @@ OPERATING_POINT_EXEMPT = {
     "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",
     "gsm8k_budget80.yaml": "the 0.80 arm of the budget sweep",
     "eval_perf_smoke.yaml": "smoke test, not a reported number",
-    "eval_perf_cpu_e2e.yaml": "CPU smoke test, not a reported number",
     "ruler_niah_mk3_omega16.yaml": "RULER uses int4, a different tier",
     "eval_faithfulness.yaml": "no cache block",
     "eval_qevict.yaml": "no cache block",

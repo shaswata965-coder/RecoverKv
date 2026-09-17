@@ -305,6 +305,40 @@ YAML
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
 echo "read gate: $GATE_RATIO$( [ "$GATE_RATIO" = "1.0" ] && echo '  (UNGATED control arm)' )"
 echo "decode graph: ${DECODE_GRAPH:-off (ablation; generate() cannot use it)}"
+
+# Say it out loud when a flag moves this run off the pinned operating point.
+# `--gate-ratio 1.0` is the case that matters: it is a legitimate ablation, and
+# it is NOT the configuration LongBench and GSM8K are pinned to, so its rows
+# cannot be quoted beside an accuracy number. A run that silently sits somewhere
+# else is how the perf table came to time quant_ratio 0.70 while LongBench
+# scored 0.0.
+python - "$CACHE_BUDGET" "$WINDOW_SIZE" "$NUM_SINK" "$LOCAL_WINDOW" \
+         "$QUANT_RATIO" "$QUANT_MODE" "$GATE_RATIO" <<'PYEOF' || true
+import sys
+sys.path.insert(0, ".")
+try:
+    from utils.config import OPERATING_POINT as OP
+except Exception:
+    raise SystemExit(0)
+got = dict(zip(("cache_budget", "window_size", "num_sink_tokens",
+                "local_window_size", "quant_ratio", "quant_budget_mode",
+                "quant_gate_ratio"), sys.argv[1:8]))
+def norm(v):
+    try:
+        return round(float(v), 6)
+    except (TypeError, ValueError):
+        return str(v).strip()
+off = [(k, v, OP[k]) for k, v in got.items() if norm(v) != norm(OP[k])]
+if off:
+    print("")
+    print("  !! THIS RUN IS NOT AT THE PINNED OPERATING POINT")
+    for k, v, want in off:
+        print(f"       {k}: {v}   (operating point: {want})")
+    print("     These rows are an ABLATION. They cannot be quoted beside a")
+    print("     LongBench or GSM8K number, which are pinned to the point above.")
+    print("     scripts/check_operating_point.py prints the full comparison.")
+    print("")
+PYEOF
 if [ -n "$DECODE_GRAPH" ]; then export STICKYKV_DECODE_GRAPH="$DECODE_GRAPH"; fi
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
