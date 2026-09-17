@@ -237,9 +237,9 @@ class WindowedCacheConfig:
     # What `quant_ratio` divides between the fp16 and int2 tiers.
     #
     # "bytes" (default) — q splits the BYTE budget; each tier then buys windows
-    #     at its own price. An int2 window costs ~3.9x less than an fp16 one
-    #     (b_fp/b_q = 32768/8448 at ws=8, D=128, H_kv=8), so the retained window
-    #     count grows with q:
+    #     at its own price. An int2 window costs ~2.8x less than an fp16 one
+    #     with its gate card (b_fp/b_q = 32768/9632 at ws=8, D=128, H_kv=8; 5.1x
+    #     without the card), so the retained window count grows with q:
     #
     #       retained_windows = top_k_windows * (1 + (b_fp/b_q - 1) * q)
     #
@@ -279,8 +279,8 @@ class WindowedCacheConfig:
     #
     #
     # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
-    # operating point the efficiency arithmetic is costed on: the card is 26.5%
-    # of a window, so break-even sits at ~0.735 and 0.25 leaves real headroom.
+    # operating point the efficiency arithmetic is costed on: the card is a
+    # third of a window, so break-even sits at ~0.67 and 0.25 leaves headroom.
     # 1.0 dequantizes everything and makes the gate a provable no-op.
     quant_gate_ratio: float = 0.25
     # Delta, in log space. A window also survives when its bound is within Delta
@@ -577,24 +577,24 @@ class WindowedCacheConfig:
         # The GATE CARD IS PART OF THE WINDOW. It is resident for the life of the
         # window, it is allocated unconditionally wherever there is a Q tier, and
         # leaving it out of `b_q` is not a rounding error: at D=128, ws=8, H_kv=8
-        # the card is 3200 B against the codes' 8448, so an unbudgeted card is a
-        # 38% overrun on the exact tier the memory claim is made about. It was
-        # missing here, which meant every reported `cache_budget` understated the
-        # bytes actually held.
+        # the card is 3200 B against the codes-plus-grid's 6432, so an unbudgeted
+        # card is a 50% overrun on the exact tier the memory claim is made about.
+        # It was missing here, which meant every reported `cache_budget`
+        # understated the bytes actually held.
+        #
+        # Both halves are priced by the modules that define the formats, not
+        # re-derived here: a window whose layout changes and whose budget does
+        # not is the same bug in a new place.
+        from modules.quant.quantizer import bytes_per_q_window
         from modules.quant.sketch import sketch_bytes_per_head
 
         gate_live = q > 0.0
         b_card = (num_kv_heads * sketch_bytes_per_head(head_dim, self.window_size)
                   if gate_live else 0)
-        b_q = (
-            (num_kv_heads * head_dim * self.window_size) // 2           # int2 codes, K+V
-            + 4 * num_kv_heads * head_dim                               # key scale+zero fp16
-            + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
-            + b_card                                                    # rank-1 card
-        )
+        b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size) + b_card
         m_evict = remaining * bytes_per_token                           # evictable bytes
         if self.quant_budget_mode == "bytes":
-            # Historic split: q divides the BYTES. An int2 window is ~3.9x
+            # Historic split: q divides the BYTES. An int2 window is ~2.8x
             # cheaper, so the retained WINDOW COUNT grows with q and the cache
             # can end up holding more keys than the prompt (see the field docs).
             top_k_fp = int(((1.0 - q) * m_evict) // b_fp)

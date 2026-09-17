@@ -31,7 +31,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from .quantizer import dequantize_key_windows
+from .quantizer import QGrid, dequantize_key_windows
 
 
 def _apply_rotary():
@@ -115,8 +115,8 @@ def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 def _dequant_rotate_flat(
     k_codes: Tensor,
-    k_scale: Tensor,
-    k_zero: Tensor,
+    k_scale: QGrid,
+    k_zero: QGrid,
     window: int,
     cos: Tensor,
     sin: Tensor,
@@ -150,8 +150,8 @@ def _dequant_rotate_flat(
 
 def dequant_rotate_q_keys(
     k_codes: Tensor,
-    k_scale: Tensor,
-    k_zero: Tensor,
+    k_scale: QGrid,
+    k_zero: QGrid,
     window: int,
     pos_flat: Tensor,
     rope_module: torch.nn.Module,

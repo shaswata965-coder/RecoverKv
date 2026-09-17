@@ -41,6 +41,7 @@ import torch
 from torch import Tensor
 
 from .quantizer import (
+    QGrid,
     dequantize_key_windows,
     dequantize_value_windows,
     quantize_key_windows,
@@ -479,10 +480,15 @@ class QuantizedStore:
             return (store_t[rows, sel, heads] if head_axis
                     else store_t[rows, sel])
 
+        def take_grid(q_name, s_name):
+            return QGrid(take(getattr(t, q_name)), take(getattr(t, s_name)))
+
         k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//4]
-        k_scale, k_zero = take(t.key_scale), take(t.key_zero)
+        k_scale = take_grid("key_scale_q", "key_scale_s")
+        k_zero = take_grid("key_zero_q", "key_zero_s")
         v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
-        v_scale, v_zero = take(t.val_scale), take(t.val_zero)
+        v_scale = take_grid("val_scale_q", "val_scale_s")
+        v_zero = take_grid("val_zero_q", "val_zero_s")
         pos = take(t.slot_pos, head_axis=False)        # [B,H,n_sel,S]
 
         # Fold the head axis into the batch axis: the read kernel treats its

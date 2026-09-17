@@ -11,6 +11,7 @@ import torch
 from modules.quant.quantizer import (
     dequantize_key_window,
     dequantize_value_window,
+    grid_group,
     pack_crumbs_last,
     quantize_key_window,
     quantize_value_window,
@@ -54,9 +55,14 @@ class TestKeyQuant:
         packed, scale, zero = quantize_key_window(k)
         assert packed.shape == (H, D, W // 4)
         assert packed.dtype == torch.uint8
-        assert scale.shape == (H, D)
-        assert zero.shape == (H, D)
-        assert scale.dtype == torch.float16
+        # The grid is one byte per (head, channel) over an fp16 scale shared by
+        # GRID_GROUP of them -- see QGrid.
+        assert scale.q.shape == (H, D) and scale.q.dtype == torch.uint8
+        assert zero.q.shape == (H, D) and zero.q.dtype == torch.int8
+        assert scale.s.shape == (H, D // grid_group(D))
+        assert scale.s.dtype == torch.float16 and zero.s.dtype == torch.float16
+        # A scale code is never 0: the fit divides by the decoded grid.
+        assert int(scale.q.min()) >= 1
 
         k_hat = dequantize_key_window(packed, scale, zero, W, out_dtype=torch.float32)
         assert k_hat.shape == (H, W, D)
@@ -70,8 +76,10 @@ class TestKeyQuant:
         # Per (head, channel) range along the token axis.
         rng = k.amax(dim=1, keepdim=True) - k.amin(dim=1, keepdim=True)  # [H,1,D]
         max_err = (k_hat - k).abs().amax(dim=1)  # [H, D]
-        # Allow a hair over R/6 for fp16 grid rounding.
-        bound = (rng.squeeze(1) / 6.0) * 1.05 + 1e-3
+        # Allow a hair over R/6 for the one-byte grid's rounding: the stored
+        # scale can exceed the true one by up to half a group quantum, which
+        # widens the four levels and so the worst-case error with them.
+        bound = (rng.squeeze(1) / 6.0) * 1.20 + 1e-3
         assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
@@ -80,8 +88,9 @@ class TestKeyQuant:
         const = torch.randn(H, 1, D).expand(H, W, D).contiguous()
         packed, scale, zero = quantize_key_window(const)
         k_hat = dequantize_key_window(packed, scale, zero, W, out_dtype=torch.float32)
-        # zero == mn == the constant (as fp16); dequant returns it exactly.
-        assert torch.allclose(k_hat, zero.unsqueeze(1).to(torch.float32).expand(H, W, D))
+        # Every code is 0, so the dequant returns the stored `zero` exactly --
+        # which is now the DECODED grid, not an fp16 copy of the constant.
+        assert torch.equal(k_hat, zero.decode().unsqueeze(1).expand(H, W, D))
 
     def test_fp16_grid_idempotence(self):
         # Dequantizing twice against the pinned fp16 grid is bit-identical, and
@@ -109,8 +118,10 @@ class TestValueQuant:
         v = torch.randn(H, W, D)
         packed, scale, zero = quantize_value_window(v)
         assert packed.shape == (H, W, D // 4)
-        assert scale.shape == (H, W)
-        assert zero.shape == (H, W)
+        assert scale.q.shape == (H, W) and scale.q.dtype == torch.uint8
+        assert zero.q.shape == (H, W) and zero.q.dtype == torch.int8
+        # ws < GRID_GROUP, so a value window's grid shares one scale per head.
+        assert scale.s.shape == (H, W // grid_group(W))
 
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
         assert v_hat.shape == (H, W, D)
@@ -130,7 +141,7 @@ class TestValueQuant:
         const = torch.randn(H, W, 1).expand(H, W, D).contiguous()
         packed, scale, zero = quantize_value_window(const)
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
-        assert torch.allclose(v_hat, zero.unsqueeze(2).to(torch.float32).expand(H, W, D))
+        assert torch.equal(v_hat, zero.decode().unsqueeze(2).expand(H, W, D))
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +401,7 @@ def test_affine_quantize_inplace_matches_the_out_of_place_form():
     scale guard exists for.
     """
     import torch
-    from modules.quant.quantizer import _affine_quantize, _LEVELS
+    from modules.quant.quantizer import _affine_quantize, _quantize_grid, _LEVELS
 
     def _reference(x, group_dim):
         x32 = x.to(torch.float32)
@@ -398,12 +409,12 @@ def test_affine_quantize_inplace_matches_the_out_of_place_form():
         mn = x32.amin(dim=group_dim, keepdim=True)
         scale = (mx - mn) / _LEVELS
         scale = torch.where(mx == mn, torch.ones_like(scale), scale)
-        scale16 = scale.to(torch.float16)
-        zero16 = mn.to(torch.float16)
-        q = torch.round((x32 - zero16.to(torch.float32))
-                        / scale16.to(torch.float32))
+        s_g = _quantize_grid(scale.squeeze(group_dim), signed=False)
+        z_g = _quantize_grid(mn.squeeze(group_dim), signed=True)
+        q = torch.round((x32 - z_g.decode().unsqueeze(group_dim))
+                        / s_g.decode().unsqueeze(group_dim))
         q = torch.clamp(q, 0.0, _LEVELS)
-        return q.to(torch.uint8), scale16, zero16
+        return q.to(torch.uint8), s_g, z_g
 
     g = torch.Generator().manual_seed(20260917)
     cases = []
@@ -420,13 +431,15 @@ def test_affine_quantize_inplace_matches_the_out_of_place_form():
     for x in cases:
         for group_dim in (-1, 1):
             before = x.clone()
-            codes, scale16, zero16 = _affine_quantize(x, group_dim)
+            codes, scale_g, zero_g = _affine_quantize(x, group_dim)
             r_codes, r_scale, r_zero = _reference(before, group_dim)
             tag = f"dtype={x.dtype} group_dim={group_dim}"
             assert torch.equal(x, before), f"{tag}: the input was mutated"
             assert torch.equal(codes, r_codes), f"{tag}: codes moved"
-            assert torch.equal(scale16, r_scale), f"{tag}: scale moved"
-            assert torch.equal(zero16, r_zero), f"{tag}: zero moved"
+            assert torch.equal(scale_g.q, r_scale.q), f"{tag}: scale codes moved"
+            assert torch.equal(scale_g.s, r_scale.s), f"{tag}: scale group moved"
+            assert torch.equal(zero_g.q, r_zero.q), f"{tag}: zero codes moved"
+            assert torch.equal(zero_g.s, r_zero.s), f"{tag}: zero group moved"
             assert codes.max() <= _LEVELS, f"{tag}: code above the top level"
 
 
@@ -453,11 +466,12 @@ def test_affine_dequantize_inplace_matches_the_out_of_place_form():
     g = torch.Generator().manual_seed(11)
     for dtype in (torch.float16, torch.float32):
         x = torch.randn(3, 4, 32, generator=g).to(dtype)
-        codes, scale16, zero16 = _affine_quantize(x, -1)
-        ref = ((codes.to(torch.float32) * scale16.to(torch.float32))
-               + zero16.to(torch.float32)).to(dtype)
+        codes, scale_g, zero_g = _affine_quantize(x, -1)
+        scale = scale_g.decode().unsqueeze(-1)   # the reduced group axis
+        zero = zero_g.decode().unsqueeze(-1)
+        ref = ((codes.to(torch.float32) * scale) + zero).to(dtype)
         codes_before = codes.clone()
-        got = _affine_dequantize(codes, scale16, zero16, dtype)
+        got = _affine_dequantize(codes, scale, zero, dtype)
         assert torch.equal(got, ref), f"dequant moved for {dtype}"
         assert torch.equal(codes, codes_before), "the codes were mutated"
 

@@ -9,11 +9,15 @@ cannot express that; a slot table can.
 Layout (one layer, ``B`` rows, ``N`` slots)::
 
     key_codes   [B, N, H_kv, D, ws//4]  uint8   channel-major, 4 tokens/byte
-    key_scale   [B, N, H_kv, D]         fp16    pinned grid
-    key_zero    [B, N, H_kv, D]         fp16
+    key_scale_q [B, N, H_kv, D]         uint8   pinned grid, one byte per entry
+    key_scale_s [B, N, H_kv, D//g]      fp16    the scale each group shares
+    key_zero_q  [B, N, H_kv, D]         int8
+    key_zero_s  [B, N, H_kv, D//g]      fp16
     val_codes   [B, N, H_kv, ws, D//4]  uint8   token-major, 4 channels/byte
-    val_scale   [B, N, H_kv, ws]        fp16
-    val_zero    [B, N, H_kv, ws]        fp16
+    val_scale_q [B, N, H_kv, ws]        uint8
+    val_scale_s [B, N, H_kv, ws//g]     fp16
+    val_zero_q  [B, N, H_kv, ws]        int8
+    val_zero_s  [B, N, H_kv, ws//g]     fp16
     slot_wid    [B, N]                  int64   original_window_id; -1 = free
     slot_active [B, N]                  bool    active vs dormant (§10)
     slot_pos    [B, N, ws]              int64   frozen original positions
@@ -42,8 +46,21 @@ from typing import Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
+from .quantizer import QGrid, grid_group
+
 FREE = -1
 """``slot_wid`` sentinel for an unoccupied slot. Real window ids are >= 0."""
+
+GRID_FIELDS = (
+    "key_scale_q", "key_scale_s", "key_zero_q", "key_zero_s",
+    "val_scale_q", "val_scale_s", "val_zero_q", "val_zero_s",
+)
+"""The two :class:`~modules.quant.quantizer.QGrid` pairs, as flat columns.
+
+A ``QGrid`` is codes plus the fp16 scale a group of them shares, so each of the
+four grid fields is two tensors here. They are named rather than nested so every
+name-driven path in this file — ``join_layers``, ``write``, ``gather`` — keeps
+working on a list of strings."""
 
 SKETCH_FIELDS = (
     "sk_mu_q", "sk_mu_s", "sk_v_q", "sk_v_s",
@@ -109,11 +126,19 @@ class QuantSlotTable:
         self.num_kv_heads = H
 
         self.key_codes = torch.zeros((B, N, H, D, S // 4), dtype=torch.uint8, device=device)
-        self.key_scale = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
-        self.key_zero = torch.zeros((B, N, H, D), dtype=torch.float16, device=device)
+        # The grid is one byte per entry against an fp16 scale shared by
+        # `grid_group` of them (QGrid). uint8 for `scale` (non-negative, and a
+        # zero would divide by zero at fit time), int8 for `zero` (an offset).
+        gk, gv = D // grid_group(D), S // grid_group(S)
+        self.key_scale_q = torch.zeros((B, N, H, D), dtype=torch.uint8, device=device)
+        self.key_scale_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
+        self.key_zero_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+        self.key_zero_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
         self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
-        self.val_scale = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
-        self.val_zero = torch.zeros((B, N, H, S), dtype=torch.float16, device=device)
+        self.val_scale_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
+        self.val_scale_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
+        self.val_zero_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+        self.val_zero_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)
@@ -121,7 +146,7 @@ class QuantSlotTable:
         # Rank-1 gate cards (modules/quant/sketch.py). Allocated only when the
         # gate is on, so a q>0 run with the gate off is byte-identical to before.
         #
-        # Slot-major with D innermost, mirroring `key_scale [B, N, H, D]`: that
+        # Slot-major with D innermost, mirroring `key_scale_q [B, N, H, D]`: that
         # layout already gives 256 contiguous bytes per (slot, head) at D=128, so
         # a gathered window is a contiguous run rather than a scalar gather, and
         # every existing index path (`_flat`, `write`, `gather`, `retain_only`)
@@ -186,8 +211,7 @@ class QuantSlotTable:
         joint.head_dim = ref.head_dim
         joint.num_kv_heads = ref.num_kv_heads
         joint.sketch = ref.sketch
-        fields = ["key_codes", "key_scale", "key_zero",
-                  "val_codes", "val_scale", "val_zero",
+        fields = ["key_codes", *GRID_FIELDS, "val_codes",
                   "slot_wid", "slot_active", "slot_pos"]
         if ref.sketch:
             fields += list(SKETCH_FIELDS)
@@ -255,11 +279,11 @@ class QuantSlotTable:
         valid: Tensor,
         wid: Tensor,
         k_codes: Tensor,
-        k_scale: Tensor,
-        k_zero: Tensor,
+        k_scale: QGrid,
+        k_zero: QGrid,
         v_codes: Tensor,
-        v_scale: Tensor,
-        v_zero: Tensor,
+        v_scale: QGrid,
+        v_zero: QGrid,
         pos: Tensor,
         sketch: Optional[Sequence[Tensor]] = None,
     ) -> None:
@@ -281,7 +305,8 @@ class QuantSlotTable:
         slot_idx : ``[B, n]`` target slots.
         valid : ``[B, n]`` bool — which lanes carry a real fresh demotion.
         wid : ``[B, n]`` int64 — window ids (``-1`` on invalid lanes).
-        k_codes .. v_zero : ``[B, n, ...]`` quantized fields.
+        k_codes, v_codes : ``[B, n, ...]`` packed int2 codes.
+        k_scale .. v_zero : the four :class:`QGrid` fields, ``[B, n, ...]``.
         pos : ``[B, n, ws]`` int64 frozen positions.
         """
         fi = self._flat(slot_idx)
@@ -294,11 +319,9 @@ class QuantSlotTable:
             flat[fi] = torch.where(m, src.reshape(cur.shape).to(cur.dtype), cur)
 
         put(self.key_codes, k_codes)
-        put(self.key_scale, k_scale)
-        put(self.key_zero, k_zero)
         put(self.val_codes, v_codes)
-        put(self.val_scale, v_scale)
-        put(self.val_zero, v_zero)
+        for name, src_t in zip(GRID_FIELDS, (*k_scale, *k_zero, *v_scale, *v_zero)):
+            put(getattr(self, name), src_t)
         put(self.slot_pos, pos)
         if sketch is not None:
             if not self.sketch:
@@ -327,8 +350,12 @@ class QuantSlotTable:
 
     # -- read ----------------------------------------------------------------
 
-    def gather(self, slot_idx: Tensor) -> Tuple[Tensor, ...]:
+    def gather(self, slot_idx: Tensor) -> Tuple:
         """Gather ``[B, n]`` slots, flattened to a ``[B*n]`` leading axis.
+
+        Returns ``(k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos)``,
+        the grids as :class:`QGrid` pairs — the same seven values the quantizers
+        take, so the caller never reassembles a grid by hand.
 
         The flattened leading axis is what the batched quantizers already
         consume (they treat leading ``N`` as opaque and reduce only over the
@@ -341,9 +368,10 @@ class QuantSlotTable:
             flat = store.view(store.shape[0] * store.shape[1], *store.shape[2:])
             return flat[fi]
 
+        g = [take(getattr(self, name)) for name in GRID_FIELDS]
         return (
-            take(self.key_codes), take(self.key_scale), take(self.key_zero),
-            take(self.val_codes), take(self.val_scale), take(self.val_zero),
+            take(self.key_codes), QGrid(g[0], g[1]), QGrid(g[2], g[3]),
+            take(self.val_codes), QGrid(g[4], g[5]), QGrid(g[6], g[7]),
             take(self.slot_pos),
         )
 

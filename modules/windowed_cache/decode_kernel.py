@@ -55,6 +55,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from modules.quant.quantizer import grid_group
+
 try:  # pragma: no cover - import guard, exercised only where triton is present
     import triton
     import triton.language as tl
@@ -569,8 +571,11 @@ if _HAS_TRITON:
     @triton.jit
     def _two_tier_decode_kernel(
         Q, KFP, VFP,
-        KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
-        VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
+        # Q keys: codes u8 [B,n,H_kv,D,ws//4]; grid = one byte per (head, channel)
+        # (u8 scale, i8 zero) over an fp16 scale per GROUP_K of them, [B,n,H_kv,D]
+        # and [B,n,H_kv,D//GROUP_K]. Values the same over (head, token) and WS.
+        KC, KS, KSS, KZ, KZS,
+        VC, VS, VSS, VZ, VZS,
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
@@ -585,6 +590,7 @@ if _HAS_TRITON:
         HEAD_DIM: tl.constexpr, HALF: tl.constexpr, WS: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_NW: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
+        GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
@@ -668,12 +674,20 @@ if _HAS_TRITON:
         ksb = n_active * H_kv * HEAD_DIM
         ksn = H_kv * HEAD_DIM
         ksh = HEAD_DIM
+        GK: tl.constexpr = HEAD_DIM // GROUP_K
+        ksgb = n_active * H_kv * GK
+        ksgn = H_kv * GK
+        ksgh = GK
         vcb = n_active * H_kv * WS * PACK_V
         vcn = H_kv * WS * PACK_V
         vch = WS * PACK_V
         vsb = n_active * H_kv * WS
         vsn = H_kv * WS
         vsh = WS
+        GV: tl.constexpr = WS // GROUP_V
+        vsgb = n_active * H_kv * GV
+        vsgn = H_kv * GV
+        vsgh = GV
         cob = n_active * WS * HALF
         vmb = n_active * H_kv * HEAD_DIM
         vmn = H_kv * HEAD_DIM
@@ -771,18 +785,34 @@ if _HAS_TRITON:
             else:
                 widx = w0 + t_win                            # [BLOCK_T] window ids
                 qmask = in_tile & (widx < n_active)
-            ks_lo = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + offs_hl[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            kz_lo = tl.load(KZ + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + offs_hl[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            ks_hi = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + (offs_hl + HALF)[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            kz_hi = tl.load(KZ + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + (offs_hl + HALF)[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
+            # The grid is one byte per entry times the fp16 scale its group of
+            # GROUP_K channels shares, in that order -- the same two ops the
+            # store's dequant does, so the kernel reads the exact grid the codes
+            # were fit to. The group scales are few (D // GROUP_K per window and
+            # head) and every lane of a group hits the same address, so the
+            # repeated load is an L1 hit, not traffic.
+            kg_lo = (offs_hl // GROUP_K)[:, None]
+            kg_hi = ((offs_hl + HALF) // GROUP_K)[:, None]
+            gptr = KSS + b * ksgb + widx[None, :] * ksgn + kv * ksgh
+            zptr = KZS + b * ksgb + widx[None, :] * ksgn + kv * ksgh
+            kptr = KS + b * ksb + widx[None, :] * ksn + kv * ksh
+            kzptr = KZ + b * ksb + widx[None, :] * ksn + kv * ksh
+            ks_lo = (tl.load(kptr + offs_hl[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(gptr + kg_lo,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            kz_lo = (tl.load(kzptr + offs_hl[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(zptr + kg_lo,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            ks_hi = (tl.load(kptr + (offs_hl + HALF)[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(gptr + kg_hi,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            kz_hi = (tl.load(kzptr + (offs_hl + HALF)[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(zptr + kg_hi,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
             kb_lo = tl.load(KC + b * kcb + widx[None, :] * kcn + kv * kch
                             + offs_hl[:, None] * PACK_K + byte_t[None, :],
                             mask=qmask[None, :], other=0)
@@ -803,10 +833,15 @@ if _HAS_TRITON:
             m_new = tl.maximum(m, tl.max(logit, axis=1))
             corr = tl.exp2(m - m_new)
             p = tl.where(qmask[None, :], tl.exp2(logit - m_new[:, None]), 0.0)
-            vs = tl.load(VS + b * vsb + widx * vsn + kv * vsh + t_tok,
-                         mask=qmask, other=0.0).to(tl.float32)
-            vz = tl.load(VZ + b * vsb + widx * vsn + kv * vsh + t_tok,
-                         mask=qmask, other=0.0).to(tl.float32)
+            vg = t_tok // GROUP_V
+            vs = (tl.load(VS + b * vsb + widx * vsn + kv * vsh + t_tok,
+                          mask=qmask, other=0).to(tl.float32)
+                  * tl.load(VSS + b * vsgb + widx * vsgn + kv * vsgh + vg,
+                            mask=qmask, other=0.0).to(tl.float32))
+            vz = (tl.load(VZ + b * vsb + widx * vsn + kv * vsh + t_tok,
+                          mask=qmask, other=0).to(tl.float32)
+                  * tl.load(VZS + b * vsgb + widx * vsgn + kv * vsgh + vg,
+                            mask=qmask, other=0.0).to(tl.float32))
             vb = tl.load(VC + b * vcb + widx[:, None] * vcn + kv * vch
                          + t_tok[:, None] * PACK_V + cbyte[None, :],
                          mask=qmask[:, None], other=0)
@@ -910,7 +945,7 @@ if _HAS_TRITON:
             #
             # This rides in the pass that was already running. The only new
             # traffic is the centroid tile (D int8 + one fp16 scale per skipped
-            # window, 130 B/head against the 8448 B/window not read), and the
+            # window, 130 B/head against the 6432 B/window not read), and the
             # only new arithmetic is one `tl.dot` of a tile the loop already
             # holds -- the same shape as the Q loop's `tl.dot(p, vv)`.
             vacc = tl.zeros([BLOCK_R, HEAD_DIM], tl.float32)
@@ -1169,18 +1204,25 @@ def _decode_triton(
     # Dummies for the empty-Q case: valid tensors so the pointers exist; never
     # indexed (the Q loop runs only while w0 < n_active == 0).
     dev = q.device
+    gk, gv = grid_group(D), grid_group(ws)
     if qtier is None:
         kc = torch.zeros((B, 1, H_kv, D, max(ws // 4, 1)), dtype=torch.uint8, device=dev)
-        ksz = torch.zeros((B, 1, H_kv, D), dtype=torch.float16, device=dev)
+        kq = torch.zeros((B, 1, H_kv, D), dtype=torch.uint8, device=dev)
+        kgs = torch.zeros((B, 1, H_kv, D // gk), dtype=torch.float16, device=dev)
         vc = torch.zeros((B, 1, H_kv, ws, max(D // 4, 1)), dtype=torch.uint8, device=dev)
-        vsz = torch.zeros((B, 1, H_kv, ws), dtype=torch.float16, device=dev)
+        vq = torch.zeros((B, 1, H_kv, ws), dtype=torch.uint8, device=dev)
+        vgs = torch.zeros((B, 1, H_kv, ws // gv), dtype=torch.float16, device=dev)
         cs = torch.zeros((B, 1, half), dtype=q.dtype, device=dev)
-        KC, KS, KZ = kc, ksz, ksz
-        VC, VS, VZ = vc, vsz, vsz
+        KC, VC = kc, vc
+        KS, KSS, KZ, KZS = kq, kgs, kq, kgs
+        VS, VSS, VZ, VZS = vq, vgs, vq, vgs
         COS, SIN = cs, cs
     else:
-        KC, KS, KZ = qtier["k_codes"], qtier["k_scale"], qtier["k_zero"]
-        VC, VS, VZ = qtier["v_codes"], qtier["v_scale"], qtier["v_zero"]
+        KC, VC = qtier["k_codes"], qtier["v_codes"]
+        KS, KSS = qtier["k_scale"]
+        KZ, KZS = qtier["k_zero"]
+        VS, VSS = qtier["v_scale"]
+        VZ, VZS = qtier["v_zero"]
         COS, SIN = qtier["cos"], qtier["sin"]
 
     # §5.2 passes shapes instead of strides for these, so contiguity stops being
@@ -1189,8 +1231,10 @@ def _decode_triton(
     # from `rope_cos_sin_halves`, which calls `.contiguous()` -- so this never
     # fires in practice and costs one flag read per launch. It is here because a
     # silently non-contiguous tensor would read garbage rather than fail.
-    for name, t in (("k_codes", KC), ("k_scale", KS), ("k_zero", KZ),
-                    ("v_codes", VC), ("v_scale", VS), ("v_zero", VZ),
+    for name, t in (("k_codes", KC), ("k_scale", KS), ("k_scale_s", KSS),
+                    ("k_zero", KZ), ("k_zero_s", KZS),
+                    ("v_codes", VC), ("v_scale", VS), ("v_scale_s", VSS),
+                    ("v_zero", VZ), ("v_zero_s", VZS),
                     ("cos", COS), ("sin", SIN)):
         if not t.is_contiguous():
             raise RuntimeError(
@@ -1291,7 +1335,8 @@ def _decode_triton(
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
         try:
             _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL, LOGM,
+                q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
+                COS, SIN, SEL, LOGM,
                 VM, VMS, VANC,
                 out, wsum, wmax,
                 scaling,
@@ -1304,6 +1349,7 @@ def _decode_triton(
                 BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
                 BLOCK_W=BLOCK_W,
                 PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+                GROUP_K=gk, GROUP_V=gv,
                 GATED=gated, LOG2E=_LOG2E,
                 num_stages=num_stages,
             )

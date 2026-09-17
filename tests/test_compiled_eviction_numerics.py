@@ -16,15 +16,15 @@ codes were fit to is bit-identical to the grid every later dequant reads
 another.
 
 The damage is not uniform. For the int2 tier it is a code off by one level on
-elements that straddle a rounding boundary. For the gate cards it is worse:
-``sketch._q_up`` rounds **up** so that ``dequant >= x``, and that inequality is
-the only reason the gate's Cauchy–Schwarz score is an *upper* bound — the
+elements that straddle a rounding boundary. The same hazard runs through the
+gate cards, whose encoder takes the same round trip, and through the int2
+grid's own group scales, which are fp16 for the same reason the
 property the read gate uses to decide a window cannot matter. Against an
-un-narrowed scale the bound silently stops holding.
+codes are fit to them.
 
 These tests pin the fix (``cache._emulating_precision_casts``) at three levels:
 the flag is actually applied and actually scoped, the three quantisers are
-byte-identical under it, and ``_q_up``'s inequality survives.
+byte-identical under it.
 """
 
 from __future__ import annotations
@@ -54,12 +54,12 @@ def _cases():
 
 @pytest.fixture(scope="module")
 def compiled():
-    """The four quantisers, compiled exactly the way the eviction compiles."""
+    """The quantisers the eviction traces, compiled the way it compiles them."""
     return {
         name: _emulating_precision_casts(torch.compile(fn, dynamic=True))
         for name, fn in (("k", Q.quantize_key_windows),
                          ("v", Q.quantize_value_windows),
-                         ("sym", S._q_sym), ("up", S._q_up))
+                         ("sym", S._q_sym), ("grid", Q._quantize_grid))
     }
 
 
@@ -112,8 +112,10 @@ def test_int2_codes_are_byte_identical_under_inductor(compiled):
                             ("val", Q.quantize_value_windows)):
             pe, se, ze = eager(x)
             pc, sc, zc = compiled[tier[0]](x)
-            assert torch.equal(se, sc), f"{tier} scale, seed {seed}"
-            assert torch.equal(ze, zc), f"{tier} zero, seed {seed}"
+            assert torch.equal(se.q, sc.q), f"{tier} scale codes, seed {seed}"
+            assert torch.equal(se.s, sc.s), f"{tier} scale group, seed {seed}"
+            assert torch.equal(ze.q, zc.q), f"{tier} zero codes, seed {seed}"
+            assert torch.equal(ze.s, zc.s), f"{tier} zero group, seed {seed}"
             n = int((pe != pc).sum())
             assert n == 0, (
                 f"{tier} codes differ on {n}/{pe.numel()} packed bytes at seed "
@@ -127,7 +129,7 @@ def test_int2_codes_are_byte_identical_under_inductor(compiled):
 
 
 def test_gate_card_codes_are_byte_identical_under_inductor(compiled):
-    """``_q_sym`` / ``_q_up`` were never behind a graph break.
+    """``_q_sym`` was never behind a graph break.
 
     So unlike the int2 tier this is not a new exposure — every compiled eviction
     since the cards landed built them on the elided grid.
@@ -138,25 +140,21 @@ def test_gate_card_codes_are_byte_identical_under_inductor(compiled):
         cc, sc = compiled["sym"](f)
         assert torch.equal(se, sc) and torch.equal(ce, cc), f"_q_sym seed {seed}"
 
-        pos = f.abs()
-        ce, se = S._q_up(pos)
-        cc, sc = compiled["up"](pos)
-        assert torch.equal(se, sc) and torch.equal(ce, cc), f"_q_up seed {seed}"
 
+def test_the_grid_group_scale_survives_inductor(compiled):
+    """The int2 grid's own fp16 round trip, isolated.
 
-def test_the_gate_bound_still_bounds_under_inductor(compiled):
-    """``_q_up``'s guarantee, asserted directly rather than via byte identity.
-
-    ``dequant >= x`` is what makes the card's Cauchy–Schwarz score an upper
-    bound, and therefore what makes it safe for the read gate to skip a window
-    on a low score. The ``(1 + 2**-9)`` scale nudge in ``_q_up`` is sized for an
-    fp16 grid; fit against an un-narrowed one it is sized for the wrong grid and
-    the inequality fails — 115 elements in this sample, measured without the fix.
+    ``_quantize_grid`` fits a byte to an fp16 group scale, so it takes the same
+    ``fp32 -> fp16 -> fp32`` trip the tier quantisers do, one level down. A grid
+    that decodes differently compiled than eager is a cache whose int2 codes were
+    fit against a grid the reader will not reproduce — the same defect as the
+    tier's, on the values every one of its codes is multiplied by.
     """
     for seed, x in _cases():
-        pos = x.to(torch.float32).reshape(6, 8, 64).abs()
-        codes, scale = compiled["up"](pos)
-        under = int((S._dq_up(codes, scale) < pos).sum())
-        assert under == 0, (
-            f"seed {seed}: {under} elements dequantise BELOW the value they "
-            "encode, so the gate's upper bound is not an upper bound.")
+        v = x.to(torch.float32).reshape(6, 8, 64)
+        for signed, val in ((False, v.abs()), (True, v)):
+            ge = Q._quantize_grid(val, signed=signed)
+            gc = compiled["grid"](val, signed=signed)
+            assert torch.equal(ge.q, gc.q), f"grid codes, signed={signed}, seed {seed}"
+            assert torch.equal(ge.s, gc.s), f"group scale, signed={signed}, seed {seed}"
+            assert torch.equal(ge.decode(), gc.decode())

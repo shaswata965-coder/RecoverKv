@@ -45,9 +45,10 @@ loosens it, without iterating.
 
 Encoding, and what measurement decided
 --------------------------------------
-``mu`` and ``v`` are int8 with a per-(window, head) scale; ``t`` int8; ``eps``
-uint8. 280 B per head, 2240 B per window at ``H_kv=8, D=128, ws=8`` — 26.5% of
-``b_q`` (8448 B).
+``mu``, ``v`` and ``vbar`` are int8 with a per-(window, head) scale, and so is
+``t``. 400 B per head, 3200 B per window at ``H_kv=8, D=128, ws=8`` — a third of
+the 9632 B a carded window costs, and the largest single field in it now that
+the codes' grid is one byte per entry.
 
 Three encoding choices were measured on synthetic keys carrying massive-
 activation channels and one outlier token per window (``tests/test_sketch.py``
@@ -115,8 +116,9 @@ def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
     This number is LOAD-BEARING, not documentation: ``config.resolve`` adds it to
     ``bytes_per_q_window``, so a card field that is not counted here is a window
     the cache holds and the budget does not know about. At ``D=128, ws=8, H=8``
-    the card is 3200 B against the codes' 8448 — 38% of the Q tier. Unbudgeted,
-    that is a 38% overrun on the tier the memory claim is made about.
+    the card is 3200 B against the codes-plus-grid's 6432 — half the Q tier
+    again. Unbudgeted, that is a 50% overrun on the tier the memory claim is
+    made about.
     """
     return 3 * (head_dim + 2) + (window_size + 2)
 

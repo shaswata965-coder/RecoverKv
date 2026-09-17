@@ -245,7 +245,7 @@ def test_gate_selects_the_window_holding_the_true_argmax():
 
 
 def test_card_size_is_what_the_plan_is_costed_on():
-    assert sketch_bytes_per_head(128, 8) == 280               # 2240 B/window at H=8
+    assert sketch_bytes_per_head(128, 8) == 400               # 3200 B/window at H=8
     b_q = (8 * 128 * 8) // 2 + 4 * 8 * 128 + 4 * 8 * 8        # config.py resolve()
     assert abs(280 * 8 / b_q - 0.265) < 0.002
 

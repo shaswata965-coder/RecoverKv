@@ -49,7 +49,8 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
-from modules.quant.slots import QuantSlotTable, n_slots_for
+from modules.quant.quantizer import QGrid
+from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +311,7 @@ class _ReadOnlySlotTableView(QuantSlotTable):
         self.window_size = parent.window_size
         self.head_dim = parent.head_dim
         self.num_kv_heads = parent.num_kv_heads
-        for field in ("key_codes", "key_scale", "key_zero",
-                      "val_codes", "val_scale", "val_zero",
+        for field in ("key_codes", "val_codes", *GRID_FIELDS,
                       "slot_wid", "slot_active", "slot_pos"):
             setattr(self, field, getattr(parent, field)[r0:r0 + rows])
         self._row_base = (
@@ -1689,7 +1689,12 @@ class WindowedCache(_HFCacheBase):
         L = self.num_layers
         idx = store.table.active_order(n)                       # [R, n] slots
         kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)  # [R*n, …]
-        fields = [t.reshape(L, B, n, *t.shape[1:]) for t in (kc, ks, kz, vc, vs, vz)]
+
+        def by_layer(t: Tensor) -> Tensor:
+            return t.reshape(L, B, n, *t.shape[1:])
+
+        kc, vc = by_layer(kc), by_layer(vc)
+        ks, kz, vs, vz = (g.map(by_layer) for g in (ks, kz, vs, vz))
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -1705,14 +1710,17 @@ class WindowedCache(_HFCacheBase):
         joint_gate = self._gate_ctx(store, idx, n)
 
         key = (store.version, n, B)
-        kc, ks, kz, vc, vs, vz = fields
         for i in range(L):
             r0 = i * B
+            # `.map` and not `[i]`: a QGrid is a NamedTuple, so indexing it with
+            # an int takes its first FIELD, not its first layer.
             self._fused_ctx[i] = {
                 "qkey": key,
                 "qtier": {
-                    "k_codes": kc[i], "k_scale": ks[i], "k_zero": kz[i],
-                    "v_codes": vc[i], "v_scale": vs[i], "v_zero": vz[i],
+                    "k_codes": kc[i], "k_scale": ks.map(lambda t: t[i]),
+                    "k_zero": kz.map(lambda t: t[i]),
+                    "v_codes": vc[i], "v_scale": vs.map(lambda t: t[i]),
+                    "v_zero": vz.map(lambda t: t[i]),
                     "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
                     "window_size": ws,
                 },
@@ -1839,12 +1847,12 @@ class WindowedCache(_HFCacheBase):
         # (position-only) the kernel applies in registers.
         idx = store.table.active_order(n)                     # [B, n] slots
         kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
-        kc = kc.reshape(B, n, *kc.shape[1:])
-        ks = ks.reshape(B, n, *ks.shape[1:])
-        kz = kz.reshape(B, n, *kz.shape[1:])
-        vc = vc.reshape(B, n, *vc.shape[1:])
-        vs = vs.reshape(B, n, *vs.shape[1:])
-        vz = vz.reshape(B, n, *vz.shape[1:])
+
+        def by_row(t: Tensor) -> Tensor:
+            return t.reshape(B, n, *t.shape[1:])
+
+        kc, vc = by_row(kc), by_row(vc)
+        ks, kz, vs, vz = (g.map(by_row) for g in (ks, kz, vs, vz))
         qpos_flat = qpos.reshape(B, n * ws)
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32

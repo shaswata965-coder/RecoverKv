@@ -32,6 +32,7 @@ import triton.language as tl                              # noqa: E402
 from modules.windowed_cache import gate_kernel as gk      # noqa: E402
 from modules.windowed_cache import decode_kernel as dk    # noqa: E402
 from modules.windowed_cache.decode_kernel import window_tiling  # noqa: E402
+from modules.quant.quantizer import grid_group                # noqa: E402
 
 #: An A100. Any real target exercises the same front end; the arch only matters
 #: for codegen, which is not what is being checked.
@@ -46,12 +47,16 @@ def _compile(fn, ptrs, consts):
     tcompile(ASTSource(fn=fn, signature=sig, constexprs=consts), target=TARGET)
 
 
+#: The int2 grid is one byte per entry (u8 scale, i8 zero) against an fp16
+#: scale per group -- `*fp16` here would type-check a kernel nobody runs.
 _DECODE_PTRS = {
-    **{n: "*fp16" for n in ("Q", "KFP", "VFP", "KS", "KZ", "VS", "VZ",
-                            "COS", "SIN", "OUT")},
-    "KC": "*u8", "VC": "*u8", "SEL": "*i32", "VM": "*i8",
+    **{n: "*fp16" for n in ("Q", "KFP", "VFP", "COS", "SIN", "OUT",
+                            "KSS", "KZS", "VSS", "VZS", "VMS")},
+    **{n: "*u8" for n in ("KC", "VC", "KS", "VS")},
+    **{n: "*i8" for n in ("KZ", "VZ", "VM")},
+    "SEL": "*i32",
     "WSUM": "*fp32", "WMAX": "*fp32", "LOGM": "*fp32", "scale": "fp32",
-    "VMS": "*fp16", "VANC": "*fp32",
+    "VANC": "*fp32",
 }
 
 _GATE_PTRS = {
@@ -96,6 +101,7 @@ def test_the_fused_decode_kernel_compiles(gated, ws):
     _compile(dk._two_tier_decode_kernel, _DECODE_PTRS, dict(
         HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=4, BLOCK_NW=block_nw,
         BLOCK_T=block_t, BLOCK_W=16, PACK_K=max(ws // 4, 1), PACK_V=32,
+        GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
         GATED=gated))
 
 

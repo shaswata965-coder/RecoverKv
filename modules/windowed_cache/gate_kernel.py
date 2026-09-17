@@ -4,7 +4,7 @@ What it replaces
 ----------------
 Without the gate the decode step dequantizes every active int2 window to find
 out which ones mattered (design §8). This kernel reads each window's card --
-``mu``/``v`` int8 plus two tiny scalars, 280 B per head against a 8448 B window
+``mu``/``v`` int8 plus two tiny scalars, 400 B per head against a 6432 B window
 -- and emits the compacted slot list the Q-tier loop should actually visit, plus
 the log-mass estimate that every **skipped** window contributes to
 ``window_scores``.

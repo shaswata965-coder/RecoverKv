@@ -8,10 +8,11 @@ Numerics are pinned by the design and must not drift:
   default), clamp **before** the uint cast.
 - ``x̂ = q · scale + zero``.
 - Degenerate group (``mx == mn``): ``scale = 1`` ⇒ all codes 0 and ``x̂ = mn``.
-- **Scales and zeros are stored fp16 (pinned).** Both quantization and every
-  later dequant run against the *fp16-stored* scale/zero (not the fp32
-  intermediates), so the grid the codes were fit to is bit-identical to the
-  grid used at read. This is what makes a re-demotion an exact reactivation.
+- **Scales and zeros are stored one byte each** (:class:`QGrid`), against an
+  fp16 scale shared by 32 of them. Both quantization and every later dequant run
+  against the *stored, decoded* grid (not the fp32 intermediates), so the grid
+  the codes were fit to is bit-identical to the grid used at read. This is what
+  makes a re-demotion an exact reactivation.
 
 Granularity (design.md §2):
 
@@ -25,9 +26,17 @@ Granularity (design.md §2):
 Crumb packing (design.md §2): four int2 codes that share a scale go in one
 byte; code index ``j`` occupies bits ``[2·(j mod 4), +2)`` (so index 0 is the
 lowest pair). ``window_size`` must be a multiple of 4 (head_dim always is), so
-there is never a tail to pad. At int2 the fp16 scale/zero grid is fixed
-overhead independent of the bit-width, so it becomes the *dominant* Q-window
-cost — see the budget resolver (config.py) for the byte accounting.
+there is never a tail to pad.
+
+**The grid is one byte per entry, not two.** At int2 the scale/zero grid is
+fixed overhead independent of the bit-width, so an fp16 grid was 48.5% of a
+window's codes-plus-grid — two bytes of precision wrapping a two-bit code. It is
+now int8 against an fp16 scale shared by :data:`GRID_GROUP` entries, which is
+:func:`grid_bytes_per_head` bytes instead of ``4·axis``: 272 B/head against
+512 at ``D=128``, and a Q window 6432 B instead of 8448 before its card. See
+:class:`QGrid` for what that cost in accuracy and why the sharing is grouped.
+The budget resolver (config.py) prices a window through
+:func:`bytes_per_q_window`, so the format and its byte count cannot drift apart.
 
 All functions here operate on a **single window** for **one row** (B = 1 in
 v1) — shapes carry no batch axis. Keys/values come in token-major
@@ -36,13 +45,23 @@ v1) — shapes carry no batch axis. Keys/values come in token-major
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import NamedTuple, Tuple
 
 import torch
 from torch import Tensor
 
 _LEVELS = 3.0  # int2 asymmetric: codes in [0, 3]
 _CODES_PER_BYTE = 4  # int2: 4 crumbs per uint8
+_TINY = torch.finfo(torch.float32).tiny
+#: Smallest positive fp16 (a subnormal, 2**-24). A group scale is clamped up to
+#: it before the cast: dividing a group's amax by 255 can underflow fp16 where
+#: the amax itself is perfectly representable, and a shared scale of zero decodes
+#: the whole group's grid to zero, which the fit then divides by.
+_FP16_MIN_POS = 2.0 ** -24
+
+#: Grid entries sharing one fp16 scale. Measured, not chosen for roundness --
+#: see :class:`QGrid`. An axis shorter than this shares a single scale.
+GRID_GROUP = 32
 
 
 # Whether the quant range-reductions may be traced into a torch.compile graph.
@@ -115,12 +134,146 @@ else:  # pragma: no cover - torch-version dependent
 
 
 # ---------------------------------------------------------------------------
+# The stored grid: one byte per entry, an fp16 scale per GRID_GROUP of them
+# ---------------------------------------------------------------------------
+
+
+def grid_group(axis_len: int) -> int:
+    """Entries sharing one fp16 scale along a grid axis of ``axis_len``.
+
+    ``GRID_GROUP``, or the whole axis when it is shorter (the value grid's axis
+    is ``window_size``, which is 8 at the shipped operating point). A longer axis
+    must be a multiple of ``GRID_GROUP``: a ragged tail would need a mask on
+    every read, including inside the decode kernel's inner loop.
+    """
+    if axis_len <= GRID_GROUP:
+        return axis_len
+    if axis_len % GRID_GROUP:
+        raise ValueError(
+            f"a grid axis of {axis_len} must be a multiple of GRID_GROUP="
+            f"{GRID_GROUP} (or shorter than it); a ragged tail would need a "
+            "masked load in the decode kernel's inner loop."
+        )
+    return GRID_GROUP
+
+
+def grid_bytes_per_head(axis_len: int) -> int:
+    """Bytes one head's ``(scale, zero)`` grid costs over ``axis_len`` entries.
+
+    Two one-byte codes per entry plus the two fp16 scales each group shares.
+    LOAD-BEARING: :func:`bytes_per_q_window` prices a window with it and the
+    budget resolver prices the tier with that, so the format and the memory
+    claim cannot drift apart.
+    """
+    return 2 * axis_len + 4 * (axis_len // grid_group(axis_len))
+
+
+def bytes_per_q_window(num_kv_heads: int, head_dim: int, window_size: int) -> int:
+    """Bytes one int2 window costs: codes + both grids, **excluding its card**.
+
+    The card is priced by :func:`modules.quant.sketch.sketch_bytes_per_head`;
+    the caller adds it when the gate is live. At ``H=8, D=128, ws=8`` this is
+    6432 B against the fp16 grid's 8448.
+    """
+    codes = (head_dim * window_size) // 2          # K and V, 2 bits per element
+    return num_kv_heads * (codes + grid_bytes_per_head(head_dim)
+                           + grid_bytes_per_head(window_size))
+
+
+class QGrid(NamedTuple):
+    """An affine grid field (``scale`` or ``zero``) as stored: codes + scales.
+
+    ``q`` holds one byte per entry -- uint8 in ``[1, 255]`` for ``scale``, which
+    is non-negative and must never decode to zero, int8 for ``zero``, which is an
+    absolute offset and signed. ``s`` holds the fp16 scale that
+    :func:`grid_group` consecutive codes share, so ``s`` has the same shape as
+    ``q`` with its last axis divided by the group.
+
+    Why one byte, and why grouped
+    -----------------------------
+    An fp16 grid was 48.5% of a window's codes-plus-grid. Narrowing it is nearly
+    free because design §2 pins the codes to the *stored* grid: a rounded scale
+    just repositions the four int2 levels and the codes re-fit against them, so
+    the int2 error (~13% on keys) swamps the grid's rounding.
+
+    Measured over 12 seeds on keys with massive-activation channels and one hot
+    token per window (``tests/test_quant_grid.py`` pins these):
+
+    ======================  ===========  ===========  ==========
+    grid                    K rel err    q.k rel err  B/head (D=128)
+    ======================  ===========  ===========  ==========
+    fp16 (was)              0.13348      0.13541      512
+    int8, one scale/head    0.13370      0.13568      260
+    **int8, groups of 32**  **0.13368**  **0.13562**  **272**
+    ======================  ===========  ===========  ==========
+
+    The grouping is what makes it safe rather than merely cheap. A single scale
+    per head is an aggregate +0.2% and hides a per-channel failure: on keys whose
+    channel gains span 1000x -- which is what a massive-activation channel *is*
+    -- the worst channel's own reconstruction error goes 0.305 -> 1.082, i.e.
+    that channel decodes to noise while the Frobenius norm, dominated by the big
+    channels, moves by +0.14% and says nothing. Groups of 32 put it back at
+    0.306, fp16's own figure, for 12 B/head. Aggregate error is the wrong
+    instrument for a shared exponent, so the choice is made on the worst channel.
+
+    fp8 was measured too (GATE_REGRESSION §5: e4m3 +1.6%, e5m2 +4.5%) and is
+    worse on both counts, and sm80 has no hardware convert for it.
+    """
+
+    q: Tensor      # [..., axis]            uint8 (scale) / int8 (zero)
+    s: Tensor      # [..., axis // group]   fp16
+
+    @property
+    def group(self) -> int:
+        """Entries per shared scale."""
+        return self.q.shape[-1] // self.s.shape[-1]
+
+    def decode(self) -> Tensor:
+        """The fp32 grid a reader sees. **This** is what codes are fit to."""
+        lead = self.q.shape[:-1]
+        wide = self.q.to(torch.float32).reshape(*lead, self.s.shape[-1], -1)
+        return (wide * self.s.to(torch.float32).unsqueeze(-1)).reshape(self.q.shape)
+
+    def reshape(self, *shape: int) -> "QGrid":
+        """Reshape with the grid axis last; ``s`` follows with its own last axis."""
+        return QGrid(self.q.reshape(*shape), self.s.reshape(*shape[:-1], -1))
+
+    def map(self, fn) -> "QGrid":
+        """Apply one tensor op to both halves — a view, a slice, a layer split.
+
+        Use this rather than indexing: a ``QGrid`` is a ``NamedTuple``, so
+        ``grid[0]`` silently returns ``q`` instead of the first row.
+        """
+        return QGrid(fn(self.q), fn(self.s))
+
+
+def _quantize_grid(x: Tensor, *, signed: bool) -> QGrid:
+    """Encode one grid field. Codes are fit to the **fp16-stored** group scale.
+
+    ``signed`` picks the field: ``zero`` is an offset and takes int8 symmetric;
+    ``scale`` is non-negative and takes the full uint8 range, clamped at 1 so a
+    decoded scale is never zero (the fit divides by it).
+    """
+    g = grid_group(x.shape[-1])
+    xg = x.reshape(*x.shape[:-1], -1, g)
+    levels = 127.0 if signed else 255.0
+    amax = (xg.abs() if signed else xg).amax(dim=-1, keepdim=True)
+    s = torch.where(amax > 0, amax / levels, torch.ones_like(amax))
+    s16 = s.clamp_min(_FP16_MIN_POS).to(torch.float16)
+    s32 = s16.to(torch.float32).clamp_min(_TINY)
+    q = torch.round(xg / s32)
+    q = q.clamp_(-levels, levels) if signed else q.clamp_(1.0, levels)
+    codes = q.to(torch.int8 if signed else torch.uint8).reshape(x.shape)
+    return QGrid(codes, s16.squeeze(-1))
+
+
+# ---------------------------------------------------------------------------
 # Core affine quant / dequant (grouped along one axis)
 # ---------------------------------------------------------------------------
 
 
 @_compile_disable
-def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]:
+def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Affine asymmetric int2 quantize ``x`` grouped along ``group_dim``.
 
     The quant group is the slice along ``group_dim``: mx/mn are reduced over
@@ -131,9 +284,9 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     codes : uint8 Tensor
         Same shape as ``x``; values in ``[0, 3]`` (unpacked, one code per
         element).
-    scale, zero : fp16 Tensor
-        Shape of ``x`` with ``group_dim`` reduced away (kept, not squeezed —
-        callers squeeze as needed). Pinned fp16 grid.
+    scale, zero : :class:`QGrid`
+        Shape of ``x`` with ``group_dim`` reduced **away** (squeezed, so the
+        grid axis is last and :class:`QGrid`'s sharing applies to it).
     """
     x32 = x.to(torch.float32)
     mx = x32.amax(dim=group_dim, keepdim=True)
@@ -146,12 +299,15 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     scale = torch.where(degenerate, torch.ones_like(scale), scale)
     zero = mn
 
-    # Pin the grid in fp16, then quantize against the fp16 values (upcast for
-    # the arithmetic) so the fit grid == the read grid, bit for bit.
-    scale16 = scale.to(torch.float16)
-    zero16 = zero.to(torch.float16)
-    scale_grid = scale16.to(torch.float32)
-    zero_grid = zero16.to(torch.float32)
+    # Encode the grid, then quantize against the DECODED grid, so the grid the
+    # codes were fit to is the grid every later dequant reads, bit for bit.
+    # `_quantize_grid` takes the grid axis last, which is what squeezing
+    # `group_dim` leaves: keys reduce over tokens and share over channels,
+    # values reduce over channels and share over tokens.
+    scale_g = _quantize_grid(scale.squeeze(group_dim), signed=False)
+    zero_g = _quantize_grid(zero.squeeze(group_dim), signed=True)
+    scale_grid = scale_g.decode().unsqueeze(group_dim)
+    zero_grid = zero_g.decode().unsqueeze(group_dim)
 
     # In place, deliberately. The out-of-place form
     #     q = torch.round((x32 - zero_grid) / scale_grid)
@@ -172,20 +328,18 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, Tensor, Tensor]
     q = q.clamp_(0.0, _LEVELS)                         # clamp BEFORE uint cast
     codes = q.to(torch.uint8)
 
-    return codes, scale16, zero16
+    return codes, scale_g, zero_g
 
 
 def _affine_dequantize(
-    codes: Tensor, scale16: Tensor, zero16: Tensor, out_dtype: torch.dtype
+    codes: Tensor, scale: Tensor, zero: Tensor, out_dtype: torch.dtype
 ) -> Tensor:
     """Inverse of :func:`_affine_quantize`.
 
-    ``scale16`` / ``zero16`` broadcast against ``codes`` along the (already
-    reduced) group axis. Arithmetic upcasts the fp16 grid to fp32, then casts
-    the result to ``out_dtype``.
+    ``scale`` / ``zero`` are **decoded** fp32 grids (``QGrid.decode()``), already
+    broadcast against ``codes`` along the reduced group axis by the caller —
+    which is the one place that knows where that axis sits.
     """
-    scale = scale16.to(torch.float32)
-    zero = zero16.to(torch.float32)
     # Same reasoning as the quantiser: `codes.to(float32) * scale + zero` holds
     # three fp32 buffers at its peak. The upcast allocates a fresh tensor
     # (codes is uint8), so chaining in place onto it is safe and mutates nothing
@@ -240,7 +394,7 @@ def unpack_crumbs_last(packed: Tensor, n: int) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Quantize one window's keys.
 
     Parameters
@@ -253,8 +407,9 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     -------
     packed : uint8 Tensor
         Shape ``[H_kv, D, window // 4]`` — channel-major, 4 tokens per byte.
-    scale, zero : fp16 Tensor
-        Shape ``[H_kv, D]`` — one grid per ``(head, channel)``.
+    scale, zero : :class:`QGrid`
+        Codes ``[H_kv, D]`` — one grid entry per ``(head, channel)`` — over
+        ``[H_kv, D // group]`` shared fp16 scales.
     """
     if k_win.dim() != 3:
         raise ValueError(f"k_win must be [H_kv, window, D], got {tuple(k_win.shape)}")
@@ -265,9 +420,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         )
 
     # Quant group = token axis (dim 1) ⇒ scale/zero per (head, channel).
-    codes, scale16, zero16 = _affine_quantize(k_win, group_dim=1)
-    scale = scale16.squeeze(1)  # [H_kv, D]
-    zero = zero16.squeeze(1)    # [H_kv, D]
+    codes, scale, zero = _affine_quantize(k_win, group_dim=1)
 
     # Channel-major, then pack along the token axis (now last).
     codes_cm = codes.transpose(1, 2).contiguous()  # [H_kv, D, window]
@@ -275,7 +428,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     return packed, scale, zero
 
 
-def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Batched :func:`quantize_key_window` over a leading window axis.
 
     Bit-identical to calling the singular form per window: the quant group is
@@ -293,7 +446,7 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     Returns
     -------
     packed : uint8 ``[N, H_kv, D, window // 4]`` — channel-major.
-    scale, zero : fp16 ``[N, H_kv, D]``.
+    scale, zero : :class:`QGrid`, codes ``[N, H_kv, D]``.
     """
     if k_wins.dim() != 4:
         raise ValueError(
@@ -306,16 +459,14 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         )
 
     # Quant group = token axis (dim 2 with the batch axis) ⇒ grid per (N, head, channel).
-    codes, scale16, zero16 = _affine_quantize(k_wins, group_dim=2)
-    scale = scale16.squeeze(2)  # [N, H_kv, D]
-    zero = zero16.squeeze(2)    # [N, H_kv, D]
+    codes, scale, zero = _affine_quantize(k_wins, group_dim=2)
 
     codes_cm = codes.transpose(2, 3).contiguous()  # [N, H_kv, D, window]
     packed = pack_crumbs_last(codes_cm)            # [N, H_kv, D, window // 4]
     return packed, scale, zero
 
 
-def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Batched :func:`quantize_value_window` over a leading window axis.
 
     Bit-identical to the singular form applied per window — see
@@ -329,7 +480,7 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     Returns
     -------
     packed : uint8 ``[N, H_kv, window, D // 4]`` — token-major.
-    scale, zero : fp16 ``[N, H_kv, window]``.
+    scale, zero : :class:`QGrid`, codes ``[N, H_kv, window]``.
     """
     if v_wins.dim() != 4:
         raise ValueError(
@@ -342,9 +493,7 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         )
 
     # Quant group = channel axis ⇒ grid per (N, head, token).
-    codes, scale16, zero16 = _affine_quantize(v_wins, group_dim=3)
-    scale = scale16.squeeze(3)  # [N, H_kv, window]
-    zero = zero16.squeeze(3)    # [N, H_kv, window]
+    codes, scale, zero = _affine_quantize(v_wins, group_dim=3)
 
     packed = pack_crumbs_last(codes.contiguous())  # [N, H_kv, window, D // 4]
     return packed, scale, zero
@@ -352,8 +501,8 @@ def quantize_value_windows(v_wins: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
 def dequantize_key_window(
     packed: Tensor,
-    scale: Tensor,
-    zero: Tensor,
+    scale: "QGrid",
+    zero: "QGrid",
     window: int,
     out_dtype: torch.dtype = torch.float16,
 ) -> Tensor:
@@ -364,15 +513,15 @@ def dequantize_key_window(
     """
     codes_cm = unpack_crumbs_last(packed, window)           # [H_kv, D, window]
     codes = codes_cm.transpose(1, 2).contiguous()           # [H_kv, window, D]
-    scale16 = scale.unsqueeze(1)                            # [H_kv, 1, D]
-    zero16 = zero.unsqueeze(1)                              # [H_kv, 1, D]
-    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+    return _affine_dequantize(
+        codes, scale.decode().unsqueeze(1), zero.decode().unsqueeze(1), out_dtype
+    )
 
 
 def dequantize_key_windows(
     packed: Tensor,
-    scale: Tensor,
-    zero: Tensor,
+    scale: "QGrid",
+    zero: "QGrid",
     window: int,
     out_dtype: torch.dtype = torch.float16,
 ) -> Tensor:
@@ -386,7 +535,7 @@ def dequantize_key_windows(
     Parameters
     ----------
     packed : uint8 ``[N, H_kv, D, window // 4]`` — channel-major, 4 tokens/byte.
-    scale, zero : fp16 ``[N, H_kv, D]`` — one grid per ``(window, head, channel)``.
+    scale, zero : :class:`QGrid` — one grid entry per ``(window, head, channel)``.
     window : int — original (unpacked) token count.
 
     Returns
@@ -395,9 +544,9 @@ def dequantize_key_windows(
     """
     codes_cm = unpack_crumbs_last(packed, window)           # [N, H_kv, D, window]
     codes = codes_cm.transpose(2, 3).contiguous()           # [N, H_kv, window, D]
-    scale16 = scale.unsqueeze(2)                            # [N, H_kv, 1, D]
-    zero16 = zero.unsqueeze(2)                              # [N, H_kv, 1, D]
-    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+    return _affine_dequantize(
+        codes, scale.decode().unsqueeze(2), zero.decode().unsqueeze(2), out_dtype
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +554,7 @@ def dequantize_key_windows(
 # ---------------------------------------------------------------------------
 
 
-def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Quantize one window's values.
 
     Parameters
@@ -417,8 +566,8 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
     -------
     packed : uint8 Tensor
         Shape ``[H_kv, window, D // 4]`` — token-major, 4 channels per byte.
-    scale, zero : fp16 Tensor
-        Shape ``[H_kv, window]`` — one grid per ``(head, token)``.
+    scale, zero : :class:`QGrid`
+        Codes ``[H_kv, window]`` — one grid entry per ``(head, token)``.
     """
     if v_win.dim() != 3:
         raise ValueError(f"v_win must be [H_kv, window, D], got {tuple(v_win.shape)}")
@@ -429,9 +578,7 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         )
 
     # Quant group = channel axis (dim 2) ⇒ scale/zero per (head, token).
-    codes, scale16, zero16 = _affine_quantize(v_win, group_dim=2)
-    scale = scale16.squeeze(2)  # [H_kv, window]
-    zero = zero16.squeeze(2)    # [H_kv, window]
+    codes, scale, zero = _affine_quantize(v_win, group_dim=2)
 
     # Token-major already; pack along the channel axis (last).
     packed = pack_crumbs_last(codes.contiguous())  # [H_kv, window, D // 4]
@@ -440,8 +587,8 @@ def quantize_value_window(v_win: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
 
 def dequantize_value_window(
     packed: Tensor,
-    scale: Tensor,
-    zero: Tensor,
+    scale: "QGrid",
+    zero: "QGrid",
     head_dim: int,
     out_dtype: torch.dtype = torch.float16,
 ) -> Tensor:
@@ -450,15 +597,15 @@ def dequantize_value_window(
     Returns token-major ``[H_kv, window, D]`` in ``out_dtype``.
     """
     codes = unpack_crumbs_last(packed, head_dim)   # [H_kv, window, D]
-    scale16 = scale.unsqueeze(2)                   # [H_kv, window, 1]
-    zero16 = zero.unsqueeze(2)                     # [H_kv, window, 1]
-    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+    return _affine_dequantize(
+        codes, scale.decode().unsqueeze(2), zero.decode().unsqueeze(2), out_dtype
+    )
 
 
 def dequantize_value_windows(
     packed: Tensor,
-    scale: Tensor,
-    zero: Tensor,
+    scale: "QGrid",
+    zero: "QGrid",
     head_dim: int,
     out_dtype: torch.dtype = torch.float16,
 ) -> Tensor:
@@ -467,7 +614,7 @@ def dequantize_value_windows(
     Parameters
     ----------
     packed : uint8 ``[N, H_kv, window, D // 4]`` — token-major, 4 channels/byte.
-    scale, zero : fp16 ``[N, H_kv, window]`` — one grid per ``(window, head, token)``.
+    scale, zero : :class:`QGrid` — one grid entry per ``(window, head, token)``.
     head_dim : int — original (unpacked) channel count.
 
     Returns
@@ -475,6 +622,6 @@ def dequantize_value_windows(
     ``[N, H_kv, window, D]`` token-major, in ``out_dtype``.
     """
     codes = unpack_crumbs_last(packed, head_dim)   # [N, H_kv, window, D]
-    scale16 = scale.unsqueeze(3)                   # [N, H_kv, window, 1]
-    zero16 = zero.unsqueeze(3)                     # [N, H_kv, window, 1]
-    return _affine_dequantize(codes, scale16, zero16, out_dtype)
+    return _affine_dequantize(
+        codes, scale.decode().unsqueeze(3), zero.decode().unsqueeze(3), out_dtype
+    )

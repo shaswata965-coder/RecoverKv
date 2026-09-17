@@ -38,6 +38,7 @@ import os
 import pytest
 import torch
 
+from modules.quant.slots import GRID_FIELDS
 from modules.windowed_cache.cache import WindowedCache
 from modules.windowed_cache.config import WindowedCacheConfig
 
@@ -169,11 +170,8 @@ def _snapshot(cache, num_layers):
                 "slot_active": t.slot_active.clone(),
                 "slot_pos": t.slot_pos.clone(),
                 "key_codes": t.key_codes.clone(),
-                "key_scale": t.key_scale.clone(),
-                "key_zero": t.key_zero.clone(),
                 "val_codes": t.val_codes.clone(),
-                "val_scale": t.val_scale.clone(),
-                "val_zero": t.val_zero.clone(),
+                **{f: getattr(t, f).clone() for f in GRID_FIELDS},
             })
         out.append(rec)
     return out

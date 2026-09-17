@@ -197,7 +197,7 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
 
     # 1. Gate: score every window from its card, keep the top `n_sel`. One extra
-    #    launch reading 280 B/head/window, against the 8448 B/window it decides
+    #    launch reading 400 B/head/window, against the 6432 B/window it decides
     #    not to read. `sel` is an INDIRECTION into the tier the cache already
     #    gathered, not a re-gather — see `_two_tier_decode_kernel`'s GATED block.
     #    Indexed, not `.get`: a missing key would run ungated and correct, i.e. a
