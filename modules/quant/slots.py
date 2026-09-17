@@ -46,6 +46,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
+from .compact import stable_partition
 from .quantizer import QGrid, grid_group
 
 FREE = -1
@@ -269,9 +270,9 @@ class QuantSlotTable:
         ``j < n_free[row]`` are guaranteed free; the bound in
         :func:`n_slots_for` guarantees every **valid** lane is.
         """
-        is_free = self.slot_wid == FREE
-        order = torch.argsort(~is_free, dim=1, stable=True)   # free slots first
-        return order[:, :n]
+        # Free slots first, in slot order -- a partition, not a sort
+        # (`compact.stable_partition` says why that distinction is worth code).
+        return stable_partition(self.slot_wid == FREE)[:, :n]
 
     def write(
         self,

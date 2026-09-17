@@ -110,6 +110,55 @@ def test_compiled_eviction_is_a_small_number_of_graphs():
     )
 
 
+def test_the_eviction_lowers_to_fused_kernels_and_not_to_aten_calls():
+    """Zero breaks is necessary, not sufficient: count what Inductor EMITTED.
+
+    A body can trace end to end and still lower to a string of extern ATen
+    calls, which is the failure the GPU profile of 2026-09-16 actually showed —
+    ``ours: compiled evict`` at 0.000 ms while the eviction ran as
+    ``elementwise_kernel`` with fractional launch counts. The break count could
+    not have caught that; this can, because it reads the generated wrapper.
+
+    Two numbers, both floors rather than targets:
+
+    * **fused kernels > 0** — the quantiser's round/clamp/div chain, the gather
+      that feeds it and the scatter that consumes it are in compiled kernels.
+    * **extern ops** — ``sort``, ``searchsorted`` and ``cumsum`` have no Inductor
+      lowering on this backend, and fusion cannot cross them. The cap is a
+      regression guard: four compactions were expressed as sorts and are now
+      cumsums (``modules/quant/compact.py``), which took ``aten.sort`` in this
+      cycle from 21 calls to 6. Re-introducing one would push this over.
+    """
+    import re
+
+    from torch._inductor.utils import run_and_get_code
+
+    dynamo.reset()
+    _res, codes = run_and_get_code(_run_decode_across_eviction,
+                                   compile_backend="inductor")
+    fused = sum(len(set(re.findall(r"^(cpp_fused[\w]*)\s*=", c, re.M))) for c in codes)
+    extern = [op for c in codes
+              for op in re.findall(r"torch\.ops\.(aten\.[\w.]+)", c)]
+    assert fused > 0, (
+        "Inductor emitted no fused kernels for the eviction: it compiled and "
+        "lowered everything to extern calls, which is the 2026-09-16 profile's "
+        "finding with the graph breaks removed."
+    )
+    kinds = {op.split(".")[1] for op in extern}
+    assert kinds <= {"sort", "searchsorted", "cumsum"}, (
+        f"a new op fell out of the fused region: {sorted(kinds)}. Everything "
+        "pointwise, every gather and every scatter has a lowering; an extern "
+        "call here is either a new unlowerable op or one used where a lowerable "
+        "one would do (see modules/quant/compact.py for the last four)."
+    )
+    n_sort = sum(1 for op in extern if op.startswith("sort"))
+    assert n_sort <= 8, (
+        f"{n_sort} extern sort calls in the compiled eviction, up from 6. A "
+        "sort is never lowered, so each one splits the fused region around it; "
+        "a compaction expressed as a sort is the usual cause."
+    )
+
+
 def test_tracing_guard_is_off_in_eager():
     """The aliasing guards are skipped **only** while Dynamo traces.
 

@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
+from modules.quant.compact import stable_partition
+
 if TYPE_CHECKING:
     from .config import ResolvedConfig
 
@@ -293,15 +295,17 @@ class EvictionPolicy:
         fp_sel = order[:, :k_fp]
         q_sel = order[:, k_fp:k_fp + n_q]
 
-        ev_idx = torch.cat([fp_sel, q_sel], dim=-1)
-        ev_tier = torch.cat([
-            torch.zeros(B, k_fp, device=device, dtype=torch.long),
-            torch.ones(B, n_q, device=device, dtype=torch.long),
-        ], dim=-1)
-        # Sort the retained evictable windows chronologically (by merged index).
-        perm = torch.argsort(ev_idx, dim=-1)
-        ev_idx = torch.gather(ev_idx, 1, perm)
-        ev_tier = torch.gather(ev_tier, 1, perm)
+        # Chronological order over the retained evictable windows. Their SET is
+        # what the ranking decided; their order is just ascending merged index,
+        # so this is a compaction of a mask rather than a sort of the picks --
+        # the same result, one scan instead of a sort over the widest tensor in
+        # the eviction (`modules/quant/compact.py`).
+        keep = torch.zeros(B, evictable_w, device=device, dtype=torch.bool)
+        keep.scatter_(1, torch.cat([fp_sel, q_sel], dim=-1), True)
+        tier_of = torch.zeros(B, evictable_w, device=device, dtype=torch.long)
+        tier_of.scatter_(1, q_sel, 1)
+        ev_idx = stable_partition(keep)[:, :k_fp + n_q]
+        ev_tier = torch.gather(tier_of, 1, ev_idx)
 
         retained = torch.cat([ev_idx, local_idx], dim=-1)
         tier = torch.cat([ev_tier, local_tier], dim=-1)
@@ -436,9 +440,8 @@ class EvictionPolicy:
                 self.num_sink_tokens + W_retained * self.window_size - oob + tail
             )
 
-        # Gather only valid indices: sort valid-first via the mask, take prefix
-        # argsort of ~mask (False=0 sorts before True=1) gives valid-idx-first order
-        order = torch.argsort(~valid_mask, dim=1, stable=True)  # valid first
+        # Gather only valid indices: partition valid-first, take the prefix.
+        order = stable_partition(valid_mask)                    # valid first
         all_idx = torch.gather(all_idx, 1, order)[:, :min_valid]
 
         return all_idx

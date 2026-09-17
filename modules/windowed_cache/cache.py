@@ -49,6 +49,7 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
+from modules.quant.compact import stable_partition
 from modules.quant.quantizer import QGrid
 from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
@@ -2213,12 +2214,12 @@ class WindowedCache(_HFCacheBase):
 
         # --- fp window order: retained-fp windows, ascending id -------------
         # `wids` is already ascending (the merged axis is chronological), so
-        # pushing the Q-tier picks to a sentinel and sorting compacts the fp
-        # picks to the front, still ascending. Everything the fp rebuild needs
-        # is then gathered onto that same axis.
-        sentinel = torch.iinfo(torch.long).max
-        fp_key = torch.where(is_q_new, torch.full_like(wids, sentinel), wids)
-        take = torch.argsort(fp_key, dim=1)[:, :n_fp]                  # [B, n_fp]
+        # compacting the non-Q picks to the front keeps them ascending, and
+        # everything the fp rebuild needs is gathered onto that same axis. This
+        # used to push the Q picks to a sentinel and sort; the sentinel existed
+        # only to express "these go last", which is what a partition says
+        # directly, and the sort was the eviction's widest unfusable op.
+        take = stable_partition(~is_q_new)[:, :n_fp]                   # [B, n_fp]
         fp_wids = torch.gather(wids, 1, take)
         fp_prom = torch.gather(promote, 1, take)
         fp_slot = torch.gather(slot_of, 1, take)

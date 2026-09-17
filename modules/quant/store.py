@@ -40,6 +40,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from .compact import stable_partition
 from .quantizer import (
     QGrid,
     dequantize_key_windows,
@@ -465,11 +466,11 @@ class QuantizedStore:
 
         B, H, S, D = keep.shape[0], self.num_kv_heads, self.window_size, self.head_dim
         n_sel = int(keep[0, 0].sum())
-        # Rank within each head, descending on the mask: the selected columns come
-        # first, so a fixed-width slice takes exactly them. argsort of ~keep is
-        # stable, so column order stays ascending-by-id within the selection —
-        # which is what compute_score_meta_gated relies on.
-        pick = torch.argsort(~keep, dim=-1, stable=True)[..., :n_sel]   # [B,H,n_sel]
+        # Rank within each head: the selected columns come first, so a
+        # fixed-width slice takes exactly them. The partition is stable, so
+        # column order stays ascending-by-id within the selection — which is
+        # what compute_score_meta_gated relies on.
+        pick = stable_partition(keep)[..., :n_sel]                      # [B,H,n_sel]
         sel = torch.gather(slots.unsqueeze(1).expand(B, H, slots.shape[1]), 2, pick)
 
         t = self.table
