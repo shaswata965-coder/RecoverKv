@@ -20,7 +20,7 @@ into three bands:
 |---|---|---|
 | sink + local | fp16, never evictable | first `num_sink` tokens, last `local` tokens |
 | **fp tier** | fp16, exact | the top `top_k_fp` evictable windows by score |
-| **int2 tier** | 2-bit codes + a grid | the next `N_q` windows |
+| **int2 tier** | 2-bit codes + a one-byte grid | the next `N_q` windows |
 | dropped | — | everything below |
 
 `quant_ratio` (`q`) splits the evictable budget between the two tiers.
@@ -50,7 +50,9 @@ vbar = mean of the window's values
 `mu`, `v`, `t` and `vbar` are int8 against a per-(window, head) scale, and `mu` /
 `vbar` are stored as residuals from a frozen per-(layer, head) anchor — massive
 activation channels are near-identical across windows, so anchoring cuts `mu`
-error 17×. 400 B/head, 3200 B/window at `H_kv=8`.
+error 17×. 400 B/head, 3200 B/window at `H_kv=8` — a third of what a carded
+window costs, and the largest single field in it now that the grid is one byte
+per entry.
 
 **A centroid alone does not work as the selector.** `exp` is convex, so a mean
 always understates a window's mass and understates it most when the window holds
@@ -131,20 +133,50 @@ it has to be closed by issuing fewer launches, not by recording them.
 ## 3. Challenges, and what each one cost
 
 **The budget did not count the card.** `bytes_per_q_window` counted codes and
-scales only, so every reported `cache_budget` understated what was held by 3200 B
-against the codes' 8448 — 38% on the exact tier the memory claim is about. Fixed;
-at budget 0.50 / q=0.70 the honest resolve is `N_q=518`, not 715. `resolve` now
-also spends the remainder (two floor divisions were leaving a window of each tier
-unbought) and *enforces* it: the leftover must be too small to buy another
-window, or it raises.
+grid only, so every reported `cache_budget` understated what was held by 3200 B
+against the codes-plus-grid's 8448 — 38% on the exact tier the memory claim is
+about. Fixed; at budget 0.50 / q=0.70 the honest resolve was `N_q=518`, not 715.
+`resolve` now also spends the remainder (two floor divisions were leaving a
+window of each tier unbought) and *enforces* it: the leftover must be too small
+to buy another window, or it raises.
+
+Read that together with the utilisation figures, because the two look like they
+contradict each other and do not. `budget_utilisation` was ~0.99 under `bytes`
+and ~0.69 under `tokens` *before* this fix and still is after it. That number
+was always a statement about the two modes' semantics — `bytes` spends the
+allowance, `tokens` pins the window count and lets the bytes fall — and it was
+computed with a meter that did not know about the card. Under `bytes` the
+resolver spent to 99% **of an under-counted price**, so the cache really held
+~1.18–1.26x its allowance; under `tokens` the count is pinned, so the same
+missing 3200 B could not buy anything and showed up only as under-reporting
+(0.638 reported against 0.686 real). Same defect, opposite symptom, and only one
+of the two was an overspend.
+
+**The grid was two bytes of precision around a two-bit code.** Fixed overhead
+does not shrink with the bit-width, so an fp16 scale/zero grid was 48.5% of a
+window's codes-plus-grid. It is now one byte per entry against an fp16 scale
+shared by 32 of them:
+
+| | codes | grid | card | window | `N_q` at 0.50 / q=0.70 |
+|---|---|---|---|---|---|
+| fp16 grid | 4096 | 4352 | 3200 | 11648 | 518 |
+| **one-byte grid** | 4096 | **2336** | 3200 | **9632** | **627** |
+
+**+21% more retained context at the same byte budget**, for +0.2% reconstruction
+error — near-free because the codes are fit to the *stored* grid, so a rounded
+scale just repositions the four int2 levels and the codes re-fit. The sharing is
+grouped rather than per-head because aggregate error cannot see what one scale
+per head does to a massive-activation channel: on keys whose gains span 1000x it
+takes the worst channel from 0.31 to 1.08 relative error while the Frobenius norm
+moves 0.14%. Groups of 32 put it back at fp16's own figure for 12 B/head.
 
 **Reading less got slower.** The gate landed as a **24% decode regression**
 (TPOT 0.0626 → 0.0777 at 4096/B=32). Three compounding causes:
 
-1. *It skips 75% of the windows but only 28% of the bytes.* The fp16 scale/zero
-   grid is **48% of an int2 window** — two bytes of precision wrapping a two-bit
-   code — and the fp tier, which the gate never touches, is 87% of what the gated
-   kernel reads. Traffic saved: 0.23 ms.
+1. *It skips 75% of the windows but only 28% of the bytes.* The scale/zero grid
+   was **48% of an int2 window** — two bytes of precision wrapping a two-bit
+   code, since narrowed to one — and the fp tier, which the gate never touches,
+   is 87% of what the gated kernel reads. Traffic saved: 0.23 ms.
 2. *`SEL` turns coalesced streams into gathers.* Ungated, `widx = w0 + t_win` is
    affine and Triton emits contiguous vector loads. Gated, it is a runtime value
    with an address dependency, so every field becomes a scattered gather. The

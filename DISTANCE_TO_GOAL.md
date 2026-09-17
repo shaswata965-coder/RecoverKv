@@ -1,6 +1,8 @@
 # Distance to the goal
 
-2026-09-17
+2026-09-17, updated the same day after items 1 and 2 of "The ceiling" landed.
+Their entries there say what they cost and what they did not buy; the latency
+projection they were sized against is withdrawn.
 
 The goal is to beat Flash FullKV, int2 KIVI and QEvict across all six cells.
 Today the branch beats Flash in **one of six**; at the best numbers this project
@@ -91,26 +93,30 @@ regression**: 0.0626 → 0.0777 at 4096/B=32.
 **Reading a quarter of the windows does not read a quarter of the bytes.** An
 int2 window at `ws=8, D=128, H_kv=8`:
 
-| field | bytes | share |
-| --- | --- | --- |
-| K int2 codes | 4,096 | 35% |
-| **K fp16 scale/zero grid** | **4,096** | **35%** |
-| V scale/zero | 256 | 2% |
-| **gate card** (after this session) | **3,200** | **27%** |
-| total | 11,648 | |
+| field | bytes (fp16 grid) | now | share now |
+| --- | --- | --- | --- |
+| K int2 codes | 4,096 | 4,096 | 43% |
+| **K scale/zero grid** | **4,096** | **2,176** | 23% |
+| V scale/zero | 256 | 160 | 2% |
+| **gate card** | 3,200 | 3,200 | 33% |
+| total | 11,648 | **9,632** | |
 
 The card has to be read for **every** window every step — that is what selecting
 means. So per step the gate reads all the cards plus a quarter of the windows:
 
 ```
-ungated   518 windows x 8,448 B = 4.4 MB/step
-gated     518 cards  x 3,200 B
-        + 130 windows x 8,448 B = 2.8 MB/step   = 63% of ungated
+ungated   627 windows x 6,432 B = 4.0 MB/step
+gated     627 cards  x 3,200 B
+        + 157 windows x 6,432 B = 3.0 MB/step   = 75% of ungated
 ```
 
-**A 37% traffic saving, not 75%.** And the measured saving is smaller still —
-0.23 ms — because the fp tier, which the gate never touches, is 87% of what the
-gated kernel reads.
+**A 25% traffic saving, not 75%** — and narrowing the grid made this *worse*,
+not better, because it shrank the part the gate can skip and left the card, which
+it cannot, untouched. That is the honest reading and it does not change the
+decision: the grid change is a memory win (+21% context per byte) that happens to
+move the gate's break-even against it. The measured saving was already smaller
+than the traffic figure — 0.23 ms — because the fp tier, which the gate never
+touches, is 87% of what the gated kernel reads.
 
 Against that 0.23 ms the gate pays two costs:
 
@@ -126,14 +132,15 @@ So: save 0.23 ms of traffic, pay for gathers on the remaining 0.58 ms plus two
 full-tier passes. **The gate is currently a net negative, and the reason is the
 memory layout, not the idea.**
 
-The uncomfortable part for this session's work: adding the value centroid made
-the card **27% of a window in absolute terms and 38% of the codes**, which moves
-break-even in the wrong direction. It bought accuracy, not speed, and it should
-be judged on that.
+The uncomfortable part: the card is now **a third of a window**, and both of the
+last two changes pushed it that way — the centroid added bytes to the card, the
+grid work removed bytes from everything else. Both bought something real
+(accuracy, and +21% context per byte); neither helped the gate, and the gate's
+break-even moved against it twice. It should be judged on that, with §3 below.
 
 ---
 
-## What this session changed
+## What the 2026-09-17 session changed
 
 | change | what it is worth | confidence |
 | --- | --- | --- |
@@ -164,34 +171,96 @@ for an sm80 target and passes.
 
 ---
 
+## What the follow-up session changed — items 1 and 2
+
+| change | what it is worth | confidence |
+| --- | --- | --- |
+| One-byte scale/zero grid (`8a8cdc0`) | An int2 window 11,648 → **9,632 B**; `N_q` at 0.50/q=0.70 **518 → 627 (+21%)** for +0.2% reconstruction and +0.2% on `q·k` | measured, CPU fixture + `resolve` |
+| Grouping that grid per 32 entries | The worst channel on 1000x-gain keys stays at fp16's 0.306 instead of going to 1.082, for 12 B/head | measured |
+| Two grid underflow guards | A group of uniformly small entries, and a scale code rounding to zero, both decoded the grid to zero and made the fit divide by it | measured, pinned |
+| Compaction by cumsum, not sort (`c65ccff`) | `aten.sort` in the compiled eviction 21 → 6 calls; `sort` has no Inductor lowering on any backend, `cumsum` has one on CUDA | op count, not time |
+| The eviction's fusion, re-measured | 3 breaks (all the deliberate `.item()`), 22 fused kernels, nothing extern but `sort`/`searchsorted`/`cumsum`. **Item 2's 9.34 ms was already recovered by `6e83a2c`** | measured, CPU Inductor |
+| `--gate-ratio` reaching the config (`a39124f`) | It was parsed, printed and operating-point-checked, but never written into the generated YAML: both arms of the gate A/B ran at 0.25 | read off the generated config |
+| `eval_efficiency.yaml`'s fourth arm | `quant_memoize_read: false` priced a memo that is unreachable, so it duplicated `ours_b50_q50`. Now `quant_gate_ratio: 1.0`, the control `TARGET_GAP §4` said did not exist | structural |
+
+**What did not change: any latency cell.** Item 1 is a memory change and item 2
+turned out to be a verification. See "Where that lands" below, where the estimate
+that assumed otherwise is withdrawn.
+
+**Any quality comparison across `8a8cdc0` is invalid**, for the same reason it
+was across the card fix: the stored format and the price of a window both moved,
+so a row before it and a row after it are not the same cache. The two together
+make an int2 window 17% cheaper than it was yesterday and the budget honest about
+all of it.
+
+---
+
 ## The ceiling, and the order to get there
 
 Ordered by measured value, not by how interesting it is.
 
-**1. Narrow the scale/zero grid to int8. This is the biggest unexploited lever in
-the repo and it is already measured.**
+**1. Narrow the scale/zero grid to int8. — LANDED (`8a8cdc0`).**
 
-The fp16 grid is **48.5% of an int2 window's codes-plus-grid** — two bytes of
-precision wrapping a two-bit code. `GATE_REGRESSION §5` measured int8 + a shared
-fp16 scale at **+0.6% reconstruction error**, against fp8 e4m3's +1.6%. On sm80
-int8 is also the only sane choice: there is no hardware fp8 convert before sm89.
+The fp16 grid was **48.5% of an int2 window's codes-plus-grid** — two bytes of
+precision wrapping a two-bit code. It is now one byte per entry against an fp16
+scale shared by 32 of them.
 
-| | now | int8 grid |
+| | fp16 grid | one byte, shared per 32 |
 | --- | --- | --- |
-| bytes per int2 window | 11,648 | 9,472 (−18.7%) |
-| `N_q` at budget 0.50 / q=0.70 | 518 | **~637 (+23%)** |
+| grid, per head | 512 B | **272 B** |
+| bytes per int2 window | 11,648 | **9,632 (−17.3%)** |
+| `N_q` at budget 0.50 / q=0.70 | 518 | **627 (+21.0%)** |
 
-That is 23% more retained context at the same byte budget, for 0.6% more
-quantization error, on a design that pins codes to the *stored* grid so a rounded
-scale just repositions the four levels and the codes re-fit. It helps gated and
-ungated reads alike, and it partly pays for the centroid. **Do not raise `ws` to
-save the same bytes — measured at 20x the accuracy cost.**
+**+21% retained context at the same byte budget.** The prediction above was
++23% at 9,472 B; the difference is that this counts the shared fp16 scales, which
+the estimate did not. `N_q` is read off `config.resolve`, not asserted.
 
-**2. Make the eviction actually fuse.** `TARGET_GAP §5.2` found **9.34 ms/step —
-18.5% of real kernel time — of unfused ATen kernels with fractional launch
-counts** (`n < 5/step`, i.e. one step in eight, i.e. the eviction), and Inductor
-contributing *exactly zero*. The compiled-evict bucket does not appear in the
-rollup at all. Largest single B=32 item; worth ~0 at B=1.
+Accuracy, 12 seeds, keys with massive-activation channels and a hot token per
+window: **+0.17% reconstruction error and +0.20% on `q·k`** — better than the
++0.6% `GATE_REGRESSION §5` predicted, because `scale` is non-negative and takes
+the full uint8 range where that measurement used a symmetric int8 for both
+fields.
+
+**The grouping is the part that was not in the estimate, and it is the part that
+matters.** One scale per head is +0.2% in aggregate and hides a per-channel
+failure: on keys whose channel gains span 1000x — which is what a
+massive-activation channel *is* — the worst channel's own reconstruction error
+goes 0.305 → 1.082, i.e. that channel decodes to noise, while the Frobenius norm
+moves 0.14% and reports nothing. Groups of 32 put it back at 0.306, fp16's own
+figure, for 12 B/head. **Aggregate error is the wrong instrument for a shared
+exponent.** Two underflow hazards were found and closed the same way (a group of
+uniformly small entries whose amax/255 underflows fp16; a scale code rounding to
+zero); both would have produced a zero grid and a divide-by-zero in the fit.
+
+**2. Make the eviction actually fuse. — the premise was stale; what was left is
+done (`c65ccff`).**
+
+`TARGET_GAP §5.2`'s 9.34 ms/step of unfused ATen kernels was measured on a build
+that predates `6e83a2c`, which found the cause — eight `data_ptr` graph breaks
+from `CacheState`'s aliasing guards — and removed it. Re-measured here on torch
+2.14 CPU Inductor over one eviction cycle, **before** this session's change:
+
+| | |
+| --- | --- |
+| graph breaks | 3, all the deliberate `.item()` width read |
+| fused kernels | 22 |
+| extern calls | `sort` 21, `searchsorted` 9, `cumsum` 9, nothing else |
+
+So the body fuses, and what is left outside the fused region is the handful of
+ops Inductor has no lowering for. Half the sorts were not sorting: four places
+wanted "the true columns, in order, first" and wrote it as
+`argsort(~mask, stable=True)`. A partition is a running count, so they are now
+one cumsum and one scatter (`modules/quant/compact.py`), which is `O(n)` in one
+pass instead of `O(n log n)` in several — and, the reason it is worth doing,
+`cumsum` lowers to a Triton scan on CUDA and fuses with the pointwise work
+around it while `sort` never lowers at all. **`sort` 21 → 6.** The rest are real
+orderings, and the score ranking stays a sort deliberately: `topk` breaks ties
+differently, and which window survives a tie is an eviction decision.
+
+**Not a measured speedup.** No GPU here, so this is justified by op count and by
+what each op does. The arithmetic bounds the prize at well under a millisecond
+per step — these are ~500-column tensors — so it claims no part of the 13.7 ms
+gap. The 9.34 ms it was aimed at was already gone.
 
 **3. Decide the gate on evidence.** It is a 24% regression today. Either fix the
 gather problem — the selected windows are scattered, so a compaction that makes
@@ -199,22 +268,91 @@ them contiguous would restore coalescing — or remove the gate and keep the car
 only as a scoring aid. The centroid work makes it *more correct*, not faster, and
 correctness does not rescue a negative.
 
-**4. Re-measure everything.** Every number in this document predates this
-session's commits, and the budget fix alone changes what `cache_budget` means.
+**4. Re-measure everything.** Every number in this document predates the commits
+it describes, and the two budget fixes together change what `cache_budget` buys
+by more than 20%.
 
 ### Where that lands
 
-| | now vs Flash | after 1+2 | after 1+2+3 |
-| --- | --- | --- | --- |
-| 4096/256 B=32 | 1.13x faster | ~1.3–1.5x faster | 1.4–1.6x faster |
-| 2048/512 B=32 | 1.17x slower | ~parity to 1.1x faster | 1.1–1.2x faster |
-| 1024/1024 B=32 | 1.36x slower | ~1.1x slower | ~parity |
-| all B=1 | ~2.4x slower | ~2.1x slower | ~2x slower |
+The estimate this section used to carry is **withdrawn**, and the withdrawal is
+the most useful thing items 1 and 2 produced.
 
-The B=32 row is winnable across all three shapes. **B=1 is not**, by roughly
-30 ms that no item on any list addresses. The realistic goal is *beat Flash at
-every B=32 shape, and beat KIVI and QEvict on memory everywhere* — and to say
-plainly that B=1 latency is not what this method is for.
+| | now vs Flash | was projected after 1+2 | actually expected |
+| --- | --- | --- | --- |
+| 4096/256 B=32 | 1.13x faster | ~1.3–1.5x faster | **unchanged** |
+| 2048/512 B=32 | 1.17x slower | ~parity to 1.1x faster | **unchanged** |
+| 1024/1024 B=32 | 1.36x slower | ~1.1x slower | **unchanged** |
+| all B=1 | ~2.4x slower | ~2.1x slower | **unchanged** |
+
+The projection rested on item 2 recovering the eviction's 9.34 ms. That recovery
+had already happened in `6e83a2c`, before the table was written, so it was being
+counted twice: once in the "now" column, which was measured after it, and again
+in the "after" column. **Items 1 and 2 as landed move no latency cell.** Item 1
+is a memory change (+21% context per byte, +0.2% error); item 2 removes ~15
+extern kernel calls per eviction cycle from a step that has ~1,650 launches.
+
+What that leaves is a plainer statement of the position than this document had:
+
+* **Latency.** The 9.5–13.7 ms gap to the best-ever numbers is unexplained by
+  anything on this list. `TARGET_GAP §3` splits it into a flat 4.3–5.3 ms
+  (Block A: the `exp2` and RoPE-dtype changes, control arms latched, never run)
+  and a gate-era remainder. The gate is a 24% regression whose cause is measured
+  and structural (§3, the `SEL` gathers). Neither is a tuning item.
+* **Memory.** This is where the method actually moved this week: an int2 window
+  went 11,648 → 9,632 B, so the same budget holds 21% more context, and the
+  budget is now honest about every byte of it. That is the axis KIVI and QEvict
+  are strongest on and the one the repo cannot yet compare on, which is why
+  wiring those two baselines outranks another millisecond.
+
+The realistic goal is unchanged: *beat Flash at every B=32 shape, and beat KIVI
+and QEvict on memory everywhere* — and say plainly that B=1 latency is not what
+this method is for.
+
+---
+
+## Two utilisation numbers that look contradictory and are not
+
+Raised as a direct question, and worth writing down because both statements are
+in this repo's history and both are true.
+
+**Earlier:** *"under `bytes`, `budget_utilisation` is 0.99 at every q; under
+`tokens` it is 0.99 / 0.69 / 0.57."* That is a statement about what the two modes
+MEAN. Under `bytes`, `q` splits the byte allowance and each tier buys windows at
+its own price, so the cache costs what it was granted at every `q`. Under
+`tokens`, the window COUNT is pinned, so cheaper int2 keys buy fewer bytes
+rather than more windows and the spend falls with `q`. Nothing about that has
+changed — the same configuration still reports 0.999 and 0.686 today.
+
+**Later:** *"the card was not in `bytes_per_q_window`, so `bytes` mode was
+overspending."* That is a statement about the METER, one level down. The
+utilisation above is `retained_bytes / total_budget_bytes`, and `retained_bytes`
+priced a Q window at its codes and grid only — 8,448 B — while the window also
+carried a 3,200 B gate card. So:
+
+At `cache_budget=0.50`, prefill 4096, local 64, `ws=8`, as the pre-fix resolver
+would have bought it:
+
+| | it reported | it actually held |
+| --- | --- | --- |
+| `bytes`, q=0.5 | 0.997 | **1.180** |
+| `bytes`, q=0.7 | 1.000 | **1.257** |
+| `tokens`, q=0.5 | 0.638 | 0.686 |
+| `tokens`, q=0.7 | 0.497 | 0.563 |
+
+**Same defect, opposite symptom.** Under `bytes` the resolver *spends* to the
+meter, so an under-counted price made it hold 18–26% more bytes than the budget
+granted — a real overspend, and the reason `N_q` at 0.50/q=0.70 fell 715 → 518
+when the card was priced in. Under `tokens` the count is pinned, so the missing
+3,200 B could not buy anything; it showed up only as under-reporting, and the
+cache was inside its budget the whole time.
+
+So "bytes spends 99% and tokens spends 70%" was never the claim that got
+corrected. What was corrected is what 99% was 99% *of*. Both fixes since — the
+card entering the budget, and the grid narrowing — move that price, and the
+utilisation figure sits at 0.999 under `bytes` after each one, because that is
+what the mode does. **`budget_utilisation` is a check on the resolver, not on the
+format.** Only `bytes_per_q_window` can be wrong about the format, which is why
+it now lives in the module that defines the layout.
 
 ---
 
