@@ -42,6 +42,10 @@
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
+#   DECODE_GRAPH    on | off  CUDA-graph the steady decode steps (default: on,
+#                   under CUDA -- the device decides, as for COMPILE_EVICT).
+#                   `off` restores the eager loop exactly; it is the first thing
+#                   to try if a number or a score looks wrong. Also --graph.
 #   THROUGHPUT      which throughput column(s) to print         (default: both)
 #                     both | decode | e2e | all | legacy
 #                     legacy = the old single throughput_tokps column, for
@@ -108,6 +112,11 @@ OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
 DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
 QUANT_MODE="${QUANT_MODE:-tokens}"
+# CUDA-graph replay of the steady decode steps. Empty = let the device decide
+# (on under CUDA); "off" restores the pre-39f6be0 eager loop. Exported below so
+# the child inherits it -- the library default and this script must not disagree,
+# which is the 1434b2c lesson.
+DECODE_GRAPH="${DECODE_GRAPH:-${STICKYKV_DECODE_GRAPH:-}}"
 # The read gate's selectivity. 1.0 makes _gate_ctx hand over nothing, so the
 # fused decode runs UNGATED over the whole Q tier -- the control arm for pricing
 # the gate against itself at identical budget, shape and batch.
@@ -148,6 +157,7 @@ while [[ $# -gt 0 ]]; do
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
+    --graph|--decode-graph) DECODE_GRAPH="$2"; shift 2;;
     --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
     --lse-strict)           LSE_STRICT="$2"; shift 2;;
     -h|--help)              sed -n '2,73p' "$0"; exit 0;;
@@ -273,6 +283,7 @@ YAML
   echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
   echo "quant_gate_ratio: $GATE_RATIO"
+  echo "decode_graph: ${DECODE_GRAPH:-device-default (on under CUDA)}"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
   echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
@@ -283,6 +294,8 @@ YAML
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
 echo "read gate: $GATE_RATIO$( [ "$GATE_RATIO" = "1.0" ] && echo '  (UNGATED control arm)' )"
+echo "decode graph: ${DECODE_GRAPH:-device-default (ON under CUDA)}"
+if [ -n "$DECODE_GRAPH" ]; then export STICKYKV_DECODE_GRAPH="$DECODE_GRAPH"; fi
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
 echo "config: $CONFIG_FILE"

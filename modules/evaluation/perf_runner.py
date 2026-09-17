@@ -95,12 +95,19 @@ def _make_graph_runner(cache):
     """
     from utils.config import FIRST_EVICTION_STEP_DEFAULT
     from modules.windowed_cache.graph_decode import (
-        DecodeGraphRunner, EpochSchedule, graph_mode)
+        DecodeGraphRunner, EpochSchedule, graph_mode, graph_mode_is_explicit)
     mode = graph_mode()
     if mode == "off":
         return None
     res = getattr(cache, "resolved", None)
     if res is None:
+        # This same loop runs the FullKV and KIVI baselines, which have no
+        # eviction cadence to build a capture schedule from. Device-decided:
+        # not applicable, run eager. Asked for by name: an error, because the
+        # request could not be honoured and eager numbers under a graphed label
+        # are the provenance bug 0091e9c and 1434b2c were both fixing.
+        if not graph_mode_is_explicit():
+            return None
         raise RuntimeError(
             "STICKYKV_DECODE_GRAPH is set but this cache exposes no resolved "
             "config, so the eviction cadence the capture schedule has to match "

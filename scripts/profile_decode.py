@@ -436,7 +436,7 @@ def main() -> None:
         from utils.config import FIRST_EVICTION_STEP_DEFAULT
         from modules.windowed_cache.graph_decode import (
             DecodeGraphRunner, EpochSchedule, graph_mode)
-        if graph_mode() != "off":
+        if graph_mode() != "off" and getattr(cache, "resolved", None) is not None:
             _graph = DecodeGraphRunner(
                 cache,
                 EpochSchedule(window_size=int(cache.resolved.window_size),

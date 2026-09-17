@@ -1,7 +1,10 @@
 """The CUDA-graph runner's policy layer, which is the only part a CPU box can run.
 
-The capture/replay mechanism needs CUDA and ships unvalidated by construction —
-that is why it is opt-in and why ``verify`` mode exists. What *is* checkable here
+The capture/replay mechanism needs CUDA and ships unvalidated by construction. It
+is the default there anyway, which is what makes this file load-bearing rather
+than nice to have: ``STICKYKV_DECODE_GRAPH=off`` is the escape hatch, and these
+are the checks that stand between a wrong replay and a wrong answer. What *is*
+checkable here
 is everything that decides **whether a replay is legal**, and that is where the
 danger lives: a graph replayed against the wrong geometry does not crash, it
 indexes the wrong windows and emits scores that still look like probabilities.
@@ -218,11 +221,31 @@ def test_a_moved_signature_falls_back_to_eager_rather_than_replaying():
     assert out == "eager" and r._graphs == {} and r.stats["replayed"] == 0
 
 
-def test_graph_mode_parses_and_refuses_a_typo(monkeypatch):
-    for raw, want in [("", "off"), ("0", "off"), ("1", "on"), ("on", "on"),
-                      ("verify", "verify"), ("check", "verify")]:
+def test_an_explicit_mode_always_wins_over_the_device(monkeypatch):
+    """`verify` is an alias: the post-replay check it used to select is now
+    unconditional, so there is nothing left for a separate mode to turn on."""
+    for raw, want in [("0", "off"), ("off", "off"), ("no", "off"),
+                      ("1", "on"), ("on", "on"), ("verify", "on"),
+                      ("check", "on")]:
         monkeypatch.setenv("STICKYKV_DECODE_GRAPH", raw)
         assert graph_mode() == want
+
+
+def test_the_device_decides_when_nothing_is_set(monkeypatch):
+    """Same rule as `_compile_evict_enabled`: CUDA gets it, CPU does not.
+
+    A library default that disagrees with the benchmark script is how the
+    profiler came to measure an eager eviction against a compiled table
+    (`1434b2c`), so there is one default and it is not the script's.
+    """
+    monkeypatch.delenv("STICKYKV_DECODE_GRAPH", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert graph_mode() == "off"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert graph_mode() == "on"
+
+
+def test_a_typo_raises_rather_than_silently_disabling_the_graph(monkeypatch):
     monkeypatch.setenv("STICKYKV_DECODE_GRAPH", "yes-please")
-    with pytest.raises(ValueError, match="off / on / verify"):
+    with pytest.raises(ValueError, match="on / off / verify"):
         graph_mode()

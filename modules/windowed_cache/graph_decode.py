@@ -58,15 +58,25 @@ CPU-only box can exercise, which is why it is split out the way
 
 Modes (``STICKYKV_DECODE_GRAPH``)
 --------------------------------
-``off`` (default)
-    Nothing here runs. This is a lever, not the method.
-``verify``
-    Replays, then **re-reads the host signature and asserts it is exactly the
-    post-state recorded at capture**. That catches the failure this design is
-    most exposed to: a replay whose hand-applied :class:`HostDelta` did not
-    reproduce the bookkeeping the eager step performed.
+``on`` (**the default on CUDA**)
+    Capture and replay. The **device decides**, exactly as it does for the
+    compiled eviction (``_compile_evict_enabled``): with nothing set, CUDA gets
+    graphs and CPU does not, so the shipped path is the fast one and the whole
+    CPU suite keeps running the ordinary loop. An explicit value still wins.
+``off``
+    The ordinary eager decode loop. This is the escape hatch, and it restores
+    byte-for-byte the behaviour of every build before ``39f6be0``.
+``verify`` (alias of ``on``, kept so scripts that set it keep working)
+    The post-replay check it used to name is now **unconditional**: every
+    replay re-reads the host signature and asserts it is exactly the post-state
+    recorded at capture. It is a handful of Python attribute reads with no
+    device sync, it overlaps with the GPU work it follows, and it is the only
+    self-check a replay has -- against the failure this design is most exposed
+    to, a hand-applied :class:`HostDelta` that did not reproduce the bookkeeping
+    the eager step performed. Paying that on the default path is the condition
+    on which the default is on at all.
 
-    It deliberately does **not** run an eager shadow of the same step. Running
+    Neither mode runs an eager shadow of the same step. Running
     the step twice advances the cache twice -- the graph replay writes the KV
     append itself -- so a per-step A/B would compare two different sequence
     positions and corrupt the run while doing it. The real equivalence check is
@@ -74,12 +84,14 @@ Modes (``STICKYKV_DECODE_GRAPH``)
     diff the token sequences. Greedy decode is deterministic, so an identical
     sequence is proof, and that is the shape of check ``H-B`` lost when
     ``676c781`` made ``audit_e2e``'s rungs 2/3 compare a path against itself.
-``on``
-    Capture and replay, no eager shadow.
 
-None of this has run on a GPU. The capture/replay mechanism below cannot be
-executed on a CPU-only box at all, so it ships unvalidated by construction --
-which is the reason ``off`` is the default and ``verify`` exists.
+**None of the capture/replay mechanism below has run on a GPU.** It cannot be
+executed on a CPU-only box at all, so it ships unvalidated by construction. It
+is nonetheless the default on CUDA, which makes two things load-bearing: the
+unconditional post-replay check above, and the run-level A/B --
+``STICKYKV_DECODE_GRAPH=off`` against the default, token sequences diffed. If
+anything at all looks wrong in a number or a score, ``off`` is the first thing
+to try, and it restores the pre-``39f6be0`` path exactly.
 """
 
 from __future__ import annotations
@@ -110,25 +122,49 @@ class GraphSignatureMismatch(RuntimeError):
     """
 
 
-def graph_mode() -> str:
-    """``"off"`` | ``"verify"`` | ``"on"``, from ``STICKYKV_DECODE_GRAPH``.
+def graph_mode_is_explicit() -> bool:
+    """Whether ``STICKYKV_DECODE_GRAPH`` was set, as opposed to device-decided.
 
-    Default **off**. Unlike ``_compile_evict_enabled``, the device does not get
-    to decide: a CUDA graph changes when host bookkeeping runs relative to
-    kernels, which is a property of the decode loop and not of the hardware.
+    The two must behave differently on a cache the runner cannot graph. Asked
+    for explicitly, an ungraphable cache is an error -- the request could not be
+    honoured and a quiet eager run would report eager numbers under a graphed
+    label. Arrived at by default, it is simply not applicable: the same decode
+    loop runs the FullKV and KIVI baselines, which have no eviction cadence to
+    build a capture schedule from, and those must keep working untouched.
+    """
+    return bool(os.environ.get("STICKYKV_DECODE_GRAPH", "").strip())
+
+
+def graph_mode() -> str:
+    """``"on"`` | ``"off"``, from ``STICKYKV_DECODE_GRAPH``; the device decides.
+
+    With nothing set this returns ``"on"`` on CUDA and ``"off"`` elsewhere --
+    the same rule ``_compile_evict_enabled`` uses, and for the same reason:
+    what a graph buys is launch coalescing, which does not exist on CPU, and a
+    library whose default disagrees with the benchmark script is how the
+    profiler came to measure an eager eviction against a compiled table
+    (``1434b2c``). One default, one path, whether or not the run went through
+    ``run_perf_table.sh``.
+
+    ``verify`` is accepted as an alias for ``on``: the post-replay signature
+    check it used to select is now unconditional, so there is nothing left for a
+    separate mode to turn on.
+
+    An unrecognised value raises rather than defaulting, so a typo cannot
+    silently disable the thing it was set to enable.
     """
     raw = os.environ.get("STICKYKV_DECODE_GRAPH", "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
+    if raw in ("1", "true", "yes", "on", "verify", "check", "2"):
         return "on"
-    if raw in ("verify", "check", "2"):
-        return "verify"
-    if raw in ("", "0", "false", "no", "off"):
+    if raw in ("0", "false", "no", "off"):
         return "off"
-    raise ValueError(
-        f"STICKYKV_DECODE_GRAPH={raw!r} is not off / on / verify. It is left "
-        "strict rather than defaulted so a typo cannot silently disable the "
-        "thing it was set to enable."
-    )
+    if raw:
+        raise ValueError(
+            f"STICKYKV_DECODE_GRAPH={raw!r} is not on / off / verify.")
+    try:
+        return "on" if torch.cuda.is_available() else "off"
+    except Exception:  # pragma: no cover - torch build dependent
+        return "off"
 
 
 # ---------------------------------------------------------------------------
@@ -496,8 +532,7 @@ class DecodeGraphRunner:
         self._graphs[slot].replay()
         self._deltas[slot].apply(self.cache)
         self.stats["replayed"] += 1
-        if self.mode == "verify":
-            self._verify_post(slot)
+        self._verify_post(slot)
         return self._static_out[slot]
 
     def _verify_post(self, slot: int) -> None:
