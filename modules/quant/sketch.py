@@ -99,6 +99,7 @@ __all__ = [
     "sketch_bytes_per_head",
     "build_sketch",
     "decode_sketch",
+    "value_centroid",
     "gate_and_score",
     "select_windows",
     "group_max",
@@ -109,9 +110,15 @@ def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
     """Bytes one head's card costs — for the budget arithmetic.
 
     ``mu`` int8(D) + fp16 scale, ``v`` int8(D) + fp16 scale, ``t`` int8(ws) +
-    fp16 scale, ``eps`` uint8(ws) + fp16 scale.
+    fp16 scale, ``vbar`` int8(D) + fp16 scale.
+
+    This number is LOAD-BEARING, not documentation: ``config.resolve`` adds it to
+    ``bytes_per_q_window``, so a card field that is not counted here is a window
+    the cache holds and the budget does not know about. At ``D=128, ws=8, H=8``
+    the card is 3200 B against the codes' 8448 — 38% of the Q tier. Unbudgeted,
+    that is a 38% overrun on the tier the memory claim is made about.
     """
-    return 2 * (head_dim + 2) + 2 * (window_size + 2)
+    return 3 * (head_dim + 2) + (window_size + 2)
 
 
 class Sketch(NamedTuple):
@@ -123,8 +130,8 @@ class Sketch(NamedTuple):
     v_s: Tensor       # [N, H]       fp16
     t_q: Tensor       # [N, H, ws]   int8   — projection onto v
     t_s: Tensor       # [N, H]       fp16
-    e_q: Tensor       # [N, H, ws]   uint8  — residual norm, rounded UP
-    e_s: Tensor       # [N, H]       fp16
+    vm_q: Tensor      # [N, H, D]    int8   — value centroid - value anchor
+    vm_s: Tensor      # [N, H]       fp16
 
 
 # ---------------------------------------------------------------------------
@@ -147,33 +154,18 @@ def _dq_sym(codes: Tensor, scale: Tensor) -> Tensor:
     return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
 
 
-def _q_up(x: Tensor, bits_max: int = 255) -> Tuple[Tensor, Tensor]:
-    """Unsigned uint8 rounding **UP**: guarantees ``dequant >= x``.
-
-    Rounding to nearest would let the stored residual fall below the true one on
-    half the tokens, which is precisely the guarantee the gate is built on. The
-    scale is nudged before the fp16 cast so a downward fp16 rounding cannot push
-    ``x / scale`` past ``bits_max`` and get clamped back under ``x``.
-    """
-    amax = x.amax(dim=-1, keepdim=True)
-    scale = torch.where(amax > 0, amax / bits_max, torch.ones_like(amax))
-    s16 = (scale * (1.0 + 2.0 ** -9)).to(torch.float16)
-    s32 = s16.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
-    codes = torch.ceil(x / s32).clamp_(0, bits_max).to(torch.uint8)
-    return codes, s16.squeeze(-1)
-
-
-def _dq_up(codes: Tensor, scale: Tensor) -> Tensor:
-    return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
-
-
 # ---------------------------------------------------------------------------
 # build — one pass, at demotion
 # ---------------------------------------------------------------------------
 
 
-def build_sketch(keys: Tensor, anchor: Tensor, need_eps: bool = True) -> Sketch:
-    """One pass over a window's **post-RoPE** keys -> its card.
+def build_sketch(
+    keys: Tensor,
+    anchor: Tensor,
+    values: Tensor,
+    v_anchor: Tensor,
+) -> Sketch:
+    """One pass over a window's **post-RoPE** keys and values -> its card.
 
     Parameters
     ----------
@@ -181,39 +173,38 @@ def build_sketch(keys: Tensor, anchor: Tensor, need_eps: bool = True) -> Sketch:
         *before* ``unrotate_key_window`` strips RoPE. Taking them at that point
         is what makes the card cost zero extra rotation, and it is frozen for
         life because eviction never rebases positions (§5, §10).
-    anchor : ``[H, D]`` float — the per-(layer, head) common mode, frozen at the
-        first eviction.
-    need_eps : bool
-        Whether to compute the residual field. ``False`` returns ``e_q``/``e_s``
-        zero-filled at the right shapes and dtypes, and **skips the single most
-        expensive step in the card build**: ``recon`` materializes a full
-        ``[N, H, ws, D]`` fp32 tensor that exists only to be normed away.
+    anchor : ``[H, D]`` float — the per-(layer, head) key common mode, frozen at
+        the first eviction.
+    values : ``[N, H, ws, D]`` float — the window's values, for the centroid a
+        skipped window contributes to the OUTPUT through.
+    v_anchor : ``[H, D]`` float — the value-side common mode, same role as
+        ``anchor``: values carry a strong per-head common mode that would
+        otherwise eat the int8 range without separating one window from another.
 
-        The field has one consumer, and the production path is not it. A finite
-        ``quant_gate_margin`` is what ``eps`` exists for, and ``cache.py``'s
-        fused gate *refuses* a finite margin outright — it is a top-k on the card
-        estimate with no margin term, so the only code that reads a margin is
-        ``store.gate_and_select``, whose only caller is ``gated_decode_step``,
-        the CPU reference. ``_gate_triton`` unpacks the card as ``…, _e_q, _e_s``
-        and discards both; ``_gate_kernel``'s docstring already records its half
-        of this (*"the bound cost a [B, H_q, NW] fp32 store and the whole eps
-        field of every card, to be discarded by _gate_triton"*). The build side
-        was never followed through.
+    Why the value side is a plain mean while the key side is rank-1
+    ---------------------------------------------------------------
+    The two sides answer different questions. The key side decides *whether* a
+    window can matter, so it needs an outlier-seeking direction — a centroid
+    there would hide the one hot token (see the module docstring). The value side
+    only has to answer *what* the window contributes once we have decided it does
+    not matter much, and that contribution is a softmax-weighted mean of values.
+    Inside a window the gate declined to read, the weights are by construction
+    near-uniform, so the unweighted mean is the correct first-order term and a
+    rank-1 value model would buy a second order we have no budget for.
 
-        Zero-filling rather than dropping the fields keeps the ``Sketch``
-        contract and the slot table's eight columns exactly as they are, so
-        ``quant_gate_margin`` remains a real setting: a caller that wants the
-        bound asks for it and pays for it. What changes is that the default
-        configuration — the only one the fused path will accept — stops paying
-        for a field nothing will read.
-
-        **A zero eps is not a valid bound**, so this is a capability switch and
-        not a cheaper approximation of one. The caller owns that: ``demote_many``
-        derives it from the resolved margin, never from a guess.
+    ``eps`` is gone
+    ---------------
+    The card used to carry a per-token residual norm, which turned the estimate
+    into a Cauchy-Schwarz upper bound. Nothing on the production path ever read
+    it: the bound exists to serve a finite ``quant_gate_margin``, and the fused
+    gate is a top-k on the point estimate with no margin term. So the field was
+    built, stored, budgeted and discarded. It is removed rather than zero-filled,
+    because a zero eps is not a weaker bound — it is not a bound at all, and
+    keeping the column invited a reader to think one was available.
     """
     k = keys.to(torch.float32)
     N, H, ws, D = k.shape
-    anc = anchor.unsqueeze(0) if anchor.dim() == 2 else anchor   # [1|N, H, D]
+    anc = _align_anchor(anchor, k[..., 0, :])
 
     mu = k.mean(dim=-2)                                        # sweep 1
     dev = k - mu.unsqueeze(-2)
@@ -228,34 +219,46 @@ def build_sketch(keys: Tensor, anchor: Tensor, need_eps: bool = True) -> Sketch:
     v_q, v_s = _q_sym(v)
     t_q, t_s = _q_sym(t)
 
-    if need_eps:
-        # eps against what is ACTUALLY STORED, not against the ideal fit.
-        mu_h = anc + _dq_sym(mu_q, mu_s)
-        v_h = _dq_sym(v_q, v_s)
-        t_h = _dq_sym(t_q, t_s)
-        recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
-        e_q, e_s = _q_up((k - recon).norm(dim=-1))
-    else:
-        # Same shapes and dtypes `_q_up` would have produced, so every consumer
-        # -- the slot table's columns, `decode_sketch`, `gather_sketch` -- is
-        # structurally unchanged. `_q_up` returns uint8 codes [N, H, ws] and an
-        # fp16 per-(window, head) scale [N, H]; a zero scale decodes to a zero
-        # residual, which is the honest encoding of "not computed": it makes the
-        # Cauchy-Schwarz term vanish rather than inventing a bound.
-        e_q = torch.zeros(N, H, ws, dtype=torch.uint8, device=k.device)
-        e_s = torch.zeros(N, H, dtype=torch.float16, device=k.device)
+    vbar = values.to(torch.float32).mean(dim=-2)               # [N, H, D]
+    vm_q, vm_s = _q_sym(vbar - _align_anchor(v_anchor, vbar))
 
-    return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, e_q, e_s)
+    return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
+
+
+def _align_anchor(anchor: Tensor, like: Tensor) -> Tensor:
+    """Broadcast an ``[H, D]`` or ``[B, H, D]`` anchor onto ``like``'s layout.
+
+    The card's leading axes differ by caller and always have: ``build_sketch``
+    sees a flattened ``[N, H, D]`` while ``QuantSlotTable.gather_sketch`` keeps
+    the ``[B, n, H, D]`` pair. Both end in ``(H, D)``, so aligning on the trailing
+    two dims and inserting singletons after the batch axis is the one rule that
+    is right for every caller. Plain broadcasting is not: a ``[B, H, D]`` anchor
+    against a ``[B, n, H, D]`` card lines ``H`` up with ``n`` and either raises
+    or, at ``n == H``, silently mixes heads.
+    """
+    while anchor.dim() < like.dim():
+        anchor = anchor.unsqueeze(0) if anchor.dim() == 2 else anchor.unsqueeze(1)
+    return anchor
+
+
+def value_centroid(s: Sketch, v_anchor: Tensor) -> Tensor:
+    """``[..., H, D]`` — the window's representative value vector.
+
+    What a window contributes to the attention output when the gate did not read
+    it. Its weight is the card's mass estimate rescaled by the deviation the read
+    windows measured this step, so the term is calibrated against real attention
+    on every step rather than trusted open-loop.
+    """
+    vm = _dq_sym(s.vm_q, s.vm_s)
+    return vm + _align_anchor(v_anchor, vm)
 
 
 def decode_sketch(s: Sketch, anchor: Tensor):
-    """``(mu_hat, v_hat, t_hat, eps_hat)`` — the decoded card."""
-    anc = anchor.unsqueeze(0) if anchor.dim() == 2 else anchor
+    """``(mu_hat, v_hat, t_hat)`` — the decoded card."""
     return (
-        anc + _dq_sym(s.mu_q, s.mu_s),
+        _align_anchor(anchor, s.mu_q) + _dq_sym(s.mu_q, s.mu_s),
         _dq_sym(s.v_q, s.v_s),
         _dq_sym(s.t_q, s.t_s),
-        _dq_up(s.e_q, s.e_s),
     )
 
 
@@ -270,39 +273,44 @@ def gate_and_score(
     anchor: Tensor,
     scaling: float,
 ) -> Tuple[Tensor, Tensor]:
-    """Per-window ``(bound, logmass)`` from two dot products.
+    """Per-window ``(logmass, est)`` from two dot products.
 
     Parameters
     ----------
     q : ``[B, Hq, D]`` post-RoPE decode query.
     s : card fields with leading axes ``[B, Nw, Hkv, ...]``.
-    anchor : ``[Hkv, D]``.
+    anchor : ``[Hkv, D]`` or ``[B, Hkv, D]``.
     scaling : the attention ``1 / sqrt(head_dim)``.
 
     Returns
     -------
-    bound : ``[B, Hq, Nw]`` upper bound on ``max_i scaling * q.k_i``.
     logmass : ``[B, Hq, Nw]`` ``logsumexp_i(scaling * q.k_i_hat)`` -- what a
-        skipped window contributes to ``window_scores``.
-    est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``, i.e. the
-        bound without its slack term. The cap ranks on this; see
-        :func:`select_windows` for why the two are not the same quantity.
+        skipped window contributes, both to ``window_scores`` and (weighted by
+        the step's measured deviation) to the attention output.
+    est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``. The
+        selection ranks on this.
 
     Both live in the log domain, so they are comparable across windows and cannot
-    overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield **both**: ``t`` and
-    ``eps`` are 10 bytes each and ride in the cache line the vectors already
-    pulled in.
+    overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield both; ``t`` is 10
+    bytes and rides in the cache line the vectors already pulled in.
+
+    **There is no bound any more.** The card used to return a Cauchy-Schwarz
+    upper bound alongside the estimate, for a ``quant_gate_margin`` rule that the
+    fused gate never implemented. Ranking on the estimate is not a weakening of
+    that: the estimate was already the better ranking quantity (the bound's slack
+    term lets a loosely-bounded window outrank a tighter one carrying a higher
+    true logit, measured at 100.0% worst-head mass recall against the bound's
+    99.7%). What is gone is a guarantee nothing consumed, and the ``eps`` field
+    that paid for it.
     """
     B, Hq, D = q.shape
     Nw, Hkv = s.mu_q.shape[1], s.mu_q.shape[2]
     rep = Hq // Hkv
     qf = q.to(torch.float32)
-    qn = qf.norm(dim=-1)                                             # [B, Hq]
 
     mu_r = _dq_sym(s.mu_q, s.mu_s)                                   # [B,Nw,Hkv,D]
     v_h = _dq_sym(s.v_q, s.v_s)
     t_h = _dq_sym(s.t_q, s.t_s)                                      # [B,Nw,Hkv,ws]
-    e_h = _dq_up(s.e_q, s.e_s)
 
     qg = qf.reshape(B, Hkv, rep, D)
     a_base = (torch.einsum("bhrd,hd->bhr", qg, anchor) if anchor.dim() == 2
@@ -311,8 +319,6 @@ def gate_and_score(
     g = torch.einsum("bhrd,bnhd->bnhr", qg, v_h)
 
     x = scaling * (m.unsqueeze(-1) + t_h.unsqueeze(-2) * g.unsqueeze(-1))
-    slack = scaling * qn.reshape(B, Hkv, rep)[:, None, :, :, None] \
-        * e_h.unsqueeze(-2)                                          # [B,Nw,Hkv,rep,ws]
 
     def flat(z):                                                     # -> [B,Hq,Nw]
         return z.permute(0, 2, 3, 1).reshape(B, Hq, Nw)
@@ -324,11 +330,11 @@ def gate_and_score(
     # so the reference and the kernel share a shape as well as a result.
     xmax = x.amax(dim=-1, keepdim=True)
     logmass = (xmax + (x - xmax).exp().sum(dim=-1, keepdim=True).log()).squeeze(-1)
-    return flat((x + slack).amax(-1)), flat(logmass), flat(x.amax(-1))
+    return flat(logmass), flat(x.amax(-1))
 
 
-def group_max(bound: Tensor, num_kv_heads: int) -> Tensor:
-    """``[B, Hq, Nw]`` -> ``[B, Hkv, Nw]``: the GQA group's union, as a bound.
+def group_max(est: Tensor, num_kv_heads: int) -> Tensor:
+    """``[B, Hq, Nw]`` -> ``[B, Hkv, Nw]``: the GQA group's union.
 
     One kernel program owns a KV head and every query head sharing it, so a
     window is loaded once for the whole group and the group's cost is one window
@@ -340,49 +346,27 @@ def group_max(bound: Tensor, num_kv_heads: int) -> Tensor:
     actually read -- at ``rep = 4`` (Llama-3.1-8B) a 25% cap becomes 100% loaded
     and the gate buys nothing. ``tests/test_sketch_store.py`` pins this.
     """
-    B, Hq, Nw = bound.shape
-    return bound.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).amax(2)
+    B, Hq, Nw = est.shape
+    return est.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).amax(2)
 
 
-def select_windows(
-    bound: Tensor,
-    margin: float,
-    max_windows: Optional[int] = None,
-    rank_by: Optional[Tensor] = None,
-) -> Tensor:
-    """Keep-mask with the same shape as ``bound``.
+def select_windows(est: Tensor, max_windows: int) -> Tensor:
+    """Keep-mask over the window axis: the top ``max_windows`` by estimate.
 
-    Call it on **KV-head** bounds (i.e. after :func:`group_max`), not on query-
-    head bounds: the KV head is the unit of work, so it is the unit the cap has
-    to bind on.
+    Call it on **KV-head** estimates (i.e. after :func:`group_max`), not on
+    query-head ones: one kernel program owns a KV head and every query head
+    sharing it, so a window is loaded once for the whole group and the KV head is
+    the unit the cap has to bind on. Capping per query head and unioning
+    afterwards lets a ratio ``r`` read up to ``r * rep`` windows — at ``rep = 4``
+    a 25% cap becomes 100% loaded and the gate buys nothing.
 
-    The threshold is relative to **each head's own maximum**, so it is a top-p in
-    log space: a peaked head admits few windows, a flat head admits many, with no
-    calibration, no sort, no host sync and no data-dependent shape. ``margin =
-    inf`` selects everything, which is how the feature ships dark.
-
-    ``bound`` and ``rank_by`` play different roles and that split is deliberate.
-    The margin thresholds on the **bound**, where "cannot miss" is a real
-    guarantee: every window is kept whose logit could possibly exceed
-    ``best - margin``. The cap top-k's on ``rank_by`` -- the point **estimate**,
-    with no slack term -- because a cap has no safety guarantee from either
-    quantity (it keeps ``k`` windows whatever their bounds say), so the right
-    criterion is simply the more accurate one. Measured on a shape-C tier
-    (271 windows, Llama-3.1-8B GQA), ranking by estimate holds 100.0% of the
-    attention mass at a 0.15 ratio against the bound's 99.7% worst-head, and
-    costs less: the ranking path never touches ``eps``.
-
-    ``rank_by`` defaults to ``bound`` so a caller that has only the bound still
-    gets sane behaviour.
+    The margin rule is gone with ``eps``. It thresholded on a Cauchy-Schwarz
+    bound the fused gate never implemented, and the estimate was already the
+    better ranking quantity — 100.0% worst-head mass recall at a 0.15 ratio
+    against the bound's 99.7%. What is left is a deterministic top-k: one
+    criterion, no calibration, no host sync, no data-dependent shape.
     """
-    top = bound.amax(dim=-1, keepdim=True)
-    keep = torch.ones_like(bound, dtype=torch.bool) if margin == float("inf") \
-        else (bound >= top - margin)
-    keep = keep | (bound == top)                            # always the best one
-    if max_windows is not None and max_windows < bound.shape[-1]:
-        crit = bound if rank_by is None else rank_by
-        rank = torch.argsort(torch.argsort(crit, dim=-1, descending=True), dim=-1)
-        keep = keep & (rank < max_windows)
-    return keep
+    rank = torch.argsort(torch.argsort(est, dim=-1, descending=True), dim=-1)
+    return rank < max_windows
 
 

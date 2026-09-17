@@ -73,13 +73,6 @@ OPERATING_POINT = {
     "quant_ratio": 0.70,
     "quant_budget_mode": "bytes",
     "quant_gate_ratio": 0.25,
-    # None = derived, i.e. the gate is live wherever there is a Q tier. Listed
-    # here so the UNGATED arm (quant_read_gate: false) shows up as a divergence
-    # rather than as a quiet second method: it compiles the gate machinery out
-    # of the decode kernel AND restores the whole-tier read memo, so it is both
-    # a different speed and a different set of eviction decisions. A speed row
-    # taken there may only be quoted beside an accuracy row taken there.
-    "quant_read_gate": None,
     "first_eviction_step": FIRST_EVICTION_STEP_DEFAULT,
 }
 
@@ -100,10 +93,6 @@ OPERATING_POINT_EXEMPT = {
     "eval_tier_study.yaml": "sweeps the tier on purpose",
     "eval_visualize.yaml": "no cache block",
     "longbench_ours_step0.yaml": "budget sweep arm at q=0.5, an ablation",
-    "longbench_ours_ungated.yaml":
-        "the UNGATED arm -- the accuracy half of --read-gate off. Identical to "
-        "longbench_ours_flash_attn.yaml except quant_read_gate, so the pair is "
-        "comparable; quote its scores ONLY beside a speed row taken the same way",
 }
 
 
@@ -166,57 +155,6 @@ class ModelConfig:
 
 @dataclass
 class CacheConfig:
-
-    backend: str = "dynamic"
-    backend_package: Optional[str] = None  # "flash_attn" | "eager" | None
-    cache_budget: Optional[float] = None  # float ratio in (0, 1]; None for baseline
-    window_size: int = 8
-    num_sink_tokens: int = 4
-    local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
-    rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
-    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
-    # What quant_ratio divides between the fp16 and int2 tiers. "bytes"
-    # (default) splits the byte budget, so the retained cache costs exactly
-    # cache_budget of the full cache at every q and cheaper int2 keys buy more
-    # context — the mode a memory-vs-quality claim is stated in. "tokens" splits
-    # the window count instead, holding the retained KEY count q-invariant; that
-    # is what a latency table needs (equal work per row) and what the perf suite
-    # pins explicitly, but it under-spends the budget it was granted (63% at
-    # q=0.5) and costs accuracy for memory nobody asked to save. See
-    # modules/windowed_cache/config.py and ACCURACY_RECOVERY_PLAN.md §2.
-    quant_budget_mode: str = "bytes"
-    # Decode step of the FIRST eviction, independent of window_size. 0 (default)
-    # compresses the prompt on decode step 0 — before that step's query attends —
-    # so every generated token comes from the budgeted cache. A positive value
-    # delays it and leaves any answer finishing inside that window measured at
-    # FULL cache whatever cache_budget says. See modules/windowed_cache/policy.py.
-    first_eviction_step: int = FIRST_EVICTION_STEP_DEFAULT
-    # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
-    # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
-    # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
-    quant_memoize_read: Optional[bool] = None
-    # Fraction of each step's ACTIVE int2 windows the read gate dequantizes.
-    # There is no on/off knob: the gate IS the read path wherever there is a Q
-    # tier. 1.0 selects every window, which makes the gate a provable no-op and
-    # is the control arm for pricing it (scripts/run_perf_table.sh --gate-ratio).
-    # Flash backend only — the eager package has no gate and always reads the
-    # whole tier. See modules/windowed_cache/config.py.
-    quant_gate_ratio: float = 0.25
-    # Tri-state ARM for the read gate itself, not its selectivity.
-    #   None (default) = derive it (on wherever there is a Q tier) -- unchanged.
-    #   False          = the UNGATED read path.
-    # `quant_gate_ratio=1.0` is a control for SELECTIVITY only: it still runs
-    # the gate kernel, its topk+sort, the SEL indirection, the GATED prologue
-    # and fill pass, and builds a card every eviction. False compiles all of
-    # that out (GATED is a Triton constexpr) and stops issuing the gate launch.
-    # It also re-enables the whole-tier read memo, but that is an EAGER-path
-    # saving only -- the fused CUDA kernel never calls effective_q_tier.
-    # It changes eviction decisions -- every
-    # window is scored truly instead of estimated -- so a speed number taken at
-    # False may only be quoted beside an accuracy number taken at False.
-    # Flash backend only, like quant_gate_ratio.
-    # See modules/windowed_cache/config.py and TARGET_GAP.md §4.
-    quant_read_gate: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:

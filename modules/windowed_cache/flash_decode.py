@@ -214,12 +214,15 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
         _STATS["windows_active"] += int(logmass.shape[-1])
 
     # 2. Attend over [sink | fp body | selected Q], scoring as it goes. The
-    #    kernel also scores the windows it skipped, from `logmass` — that used to
-    #    be 22 torch ops here, 704 launches per token at L=32, on a path bound by
-    #    launch count. It rides along in an epilogue pass that already runs.
+    #    kernel also scores the windows it skipped, from `logmass`, AND attends
+    #    over them through their value centroids at that same calibrated weight —
+    #    both in an epilogue pass that already runs. Doing either on the host cost
+    #    22 torch ops here, 704 launches per token at L=32, on a path bound by
+    #    launch count.
     out, wsum = fused_two_tier_decode(
         q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
         sel=sel, logmass=logmass,
+        centroids=None if gate is None else gate["centroid"],
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is

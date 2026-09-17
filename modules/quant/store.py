@@ -70,7 +70,6 @@ class QuantizedStore:
         n_slots: int,
         memoize_read: bool = True,
         sketch_enabled: bool = False,
-        sketch_needs_eps: bool = True,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
@@ -81,20 +80,14 @@ class QuantizedStore:
         # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
         # off nothing is allocated and every path below is the pre-gate one.
         self.sketch_enabled = sketch_enabled
-        # Whether those cards carry a REAL `eps` residual field. It is the card's
-        # Cauchy-Schwarz term and the only thing a finite `quant_gate_margin` can
-        # be computed from -- and the fused decode path refuses a finite margin
-        # (cache.py raises), so on every production configuration the field is
-        # built and then discarded by `_gate_triton`. Building it materializes a
-        # full [N, H, ws, D] fp32 `recon`, the most expensive step in the card.
-        # The caller sets this from the RESOLVED margin, so the capability is
-        # intact and only the unused work is skipped. See `sketch.build_sketch`.
-        self.sketch_needs_eps = sketch_needs_eps
         # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
         # be frozen, not running: a card is written once and never revisited
         # (§10), so a later anchor change would silently reinterpret every card
         # already on disk. Freezing makes the encoding as immutable as the codes.
         self._anchor: Optional[Tensor] = None
+        # [B, H_kv, D] value-side common mode, frozen on the same batch and for
+        # the same reason as `_anchor`.
+        self._v_anchor: Optional[Tensor] = None
 
         # Allocated on first use: the row count and device are not known until
         # the first forward pass reaches the cache.
@@ -181,12 +174,12 @@ class QuantizedStore:
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
-            sketch_needs_eps=ref.sketch_needs_eps,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
         if ref.sketch_enabled and all(s._anchor is not None for s in stores):
             joint._anchor = torch.cat([s._anchor for s in stores], dim=0)
+            joint._v_anchor = torch.cat([s._v_anchor for s in stores], dim=0)
         if ref.table is not None:
             joint.table = QuantSlotTable.join_layers([s.table for s in stores])
         joint._n_active = ref._n_active
@@ -298,13 +291,18 @@ class QuantizedStore:
                 )
             from .sketch import build_sketch
             kp = keys_post_rope.reshape(B * n, H, S, D).to(torch.float32)
+            vp = values.reshape(B * n, H, S, D).to(torch.float32)
             if self._anchor is None:
                 # Frozen here, from the first batch of demoted windows: the mean
                 # over (window, token) of this layer's keys, per row and head.
+                # Frozen and not running, because a card is written once and never
+                # revisited (§10) -- a later anchor change would silently
+                # reinterpret every card already stored.
                 self._anchor = kp.reshape(B, n, H, S, D).mean(dim=(1, 3))
+                self._v_anchor = vp.reshape(B, n, H, S, D).mean(dim=(1, 3))
             anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
-            sketch = tuple(build_sketch(kp, anc,
-                                        need_eps=self.sketch_needs_eps))
+            vanc = self._v_anchor.repeat_interleave(n, dim=0)
+            sketch = tuple(build_sketch(kp, anc, vp, vanc))
 
         self.table.write(
             slot_idx, valid, wid,
@@ -356,25 +354,18 @@ class QuantizedStore:
         self,
         query: Tensor,
         scaling: float,
-        margin: float = float("inf"),
-        ratio: Optional[float] = None,
-        max_windows: Optional[int] = None,
+        ratio: float,
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
-        """Which active Q windows this step must dequantize, and what the rest score.
+        """Which active Q windows this step dequantizes, and what the rest score.
 
         Parameters
         ----------
         query : ``[B, H_q, D]`` post-RoPE decode query.
         scaling : attention ``1 / sqrt(head_dim)``.
-        margin : ``Delta``. A window survives when its bound is within ``Delta``
-            of its head's best bound -- a top-p in log space, so a peaked head
-            keeps few windows and a flat head keeps many, with no calibration and
-            no sort. ``inf`` keeps everything and makes this a no-op.
         ratio : fraction of this step's ACTIVE windows to dequantize. Resolved
             against the live ``n_active`` rather than a fixed count, because
             ``N_q`` moves with the shape and a pinned integer would not be the
             same fraction anywhere. At least one window always survives.
-        max_windows : absolute cap; overrides ``ratio`` when given.
 
         Returns
         -------
@@ -382,10 +373,10 @@ class QuantizedStore:
         keep : ``[B, H_kv, n_active]`` bool -- the union over each GQA group, which
             is what the kernel needs because one program owns a whole group.
         logmass : ``[B, H_q, n_active]`` -- the estimated log mass of EVERY window,
-            selected or not. The skipped ones are what the caller writes back to
-            ``window_scores``; without that a skipped window scores zero, ranks
-            last, and gets evicted -- which would silently destroy the tier this
-            gate exists to read less often.
+            selected or not. The skipped ones are what the caller credits back,
+            both to ``window_scores`` and to the attention output; without that a
+            skipped window scores zero, ranks last, and gets evicted -- which
+            would silently destroy the tier this gate exists to read less often.
         slots : ``[B, n_active]`` the slot index behind each column.
         """
         if self.table is None or self._n_active == 0:
@@ -397,22 +388,32 @@ class QuantizedStore:
             )
         from .sketch import Sketch, gate_and_score, group_max, select_windows
 
-        cap = max_windows
-        if cap is None and ratio is not None and ratio < 1.0:
-            cap = max(1, math.ceil(ratio * self._n_active))
-
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
-        bound, logmass, est = gate_and_score(query, card, self._anchor, scaling)
+        logmass, est = gate_and_score(query, card, self._anchor, scaling)
         # Union the GQA group FIRST, then select. The KV head is the unit of
         # work -- one program loads a window once for every query head sharing
         # it -- so the cap has to bind there. Capping per query head and unioning
         # afterwards would let ratio r read up to r*rep windows (see group_max).
         keep = select_windows(
-            group_max(bound, self.num_kv_heads), margin, cap,
-            rank_by=group_max(est, self.num_kv_heads),
-        )
+            group_max(est, self.num_kv_heads), self.cap_for_ratio(ratio))
         return keep, logmass, slots
+
+    def cap_for_ratio(self, ratio: float) -> int:
+        """Windows read per head per step at ``ratio``, against the live count."""
+        return max(1, min(self._n_active, math.ceil(ratio * self._n_active)))
+
+    def window_centroids(self, slots: Tensor) -> Tensor:
+        """``[B, n_active, H_kv, D]`` — each active window's representative value.
+
+        What a skipped window contributes to the attention output. Gathered from
+        the same card the scan already pulled, so it rides the cache line the
+        scan warmed rather than costing a second pass over the tier.
+        """
+        from .sketch import Sketch, value_centroid
+
+        card = Sketch(*self.table.gather_sketch(slots))
+        return value_centroid(card, self._v_anchor)
 
     def gated_q_tier(
         self,

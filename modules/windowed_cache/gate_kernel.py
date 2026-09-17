@@ -73,7 +73,7 @@ def gate_reference(
     mu_q: Tensor, mu_s: Tensor,
     v_q: Tensor, v_s: Tensor,
     t_q: Tensor, t_s: Tensor,
-    e_q: Tensor, e_s: Tensor,
+    vm_q: Tensor, vm_s: Tensor,
     anchor: Tensor,
     scaling: float,
     n_sel: int,
@@ -83,7 +83,10 @@ def gate_reference(
     Parameters
     ----------
     q : ``[B, H_q, D]`` post-RoPE decode query.
-    mu_q .. e_s : card fields, ``[B, Nw, H_kv, ...]``.
+    mu_q .. vm_s : card fields, ``[B, Nw, H_kv, ...]``. ``vm_*`` is the value
+        centroid; the gate does not read it (the decode kernel does, for the
+        windows this selection skips) and it is taken only to keep the card one
+        object.
     anchor : ``[B, H_kv, D]`` or ``[H_kv, D]``.
     n_sel : windows to keep per ``(row, KV head)``.
 
@@ -96,8 +99,8 @@ def gate_reference(
     """
     from modules.quant.sketch import Sketch, gate_and_score, group_max
 
-    card = Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, e_q, e_s)
-    _, logmass, est = gate_and_score(q, card, anchor, scaling)
+    card = Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
+    logmass, est = gate_and_score(q, card, anchor, scaling)
     hkv = mu_q.shape[2]
     top = group_max(est, hkv).topk(n_sel, dim=-1).indices          # [B,Hkv,n_sel]
     return _sorted_pick(top), logmass
@@ -272,7 +275,7 @@ def _sm_count(device) -> int:  # pragma: no cover - GPU-only
 def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-only
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
-    mu_q, mu_s, v_q, v_s, t_q, t_s, _e_q, _e_s = card
+    mu_q, mu_s, v_q, v_s, t_q, t_s, _vm_q, _vm_s = card
     B, NW, HKV, D = mu_q.shape
     HQ = q.shape[1]
     ws = t_q.shape[-1]

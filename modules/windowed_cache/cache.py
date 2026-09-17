@@ -807,16 +807,6 @@ class WindowedCache(_HFCacheBase):
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
-                    # The card's `eps` residual is the Cauchy-Schwarz term, and
-                    # a finite `quant_gate_margin` is the only thing that reads
-                    # it. `_gate_ctx` raises on a finite margin (the fused gate
-                    # has no margin term), so at the default `inf` the field is
-                    # built every eviction -- a full [N, H, ws, D] fp32 `recon`,
-                    # the most expensive step in the card build -- and discarded
-                    # unread by `_gate_triton`. Derived from the resolved margin,
-                    # not hard-coded off: ask for a margin and you get the field.
-                    sketch_needs_eps=(
-                        self.resolved.quant_gate_margin != float("inf")),
                 )
                 for _ in range(num_layers)
             ]
@@ -1815,6 +1805,8 @@ class WindowedCache(_HFCacheBase):
                 "gate": None if joint_gate is None else {
                     "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
                     "anchor": joint_gate["anchor"][r0:r0 + B],
+                    "centroid": tuple(t[r0:r0 + B]
+                                      for t in joint_gate["centroid"]),
                     "n_sel": joint_gate["n_sel"],
                 },
             }
@@ -1982,24 +1974,15 @@ class WindowedCache(_HFCacheBase):
         if not (store.sketch_enabled and store._anchor is not None
                 and getattr(store.table, "sketch", False)):
             return None
-        # The fused gate ranks by a plain top-k on the card estimate; it has no
-        # margin term. At the default `inf` margin the two agree exactly (an inf
-        # margin keeps everything, leaving the cap to decide), but a finite margin
-        # would be silently dropped — a configured selectivity that does nothing.
-        if self.resolved.quant_gate_margin != float("inf"):
-            raise NotImplementedError(
-                "quant_gate_margin is not implemented on the fused decode path: "
-                "the fused gate is a top-k on the card estimate with no margin "
-                "term, so a finite margin would be accepted and then ignored. Use "
-                "quant_gate_ratio to set selectivity. Falling back is NOT an "
-                "option here: the materialize path does not gate at all — it "
-                "dequantizes the whole tier — so it honours a margin even less. "
-                "The only code that reads a margin is gate_and_select, which "
-                "today has no caller but gated_decode_step (the CPU reference)."
-            )
+        card = store.table.gather_sketch(idx)
+        # The centroid columns ride the same gather, so the windows this step
+        # skips cost no second pass over the tier to attend through. `vm_q` /
+        # `vm_s` are SKETCH_FIELDS[-2:]; the kernel wants them contiguous and
+        # separate from the scan fields, which the gather already gives.
         return {
-            "card": store.table.gather_sketch(idx),
+            "card": card,
             "anchor": store._anchor,
+            "centroid": (card[-2], card[-1], store._v_anchor),
             "n_sel": max(1, math.ceil(ratio * n)),
         }
 

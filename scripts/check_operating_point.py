@@ -77,7 +77,6 @@ def _perf_table_point() -> dict:
         "quant_ratio": "QUANT_RATIO",
         "quant_budget_mode": "QUANT_MODE",
         "quant_gate_ratio": "GATE_RATIO",
-        "quant_read_gate": "READ_GATE",
     }
     out: dict = {"first_eviction_step": 0}   # the generated YAML hardcodes it
     for field, var in want.items():

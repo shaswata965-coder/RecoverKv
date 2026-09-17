@@ -16,6 +16,11 @@ import torch
 
 from .policy import FIRST_EVICTION_STEP
 
+#: Floor on `ResolvedConfig.budget_utilisation`. A budget that is granted and
+#: not spent is a quality result reported at the wrong operating point, so under
+#: 'bytes' this is enforced rather than reported.
+MIN_BUDGET_UTILISATION = 0.99
+
 
 # ---------------------------------------------------------------------------
 # ResolvedConfig (frozen, output of resolve())
@@ -60,6 +65,9 @@ class ResolvedConfig:
     # actually achieved under either.
     bytes_per_fp_window: int = 0
     bytes_per_q_window: int = 0
+    # The card's share of `bytes_per_q_window`, carried so a memory report can
+    # say what the gate costs without re-deriving it. Zero when there is no gate.
+    bytes_per_gate_card: int = 0
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
@@ -269,42 +277,6 @@ class WindowedCacheConfig:
     # the bar. Because the bound is a bound, a skipped window provably carries no
     # logit above it: the gate can over-select, it cannot miss.
     #
-    # `quant_read_gate` is a tri-state ARM, not a production setting:
-    #
-    #   None  (default) -- derive it, exactly as before: on wherever there is a
-    #                      Q tier to gate, off at q=0 where there is nothing to
-    #                      skip. The shipped operating point.
-    #   True            -- same thing, said out loud.
-    #   False           -- the UNGATED read path. Every active window is
-    #                      dequantized and scored truly.
-    #
-    # It exists because the gate had no control arm. `e7bc158` deliberately made
-    # every ratio take the same route, so `quant_gate_ratio=1.0` still runs the
-    # fused_gate launch, its topk+sort, the `SEL` indirection in the Q loop, the
-    # `GATED` prologue over every Q column, the §5 fill pass, and `build_sketch`
-    # on every eviction. 1.0 is a control for SELECTIVITY; it is not a control
-    # for THE MACHINERY, and the machinery is what every remaining speed item
-    # accuses (TARGET_GAP.md §4).
-    #
-    # `False` is a control for the machinery, because `GATED` is a `constexpr`:
-    # `sel=None` compiles the indirection, the prologue and the fill pass out of
-    # the kernel entirely (`decode_kernel.py` :652, :1240), and the `fused_gate`
-    # launch with its `topk` + `sort` stops being issued at all.
-    #
-    # It also re-enables the whole-tier read memo, which a live gate disables
-    # unconditionally (`cache._resolve_memoization`). That part helps the EAGER
-    # / materialize path only: on CUDA the fused kernel dequantizes int2 inside
-    # itself and never calls `effective_q_tier`, so the memo is not what makes
-    # this faster on a GPU. Do not quote it as a GPU saving.
-    #
-    # It is NOT score-neutral, which is why it is an arm and not a default: the
-    # ungated path scores every window truly where the gate credits a skipped
-    # window with a rescaled estimate. The direction is more accuracy, not less,
-    # but it changes eviction decisions, so a speed number taken here may only
-    # be quoted beside an accuracy number taken here. `utils.config`'s
-    # OPERATING_POINT carries the field so `scripts/check_operating_point.py`
-    # says so rather than leaving it to be noticed.
-    quant_read_gate: Optional[bool] = None
     #
     # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
     # operating point the efficiency arithmetic is costed on: the card is 26.5%
@@ -394,14 +366,7 @@ class WindowedCacheConfig:
             )
 
         # -- rank-1 read gate --
-        if self.quant_read_gate is not None and not isinstance(
-            self.quant_read_gate, bool
-        ):
-            raise ValueError(
-                f"quant_read_gate must be None (derive), True or False, got "
-                f"{type(self.quant_read_gate).__name__}"
-            )
-        gate_live = self.quant_ratio > 0.0 and self.quant_read_gate is not False
+        gate_live = self.quant_ratio > 0.0
         if gate_live and self.quant_memoize_read is True:
             raise ValueError(
                 "quant_memoize_read=True cannot be combined with a LIVE read "
@@ -409,7 +374,7 @@ class WindowedCacheConfig:
                 "store.version -- which only moves at eviction, while the "
                 "gate's selected set moves every step. It would serve a set the "
                 "gate did not choose. Leave it None, or set "
-                "quant_read_gate=False to take the ungated path, which has no "
+                ""
                 "per-step selected set and memoizes legitimately."
             )
         if not (0.0 < self.quant_gate_ratio <= 1.0):
@@ -609,10 +574,23 @@ class WindowedCacheConfig:
         # that now dominates the Q window (design.md §2, §7). window_size % 4 == 0
         # is validated, so the // 2 below is exact.
         b_fp = bytes_per_token * self.window_size                       # K+V fp16
+        # The GATE CARD IS PART OF THE WINDOW. It is resident for the life of the
+        # window, it is allocated unconditionally wherever there is a Q tier, and
+        # leaving it out of `b_q` is not a rounding error: at D=128, ws=8, H_kv=8
+        # the card is 3200 B against the codes' 8448, so an unbudgeted card is a
+        # 38% overrun on the exact tier the memory claim is made about. It was
+        # missing here, which meant every reported `cache_budget` understated the
+        # bytes actually held.
+        from modules.quant.sketch import sketch_bytes_per_head
+
+        gate_live = q > 0.0
+        b_card = (num_kv_heads * sketch_bytes_per_head(head_dim, self.window_size)
+                  if gate_live else 0)
         b_q = (
             (num_kv_heads * head_dim * self.window_size) // 2           # int2 codes, K+V
             + 4 * num_kv_heads * head_dim                               # key scale+zero fp16
             + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
+            + b_card                                                    # rank-1 card
         )
         m_evict = remaining * bytes_per_token                           # evictable bytes
         if self.quant_budget_mode == "bytes":
@@ -621,6 +599,30 @@ class WindowedCacheConfig:
             # can end up holding more keys than the prompt (see the field docs).
             top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
             N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+            # SPEND THE REMAINDER. Two independent floor divisions leave up to
+            # one window of each tier unbought -- and because the leftover is
+            # never spent, the cache quietly runs under budget while the report
+            # says otherwise. Top up one window at a time, each time taking the
+            # tier that keeps the realised byte split closest to `q`, so filling
+            # the budget does not drift the operating point it was resolved at.
+            spent = top_k_fp * b_fp + N_q * b_q
+            while True:
+                room_fp = (spent + b_fp) <= m_evict
+                room_q = q > 0.0 and (spent + b_q) <= m_evict
+                if not (room_fp or room_q):
+                    break
+
+                def _err(dfp: int, dq: int) -> float:
+                    fp_b = (top_k_fp + dfp) * b_fp
+                    q_b = (N_q + dq) * b_q
+                    return abs(q_b / max(fp_b + q_b, 1) - q)
+
+                if room_q and (not room_fp or _err(0, 1) <= _err(1, 0)):
+                    N_q += 1
+                    spent += b_q
+                else:
+                    top_k_fp += 1
+                    spent += b_fp
         else:
             # Token split (default): q divides the retained WINDOW COUNT, so
             # top_k_fp + N_q == top_k_windows for every q. The keys a decode step
@@ -638,7 +640,7 @@ class WindowedCacheConfig:
         if q == 0.0:
             top_k_fp = top_k_windows
 
-        return ResolvedConfig(
+        resolved = ResolvedConfig(
             window_size=self.window_size,
             num_sink_tokens=self.num_sink_tokens,
             local_tokens=local_tokens,
@@ -653,16 +655,73 @@ class WindowedCacheConfig:
             quant_budget_mode=self.quant_budget_mode,
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
+            bytes_per_gate_card=b_card,
             quant_memoize_read=self.quant_memoize_read,
-            # Derived unless `quant_read_gate` overrides it. The derivation is
-            # unchanged at the default (None): the gate is the read path
-            # wherever there is a Q tier. `False` asks for the ungated one; it
-            # cannot conjure a gate where there is no Q tier, so `q > 0.0`
-            # remains a necessary condition either way.
-            quant_sketch_enabled=(q > 0.0) if self.quant_read_gate is None
-            else bool(self.quant_read_gate and q > 0.0),
+            # The gate IS the read path wherever there is a Q tier. There is no
+            # knob: an ungated arm is a second method with different eviction
+            # decisions and a different kernel compile, and keeping one meant
+            # every downstream number had to say which arm it came from.
+            quant_sketch_enabled=q > 0.0,
             quant_gate_ratio=self.quant_gate_ratio,
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,
             first_eviction_step=self.first_eviction_step,
         )
+
+        # --- ENFORCE the budget, do not merely compute it --------------------
+        # `budget_utilisation` has always been reported; nothing has ever
+        # refused a configuration that failed to spend what it was granted. A
+        # cache that holds 70% of its allowance is a quality result taken at a
+        # budget nobody asked for, and it reads as a memory win in the table.
+        #
+        # Under 'bytes' the remainder is spent above, so this is reachable only
+        # if the allowance cannot buy a single window of either tier -- a
+        # genuinely unusable budget, worth refusing loudly.
+        #
+        # Under 'tokens' the window COUNT is pinned and the bytes are whatever
+        # the cheaper keys cost, so under-spend is the mode's definition, not a
+        # fault. It is still not allowed to be silent: 'tokens' is a latency
+        # mode, and a quality number taken under it is stated at a budget the
+        # config did not ask for.
+        util = resolved.budget_utilisation
+        if self.quant_budget_mode == "bytes":
+            # The invariant is GRANULARITY-EXACT, not a percentage: the leftover
+            # must be too small to buy another window of any tier. A flat 99%
+            # floor is the wrong shape -- it is unreachable when the allowance
+            # buys only a handful of windows (one fp window is 15% of a 6-window
+            # budget) and it is far too loose when it buys hundreds. At the
+            # shipped shapes this implies >= 99.6%.
+            cheapest = b_q if q > 0.0 else b_fp
+            leftover = m_evict - resolved.retained_evictable_bytes
+            if leftover >= cheapest:
+                raise ValueError(
+                    f"cache_budget={self.cache_budget} leaves {leftover} B of its "
+                    f"{m_evict} B evictable allowance unspent, enough for another "
+                    f"{'int2' if q > 0.0 else 'fp'} window ({cheapest} B"
+                    f"{f', incl. {b_card} B of gate card' if b_card else ''}). "
+                    "The remainder loop should have bought it; this is a bug in "
+                    "resolve(), not a bad configuration."
+                )
+            if util < MIN_BUDGET_UTILISATION:
+                warnings.warn(
+                    f"cache_budget={self.cache_budget} spends {util:.1%} of its "
+                    f"byte allowance ({resolved.retained_bytes} of "
+                    f"{resolved.total_budget_bytes} B). The allowance is fully "
+                    f"spent to within one window ({leftover} B left, cheapest "
+                    f"window {cheapest} B) -- the shortfall is granularity, not "
+                    "waste. It matters anyway: this run holds "
+                    f"{util * self.cache_budget:.1%} of the full cache, not "
+                    f"{self.cache_budget:.1%}. Quote quality numbers against that.",
+                    stacklevel=2,
+                )
+        elif util < MIN_BUDGET_UTILISATION:
+            warnings.warn(
+                f"quant_budget_mode='tokens' at quant_ratio={q} spends "
+                f"{util:.1%} of the byte budget: the window count is pinned, so "
+                f"cheaper int2 keys buy fewer bytes rather than more windows. "
+                f"This run holds {util * self.cache_budget:.1%} of the full "
+                "cache, not cache_budget. Quote quality numbers against that, "
+                "or resolve in 'bytes'.",
+                stacklevel=2,
+            )
+        return resolved

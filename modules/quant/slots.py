@@ -47,7 +47,7 @@ FREE = -1
 
 SKETCH_FIELDS = (
     "sk_mu_q", "sk_mu_s", "sk_v_q", "sk_v_s",
-    "sk_t_q", "sk_t_s", "sk_e_q", "sk_e_s",
+    "sk_t_q", "sk_t_s", "sk_vm_q", "sk_vm_s",
 )
 """The rank-1 gate card's columns, in :class:`modules.quant.sketch.Sketch` order.
 
@@ -135,8 +135,13 @@ class QuantSlotTable:
             self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             self.sk_t_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
             self.sk_t_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_e_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
-            self.sk_e_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+            # Value-side centroid. This is what makes a SKIPPED window contribute
+            # to the attention output instead of vanishing from it; its weight is
+            # the card's mass estimate, recalibrated every step against the
+            # windows that were actually read. It replaces the `eps` residual
+            # field, which served a bound the fused gate never implemented.
+            self.sk_vm_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
         # ws//2] index tensor would allocate an int64 index the size of the codes

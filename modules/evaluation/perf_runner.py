@@ -1315,7 +1315,6 @@ class PerfRunner:
                 assert_transformers_version_supported,
                 get_cache_classes,
                 quant_gate_ratio_kwargs,
-                quant_read_gate_kwargs,
                 validate_backend_attn_pairing,
             )
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
@@ -1407,13 +1406,7 @@ class PerfRunner:
                       # through the factory: the eager package has no gate.
                       **quant_gate_ratio_kwargs(
                           WCC, c.get("quant_gate_ratio",
-                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))),
-                      # The gate ITSELF, not its selectivity. Threaded here for
-                      # the same reason the ratio is: a knob a runner forgets to
-                      # pass is a knob that is silently inert.
-                      **quant_read_gate_kwargs(
-                          WCC, c.get("quant_read_gate",
-                                     getattr(cfg.cache, "quant_read_gate", None))))
+                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))))
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():

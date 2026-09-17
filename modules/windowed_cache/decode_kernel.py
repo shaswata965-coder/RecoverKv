@@ -354,6 +354,7 @@ def two_tier_window_reference(
     exp2: bool = False,
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
+    centroids: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -579,10 +580,23 @@ def two_tier_window_reference(
             -1, keepdim=True)
         rel = (logmass - gmx).exp()
         gsm = (rel * read).sum(-1, keepdim=True).clamp_min(1e-30)
+        fill = num * rel / gsm                                 # calibrated mass
         wsum = torch.cat([
             wsum[..., :n_body_win],
-            torch.where(read, wsum[..., n_body_win:], num * rel / gsm),
+            torch.where(read, wsum[..., n_body_win:], fill),
         ], dim=-1)
+
+        # The skipped windows also ATTEND, through their value centroids, at the
+        # weight `fill` just measured. Mirrors the kernel's §5 block: a `tl.dot`
+        # of the same tile, then one renormalization of `out` and of every score.
+        if centroids is not None:
+            skipped = (~read).to(fill.dtype)
+            mhat = fill * skipped                              # [B,H_q,n_active]
+            out = out.float() + torch.einsum(
+                "bhw,bhwd->bhd", mhat, centroids.to(torch.float32))
+            den = 1.0 + mhat.sum(-1, keepdim=True)
+            out = out / den
+            wsum = wsum / den
     return out.to(v_eff.dtype), wsum
 
 
@@ -601,6 +615,7 @@ if _HAS_TRITON:
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
+        VM, VMS, VANC,             # value centroids: int8 [B,n,H_kv,D], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -702,6 +717,13 @@ if _HAS_TRITON:
         vsn = H_kv * WS
         vsh = WS
         cob = n_active * WS * HALF
+        vmb = n_active * H_kv * HEAD_DIM
+        vmn = H_kv * HEAD_DIM
+        vmh = HEAD_DIM
+        vmsb = n_active * H_kv
+        vmsn = H_kv
+        vab = H_kv * HEAD_DIM
+        vah = HEAD_DIM
 
         # ---- 1. sink prologue: softmax only, emits no window score -----------
         # Sinks are not represented in window scores (the scorer strips them
@@ -853,8 +875,11 @@ if _HAS_TRITON:
 
         out = acc / l[:, None]
         lse = m + tl.log2(l)
-        tl.store(OUT + b * ob + hq[:, None] * HEAD_DIM + offs_d[None, :],
-                 out.to(OUT.dtype.element_ty), mask=r_mask[:, None])
+        # OUT is NOT stored here. Under GATED the windows this step declined to
+        # read still contribute to the attention output, through their value
+        # centroids at the weight the epilogue is about to measure -- so the
+        # output is not final until §5 has run. The ungated kernel stores at the
+        # bottom unchanged; `GATED` is a constexpr, so it costs it nothing.
 
         # ---- 4. epilogue: rescale each window from its tile max to the LSE ----
         # Runs over W_phys values, not S. That is the whole of §5.1's traffic cut.
@@ -915,6 +940,24 @@ if _HAS_TRITON:
         # every exponential in this kernel stays base 2.
         if GATED:
             gsm = tl.maximum(gsm, 1e-30)
+            # The skipped windows also ATTEND, through their value centroids.
+            #
+            # Reading 25% of the tier and returning that softmax unchanged is not
+            # an approximation of attention over the cache -- it is exact
+            # attention over a DIFFERENT cache, one where the other 75% does not
+            # exist and the surviving weights have been inflated to cover for it.
+            # `fill` is already the calibrated mass those windows carry, so the
+            # honest output adds each one's representative at that weight and
+            # renormalizes.
+            #
+            # This rides in the pass that was already running. The only new
+            # traffic is the centroid tile (D int8 + one fp16 scale per skipped
+            # window, 130 B/head against the 8448 B/window not read), and the
+            # only new arithmetic is one `tl.dot` of a tile the loop already
+            # holds -- the same shape as the Q loop's `tl.dot(p, vv)`.
+            vacc = tl.zeros([BLOCK_R, HEAD_DIM], tl.float32)
+            msum = tl.zeros([BLOCK_R], tl.float32)
+            vanc = tl.load(VANC + b * vab + kv * vah + offs_d).to(tl.float32)
             for w0 in range(n_body_win, W_phys, BLOCK_W):
                 cols = w0 + offs_w
                 cmask = cols < W_phys
@@ -929,6 +972,35 @@ if _HAS_TRITON:
                 fill = (num[:, None]
                         * tl.exp2((lg - gmx[:, None]) * LOG2E) / gsm[:, None])
                 tl.store(ptr, fill, mask=skipped)
+
+                f = tl.where(skipped, fill, 0.0)           # [BLOCK_R, BLOCK_W]
+                msum += tl.sum(f, axis=1)
+                # Centroid tile: [BLOCK_W, HEAD_DIM]. Dequantized in registers,
+                # exactly as the Q loop dequantizes codes -- no fp16 centroid
+                # tensor is ever built.
+                qmask = cmask & (cols >= n_body_win)
+                vq = tl.load(VM + b * vmb + qc[:, None] * vmn + kv * vmh
+                             + offs_d[None, :],
+                             mask=qmask[:, None], other=0).to(tl.float32)
+                vsc = tl.load(VMS + b * vmsb + qc * vmsn + kv,
+                              mask=qmask, other=0.0).to(tl.float32)
+                vbar = vq * vsc[:, None] + vanc[None, :]
+                vacc = vacc + tl.dot(f, vbar)
+
+            # Renormalize: `out` and every stored window score are on a softmax
+            # that summed to 1 over the read set, and `msum` of mass has just
+            # been added to it.
+            den = 1.0 + msum
+            out = (out + vacc) / den[:, None]
+            for w0 in range(0, W_phys, BLOCK_W):
+                cols = w0 + offs_w
+                sm = r_mask[:, None] & (cols < W_phys)[None, :]
+                ptr = WSUM + b * wsb + hq[:, None] * wsh + cols[None, :]
+                tl.store(ptr, tl.load(ptr, mask=sm, other=0.0) / den[:, None],
+                         mask=sm)
+
+        tl.store(OUT + b * ob + hq[:, None] * HEAD_DIM + offs_d[None, :],
+                 out.to(OUT.dtype.element_ty), mask=r_mask[:, None])
 
 
 #: Per-(shape, dtype, device) scratch, reused across layers within a step.
@@ -1128,6 +1200,7 @@ def _decode_triton(
     n_body_win: Optional[int] = None,
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
+    centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -1235,11 +1308,36 @@ def _decode_triton(
                 "fused decode requires a contiguous logmass; its strides are "
                 "derived from its shape inside the kernel.")
         LOGM = logmass
+        if centroids is None:
+            raise RuntimeError(
+                "a gated fused decode needs the value centroids: the windows it "
+                "skips attend through them, and without them 75% of the tier "
+                "would be silently absent from the attention output.")
+        VM, VMS, VANC = centroids
+        if VM.shape != (B, n_active, H_kv, D):
+            raise RuntimeError(
+                f"centroid codes must be [B, n_active, H_kv, D] = [{B}, "
+                f"{n_active}, {H_kv}, {D}]; got {tuple(VM.shape)}.")
+        if VMS.shape != (B, n_active, H_kv):
+            raise RuntimeError(
+                f"centroid scales must be [B, n_active, H_kv]; got {tuple(VMS.shape)}.")
+        if VANC.shape != (B, H_kv, D):
+            raise RuntimeError(
+                f"the value anchor must be [B, H_kv, D] = [{B}, {H_kv}, {D}]; "
+                f"got {tuple(VANC.shape)}.")
+        for name, t in (("vm", VM), ("vms", VMS), ("vanc", VANC)):
+            if not t.is_contiguous():
+                raise RuntimeError(
+                    f"fused decode requires a contiguous {name}; its strides are "
+                    "derived from its shape inside the kernel.")
     else:
         # Valid pointers the kernel never dereferences: the Q loop runs while
         # w0 < n_sel == 0, and the GATED blocks are compiled out entirely.
         SEL = torch.zeros((1,), dtype=torch.int32, device=dev)
         LOGM = torch.zeros((1,), dtype=torch.float32, device=dev)
+        VM = torch.zeros((1,), dtype=torch.int8, device=dev)
+        VMS = torch.zeros((1,), dtype=torch.float16, device=dev)
+        VANC = torch.zeros((1,), dtype=torch.float32, device=dev)
         selb = selh = 0
 
     BLOCK_R = _pow2_at_least(rep)
@@ -1290,6 +1388,7 @@ def _decode_triton(
         try:
             _two_tier_decode_kernel[grid](
                 q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, SEL, LOGM,
+                VM, VMS, VANC,
                 out, wsum, wmax,
                 scaling,
                 H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -1346,6 +1445,7 @@ def fused_two_tier_decode(
     n_body_win: Optional[int] = None,
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
+    centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -1374,4 +1474,4 @@ def fused_two_tier_decode(
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
     return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
-                          sel, logmass)
+                          sel, logmass, centroids)
