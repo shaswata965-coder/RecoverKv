@@ -862,12 +862,21 @@ the whole argument for splitting the window axis), it just cannot price it.
 the same work first-fit did. The search itself is ~19 launches of a
 sub-millisecond kernel, once per signature.
 
-**Warmup: up to one Triton compile per rung, once per machine.** That is the real
-price. It is bounded by deduplicating rungs that collapse onto the same launch
-(`window_tiling` floors `target_keys // ws`, so at `ws=128` the 64/32/16 rungs
-are the same kernel), it lands in the warmup the harness already reserves for
-JIT, and Triton's on-disk cache makes it once-per-machine rather than
-once-per-run.
+**Warmup: one Triton compile per rung — at the shipped geometry, all 12 of
+them.** That is the real price, and it is the one number in this section that
+was checked rather than asserted. An earlier draft of this paragraph claimed the
+rung dedup reduced it: it does not, here. `window_tiling` does collapse
+`target_keys` 64/32/16 onto one `(BLOCK_NW, BLOCK_T)` at a large `ws`, but
+`BLOCK_W` is derived from `target_keys` as well, so those rungs still differ in a
+constexpr and still compile separately. The dedup only bites when the tiling
+*and* `BLOCK_W` both collapse — a large `ws` with `W_phys <= 16`. It is kept
+because that regime is real, not because it helps the common case.
+
+So: ~12 decode compiles and 8 gate compiles on a cold Triton cache, once per
+machine, in the warmup the harness already reserves for JIT. If that is ever too
+slow somewhere, `_FIT_LADDER` is one list literal — but trim it by measurement,
+not by guessing which rungs matter, which is the mistake that made the ladder
+first-fit in the first place.
 
 **The one property that moves: `num_warps` changes the lane layout of the
 reductions, so `wsum`, `est` and `logmass` move in their last bits.** Stated

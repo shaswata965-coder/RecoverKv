@@ -563,45 +563,54 @@ def main() -> None:
         """
         try:
             chosen, timed = choice_fn(), timings_fn()
+            if not chosen:
+                print(f"\n  {title}: nothing tuned (the kernel never ran)")
+                return
+            print(f"\n  {title}:")
+            # Formatting is INSIDE the try too. A signature's arity is part of
+            # the tuner's contract, so a stale or renamed one unpacks wrong here
+            # -- and a diagnostic that kills the run it is diagnosing is worse
+            # than one that says it cannot answer.
+            for sig, rung in sorted(chosen.items(), key=lambda kv: str(kv[0])):
+                ranked = timed.get(sig, [])
+                best_ms = ranked[0][1] if ranked else None
+                # The margin is the point: a rung that won by 30% and one that
+                # won by 0.5% call for different next moves.
+                margin = ""
+                if len(ranked) > 1 and best_ms:
+                    margin = (f"   ({100.0 * (ranked[1][1] - best_ms) / best_ms:.1f}% "
+                              f"clear of {fmt_rung(ranked[1][0])})")
+                ms = f"  {best_ms:.3f} ms" if best_ms else ""
+                print(f"    {fmt_sig(sig)}  ->  {fmt_rung(rung)}{ms}{margin}")
+                for r, t in ranked:
+                    mark = " *" if r == rung else "  "
+                    print(f"        {mark} {fmt_rung(r):<18} {t:.3f} ms")
         except Exception as exc:  # pragma: no cover - diagnostics only
             print(f"\n  {title}: unavailable ({type(exc).__name__}: {exc})")
-            return
-        if not chosen:
-            print(f"\n  {title}: nothing tuned (the kernel never ran)")
-            return
-        print(f"\n  {title}:")
-        for sig, rung in sorted(chosen.items(), key=lambda kv: str(kv[0])):
-            ranked = timed.get(sig, [])
-            best_ms = ranked[0][1] if ranked else None
-            # The margin is the point: a rung that won by 30% and one that won
-            # by 0.5% call for different next moves.
-            margin = ""
-            if len(ranked) > 1 and best_ms:
-                margin = (f"   ({100.0 * (ranked[1][1] - best_ms) / best_ms:.1f}% "
-                          f"clear of {fmt_rung(ranked[1][0])})")
-            ms = f"  {best_ms:.3f} ms" if best_ms else ""
-            print(f"    {fmt_sig(sig)}  ->  {fmt_rung(rung)}{ms}{margin}")
-            for r, t in ranked:
-                mark = " *" if r == rung else "  "
-                print(f"        {mark} {fmt_rung(r):<18} {t:.3f} ms")
 
-    from modules.windowed_cache import decode_kernel as _dk
-    from modules.windowed_cache import gate_kernel as _gk
+    try:
+        from modules.windowed_cache import decode_kernel as _dk
+        from modules.windowed_cache import gate_kernel as _gk
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        _dk = _gk = None
+        print(f"\n  tile searches: unavailable ({type(exc).__name__}: {exc})")
 
-    _print_search(
-        "decode tiling (target_keys x num_stages x num_warps), per geometry",
-        _dk.fit_choice, _dk.fit_timings,
-        lambda s: (f"ws={s[0]} head_dim={s[1]} BLOCK_R={s[2]} q_tier={bool(s[3])} "
-                   f"gated={s[4]} B={s[5]} Sfp~2^{s[6]} n_sel~2^{s[7]}"),
-        lambda r: f"{r[0]}x{r[1]}x{r[2]}w",
-    )
-    _print_search(
-        "read gate tiling (BLOCK_W x num_warps), per geometry",
-        _gk.gate_choice, _gk.gate_timings,
-        lambda s: (f"NW={s[0]} H_kv={s[1]} head_dim={s[2]} ws={s[3]} B={s[4]} "
-                   f"rep={s[5]}"),
-        lambda r: f"BLOCK_W={r[0]}x{r[1]}w",
-    )
+    if _dk is not None:
+        _print_search(
+            "decode tiling (target_keys x num_stages x num_warps), per geometry",
+            _dk.fit_choice, _dk.fit_timings,
+            lambda s: (f"ws={s[0]} head_dim={s[1]} BLOCK_R={s[2]} "
+                       f"q_tier={bool(s[3])} gated={s[4]} B={s[5]} "
+                       f"Sfp~2^{s[6]} n_sel~2^{s[7]}"),
+            lambda r: f"{r[0]}x{r[1]}x{r[2]}w",
+        )
+        _print_search(
+            "read gate tiling (BLOCK_W x num_warps), per geometry",
+            _gk.gate_choice, _gk.gate_timings,
+            lambda s: (f"NW={s[0]} H_kv={s[1]} head_dim={s[2]} ws={s[3]} "
+                       f"B={s[4]} rep={s[5]}"),
+            lambda r: f"BLOCK_W={r[0]}x{r[1]}w",
+        )
 
     # What the eviction's worst-case width actually bought (DECODE_NEXT.md D1).
     # Printed here, after both timed windows, because reading it syncs once.

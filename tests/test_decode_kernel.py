@@ -184,21 +184,24 @@ def test_unrelated_errors_are_not_swallowed_by_the_ladder():
     assert not _is_out_of_resources(RuntimeError("CUDA error: out of memory"))
 
 
-def test_fit_ladder_is_ordered_fastest_first_and_terminates():
+def test_every_fit_ladder_rung_is_launchable():
+    """Each rung must name a legal launch. Ordering is NOT asserted any more.
+
+    The ladder used to be first-fit, so its order *was* the policy and
+    "widest-first" was the claim being made. It is now timed (`_search_rungs`),
+    so every rung that fits is measured and the fastest wins — the order only
+    decides the sequence of the announcement. What still has to hold is that no
+    rung can turn a fit problem into a crash.
+    """
     from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
 
     assert len(_FIT_LADDER) >= 2
-    keys = [k for k, _ in _FIT_LADDER]
-    assert keys == sorted(keys, reverse=True), "biggest tile must be tried first"
-    # every rung yields a legal, shrinking tile at the shipped window size
-    seen = []
-    for target_keys, num_stages in _FIT_LADDER:
+    for target_keys, num_stages, num_warps in _FIT_LADDER:
         nw, t = window_tiling(8, target_keys)
         assert nw >= 1 and t & (t - 1) == 0
         assert num_stages >= 1
-        seen.append(nw)
-    assert seen[0] >= seen[-1], "tiles must not grow as the ladder steps down"
-    assert seen[-1] >= 1, "the last rung must still be launchable"
+        assert num_warps >= 1 and num_warps & (num_warps - 1) == 0, (
+            f"num_warps={num_warps} is not a power of two")
 
 
 @pytest.mark.parametrize("ws", [1, 4, 8, 12, 32, 128])
@@ -207,7 +210,7 @@ def test_every_ladder_rung_is_a_legal_tiling(ws):
     the next one, turning a fit problem into a crash."""
     from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
 
-    for target_keys, _ in _FIT_LADDER:
+    for target_keys, _, _ in _FIT_LADDER:
         nw, t = window_tiling(ws, target_keys)
         assert nw >= 1, f"ws={ws} target={target_keys} produced {nw} windows/tile"
         assert nw * ws <= t
@@ -234,16 +237,13 @@ def test_the_ladder_can_drop_a_stage_before_it_drops_the_tile():
     """
     from modules.windowed_cache.decode_kernel import _FIT_LADDER
 
-    keys = [k for k, _ in _FIT_LADDER]
-    assert keys == sorted(keys, reverse=True), "rungs must be widest-first"
-    top_keys = _FIT_LADDER[0][0]
-    at_top = [s for k, s in _FIT_LADDER if k == top_keys]
+    widest = max(k for k, _, _ in _FIT_LADDER)
+    at_top = {s for k, s, _ in _FIT_LADDER if k == widest}
     assert len(at_top) > 1, (
-        f"the ladder offers only num_stages={at_top} at target_keys={top_keys}, "
-        "so a kernel that misses the top rung halves its tile instead of "
-        "dropping a pipeline stage first"
+        f"the ladder offers only num_stages={sorted(at_top)} at "
+        f"target_keys={widest}, so a kernel that cannot fit the widest tile has "
+        "to halve the tile instead of dropping a pipeline stage first"
     )
-    assert at_top == sorted(at_top, reverse=True), "stages must descend"
 
 
 def test_every_rung_is_distinct():
@@ -288,10 +288,10 @@ def test_a_malformed_override_raises_rather_than_being_ignored(raw, monkeypatch)
 def test_fit_choice_is_readable_and_a_copy():
     """The chosen rung has to be ASKABLE, not caught in warmup scrollback."""
     from modules.windowed_cache import decode_kernel as dk
-    dk._FIT_CHOICE[("probe",)] = (64, 2)
+    dk._FIT_CHOICE[("probe",)] = (64, 2, 4)
     try:
         got = dk.fit_choice()
-        assert got[("probe",)] == (64, 2)
+        assert got[("probe",)] == (64, 2, 4)
         got.clear()
         assert ("probe",) in dk._FIT_CHOICE, "fit_choice must return a copy"
     finally:

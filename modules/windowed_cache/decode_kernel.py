@@ -1147,12 +1147,17 @@ def fit_timings() -> dict:
 
 #: Launches per timed sample, and samples per rung. Small on purpose: the whole
 #: search is ``len(_FIT_LADDER) * (_TUNE_WARMUP + _TUNE_ITERS)`` launches of a
-#: ~0.5 ms kernel, i.e. tens of milliseconds, and it runs ONCE per geometry. The
-#: cost that is not small is Triton's JIT -- one compile per rung it reaches --
-#: which is why the harness's warmup exists (``perf_shapes.py`` runs enough
-#: decode steps to cross the first eviction precisely so JIT and autotune land in
-#: warmup rather than in measurement run 0) and why Triton's on-disk cache makes
-#: it a once-per-machine cost rather than a once-per-run one.
+#: ~0.5 ms kernel, i.e. tens of milliseconds, and it runs ONCE per geometry.
+#:
+#: **The cost that is not small is Triton's JIT: one compile per rung, and at the
+#: shipped geometry that is all 12.** The rung dedup does not reduce it there
+#: (see :func:`_search_rungs`). This is why the harness's warmup exists --
+#: ``perf_shapes.py`` runs enough decode steps to cross the first eviction
+#: precisely so JIT and autotune land in warmup rather than in measurement run 0
+#: -- and why Triton's on-disk cache makes it a once-per-machine cost rather than
+#: a once-per-run one. If a cold-cache warmup of a few minutes is not acceptable
+#: somewhere, ``_FIT_LADDER`` is one list literal and trimming it is the knob;
+#: trim it by *measurement*, not by guessing which rungs matter.
 _TUNE_WARMUP = 1
 _TUNE_ITERS = 3
 
@@ -1195,11 +1200,18 @@ def _search_rungs(choice: dict, timed: dict, announced: set, sig,
     repeatedly, so it must be idempotent (see :func:`_time_launch`).
 
     ``key(rung)`` maps a rung to the launch it actually produces, and rungs that
-    collapse onto one are timed once. Distinct rungs are NOT distinct kernels:
-    ``window_tiling`` floors ``target_keys // ws``, so at ``ws=128`` the 64, 32
-    and 16 rungs all yield ``BLOCK_NW=1, BLOCK_T=128`` and differ in nothing the
-    kernel can see. Timing them separately would buy three identical numbers for
-    three Triton compiles, and the compile is the expensive half of this search.
+    collapse onto one are timed once. Distinct rungs are not always distinct
+    kernels: ``window_tiling`` floors ``target_keys // ws``, so at a large ``ws``
+    several ``target_keys`` yield the same ``(BLOCK_NW, BLOCK_T)``.
+
+    **At the shipped geometry this fires for nothing, and that was measured, not
+    assumed.** ``BLOCK_W`` is derived from ``target_keys`` too
+    (``_pow2_at_least(min(W_phys, target_keys), 16)``), so those rungs still
+    differ in a constexpr and are still separate compiles. The dedup only bites
+    where the tiling AND ``BLOCK_W`` both collapse -- a large ``ws`` with a short
+    window axis (``W_phys <= 16``). It is kept because that regime is real and
+    the check is free, NOT because it makes the common case cheaper: at
+    ``ws=8, W_phys=273`` the ladder is 12 rungs and 12 compiles.
 
     A rung that raises ``OutOfResources`` is skipped -- that is the shared-memory
     half of the search and it is unchanged. Any other exception propagates: a

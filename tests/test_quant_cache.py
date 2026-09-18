@@ -1317,7 +1317,7 @@ def test_oom_keeps_the_compiled_fn_and_the_static_retry():
     import torch
     from modules.windowed_cache import cache as cache_mod
 
-    def _oom_fn(cache, layer_idx, step):
+    def _oom_fn(cache, state, store, policy, joint):
         raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 7.25 GiB")
 
     prev = (cache_mod._COMPILED_EVICT_FN, cache_mod._EVICT_COMPILE_FAILED,
@@ -1329,7 +1329,8 @@ def test_oom_keeps_the_compiled_fn_and_the_static_retry():
         cache_mod._EVICT_ANNOUNCED["done"] = True
 
         with pytest.raises(torch.cuda.OutOfMemoryError):
-            cache_mod._run_compiled_evict(object(), 0, 8)
+            cache_mod._run_compiled_evict(
+                object(), object(), object(), object(), True, 8)
 
         assert cache_mod._EVICT_COMPILE_FAILED is None, (
             "an OOM was filed as a build-wide lowering failure")
