@@ -156,6 +156,11 @@ def _evict_widths(masks, bounds):
     # ONE `.item()` for every width this eviction needs. Two separate reads
     # would be two host syncs and two graph breaks per eviction, for the same
     # information; stacking them first makes it one of each.
+    #
+    # Per mask, NOT one reduction over a stack of them: the masks are different
+    # widths -- fresh/react span the merged window axis, promote spans the fp
+    # picks -- so stacking raises. (Tried; the compiled eviction refused it on
+    # the first call, which is the kernel-or-error contract working.)
     needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
     out = []
     for need, bound in zip(needs, bounds):
@@ -2049,8 +2054,12 @@ class WindowedCache(_HFCacheBase):
         """
         B = mask.shape[0]
         rank = mask.cumsum(1) - 1                                   # [B, W]
-        dump = torch.full_like(rank, width)
-        idx = torch.where(mask & (rank < width), rank.clamp_min(0), dump)
+        # `width` as a SCALAR other, not a full_like tensor of it: the tensor was
+        # a [B, W] int64 allocation and fill per call, three times an eviction,
+        # to be read by one `where`. And no `clamp_min(0)` on the true branch --
+        # a lane the condition selects has `mask` true, so its `rank` is already
+        # >= 0; the -1 lanes it was guarding take `width` regardless.
+        idx = torch.where(mask & (rank < width), rank, width)
         out = torch.full((B, width + 1), -1, dtype=src.dtype, device=src.device)
         out.scatter_(1, idx, src)
         valid = torch.zeros((B, width + 1), dtype=torch.bool, device=src.device)
@@ -2197,7 +2206,7 @@ class WindowedCache(_HFCacheBase):
 
         # --- Resolve window ids → slots ONCE, then decide with masks --------
         store.ensure(B, device)
-        has_entry, is_q_cur, slot_of, match = store.lookup(wids)
+        has_entry, is_q_cur, slot_of, keep_slots = store.lookup(wids)
 
         demote = is_q_new & ~is_q_cur      # currently fp, wants Q
         fresh = demote & ~has_entry        # never quantized → quantize now
@@ -2211,7 +2220,7 @@ class WindowedCache(_HFCacheBase):
         # top_k_fp + N_q bound exact rather than merely likely. Safe in either
         # order — retain_only only touches windows that are NOT retained, and
         # every demote/promote/reactivate target is retained by construction.
-        store.retain_only(match)
+        store.retain_only(keep_slots)
 
         # --- fp window order: retained-fp windows, ascending id -------------
         # `wids` is already ascending (the merged axis is chronological), so

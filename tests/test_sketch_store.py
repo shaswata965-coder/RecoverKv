@@ -178,8 +178,8 @@ def test_retain_only_frees_a_card_with_its_window():
     st = _store()
     _demote(st)
     keep_ids = torch.tensor([[0, 2, 4], [0, 2, 4]])
-    _, _, _, match = st.table.lookup(keep_ids)
-    st.table.retain_only(match)
+    _, _, _, keep = st.table.lookup(keep_ids)
+    st.table.retain_only(keep)
     assert int(st.table.n_live.min()) == 3
 
 

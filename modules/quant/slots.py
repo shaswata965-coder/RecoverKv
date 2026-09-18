@@ -247,18 +247,45 @@ class QuantSlotTable:
         is_active : ``[B, W]`` bool — the entry exists and is in the Q tier.
         slot_of : ``[B, W]`` int64 — the owning slot; **only valid where
             ``has_entry``** (0 elsewhere, from argmax over an all-False row).
-        match : ``[B, W, N]`` bool — the raw match, reused by
-            :meth:`retain_only` (its ``any(1)`` is exactly the keep mask).
+        keep : ``[B, N]`` bool — "some looked-up id lives in this slot", which is
+            exactly what :meth:`retain_only` needs.
 
         Free slots hold ``-1`` and real ids are >= 0, so a free slot never
         matches. At most one slot per row can carry a given id (the table's
         invariant), so ``argmax`` picks that slot outright.
+
+        **Three passes over the [B, W, N] match, not six.** That tensor is the
+        largest transient in the eviction (167 MB at B·L=1024, W=512, N=318), and
+        this used to walk it once to build it, once for ``any(-1)``, once for an
+        ``&`` against ``slot_active`` (materialising a second one), once more to
+        reduce that, once for the ``uint8`` copy and once for ``argmax`` — then
+        hand it out so ``retain_only`` could walk it a seventh time. Every one of
+        those but the build and the ``max`` answers a question that the [B, W]
+        results already answer:
+
+        * ``max(-1)`` returns the maximum AND its index, so ``has_entry`` and
+          ``slot_of`` come out of one pass instead of two plus a separate
+          ``argmax``.
+        * a matched id lives in exactly one slot, so "is that entry active" is
+          ``slot_active`` read at ``slot_of`` — a ``[B, W]`` gather, not a
+          ``[B, W, N]`` conjunction.
+        * "does some retained id live in slot j" is that same map inverted, so it
+          is a ``[B, W]`` scatter. Lanes with no entry are routed to a dump
+          column rather than writing ``False`` at slot 0, which would erase a
+          real hit there (they alias, because ``argmax`` returns 0 for a row that
+          matched nothing).
         """
         match = self.slot_wid.unsqueeze(1) == wids.unsqueeze(2)      # [B, W, N]
-        has_entry = match.any(-1)
-        is_active = (match & self.slot_active.unsqueeze(1)).any(-1)
-        slot_of = match.to(torch.uint8).argmax(-1)
-        return has_entry, is_active, slot_of, match
+        hit, slot_of = match.to(torch.uint8).max(-1)
+        has_entry = hit.bool()
+        is_active = has_entry & self.slot_active.gather(1, slot_of)
+        N = self.slot_wid.shape[1]
+        ext = torch.zeros((wids.shape[0], N + 1), dtype=torch.bool,
+                          device=wids.device)
+        # `N` and `True` as SCALARS: the tensor forms of both (`full_like`,
+        # `ones_like`) are allocations the overloads do not need.
+        ext.scatter_(1, torch.where(has_entry, slot_of, N), True)
+        return has_entry, is_active, slot_of, ext[:, :N]
 
     # -- allocation ----------------------------------------------------------
 
@@ -411,17 +438,18 @@ class QuantSlotTable:
 
     # -- eviction bookkeeping ------------------------------------------------
 
-    def retain_only(self, match: Tensor) -> None:
+    def retain_only(self, keep: Tensor) -> None:
         """Free every slot whose window is not in the retained set (§6).
 
-        ``match`` is :meth:`lookup`'s ``[B, W, N]`` output for the retained
-        window ids, so ``match.any(1)`` — "does this slot's id appear anywhere in
-        this row's retained list?" — is exactly the keep mask, already computed.
+        ``keep`` is :meth:`lookup`'s fourth output for the retained window ids:
+        ``[B, N]``, "does this slot's id appear anywhere in this row's retained
+        list?". It is built there because that is where the map from id to slot
+        already exists, and building it there costs a ``[B, W]`` scatter instead
+        of a reduction over the ``[B, W, N]`` match.
 
         Freed slots keep their stale codes; ``slot_wid = -1`` is what makes a
         slot free, and :meth:`write` overwrites every field on reuse.
         """
-        keep = match.any(1)                                          # [B, N]
         self.slot_wid = torch.where(
             keep, self.slot_wid, torch.full_like(self.slot_wid, FREE)
         )

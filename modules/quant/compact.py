@@ -52,12 +52,29 @@ def stable_partition(mask: Tensor) -> Tensor:
     cannot have two lanes aliasing one slot.
     """
     n = mask.shape[-1]
-    m = mask.to(torch.long)
-    csum = m.cumsum(-1)                                  # trues at or before i
+    # `cumsum` on a bool promotes to int64 on its own, so the explicit `.to()`
+    # this used to do was a whole extra elementwise pass over the mask for a
+    # dtype the next op would have produced anyway.
+    csum = mask.cumsum(-1)                               # trues at or before i
     n_true = csum[..., -1:]                              # trues in the row
-    idx = torch.arange(n, device=mask.device).expand_as(m)
+    idx = _arange_like(csum, n)
     # true  -> its rank among trues;  false -> n_true + its rank among falses.
     # (falses at or before i) - 1 == i - csum[i], which saves the second scan.
     dest = torch.where(mask, csum - 1, n_true + idx - csum)
-    order = torch.empty_like(m)
+    order = torch.empty_like(csum)
     return order.scatter_(-1, dest, idx)
+
+
+#: ``arange`` is a kernel, and this one is the same ``0..n-1`` on every
+#: eviction. Keyed by (n, device) and never mutated -- callers only read it and
+#: `scatter_` copies out of it.
+_ARANGE: dict = {}
+
+
+def _arange_like(ref: Tensor, n: int) -> Tensor:
+    key = (n, ref.device)
+    out = _ARANGE.get(key)
+    if out is None:
+        out = torch.arange(n, device=ref.device)
+        _ARANGE[key] = out
+    return out.expand(ref.shape)

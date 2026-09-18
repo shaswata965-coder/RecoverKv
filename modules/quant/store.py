@@ -229,10 +229,10 @@ class QuantizedStore:
         """Resolve ``[B, W]`` window ids to slots. See :meth:`QuantSlotTable.lookup`."""
         return self.table.lookup(wids)
 
-    def retain_only(self, match: Tensor) -> None:
+    def retain_only(self, keep: Tensor) -> None:
         """Free slots for windows dropped outright (§6). ``match`` from :meth:`lookup`."""
         self._invalidate()
-        self.table.retain_only(match)
+        self.table.retain_only(keep)
 
     def reactivate_many(self, slot_idx: Tensor, valid: Tensor) -> None:
         """Re-demote dormant entries: dormant → active, no recompute (§10)."""
