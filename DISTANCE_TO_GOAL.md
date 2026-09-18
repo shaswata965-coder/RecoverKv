@@ -385,7 +385,7 @@ context *incremental* is worth more than any of the three proposals below and
 changes nothing about what the cache keeps; it is not done here because it is a
 kernel-visible change and this box has no GPU.
 
-Landed instead (`e9d4a2a`): `lookup` now walks its `[B, W, N]` match three times
+Landed instead (`513b3d1`): `lookup` now walks its `[B, W, N]` match three times
 instead of six — 167 MB at B·L=1024, and it was reduced six ways and handed out
 for a seventh. ~500 MB of traffic and ~330 MB of peak transient per eviction.
 
