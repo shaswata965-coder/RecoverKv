@@ -87,12 +87,18 @@ OPERATING_POINT_EXEMPT = {
     "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",
     "gsm8k_budget80.yaml": "the 0.80 arm of the budget sweep",
     "eval_perf_smoke.yaml": "smoke test, not a reported number",
-    "ruler_niah_mk3_omega16.yaml": "RULER uses int4, a different tier",
     "eval_faithfulness.yaml": "no cache block",
     "eval_qevict.yaml": "no cache block",
     "eval_tier_study.yaml": "sweeps the tier on purpose",
     "eval_visualize.yaml": "no cache block",
     "longbench_ours_step0.yaml": "budget sweep arm at q=0.5, an ablation",
+    # window_size=16 ONLY -- the file is the omega=16 arm and says so in its
+    # name. It sat exempt for "RULER uses int4, a different tier", which was not
+    # true of anything in the repo and hid the fact that it was also running
+    # quant_ratio=0.0: a pure fp16 cache with no Q tier and therefore no read
+    # gate, scored under the same branch's name as LongBench at 0.70. It is now
+    # at the operating point on every axis but the one it exists to vary.
+    "ruler_niah_mk3_omega16.yaml": "the omega=16 arm; window_size is the ablation",
 }
 
 

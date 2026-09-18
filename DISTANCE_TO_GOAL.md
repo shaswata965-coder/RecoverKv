@@ -371,6 +371,54 @@ read gate: ran on all 192 fused layers, realised read fraction 0.252
 
 **If the first line is not there, the number above it is not a gated number.**
 
+### Every runner, not just the perf suite
+
+The gate is the decode path wherever the flash backend meets a Q tier, so the
+same question — *did it actually gate?* — has to be answerable from a LongBench,
+GSM8K, RULER or parity run, not only from a latency table. It was not: none of
+the quality runners touched `flash_decode.stats()`.
+
+An ungated quality run is the harder version of the same failure. It reads the
+whole int2 tier, generates correct text, and scores normally; quality moves for a
+hundred reasons and nobody re-derives them, so a score quoted for "the gated
+method" when the gate never ran survives review in a way a latency number might
+not.
+
+Now: one definition, `flash_decode.expect_gated(backend, quant_ratio, cuda)`,
+restating the three conditions `hooks.install_score_hooks` uses to pick the path
+— flash backend, `quant_ratio > 0`, CUDA — so a perf row and a LongBench sidecar
+cannot disagree about what the run was. `gate_report` turns the counters into one
+of four stable verdicts (`gated`, `not-expected`, `NOT-GATED-kernel-never-fired`,
+`NOT-GATED-partial`) plus `ok`, and every runner records it:
+
+| runner | where it lands |
+|---|---|
+| LongBench | `read_gate` in the per-dataset metadata sidecar |
+| GSM8K | `read_gate` in the metadata sidecar |
+| RULER | `read_gate` in the per-task metadata sidecar |
+| perf | `diagnostics.<config>.gate` in the npz, printed under the table |
+
+`not-expected` is a pass, not a failure: the eager backend and `quant_ratio = 0`
+have no Q tier to select over, and **eager is the supported way to ask for an
+ungated decode**. What the verdict removes is the case where nobody could tell
+which had happened.
+
+### RULER was scoring a different method
+
+`configs/ruler_niah_mk3_omega16.yaml` sat at **`quant_ratio: 0.0`** while
+LongBench and GSM8K ran at 0.70 — a pure fp16 windowed cache, no int2 tier, and
+therefore no read gate, scored under the same branch's name. It had an
+`OPERATING_POINT_EXEMPT` entry reading "RULER uses int4, a different tier", which
+was not true of anything in the repo and was covering the divergence rather than
+recording it.
+
+It is now at the operating point (`quant_ratio: 0.70`, `quant_gate_ratio: 0.25`)
+and exempt only on `window_size=16`, which is the arm the file exists to be.
+`scripts/check_operating_point.py` passes with that as the stated reason.
+
+**Any RULER number taken before this change is not comparable with one taken
+after it** — it was a different cache.
+
 ### It is the fastest path this repo has — not the fastest possible
 
 What the next run measures is: int4 cards (272 B/head, the §6.1 frontrunner,

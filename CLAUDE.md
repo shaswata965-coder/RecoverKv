@@ -47,14 +47,20 @@ fired` says the gate ran on every fused layer, and `read_fraction` is
 `quant_gate_ratio` **as realised**. `gated == 0` with a large `fired` is the
 silent no-cards case, which looks exactly like success everywhere else.
 
-**A perf run now carries that proof.** `perf_runner` records the counters into
-the npz (`diagnostics.<config>.gate`) and `print_perf_table.py` prints one of
-three lines under every table: the gate ran on all N fused layers with its
-realised read fraction, or it did not gate, or the fused kernel never fired at
-all. **If that line is missing, the table above it is not a gated number.** Until
-2026-09-18 the runner recorded the eviction's counters and not the gate's, so
-there was no way to tell — which is how eight commits of ungated numbers passed
-for results.
+**Every run now carries that proof — quality as well as perf.**
+`flash_decode.expect_gated(backend, quant_ratio, cuda)` is the single definition
+of "should this have gated" (flash backend, `quant_ratio > 0`, CUDA), and
+`gate_report` turns the counters into one of four stable verdicts — `gated`,
+`not-expected`, `NOT-GATED-kernel-never-fired`, `NOT-GATED-partial`. LongBench,
+GSM8K and RULER record it as `read_gate` in their metadata sidecars; perf records
+it under `diagnostics.<config>.gate` and prints it under the table. **If that
+verdict is missing or is not `gated`, the number beside it is not a gated
+number.** `not-expected` is a pass: eager, or `quant_ratio = 0`, has no Q tier to
+select over, and **eager is the supported way to ask for an ungated decode**.
+
+An ungated *quality* run is the harder version of this failure — it scores
+normally, and quality moves for a hundred reasons — which is why the verdict is
+recorded rather than inferred from the config.
 
 ### There is no on/off knob, by design
 

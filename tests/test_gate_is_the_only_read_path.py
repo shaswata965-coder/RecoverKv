@@ -82,3 +82,50 @@ def test_read_fraction_is_the_realised_ratio_not_the_configured_one():
     flash_decode._STATS["windows_active"] = 184
     assert flash_decode.stats()["read_fraction"] == pytest.approx(0.25)
     flash_decode.reset_stats()
+
+
+# ---------------------------------------------------------------------------
+# every runner, not just the perf suite
+# ---------------------------------------------------------------------------
+
+
+def test_expect_gated_is_one_definition_for_every_runner():
+    """The three conditions that decide the path, restated where a runner can
+    check them after the fact. A perf row and a LongBench sidecar must not be
+    able to disagree about what the run was."""
+    e = flash_decode.expect_gated
+    assert e("flash_attn", 0.70, True) is True
+    assert e("flash_attn", 0.0, True) is False, "no Q tier: nothing to gate"
+    assert e("eager", 0.70, True) is False, "eager is the supported ungated ask"
+    assert e("flash_attn", 0.70, False) is False, "CPU runs the materialize oracle"
+    # Tolerant of what a YAML actually yields.
+    assert e("flash_attn", None, True) is False
+    assert e(None, 0.70, True) is False
+
+
+@pytest.mark.parametrize("fired,gated,expect,verdict,ok", [
+    (192, 192, True, flash_decode.GATE_OK, True),
+    (0, 0, False, flash_decode.GATE_NOT_EXPECTED, True),
+    (0, 0, True, flash_decode.GATE_NEVER_FIRED, False),
+    (192, 5, True, flash_decode.GATE_PARTIAL, False),
+])
+def test_gate_report_verdicts(fired, gated, expect, verdict, ok):
+    """The verdict a runner stores. Stable strings, so a reader can grep a
+    results directory for the runs that were not gated."""
+    flash_decode.reset_stats()
+    flash_decode._STATS.update(fired=fired, gated=gated,
+                               windows_read=48 if fired else 0,
+                               windows_active=190 if fired else 0)
+    r = flash_decode.gate_report(expect)
+    assert r["verdict"] == verdict and r["ok"] is ok and r["expected"] is expect
+    flash_decode.reset_stats()
+
+
+def test_gate_report_never_raises_and_always_records():
+    """A quality run that has finished generating must record what happened
+    rather than lose the work to an assertion."""
+    flash_decode.reset_stats()
+    for expect in (True, False):
+        r = flash_decode.gate_report(expect)
+        assert set(r) >= {"verdict", "ok", "expected", "fired", "gated",
+                          "read_fraction"}

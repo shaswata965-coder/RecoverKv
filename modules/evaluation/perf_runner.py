@@ -389,7 +389,7 @@ def _evict_path_stats() -> Dict[str, int]:
         return {}
 
 
-def _gate_stats() -> Dict[str, Any]:
+def _gate_stats(expect_gated: bool = True) -> Dict[str, Any]:
     """``flash_decode.stats()`` — proof the read gate ran, or {} off that path.
 
     Recorded because a run that did NOT gate is indistinguishable in a latency
@@ -401,7 +401,7 @@ def _gate_stats() -> Dict[str, Any]:
     """
     try:
         from modules.windowed_cache import flash_decode
-        return dict(flash_decode.stats())
+        return dict(flash_decode.gate_report(expect_gated))
     except Exception:  # pragma: no cover - environment dependent
         return {}
 
@@ -1893,28 +1893,29 @@ class PerfRunner:
         # QuantizedStore in place and calls free_slots, so breaks are the
         # expected failure mode, not a remote one.
         if cache_backend == "windowed":
-            gs = _gate_stats()
+            # One definition of "should this have gated", shared with the quality
+            # runners (flash_decode.expect_gated), so a perf row and a LongBench
+            # sidecar cannot disagree about what the run was.
+            from modules.windowed_cache import flash_decode as _fd
+            # Re-read the two knobs rather than reusing locals bound inside the
+            # cache-construction branch: this site must not depend on which
+            # branches ran above it.
+            gs = _gate_stats(_fd.expect_gated(
+                c.get("cache_package"),
+                c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0)),
+                torch.cuda.is_available()))
             diag["gate"] = gs
             if gs:
                 rf = gs.get("read_fraction")
-                log.info("read gate: gated=%s fired=%s read_fraction=%s",
-                         gs.get("gated"), gs.get("fired"),
-                         "n/a" if rf is None else f"{rf:.3f}")
-                # `gated` must equal `fired`: the flash path has no ungated arm
-                # (flash_decode._run_fused raises without cards), so a gap here
-                # means some layers took a different route entirely.
-                if gs.get("fired") and gs.get("gated") != gs.get("fired"):
+                log.info("read gate [%s]: %s (gated=%s fired=%s read_fraction=%s)",
+                         c.get("name"), gs.get("verdict"), gs.get("gated"),
+                         gs.get("fired"), "n/a" if rf is None else f"{rf:.3f}")
+                if not gs.get("ok", True):
                     log.warning(
-                        "config %s: the fused decode fired %s times but the read "
-                        "gate ran %s times. The gate is the only Q-tier read path "
-                        "on this backend, so this cell is NOT measuring the "
-                        "shipped method.",
-                        c.get("name"), gs.get("fired"), gs.get("gated"))
-                elif not gs.get("fired"):
-                    log.warning(
-                        "config %s: the fused decode kernel never fired, so the "
-                        "read gate never ran. This cell timed the materialize "
-                        "path, not the gated one.", c.get("name"))
+                        "config %s: %s -- this cell is NOT measuring the gated "
+                        "method. The flash path has no ungated arm, so either the "
+                        "fused kernel never fired or some layers took a different "
+                        "route.", c.get("name"), gs.get("verdict"))
             ev = _evict_path_stats()
             dyn = _dynamo_counters()
             compile_failed = _evict_compile_failed()

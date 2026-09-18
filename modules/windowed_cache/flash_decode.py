@@ -97,6 +97,97 @@ def reset_stats() -> None:
         _STATS[k] = 0
 
 
+#: Verdicts :func:`gate_report` can return, as stable strings a runner can store
+#: in its output and a reader can grep for.
+GATE_OK = "gated"
+GATE_NOT_EXPECTED = "not-expected"
+GATE_NEVER_FIRED = "NOT-GATED-kernel-never-fired"
+GATE_PARTIAL = "NOT-GATED-partial"
+
+
+def expect_gated(backend_package, quant_ratio, cuda: bool) -> bool:
+    """Should this configuration have gated? One definition, for every runner.
+
+    Takes primitives rather than a config object so it can live beside the
+    counters it explains without importing the evaluation layer. The three
+    conditions are the same ones ``hooks.install_score_hooks`` uses to choose the
+    path, restated where a runner can check them AFTER the fact:
+
+    * the flash backend — the fused decode patch replaces the module-global
+      ``flash_attn_func``, so the eager backend never reaches it (that is the
+      supported way to ask for an ungated decode);
+    * ``quant_ratio > 0`` — with no Q tier there is nothing to select over;
+    * CUDA — the fused kernel is Triton-or-raise, and CPU runs the materialize
+      path, which exists as the kernel's oracle and not as an alternative.
+    """
+    try:
+        q = float(quant_ratio or 0.0)
+    except (TypeError, ValueError):
+        q = 0.0
+    return bool(cuda) and q > 0.0 and str(backend_package or "") == "flash_attn"
+
+
+def gate_report(expect_gated: bool) -> dict:
+    """:func:`stats` plus a verdict — the one check every runner should record.
+
+    ``expect_gated`` is the caller's claim about its own configuration: True
+    when the run is on the flash backend with a Q tier (``quant_ratio > 0``), so
+    the read gate is the only path the decode step may take. False for the eager
+    backend or ``quant_ratio == 0``, where there is no Q tier to select over and
+    an ungated read is the correct and only behaviour.
+
+    Why every runner and not just the perf suite: a run that did NOT gate reads
+    the whole int2 tier, produces correct output, and scores normally. It is
+    invisible in an accuracy number in exactly the way it was invisible in a
+    latency number — and this branch shipped eight commits of the latter. A
+    LongBench score quoted for "the gated method" when the gate never ran is the
+    same error wearing different clothes, and it is harder to catch, because
+    quality moves for a hundred reasons and nobody re-derives them.
+
+    Returns the counters plus ``verdict`` (one of the ``GATE_*`` constants),
+    ``expected``, and ``ok``. It never raises: a quality run that has finished
+    generating should record what happened rather than lose the work.
+    """
+    s = stats()
+    s["expected"] = bool(expect_gated)
+    if not expect_gated:
+        s["verdict"] = GATE_NOT_EXPECTED
+    elif not s["fired"]:
+        s["verdict"] = GATE_NEVER_FIRED
+    elif s["gated"] != s["fired"]:
+        s["verdict"] = GATE_PARTIAL
+    else:
+        s["verdict"] = GATE_OK
+    s["ok"] = s["verdict"] in (GATE_OK, GATE_NOT_EXPECTED)
+    return s
+
+
+def log_gate_report(log, label: str, expect_gated: bool) -> dict:
+    """:func:`gate_report`, announced. Returns the report for the caller to store."""
+    r = gate_report(expect_gated)
+    rf = r.get("read_fraction")
+    rf_s = "n/a" if rf is None else f"{rf:.3f}"
+    if r["verdict"] == GATE_OK:
+        log.info("%s: read gate ran on all %d fused layers, realised read "
+                 "fraction %s", label, r["fired"], rf_s)
+    elif r["verdict"] == GATE_NOT_EXPECTED:
+        log.info("%s: no read gate expected (eager backend, or quant_ratio=0 so "
+                 "there is no Q tier to select over)", label)
+    elif r["verdict"] == GATE_NEVER_FIRED:
+        log.warning(
+            "%s: THE READ GATE NEVER RAN. The fused decode kernel fired 0 times, "
+            "so this run used the materialize path over the WHOLE int2 tier. The "
+            "output is correct and the score is real, but it is NOT the gated "
+            "method and must not be quoted as one.", label)
+    else:
+        log.warning(
+            "%s: the read gate ran on %d of %d fused layers. The flash path has "
+            "no ungated arm, so a gap means some layers took a different route "
+            "entirely; this run is not the shipped method.",
+            label, r["gated"], r["fired"])
+    return r
+
+
 class FusedDecodeNotReached(RuntimeError):
     """The kernel was armed for a layer and the wrapper never ran it.
 

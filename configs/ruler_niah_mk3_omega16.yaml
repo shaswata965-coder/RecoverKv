@@ -4,8 +4,12 @@
 # Captures a utils/cache_memory.py byte-accounting report per example
 # (ruler.capture_memory) so retained-bytes / compression-ratio can be read
 # off directly, alongside the task's accuracy score.
-# quant_ratio=0.0 -> pure fp16 windowed cache (Q tier disabled). Set > 0.0
-# to sweep in the two-tier int2 split (needs window_size % 4 == 0, which 16 is).
+# At the shipped operating point (utils.config.OPERATING_POINT): quant_ratio
+# 0.70 with the read gate at 0.25. This suite sat at quant_ratio=0.0 while
+# LongBench and GSM8K ran at 0.70, which meant RULER scored a DIFFERENT METHOD —
+# a pure fp16 windowed cache with no int2 tier and therefore no read gate — under
+# the same branch's name. window_size 16 satisfies the % 4 == 0 that int2 crumb
+# packing needs.
 # Produces: outputs/ruler/4096_niah_mk3_omega16/
 _base_: base.yaml
 
@@ -26,7 +30,8 @@ cache:
   window_size: 16                           # omega=16
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens
-  quant_ratio: 0.0                          # two-tier int4 split q in [0,1]; 0 = pure fp16
+  quant_ratio: 0.70                         # two-tier int2 split q in [0,1]; 0 = pure fp16
+  quant_gate_ratio: 0.25                    # read-gate selectivity; 1.0 = read everything
   # The mode a memory-vs-quality claim is stated in: q splits the BYTE
   # budget, so the retained cache costs exactly cache_budget of the full
   # cache at every q and cheaper int2 keys buy more context. Pinned, not

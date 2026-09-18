@@ -411,6 +411,27 @@ class GSM8KRunner:
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks, resolved
 
+
+    def _read_gate_report(self, label: str) -> dict:
+        """Did the read gate actually run? Recorded into the metadata sidecar.
+
+        A run that did NOT gate reads the whole int2 tier, generates correct
+        text, and scores normally — invisible in an accuracy number exactly as
+        it was invisible in a latency number, and harder to catch, because
+        quality moves for a hundred reasons and nobody re-derives them. So the
+        sidecar carries the verdict rather than leaving it to be inferred from
+        the config.
+        """
+        from modules.windowed_cache import flash_decode
+        import torch as _t
+        cache_cfg = getattr(self.config, "cache", None)
+        expect = flash_decode.expect_gated(
+            getattr(cache_cfg, "backend_package", None),
+            getattr(cache_cfg, "quant_ratio", 0.0),
+            _t.cuda.is_available(),
+        )
+        return flash_decode.log_gate_report(log, label, expect)
+
     def _cleanup_memory(self, cache=None) -> None:
         if cache is not None:
             del cache
@@ -486,6 +507,7 @@ class GSM8KRunner:
         budget = cfg.cache.cache_budget
 
         meta = {
+            "read_gate": self._read_gate_report("gsm8k"),
             "task": "gsm8k",
             "run_name": output_dir.name,
             "num_examples": n_examples,

@@ -481,6 +481,27 @@ class RulerRunner:
             )
             self._over_context_warned = True
 
+
+    def _read_gate_report(self, label: str) -> dict:
+        """Did the read gate actually run? Recorded into every metadata sidecar.
+
+        A run that did NOT gate reads the whole int2 tier, generates correct
+        text, and scores normally — invisible in an accuracy number exactly as
+        it was invisible in a latency number, and harder to catch, because
+        quality moves for a hundred reasons and nobody re-derives them. So the
+        sidecar carries the verdict rather than leaving it to be inferred from
+        the config.
+        """
+        from modules.windowed_cache import flash_decode
+        import torch as _t
+        cache_cfg = getattr(self.config, "cache", None)
+        expect = flash_decode.expect_gated(
+            getattr(cache_cfg, "backend_package", None),
+            getattr(cache_cfg, "quant_ratio", 0.0),
+            _t.cuda.is_available(),
+        )
+        return flash_decode.log_gate_report(log, label, expect)
+
     def _cleanup_memory(self, cache=None) -> None:
         """Memory hygiene between examples."""
         if cache is not None:
@@ -565,6 +586,7 @@ class RulerRunner:
         compression_ratio = round(1.0 - budget, 2) if budget else None
 
         meta = {
+            "read_gate": self._read_gate_report(task_name),
             "task": task_name,
             "data_dir": self.ruler.data_dir,
             "num_examples": num_examples,
