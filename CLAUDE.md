@@ -115,6 +115,16 @@ one per-window block is the real fix and needs a GPU to verify.
   *memory* at B=1, not latency (§8).
 * **A change that adds per-layer host work to save Q-tier bytes is a net loss by
   default.**
+* **The host path is already tight — do not go hunting launches.** The
+  2026-09-18 review (`DISTANCE_TO_GOAL.md` §5.1) measured the production step at
+  **3 launches and 2 copies per layer**: the gate, the decode kernel, the score
+  gather, and the two K/V writes. Nothing else. No unbatched per-layer work, no
+  per-step re-gather, no device sync. The two fusions still open (gate as a
+  kernel prologue; score permutation into the epilogue) are worth ~2% together.
+  The remaining factor of two is inside the kernel, not around it.
+* **A `TorchDispatchMode` sees the eviction's op chain BEFORE Inductor fuses
+  it** — counts are identical with the compile flag on and off. Eviction byte
+  totals taken that way are an upper bound, not a GPU measurement.
 
 ## Two traps in the harness
 

@@ -217,6 +217,108 @@ kernel-visible change and this box has no GPU.
 
 ---
 
+## 5.1 Optimization review, 2026-09-18 — unit, module, design
+
+Done on a CPU box with a `TorchDispatchMode` counter attributing every launching
+op to the repo line that issued it. **Read the caveat at the end before quoting
+any byte figure from it.**
+
+### Unit: the ordinary decode step is already minimal
+
+Measured on the PRODUCTION path (layer-major store, gate live, both Triton
+kernels stubbed so the host work around them runs), L=32, B=1, N_q=99, ws=8:
+
+| per layer, per step | |
+|---|---|
+| `state.write_rows` — K and V into the joint buffer | 2 copies |
+| `fused_gate` | **1 launch** |
+| `fused_two_tier_decode` | **1 launch** |
+| `torch.gather` — physical → merged-id score permutation | **1 launch** |
+
+Once per step, not per layer: `_begin_step`, `scorer.accumulate`,
+`state.reserve` — 3 ops total for all 32 layers.
+
+**That is 3 launches and 2 copies per layer per step and nothing else.** There is
+no per-layer Python building tensors, no per-step re-gather of the tier, no
+device sync anywhere on the step. Every memo (`_fused_ctx`, `score_meta`, the
+gate's cards) is keyed on the store's version and hits between evictions. The
+`_scratch` buffers mean `est` and `logmass` are not reallocated per layer.
+
+**Conclusion: there is nothing left to win at unit level on the ordinary step.**
+Anyone arriving with a launch-count idea for this path should stop here.
+
+### Unit: the eviction's widths are measured, not bounded
+
+`_evict_widths` takes ONE host sync for the whole eviction (three masks stacked
+into one `.item()`) and returns the true max over rows. At steady state, against
+a bound of `N_q = 99`:
+
+| | promote `n_p` | reactivate `n_r` | demote `n_d` |
+|---|---|---|---|
+| steady-state evictions | 8–16 | 0–8 | 4–16 |
+
+So D1 landed and works: the quantizer round-trip runs at roughly the real count,
+not at 99. (The first eviction is different by construction — it demotes the
+whole Q tier at once, `n_d = N_q`.) **A previous session's hypothesis that this
+was a ~99x overcompute is wrong and is retired here.**
+
+### Module: the eviction is the only heavy cache phase, and it is already batched
+
+Marginal cost of an eviction over an ordinary step: **557 host dispatches**,
+across all 32 layers at once. It is layer-major (one pass, not 32), compiled
+unconditionally, and takes one sync. The per-call-site ranking, by dispatches:
+`slots.put` (64), the quantizer's `decode` / `_quantize_grid` / `pack_crumbs_last`
+(~60), `effective._rope_cos_sin` (14).
+
+### Design: two fusions are open, and together they are worth about 2%
+
+Both are score-neutral — they move where a computation happens, not what it
+computes — and each removes one launch per layer per step:
+
+1. **Fold the gate into the decode kernel as a prologue.** `gate_kernel.py` says
+   this itself ("A separate kernel, for now"): one program already owns the right
+   `(batch, KV head)`. It removes 32 launches/step *and* the `est`/`logmass`
+   round trip through HBM. The reason it has not been done is real — a prologue
+   competes for the main kernel's register budget, and the autotuner falls back
+   silently when that budget is exceeded — so it needs the tile rung pinned and a
+   GPU to confirm the rung did not drop.
+2. **Fold the score permutation into the kernel's epilogue.** The kernel already
+   writes `wsum`; passing it `ORDER` (memoized per window epoch) lets it store
+   straight to the permuted column, removing the host `gather` and one
+   `[B, H_q, W]` read-plus-write per layer per step.
+
+**Sizing, honestly.** Together that is 64 of the ~96 cache-side launches per
+step. At the ~17 us exposed per launch this document measures elsewhere, it is
+~1.1 ms against a ~57 ms step: **about 2%.** Worth doing, not a headline, and
+*not* where the remaining factor of two lives.
+
+### What the review did NOT find
+
+No unbatched per-layer work. No redundant per-step gather. No device sync on the
+decode path. No dead allocation. The host side of this cache is in good shape,
+and the gap to Flash is not sitting in it.
+
+**The dominant term is still inside the decode kernel** — 7.03 ms against a
+0.58 ms roofline, from the gather-bound reads §2 describes. That is §6.2, and it
+is a memory-layout change, not a launch-count one.
+
+### Caveat on the byte figures
+
+The eviction is compiled, and a `TorchDispatchMode` observes the op chain
+**before** Inductor fuses it: the counts above are identical with
+`STICKYKV_COMPILE_EVICT` set to 1 and to 0. So the eager chain's byte totals
+(the quantizer round-trip at ~235 MB, RoPE at ~134 MB per eviction across 32
+layers) are an upper bound on a fused kernel's real traffic, not a measurement of
+it. **Do not quote them as GPU numbers.** The dispatch counts are graph-size
+facts; the launch counts on the *uncompiled* per-step path above are real.
+
+While checking this, two dead controls were found and removed: the eviction
+banner printed `(STICKYKV_COMPILE_EVICT=1)` for a variable deleted in `0974687`
+and read nowhere, and `perf_runner` set that same variable on CUDA. Both looked
+like a control arm and were not one.
+
+---
+
 ## 6. What to do next
 
 ### 6.1 Shrink the card to int4 — **FRONTRUNNER**

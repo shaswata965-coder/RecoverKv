@@ -1294,10 +1294,14 @@ class PerfRunner:
             # chain. It was setting a flag that selected nothing and printing a
             # banner naming a read path the run was not taking, so the flag and
             # its fork are gone (modules/quant/effective.py).
-            if torch.cuda.is_available() and os.environ.get(
-                    "STICKYKV_COMPILE_EVICT") is None:
-                os.environ["STICKYKV_COMPILE_EVICT"] = "1"
-                log.info("enabled STICKYKV_COMPILE_EVICT=1 for CUDA windowed decode")
+            # STICKYKV_COMPILE_EVICT is NOT set here any more. The eviction has
+            # been compiled unconditionally since 0974687 and `cache.py` reads no
+            # environment variable at all, so setting it selected nothing while
+            # leaving a variable in the run's environment that a reader would
+            # reasonably take for a control arm. A knob that records intent but
+            # controls nothing is worse than no knob: it is the shape of a
+            # measurement you can attribute to something, and the attribution is
+            # false. See the banner at the top of modules/windowed_cache/cache.py.
             # Fair measurement: reject a backend/attn mismatch up front, exactly
             # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
             # it, cache_package='eager' paired with flash attention (or vice

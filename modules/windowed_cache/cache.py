@@ -691,7 +691,7 @@ def _announce_evict_path_once(compiled: bool) -> None:
     if compiled:
         print(
             "[StickyKV] eviction path: COMPILED two-tier eviction ACTIVE [OK] "
-            "(STICKYKV_COMPILE_EVICT=1)",
+            "(unconditional; no env var selects this)",
             flush=True,
         )
     else:
