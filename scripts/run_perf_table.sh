@@ -55,6 +55,16 @@
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
+#   COOLDOWN        seconds idled between runs                  (default: 0)
+#   CLOCK_LOCK      true | false  lock GPU clocks               (default: false)
+#                   THE DEFAULTS ARE THE HISTORIC TABLE'S, NOT THE REPO'S. Every
+#                   other perf config here sets 3.0 / true, and perf_runner warns
+#                   that without them back-to-back cells heat the GPU and later
+#                   rows are measured on a slower part. They are 0 / false here
+#                   so a fresh run stays comparable to the tables already
+#                   recorded. Pass --cooldown 3 --clock-lock true for hygiene,
+#                   and then do not compare the result cell-by-cell against a
+#                   table taken without them.
 #   THROUGHPUT      which throughput column(s) to print         (default: both)
 #                     both | decode | e2e | all | legacy
 #                     legacy = the old single throughput_tokps column, for
@@ -134,6 +144,10 @@ RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
+# See the header: these two default to what the recorded tables were taken with,
+# not to what the rest of the repo's perf configs use.
+COOLDOWN="${COOLDOWN:-0}"
+CLOCK_LOCK="${CLOCK_LOCK:-false}"
 THROUGHPUT="${THROUGHPUT:-both}"
 
 # ---- flags (win over env) --------------------------------------------------
@@ -156,8 +170,12 @@ while [[ $# -gt 0 ]]; do
     --warmup)               WARMUP="$2"; shift 2;;
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
+    --cooldown)             COOLDOWN="$2"; shift 2;;
+    --clock-lock)           CLOCK_LOCK="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
-    -h|--help)              sed -n '2,73p' "$0"; exit 0;;
+    # 2..96 is the whole banner; a hard-coded end line silently truncated the
+    # help every time the header grew.
+    -h|--help)              sed -n '2,96p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
 done
@@ -240,8 +258,9 @@ cache:
   # Written here, not only announced below: a knob this script prints into
   # run_perf_table.env and checks against the operating point, but does not put
   # in the config, is a knob whose two arms measure the same thing. That is the
-  # 6b8a188 bug (`quant_gate_ratio` inert in every runner) recurring in the
-  # runner that prices the gate.
+  # 6b8a188 bug (quant_gate_ratio inert in every runner) recurring in the
+  # runner that prices the gate. NB this heredoc is unquoted, so backticks here
+  # would be command substitution, not quotes.
   quant_gate_ratio: ${GATE_RATIO}
   first_eviction_step: 0
 
@@ -270,7 +289,8 @@ ${GRID_LINES}
   allow_shared_gpu: true
   skip_if_oom: true              # an OOM cell prints OOM rather than aborting
   skip_if_flash_attn_unavailable: true
-  enable_clock_locking: false
+  cooldown_s: ${COOLDOWN}
+  enable_clock_locking: ${CLOCK_LOCK}
 
 telemetry:
   track_scores: false            # scoring telemetry would distort the timings
@@ -287,6 +307,7 @@ YAML
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
   echo "window_size: $WINDOW_SIZE  num_sink: $NUM_SINK  local_window: $LOCAL_WINDOW"
   echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE  stat: $STAT"
+  echo "cooldown_s: $COOLDOWN  clock_locking: $CLOCK_LOCK"
   echo "throughput_columns: $THROUGHPUT"
 } > "$OUT_DIR/run_perf_table.env"
 
