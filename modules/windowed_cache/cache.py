@@ -49,7 +49,7 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
-from modules.quant.compact import stable_partition
+from modules.quant.compact import join, stable_partition
 from modules.quant.quantizer import QGrid
 from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
@@ -498,31 +498,49 @@ reset is load-bearing: without it Dynamo reuses the code object's frame state an
 the "static" retry gets automatic-dynamic promoted straight back, so it re-raises
 the identical symbolic error). The message recorded below is the SECOND attempt's.
   The known causes are addressed at the source, and each has a named home:
-    * a symbolic `((I)//ws)` guard -- every shape-derived value used as a SCALAR
-      is forced concrete with `int()`: `H_kv`/`T_fp`/`D`/`W` here, `W` in
-      `policy.compute_two_tier_retain`, `n` in `compact.stable_partition`, `N` in
-      `QuantSlotTable.lookup`, `n` in `QuantizedStore.promote_many`/`demote_many`,
-      `H`/`D` in `sketch.build_sketch`. A raw `.shape` read that reaches
-      `torch.arange`, a `torch.where` sentinel, a slice bound, a reshape extent
-      or a dict key is the bug; `B` (and the flattened `B * n`) is the one axis
-      deliberately left symbolic. BOTH forms count -- `x = t.shape[i]` AND
-      `a, b, c = t.shape`. The unpack is how this failure survived `014c40b`:
-      that commit forced four subscript reads and named
-      `policy.compute_two_tier_retain` as fixed, but the `int()` landed on
-      `compute_retain_window_indices` (the `quant_ratio == 0` single-tier path,
-      which the compiled body never calls) while the real offender,
-      `B, _, W = window_scores.shape`, was an unpack and went unseen -- by the
-      patch and by the AST guard, which exempted unpacks by name.
+    * `The argument '((I)//8)' is not comparable` -- a `torch.cat` in this graph.
+      READ THIS BEFORE TOUCHING A `.shape` READ: it is NOT a symbolic-shape bug,
+      and two rounds of forcing `int()` on shape reads (`d44baba`, `014c40b`)
+      changed nothing because of that. `I` is not the imaginary unit and not a
+      shape symbol -- it is `torch.utils._sympy.functions.Identity`, Inductor's
+      "do not expand this" wrapper, which prints as `I` only because sympy's
+      StrPrinter defines `_print_Identity` for the identity MATRIX and dispatches
+      on the class name. So `((I)//8)` is `FloorDiv(Identity(<expr>), ws)`.
+      Inductor builds that wrapper in exactly one place --
+      `_inductor/lowering.py::pointwise_cat` -- so a cat lowered pointwise is the
+      only way to get one. It then blows up in `_simplify_loops` -> `stride_vars`,
+      which substitutes every index var with 0: `Identity(i - h)` becomes
+      `Identity(-h)`, which has no free symbols, and sympy's `Min`/`Max` rejects
+      any arg that `is_number` but is not `is_comparable`. That `is_number` is
+      the proof the value was already CONCRETE -- and why the `dynamic=False`
+      retry failed with the byte-identical message instead of a different one.
+      The fix is never `int()`; it is to build the tensor without a cat:
+      `compact.join` for a plain join, `effective._rotate_half_no_cat` for RoPE's
+      rotation. `test_the_compiled_eviction_contains_no_cat` asserts zero cats in
+      this graph, which is what makes the failure impossible rather than
+      unlikely; it asserts ZERO because removing one cat changes the fusion
+      heuristics and can expose another (it did, twice).
     * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
+    * a symbolic scalar reaching `torch.arange`, a `torch.where` sentinel, a
+      slice bound or a reshape extent. Still a real hazard class, just NOT the
+      one above: every shape-derived scalar in the region is forced with `int()`
+      and `test_scalar_shape_reads_in_the_compiled_region_are_int_forced` keeps
+      it that way. `B` (and the flattened `B * n`) is the one axis deliberately
+      left symbolic.
   If it still fails, the traceback names the op that did not lower.
   To diagnose: the FULL Inductor traceback (which names the exact aten op /
 source line) is in evict_compile_traceback() and is written by the perf runner to
 <output_dir>/evict_compile_error_*.txt -- read that first. Then
 TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape.
   To reproduce on a CPU box, with no GPU: `pytest
-tests/test_evict_graph_breaks.py -k dynamic` compiles this body with
-`dynamic=True`, which is what makes the shape ints symbolic. That is the test
-that catches this class of failure before a GPU run does."""
+tests/test_evict_graph_breaks.py -k no_cat`. It needs
+`force_pointwise_cat=True`, and that is not a detail -- `lowering.py::cat`
+returns a `ConcatKernel` UNCONDITIONALLY for CPU devices ("negative performance
+impact of pointwise_cat optimization on CPU"), so a CPU box never takes the
+pointwise path and never builds an `Identity` at all. That branch, not anything
+about the C++ backend tolerating symbolic ints, is why this class of failure is
+invisible on CPU by default. The test also disables `fx_graph_cache`, because a
+cache hit lowers nothing and passes vacuously."""
 
 
 def _cuda_oom_cause(exc: BaseException) -> Optional[BaseException]:
@@ -2449,10 +2467,13 @@ class WindowedCache(_HFCacheBase):
             # Per-layer: this IS the first eviction, where `replace` reallocating
             # from the prompt capacity down to the budget is the point — it is
             # what releases the prompt-sized buffer.
+            # `join`, not `torch.cat`: same tensor, but a cat here is lowered
+            # through Inductor's `pointwise_cat` on CUDA, which is the single
+            # source of the `Identity` node behind the `((I)//8)` failure.
             state.replace(
-                torch.cat([state.key_states[:, :, :num_sink, :], new_k], dim=2),
-                torch.cat([state.value_states[:, :, :num_sink, :], new_v], dim=2),
-                torch.cat([state.position_ids[:, :num_sink], new_pos], dim=1),
+                join(state.key_states[:, :, :num_sink, :], new_k, 2),
+                join(state.value_states[:, :, :num_sink, :], new_v, 2),
+                join(state.position_ids[:, :num_sink], new_pos, 1),
             )
 
         # --- 5. Gather scores + ids to the retained merged axis -------------

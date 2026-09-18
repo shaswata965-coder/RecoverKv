@@ -34,7 +34,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
-__all__ = ["stable_partition"]
+__all__ = ["stable_partition", "join"]
 
 
 def stable_partition(mask: Tensor) -> Tensor:
@@ -77,3 +77,39 @@ def stable_partition(mask: Tensor) -> Tensor:
     dest = torch.where(mask, csum - 1, n_true + idx - csum)
     order = torch.empty_like(csum)
     return order.scatter_(-1, dest, idx)
+
+
+def join(a: Tensor, b: Tensor, dim: int) -> Tensor:
+    """``torch.cat([a, b], dim)`` WITHOUT emitting ``aten.cat``.
+
+    The compiled eviction must contain no ``torch.cat`` at all, and that is a
+    lowering constraint rather than a numerical one. On CUDA Inductor routes a
+    cat through ``_inductor/lowering.py::pointwise_cat``, which wraps the shifted
+    index in ``torch.utils._sympy.functions.Identity`` -- and that node is the
+    whole of the ``The argument '((I)//8)' is not comparable`` failure that
+    ERRORed every cell of three consecutive GPU perf tables.
+    ``modules/quant/effective._rotate_half_no_cat`` carries the full derivation;
+    the short version is that ``Identity`` prints as ``I`` only because sympy's
+    ``StrPrinter`` has a ``_print_Identity`` written for the identity *matrix*,
+    ``pointwise_cat`` is its only source in Inductor, and ``stride_vars``
+    substituting index vars to 0 leaves ``Identity(<a number>)``, which sympy's
+    ``Min``/``Max`` refuses because it ``is_number`` but is not ``is_comparable``.
+
+    Allocate-and-fill is exactly what ``ir.ConcatKernel`` -- the non-pointwise
+    lowering, and the one a CPU device always takes -- does anyway, so this is
+    the same work and the same bytes, written so the pointwise path cannot be
+    selected. The two ``narrow``s together cover every element, so nothing
+    uninitialised escapes.
+
+    Removing one cat can expose another, because it changes the fusion
+    heuristics that decide whether the *next* cat is lowered pointwise. That is
+    why ``test_the_compiled_eviction_contains_no_cat`` asserts on zero rather
+    than on a known set -- it found these callers one round after the first.
+    """
+    n_a = a.shape[dim]
+    size = list(b.shape)
+    size[dim] = n_a + b.shape[dim]
+    out = torch.empty(size, dtype=b.dtype, device=b.device)
+    out.narrow(dim, 0, n_a).copy_(a)
+    out.narrow(dim, n_a, b.shape[dim]).copy_(b)
+    return out

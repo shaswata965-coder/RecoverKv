@@ -336,25 +336,28 @@ def test_the_promote_width_is_the_measured_count_not_the_bound():
 
 
 def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
-    """A raw ``.shape[i]`` inside the compiled eviction is a lowering failure.
+    """A raw ``.shape[i]`` inside the compiled eviction is a lowering hazard.
 
     The eviction compiles with ``dynamic=True`` first
     (``cache._run_compiled_evict``), so every ``.shape`` read in the region is a
-    **SymInt**. That is fine where the value is only a tensor size, and fatal
+    **SymInt**. That is fine where the value is only a tensor size, and hazardous
     where it reaches a SCALAR context -- ``torch.arange``'s length, a
-    ``torch.where`` sentinel, a slice bound, a dict key. Inductor is then handed
-    an integer *expression*; the window axis is a token count over
-    ``window_size``, so it arrives as ``((I)//8)`` and CUDA codegen raises
-    ``ValueError: The argument '((I)//8)' is not compatible``.
+    ``torch.where`` sentinel, a slice bound, a reshape extent, a dict key --
+    because Inductor is then handed an integer *expression* instead of an int.
 
-    **This cannot be caught by compiling on CPU.** The C++ backend takes symbolic
-    ints in stride; only the Triton backend rejects them, so the whole existing
-    Inductor coverage in this file -- which greps for ``cpp_fused`` -- is green
-    while a GPU run dies on every cell. That is exactly what happened: six ERROR
-    rows on the first GPU table after ``c65ccff`` routed a symbolic window count
-    into ``stable_partition``'s ``torch.arange``. So this asserts the INVARIANT
-    at the source instead of the symptom at runtime, the way
-    ``test_no_python_loops_in_hot_path`` does.
+    **This guard does NOT prevent the ``((I)//8)`` outage, and the first two
+    versions of it claimed to.** That failure is
+    ``FloorDiv(Identity(<a number>), window_size)``, where ``Identity`` is
+    Inductor's ``pointwise_cat`` wrapper and ``is_number`` is True -- i.e. the
+    value was already concrete, so no amount of ``int()`` could have mattered.
+    ``test_the_compiled_eviction_contains_no_cat`` is the test for that one; this
+    one is a separate, still-worthwhile invariant, and the two must not be
+    confused again. Believing this guard covered ``((I)//8)`` is what sent two
+    fixes at the wrong code.
+
+    **A CPU compile does not exercise the CUDA lowering decisions**, so this
+    asserts the INVARIANT at the source instead of the symptom at runtime, the
+    way ``test_no_python_loops_in_hot_path`` does.
 
     The fix is always the same and always free: wrap the read in ``int()``. It is
     a no-op in eager and byte-identical, and it adds no recompiles, because the
@@ -363,11 +366,8 @@ def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
     **A whole-shape unpack counts.** The first version of this guard matched only
     ``x = t.shape[i]`` and said in a comment that ``B, H, T, D = t.shape`` was "a
     different pattern ... handled by the callers". It is not a different pattern
-    -- it is the same symbolic read wearing a different AST -- and that exemption
-    is precisely what let the live bug through: ``014c40b`` put ``int()`` on four
-    subscript reads, declared ``compute_two_tier_retain`` fixed, and the offender
-    in that function was ``B, _, W = window_scores.shape``. The guard passed and
-    every GPU cell still ERRORed. Both forms are matched now.
+    -- it is the same symbolic read wearing a different AST -- so both forms are
+    matched now.
     """
     import ast
     import pathlib
@@ -447,3 +447,133 @@ def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
           "Add a name to that function's allow-set ONLY if it is the row axis "
           "(see `B`), which is the one axis `dynamic=True` exists for."
     )
+
+
+# ---------------------------------------------------------------------------
+# No torch.cat in the compiled eviction  (the ((I)//8) lowering failure)
+# ---------------------------------------------------------------------------
+
+
+def _cat_lowerings_during(fn):
+    """Every ``aten.cat`` Inductor lowers while ``fn`` runs, as source lines."""
+    import torch._inductor.config as ic
+    import torch._inductor.lowering as L
+    from torch._inductor.virtualized import V
+
+    aten = torch.ops.aten
+    hits: list[str] = []
+    saved = {k: L.lowerings[k] for k in (aten.cat, aten.cat.default) if k in L.lowerings}
+
+    def wrap(orig):
+        def w(inputs, dim=0):
+            node = getattr(V, "current_node", None)
+            st = (getattr(node, "meta", {}) or {}).get("stack_trace", "") or ""
+            frames = [l.strip() for l in st.splitlines() if l.strip().startswith("File ")]
+            mine = [f for f in frames if "RecoverKv" in f]
+            hits.append(mine[-1] if mine else (frames[-1] if frames else "<no stack>"))
+            return orig(inputs, dim)
+        return w
+
+    # force_pointwise_cat: `lowering.py::cat` returns a ConcatKernel
+    # UNCONDITIONALLY for CPU devices, so a CPU box never takes the pointwise
+    # path and never builds the `Identity` node this is all about. Forcing it is
+    # what makes this test exercise the CUDA lowering decision. simdlen=0 keeps
+    # the scalar C++ backend, which sidesteps an unrelated CppVecOverrides break
+    # under emulate_precision_casts on some torch builds.
+    # fx_graph_cache OFF: a cache hit returns a compiled artifact without
+    # lowering anything, so the counter below sees zero cats and the test passes
+    # vacuously. That is not hypothetical -- it is what happened the first time
+    # this test was run twice in a row.
+    with ic.patch({"force_pointwise_cat": True, "cpp.simdlen": 0,
+                   "fx_graph_cache": False, "fx_graph_remote_cache": False}):
+        try:
+            for k, o in saved.items():
+                L.lowerings[k] = wrap(o)
+            dynamo.reset()
+            fn()
+        finally:
+            for k, o in saved.items():
+                L.lowerings[k] = o
+    return hits
+
+
+def test_the_compiled_eviction_contains_no_cat():
+    """A ``torch.cat`` in the eviction graph is the ``((I)//8)`` outage.
+
+    That error -- which ERRORed every cell of three consecutive GPU perf tables
+    -- is not about shapes, despite two rounds of forcing ``int()`` on ``.shape``
+    reads on the theory that it was. Decoding it:
+
+    * ``I`` is ``torch.utils._sympy.functions.Identity``, Inductor's "do not
+      expand this" wrapper. It prints as ``I`` because sympy's ``StrPrinter``
+      defines ``_print_Identity`` for the identity *matrix* and dispatches on the
+      class *name*, so ``((I)//8)`` is ``FloorDiv(Identity(<expr>), window_size)``.
+    * Inductor builds that wrapper in exactly ONE place --
+      ``_inductor/lowering.py::pointwise_cat``, as
+      ``Identity(idx[dim] - inputs_ranges[i][0])``. A ``cat`` lowered pointwise
+      is the only way to get one.
+    * ``_simplify_loops`` -> ``stride_vars`` removes the offset by substituting
+      every index var with 0, turning ``Identity(i - h)`` into ``Identity(-h)``.
+      That has no free symbols, so when sympy rebuilds the enclosing
+      ``Min``/``Max`` its ``_new_args_filter`` rejects it: ``is_number`` and not
+      ``is_comparable``.
+
+    ``is_number`` being True is the proof that the shape theory was wrong -- the
+    value was already concrete. It is also why the ``dynamic=False`` retry failed
+    with the byte-identical message rather than a different one.
+
+    So the invariant is not "make the shapes concrete", it is **no cat in this
+    graph at all**, which is what this asserts. ``Identity`` has a single source,
+    so zero cats makes the failure impossible rather than unlikely.
+    """
+    hits = _cat_lowerings_during(lambda: _run_decode_across_eviction(compile_backend="inductor"))
+    assert not hits, (
+        "the compiled eviction lowered a torch.cat:\n  "
+        + "\n  ".join(dict.fromkeys(hits))
+        + "\n\nOn CUDA that goes through `pointwise_cat`, which wraps the shifted "
+          "index in `Identity` and makes Inductor raise `The argument '((I)//8)' "
+          "is not comparable` from sympy's Min/Max -- every perf cell ERRORs. "
+          "Build the tensor without a cat: `cache._prepend_prefix` for a prefix "
+          "join, `effective._rotate_half_no_cat` for RoPE's rotation. Removing "
+          "one cat can expose another (it changes Inductor's fusion heuristics), "
+          "which is why this asserts on ZERO rather than on a known set."
+    )
+
+
+def test_rotate_half_no_cat_is_bit_identical_to_huggingface():
+    """The cat-free rotation must be HF's, bit for bit -- not merely close.
+
+    ``_apply_rotary_one`` is the reference every accuracy test validates against,
+    and its contract is that it reproduces
+    ``apply_rotary_pos_emb(k, k, cos, sin)[1]`` exactly. Replacing the ``cat``
+    inside it is only admissible if the bits are unchanged, so this compares the
+    raw bit patterns (``torch.equal`` alone would call ``-0.0`` equal to ``0.0``)
+    over the dtypes the cache actually stores and the values most likely to
+    expose a sign-handling difference.
+    """
+    from modules.quant.effective import _rotate_half, _rotate_half_no_cat
+
+    hf = _rotate_half()
+    ibits = {2: torch.int16, 4: torch.int32, 8: torch.int64}
+
+    def same_bits(a, b):
+        assert a.dtype == b.dtype and a.shape == b.shape
+        t = ibits[a.element_size()]
+        return torch.equal(a.contiguous().view(t), b.contiguous().view(t))
+
+    torch.manual_seed(0)
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        for shape in ((4, 2, 8, 16), (1, 1, 1, 2), (3, 5, 7, 128)):
+            x = torch.randn(*shape).to(dtype)
+            assert same_bits(hf(x), _rotate_half_no_cat(x)), (dtype, shape)
+        # signed zeros, infinities and a subnormal -- where `x * -1` would differ
+        # from `-x` if the identity did not hold.
+        edge = torch.tensor(
+            [[0.0, -0.0, float("inf"), -float("inf"), 3.5, -3.5, 1.0, -1.0]]
+        ).to(dtype)
+        assert same_bits(hf(edge), _rotate_half_no_cat(edge)), dtype
+
+    # A non-contiguous caller must work too: `_apply_rotary_one` is handed
+    # permuted views on the promote path.
+    x = torch.randn(4, 8, 16).transpose(0, 1)
+    assert same_bits(hf(x), _rotate_half_no_cat(x))

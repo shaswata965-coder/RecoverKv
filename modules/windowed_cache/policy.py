@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
-from modules.quant.compact import stable_partition
+from modules.quant.compact import join, stable_partition
 
 if TYPE_CHECKING:
     from .config import ResolvedConfig
@@ -325,14 +325,17 @@ class EvictionPolicy:
         # the same result, one scan instead of a sort over the widest tensor in
         # the eviction (`modules/quant/compact.py`).
         keep = torch.zeros(B, evictable_w, device=device, dtype=torch.bool)
-        keep.scatter_(1, torch.cat([fp_sel, q_sel], dim=-1), True)
+        keep.scatter_(1, join(fp_sel, q_sel, -1), True)
         tier_of = torch.zeros(B, evictable_w, device=device, dtype=torch.long)
         tier_of.scatter_(1, q_sel, 1)
         ev_idx = stable_partition(keep)[:, :k_fp + n_q]
         ev_tier = torch.gather(tier_of, 1, ev_idx)
 
-        retained = torch.cat([ev_idx, local_idx], dim=-1)
-        tier = torch.cat([ev_tier, local_tier], dim=-1)
+        # `join`, not `torch.cat`: these three run inside the compiled eviction,
+        # where a cat is lowered pointwise on CUDA and emits the `Identity` node
+        # that makes the whole graph unlowerable (`compact.join` explains it).
+        retained = join(ev_idx, local_idx, -1)
+        tier = join(ev_tier, local_tier, -1)
         return retained, tier
 
     # -----------------------------------------------------------------

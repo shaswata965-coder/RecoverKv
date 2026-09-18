@@ -49,12 +49,76 @@ def _rotate_half():
     Imported rather than restated so the RoPE convention stays HF's. The only
     thing :func:`_apply_rotary_one` changes is *how many tensors get rotated*,
     never which halves go where or with what sign.
+
+    **Not used on the compiled eviction path** -- see :func:`_rotate_half_no_cat`,
+    which is bit-identical and is what that path calls. This stays as the
+    reference the equality test compares against.
     """
     try:
         from transformers.models.llama.modeling_llama import rotate_half
     except ImportError:  # pragma: no cover - depends on installed model families
         from transformers.models.qwen2.modeling_qwen2 import rotate_half
     return rotate_half
+
+
+def _rotate_half_no_cat(x: Tensor) -> Tensor:
+    """``rotate_half`` without ``torch.cat``. Bit-identical; see why it must be.
+
+    HF writes the rotation as ``torch.cat((-x2, x1), dim=-1)``. That one line is
+    what made every GPU perf cell ERROR with
+
+        ValueError: The argument '((I)//8)' is not comparable.
+
+    and the message is not about shapes at all, which is why two rounds of
+    forcing ``int()`` on ``.shape`` reads changed nothing. Decoded:
+
+    * ``I`` is **not** the imaginary unit and not a shape symbol. It is
+      ``torch.utils._sympy.functions.Identity`` -- Inductor's "do not expand
+      this" wrapper -- printed as ``I`` because sympy's ``StrPrinter`` has a
+      ``_print_Identity`` written for the identity *matrix* and dispatches on the
+      class *name*. So ``((I)//8)`` is ``FloorDiv(Identity(<expr>), ws)``.
+    * Inductor creates that wrapper in exactly one place:
+      ``_inductor/lowering.py::pointwise_cat``, as
+      ``Identity(idx[dim] - inputs_ranges[i][0])`` -- the shifted index of a
+      ``torch.cat`` lowered as a fused pointwise read. **A cat is the only way to
+      get one.**
+    * It blows up in ``_simplify_loops`` -> ``stride_vars``, which removes the
+      offset by substituting every index var with 0. ``Identity(i - h)`` then
+      becomes ``Identity(-h)`` -- no free symbols -- and sympy rebuilds the
+      enclosing ``Min``/``Max``, whose ``_new_args_filter`` rejects any arg that
+      ``is_number`` but not ``is_comparable``. ``Identity`` is a ``Function``
+      sympy cannot evaluate, so it is exactly that.
+
+    Two consequences worth keeping in mind, because both were got wrong before:
+
+    * ``is_number`` is True on the failing argument, so the value was **already
+      concrete**. A symbolic shape is not what this is, and no amount of
+      ``int()`` can fix it. It is also why the ``dynamic=False`` retry failed
+      with the identical message instead of a different one.
+    * It cannot reproduce on CPU no matter what is compiled, because
+      ``lowering.py::cat`` returns a ``ConcatKernel`` unconditionally for CPU
+      devices ("negative performance impact of pointwise_cat on CPU") and so
+      never builds an ``Identity`` at all. The CPU/GPU split is that branch, not
+      anything about the C++ backend tolerating symbolic ints.
+
+    The rotation itself is pure index motion, so it does not need a cat:
+    view the last axis as ``[2, h]`` (half 0 = ``x1``, half 1 = ``x2``), ``flip``
+    that axis to get ``[x2, x1]``, and scale by ``[-1, +1]``. ``flip`` lowers to
+    an index transform, not a concatenation, so no ``Identity`` is created.
+
+    Bit-identity, not approximate equality: ``x * -1`` flips the sign bit and
+    ``x * 1`` is the identity, for every finite, infinite and subnormal value in
+    every float dtype, so each output element is the same bit pattern HF's
+    ``cat((-x2, x1))`` produces. ``test_rotate_half_no_cat_is_bit_identical``
+    pins it against HF directly.
+    """
+    # int(): a concrete half-width, for the same reason the rest of the compiled
+    # region forces its shape reads. HF writes `x.shape[-1] // 2` raw.
+    h = int(x.shape[-1]) // 2
+    # [..., 2, h] -- reshape, not unflatten, so a non-contiguous caller is handled.
+    u = x.reshape(*x.shape[:-1], 2, h)
+    sign = torch.tensor([[-1.0], [1.0]], dtype=x.dtype, device=x.device)
+    return (u.flip(-2) * sign).reshape(x.shape)
 
 
 def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -78,11 +142,14 @@ def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     returns -- which is asserted directly in
     ``test_apply_rotary_one_matches_huggingface``.
     """
-    rotate_half = _rotate_half()
     cos = cos.unsqueeze(1)    # HF's unsqueeze_dim default: the head axis
     sin = sin.unsqueeze(1)
     out = k * cos                         # allocation 1 (ours; safe in place)
-    tmp = rotate_half(k) * sin            # allocation 2 (ours)
+    # `_rotate_half_no_cat`, NOT HF's `rotate_half`: bit-identical, and free of
+    # the `torch.cat` whose Inductor lowering emitted the `Identity` node that
+    # made every compiled eviction fail to lower. The whole derivation is in
+    # that function's docstring; this call site is the only reason it exists.
+    tmp = _rotate_half_no_cat(k) * sin    # allocation 2 (ours)
     return out.add_(tmp)
 
 
