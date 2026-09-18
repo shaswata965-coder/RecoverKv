@@ -155,7 +155,11 @@ class QuantSlotTable:
         # the inner dim is what matters -- and would need a `slots.py` refactor.
         self.sketch = sketch
         if sketch:
-            self.sk_mu_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            # int4, packed two per byte along D (modules/quant/sketch._q_sym4).
+            # mu and vbar are 64% of the card and neither needs int8's range, so
+            # halving them is what takes the card from 400 B/head to 272 and
+            # moves the gate's break-even read ratio from 0.50 to 0.66.
+            self.sk_mu_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
             self.sk_mu_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             self.sk_v_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
             self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
@@ -166,7 +170,7 @@ class QuantSlotTable:
             # the card's mass estimate, recalibrated every step against the
             # windows that were actually read. It replaces the `eps` residual
             # field, which served a bound the fused gate never implemented.
-            self.sk_vm_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_vm_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
             self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,

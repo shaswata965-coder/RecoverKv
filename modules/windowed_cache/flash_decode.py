@@ -60,10 +60,11 @@ _PENDING: dict = {"ctx": None}
 #: ``fired`` counts wrapper invocations that actually ran the kernel. They must
 #: stay equal; :func:`clear` raises the moment they diverge.
 #:
-#: ``gated`` and the two window counters are the same idea one level down. The
-#: fused kernel running does NOT mean the gate ran: a store with no sketch cards
-#: hands over ``gate=None`` and reads the whole tier, correctly and slowly, with
-#: nothing in the output to say so. Counting is Python integer arithmetic on
+#: ``gated`` and the two window counters are the same idea one level down.
+#: ``gated`` must equal ``fired``: there is no ungated arm on the flash path, so
+#: a fused layer that did not gate is a hard error (``_run_fused``), not a slow
+#: success. The counters are how a finished run proves it. Counting is Python
+#: integer arithmetic on
 #: values already in hand (``n_sel`` from the context, ``n_active`` from a tensor
 #: SHAPE), so it costs no kernel launch and no device sync — the read fraction is
 #: readable without a ``.item()`` anywhere on the decode path.
@@ -75,9 +76,10 @@ def stats() -> dict:
     """Hand-offs vs. kernel runs vs. gate runs, plus the realised read fraction.
 
     ``armed`` == ``fired`` says the fused decode kernel served every layer it was
-    handed. ``gated`` == ``fired`` says the read gate ran on every one of those;
-    ``gated`` of 0 against a large ``fired`` is the silent no-cards case, which
-    looks exactly like success in every other measurement.
+    handed, and ``gated`` == ``fired`` says the read gate ran on every one of
+    those. Both are invariants the code enforces rather than hopes for — a
+    missing gate raises in ``_run_fused`` — so these read as proof, not as a
+    diagnostic to go checking when a number looks wrong.
 
     ``read_fraction`` is the windows actually dequantized over the windows
     available — ``quant_gate_ratio`` as realised, not as configured. It is
@@ -204,14 +206,31 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     #    decode silently timed against a method it is not running — the same
     #    failure FusedDecodeNotReached exists to refuse. `None` is the explicit
     #    way to say "this store has no cards".
-    gate, sel, logmass = ctx["gate"], None, None
-    if gate is not None:
-        sel, logmass = fused_gate(
-            q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
-        # Shapes only — no device sync, no launch. See _STATS.
-        _STATS["gated"] += 1
-        _STATS["windows_read"] += int(sel.shape[-1])
-        _STATS["windows_active"] += int(logmass.shape[-1])
+    gate = ctx["gate"]
+    if gate is None:
+        # No ungated arm on this path, by design. The caller only arms the fused
+        # decode when `store.num_active_windows > 0`, so arriving here without
+        # cards means a store holding a Q tier it cannot select over: the gate
+        # would be skipped, the whole tier read, and the run would look exactly
+        # like success while timing a method it is not running. That is the
+        # failure FusedDecodeNotReached exists to refuse, one level down, and it
+        # is how the gate sat unreachable for eight commits.
+        raise FusedDecodeNotReached(
+            f"layer {ctx.get('layer_idx')} armed the fused decode over "
+            f"{int(ctx['qtier']['k_codes'].shape[1])} active int2 windows with "
+            "no gate cards. The read gate is the only Q-tier read path on the "
+            "flash backend — there is no ungated fallback. A store with a Q "
+            "tier must carry cards: check `quant_sketch_enabled` (derived from "
+            "quant_ratio > 0) and that the store has demoted at least once. "
+            "To read every window, set quant_gate_ratio=1.0, which selects all "
+            "of them through this same path."
+        )
+    sel, logmass = fused_gate(
+        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+    # Shapes only — no device sync, no launch. See _STATS.
+    _STATS["gated"] += 1
+    _STATS["windows_read"] += int(sel.shape[-1])
+    _STATS["windows_active"] += int(logmass.shape[-1])
 
     # 2. Attend over [sink | fp body | selected Q], scoring as it goes. The
     #    kernel also scores the windows it skipped, from `logmass`, AND attends
@@ -221,8 +240,7 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     #    launch count.
     out, wsum = fused_two_tier_decode(
         q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
-        sel=sel, logmass=logmass,
-        centroids=None if gate is None else gate["centroid"],
+        sel=sel, logmass=logmass, centroids=gate["centroid"],
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is

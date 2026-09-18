@@ -579,7 +579,7 @@ if _HAS_TRITON:
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
-        VM, VMS, VANC,             # value centroids: int8 [B,n,H_kv,D], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
+        VM, VMS, VANC,             # value centroids: int4-packed u8 [B,n,H_kv,D//2], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -689,9 +689,10 @@ if _HAS_TRITON:
         vsgn = H_kv * GV
         vsgh = GV
         cob = n_active * WS * HALF
-        vmb = n_active * H_kv * HEAD_DIM
-        vmn = H_kv * HEAD_DIM
-        vmh = HEAD_DIM
+        # VM is int4, packed two per byte along D, so its row is HALF wide.
+        vmb = n_active * H_kv * HALF
+        vmn = H_kv * HALF
+        vmh = HALF
         vmsb = n_active * H_kv
         vmsn = H_kv
         vab = H_kv * HEAD_DIM
@@ -764,6 +765,9 @@ if _HAS_TRITON:
 
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
+        # int4 lane map for the value centroids (§5): two per byte along D.
+        vbyte = (offs_d // 2)
+        vshift = (4 * (offs_d % 2)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
         # A statement, not a ternary: `if` on a constexpr is the form Triton's
@@ -972,9 +976,12 @@ if _HAS_TRITON:
                 # exactly as the Q loop dequantizes codes -- no fp16 centroid
                 # tensor is ever built.
                 qmask = cmask & (cols >= n_body_win)
-                vq = tl.load(VM + b * vmb + qc[:, None] * vmn + kv * vmh
-                             + offs_d[None, :],
-                             mask=qmask[:, None], other=0).to(tl.float32)
+                # int4 nibbles, +8 biased: element d is byte d//2, shift 4*(d%2)
+                # -- the same unpack as the Q loop's int2 crumbs, one width up.
+                vb_ = tl.load(VM + b * vmb + qc[:, None] * vmn + kv * vmh
+                              + vbyte[None, :],
+                              mask=qmask[:, None], other=0)
+                vq = (((vb_ >> vshift[None, :]) & 0xF).to(tl.float32) - 8.0)
                 vsc = tl.load(VMS + b * vmsb + qc * vmsn + kv,
                               mask=qmask, other=0.0).to(tl.float32)
                 vbar = vq * vsc[:, None] + vanc[None, :]
@@ -1267,10 +1274,18 @@ def _decode_triton(
                 "skips attend through them, and without them 75% of the tier "
                 "would be silently absent from the attention output.")
         VM, VMS, VANC = centroids
-        if VM.shape != (B, n_active, H_kv, D):
+        # int4, packed two per byte along D (modules/quant/sketch._q_sym4), so
+        # the stored row is D//2 wide. Checked rather than inferred: a full-width
+        # int8 centroid would read the right number of BYTES and the wrong
+        # VALUES, which is the failure mode a shape check exists to catch.
+        if VM.shape != (B, n_active, H_kv, D // 2):
             raise RuntimeError(
-                f"centroid codes must be [B, n_active, H_kv, D] = [{B}, "
-                f"{n_active}, {H_kv}, {D}]; got {tuple(VM.shape)}.")
+                f"centroid codes must be int4-packed [B, n_active, H_kv, D//2] = "
+                f"[{B}, {n_active}, {H_kv}, {D // 2}]; got {tuple(VM.shape)}.")
+        if VM.dtype != torch.uint8:
+            raise RuntimeError(
+                f"centroid codes must be uint8 (packed int4 nibbles); got "
+                f"{VM.dtype}.")
         if VMS.shape != (B, n_active, H_kv):
             raise RuntimeError(
                 f"centroid scales must be [B, n_active, H_kv]; got {tuple(VMS.shape)}.")
@@ -1288,7 +1303,7 @@ def _decode_triton(
         # w0 < n_sel == 0, and the GATED blocks are compiled out entirely.
         SEL = torch.zeros((1,), dtype=torch.int32, device=dev)
         LOGM = torch.zeros((1,), dtype=torch.float32, device=dev)
-        VM = torch.zeros((1,), dtype=torch.int8, device=dev)
+        VM = torch.zeros((1,), dtype=torch.uint8, device=dev)
         VMS = torch.zeros((1,), dtype=torch.float16, device=dev)
         VANC = torch.zeros((1,), dtype=torch.float32, device=dev)
         selb = selh = 0

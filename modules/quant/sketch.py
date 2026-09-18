@@ -27,30 +27,33 @@ The card here is a **rank-1 model** of the window instead of a point::
 
     k_i  ~=  mu  +  t_i * v          v = direction of the farthest deviation
 
-which gives a per-token estimate from two dot products, plus a per-token
-residual ``eps_i`` that makes the gate a genuine **upper bound** rather than a
-guess:
+which gives a per-token estimate from two dot products. ``v`` points at the
+token furthest from the mean — in a sparse window that is the hot one — so the
+model spends its one direction on the token the gate exists to find.
 
-    |q.k_i - (q.mu + t_i * q.v)|  <=  ||q|| * eps_i        (Cauchy-Schwarz)
-
-so a window whose bound falls below the threshold provably carries no logit above
-it. The gate can over-select; it cannot miss. ``v`` points at the token furthest
-from the mean — in a sparse window that is the hot one — so the model spends its
-one direction on the token the gate exists to find.
-
-Construction is one pass (mean, farthest point, projection, residual) with a
-fixed instruction count and no convergence loop. This is greedy k-center, not
-Lloyd's: the gate is a max-bound, and k-center minimises exactly the radius that
-loosens it, without iterating.
+Construction is one pass (mean, farthest point, projection) with a fixed
+instruction count and no convergence loop. This is greedy k-center, not Lloyd's:
+k-center minimises exactly the radius that would loosen the estimate, without
+iterating.
 
 Encoding, and what measurement decided
 --------------------------------------
-``mu``, ``v`` and ``vbar`` are int8 with a per-(window, head) scale, and so is
-``t``. 400 B per head, 3200 B per window at ``H_kv=8, D=128, ws=8`` — a third of
-the 9632 B a carded window costs, and the largest single field in it now that
-the codes' grid is one byte per entry.
+``mu`` and ``vbar`` are **int4**, packed two per byte; ``v`` and ``t`` are int8.
+All four carry a per-(window, head) fp16 scale. **272 B per head, 2176 B per
+window** at ``H_kv=8, D=128, ws=8``.
 
-Three encoding choices were measured on synthetic keys carrying massive-
+The width split is the whole economics of the gate, so it is worth stating why.
+A card must be read for *every* window on *every* step — that is what selecting
+means — while a window is only opened if selected. So the gate costs
+``card + ratio * window`` against ``window``, and break-even sits at
+``1 - card/window``. At int8 the card was 400 B against a 804 B window of token
+data: **78% of the thing it summarises**, break-even at a 0.50 read ratio, and
+measurably worth nothing at the shipped 0.25. At int4 it is 272 B, and
+break-even moves to **0.66**. The card was written at four times the precision
+of the 2-bit tokens it stands in for; that, not the idea, is what made skimming
+expensive.
+
+Four encoding choices were measured on synthetic keys carrying massive-
 activation channels and one outlier token per window (``tests/test_sketch.py``
 pins the conclusions):
 
@@ -58,7 +61,12 @@ pins the conclusions):
   *largest* residual in its window (38.0 vs a 15.0 mean), worse than useless for
   the case the card exists to serve; int4 is nearly as bad (7.0). int8 brings it
   to 0.39 against a 9.2 mean — the hot token becomes the best-fit token, which is
-  the property the whole design turns on.
+  the property the whole design turns on. This is why the int4 change took
+  ``mu`` and ``vbar`` and left ``v`` alone.
+* **``mu`` and ``vbar`` do not need int8.** Both are means, both stored as a
+  residual from a frozen anchor, and coarsening them to int4 leaves the gate's
+  selection and the skipped windows' contribution unchanged at the shipped read
+  ratio. They are 64% of the card, which is where the 400 -> 272 B comes from.
 * **``mu`` is stored as a residual from a frozen per-(layer, head) anchor.**
   Massive-activation channels are near-identical across windows, so they carry no
   information that separates one window from another while eating the entire
@@ -71,14 +79,6 @@ pins the conclusions):
   variant, which is gone, so it is gone too — one fewer matmul on the launch-
   bound eviction path, one fewer transform in the kernel prologue, and no
   resident transform matrix.
-
-The bound survives quantisation
--------------------------------
-``eps`` is computed against the **decoded** ``mu``/``v``/``t``, not against the
-ideal rank-1 fit, and is quantised by rounding **up**. So Cauchy-Schwarz holds
-for the values actually stored, not for the values we wished we had stored.
-:func:`build_sketch` therefore encodes, decodes, and only then measures the
-residual — that order is the guarantee, not an implementation detail.
 
 Shapes
 ------
@@ -110,29 +110,39 @@ __all__ = [
 def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
     """Bytes one head's card costs — for the budget arithmetic.
 
-    ``mu`` int8(D) + fp16 scale, ``v`` int8(D) + fp16 scale, ``t`` int8(ws) +
-    fp16 scale, ``vbar`` int8(D) + fp16 scale.
+    ``mu`` **int4**(D, packed 2/byte) + fp16 scale, ``v`` int8(D) + fp16 scale,
+    ``t`` int8(ws) + fp16 scale, ``vbar`` **int4**(D, packed) + fp16 scale.
+
+    ``mu`` and ``vbar`` are int4 and ``v`` is not, and that split is measured,
+    not stylistic. ``v`` is the deviation DIRECTION -- the thing that lets the
+    card find a window's one hot token -- and at int4 the hot token stops being
+    the best-fit token, which is the single property the card exists for
+    (``tests/test_sketch.py::test_int8_direction_is_required_not_a_preference``).
+    ``mu`` and ``vbar`` are both means, both stored as residuals from a frozen
+    anchor, and neither needs the range: coarsening them is accuracy-neutral at
+    the shipped read ratio. ``t`` is 10 B of the card and cannot shrink either --
+    without it the card is a plain average again.
 
     This number is LOAD-BEARING, not documentation: ``config.resolve`` adds it to
     ``bytes_per_q_window``, so a card field that is not counted here is a window
     the cache holds and the budget does not know about. At ``D=128, ws=8, H=8``
-    the card is 3200 B against the codes-plus-grid's 6432 — half the Q tier
-    again. Unbudgeted, that is a 50% overrun on the tier the memory claim is
-    made about.
+    the card is 2176 B against the codes-plus-grid's 6432 — down from 3200 B
+    when ``mu`` and ``vbar`` were int8. Unbudgeted, that would be a 34% overrun
+    on the tier the memory claim is made about.
     """
-    return 3 * (head_dim + 2) + (window_size + 2)
+    return 2 * (head_dim // 2 + 2) + (head_dim + 2) + (window_size + 2)
 
 
 class Sketch(NamedTuple):
     """One window's card, per head. Leading axis opaque (``N``)."""
 
-    mu_q: Tensor      # [N, H, D]    int8   — mu - anchor
+    mu_q: Tensor      # [N, H, D//2] uint8  — mu - anchor, int4 packed 2/byte
     mu_s: Tensor      # [N, H]       fp16
     v_q: Tensor       # [N, H, D]    int8   — unit deviation direction
     v_s: Tensor       # [N, H]       fp16
     t_q: Tensor       # [N, H, ws]   int8   — projection onto v
     t_s: Tensor       # [N, H]       fp16
-    vm_q: Tensor      # [N, H, D]    int8   — value centroid - value anchor
+    vm_q: Tensor      # [N, H, D//2] uint8  — value centroid - v_anchor, int4
     vm_s: Tensor      # [N, H]       fp16
 
 
@@ -153,6 +163,48 @@ def _q_sym(x: Tensor, bits_max: int = 127) -> Tuple[Tensor, Tensor]:
 
 
 def _dq_sym(codes: Tensor, scale: Tensor) -> Tensor:
+    return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
+
+
+#: int4 nibble bias. Codes are symmetric in ``[-7, 7]``; storing ``code + 8``
+#: makes every nibble unsigned in ``[1, 15]``, so unpacking is a shift-and-mask
+#: with no sign extension — the same shape as the int2 crumb unpack the decode
+#: kernel already does, which is why the Triton side is three extra lines.
+_NIB_BIAS = 8
+_NIB_MAX = 7
+
+
+def _q_sym4(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """Symmetric int4, **packed two per byte** along the last axis.
+
+    Returns ``(packed uint8 [..., D//2], scale fp16 [...])``.
+
+    The packing order matches the int2 crumb packer in
+    :mod:`modules.quant.quantizer`: element ``j`` lives in byte ``j // 2`` at
+    shift ``4 * (j % 2)``, low nibble first. Keeping one convention across both
+    widths means the kernel's unpack is the same idiom twice, not two idioms.
+
+    This is a REAL int4 encoder, not a coarsened int8 one: the scale is re-fit to
+    ``amax / 7`` rather than inherited from the wider grid, so the codes use the
+    whole 4-bit range. The ablation that cleared this change simulated int4 by
+    rounding int8 codes against the int8 scale, which is strictly worse — so the
+    measured accuracy is a floor, not an estimate.
+    """
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / _NIB_MAX, torch.ones_like(amax))
+    s16 = scale.to(torch.float16)
+    s32 = s16.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    codes = torch.round(x / s32).clamp_(-_NIB_MAX, _NIB_MAX)
+    nib = (codes + _NIB_BIAS).to(torch.uint8)                   # [..., D] in [1,15]
+    lo, hi = nib[..., 0::2], nib[..., 1::2]
+    return (lo | (hi << 4)), s16.squeeze(-1)
+
+
+def _dq_sym4(packed: Tensor, scale: Tensor) -> Tensor:
+    """Unpack + dequantize :func:`_q_sym4`. ``[..., D//2]`` -> ``[..., D]``."""
+    lo = (packed & 0x0F).to(torch.int16) - _NIB_BIAS
+    hi = ((packed >> 4) & 0x0F).to(torch.int16) - _NIB_BIAS
+    codes = torch.stack([lo, hi], dim=-1).flatten(-2)           # interleave back
     return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
 
 
@@ -222,12 +274,12 @@ def build_sketch(
     v = fdev.squeeze(-2) / fnrm                                # sweep 2, unit
     t = (dev * v.unsqueeze(-2)).sum(-1)                        # sweep 3
 
-    mu_q, mu_s = _q_sym(mu - anc)
+    mu_q, mu_s = _q_sym4(mu - anc)
     v_q, v_s = _q_sym(v)
     t_q, t_s = _q_sym(t)
 
     vbar = values.to(torch.float32).mean(dim=-2)               # [N, H, D]
-    vm_q, vm_s = _q_sym(vbar - _align_anchor(v_anchor, vbar))
+    vm_q, vm_s = _q_sym4(vbar - _align_anchor(v_anchor, vbar))
 
     return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
 
@@ -256,14 +308,17 @@ def value_centroid(s: Sketch, v_anchor: Tensor) -> Tensor:
     windows measured this step, so the term is calibrated against real attention
     on every step rather than trusted open-loop.
     """
-    vm = _dq_sym(s.vm_q, s.vm_s)
+    vm = _dq_sym4(s.vm_q, s.vm_s)
     return vm + _align_anchor(v_anchor, vm)
 
 
 def decode_sketch(s: Sketch, anchor: Tensor):
     """``(mu_hat, v_hat, t_hat)`` — the decoded card."""
+    # Align against the DECODED mu, not the stored codes: mu_q's last axis is
+    # D//2 now, so aligning on it would broadcast the anchor onto half a head.
+    mu = _dq_sym4(s.mu_q, s.mu_s)
     return (
-        _align_anchor(anchor, s.mu_q) + _dq_sym(s.mu_q, s.mu_s),
+        _align_anchor(anchor, mu) + mu,
         _dq_sym(s.v_q, s.v_s),
         _dq_sym(s.t_q, s.t_s),
     )
@@ -315,7 +370,7 @@ def gate_and_score(
     rep = Hq // Hkv
     qf = q.to(torch.float32)
 
-    mu_r = _dq_sym(s.mu_q, s.mu_s)                                   # [B,Nw,Hkv,D]
+    mu_r = _dq_sym4(s.mu_q, s.mu_s)                                  # [B,Nw,Hkv,D]
     v_h = _dq_sym(s.v_q, s.v_s)
     t_h = _dq_sym(s.t_q, s.t_s)                                      # [B,Nw,Hkv,ws]
 

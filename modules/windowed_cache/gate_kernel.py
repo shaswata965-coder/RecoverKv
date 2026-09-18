@@ -175,7 +175,7 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
     def _gate_kernel(
         Q, MU, MUS, V, VS, T, TS, ANCH,
         EST, LOGM,
-        qb, qh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah,
+        qb, qh, pmb, pmn, pmh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah,
         lb, lh, eb, eh,
         NW, REP, SCALE,
         HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
@@ -222,10 +222,16 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
 
         cols = tl.program_id(2) * BLOCK_W + tl.arange(0, BLOCK_W)
         cm = cols < NW
+        # mu is int4 packed two per byte along D: element `d` is the nibble at
+        # byte `d // 2`, shift `4 * (d % 2)`, biased by +8 so it is unsigned.
+        # Same idiom as the decode kernel's int2 crumbs, one width up.
+        dbyte = d // 2
+        dshift = (4 * (d % 2)).to(tl.uint8)
 
         # ---- the cards for this tile: read ONCE for the whole query group ----
-        mu = tl.load(MU + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
-                     mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
+        mu_b = tl.load(MU + b * pmb + cols[:, None] * pmn + kv * pmh + dbyte[None, :],
+                       mask=cm[:, None] & dm[None, :], other=0)
+        mu = (((mu_b >> dshift[None, :]) & 0xF).to(tl.float32) - 8.0)
         mus = tl.load(MUS + b * sb + cols * sn + kv * sh,
                       mask=cm, other=0.0).to(tl.float32)
         vv = tl.load(V + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
@@ -275,7 +281,11 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
     mu_q, mu_s, v_q, v_s, t_q, t_s, _vm_q, _vm_s = card
-    B, NW, HKV, D = mu_q.shape
+    # mu_q's last axis is D//2 (int4, packed); the head dim comes from `v_q`,
+    # which is still full-width int8. Reading it off mu_q would halve every
+    # downstream extent.
+    B, NW, HKV = mu_q.shape[0], mu_q.shape[1], mu_q.shape[2]
+    D = v_q.shape[-1]
     HQ = q.shape[1]
     ws = t_q.shape[-1]
     if anchor.dim() == 2:
@@ -292,6 +302,7 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
         est, logm,
         q.stride(0), q.stride(1),
         mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
+        v_q.stride(0), v_q.stride(1), v_q.stride(2),
         mu_s.stride(0), mu_s.stride(1), mu_s.stride(2),
         t_q.stride(0), t_q.stride(1), t_q.stride(2),
         anchor.stride(0), anchor.stride(1),

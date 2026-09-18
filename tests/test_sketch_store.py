@@ -97,26 +97,36 @@ def test_card_survives_the_table_round_trip():
     _demote(st)
     slots = st.table.active_order(st._n_active)
     card = Sketch(*st.table.gather_sketch(slots))
-    assert card.mu_q.shape == (B, N, H, D)
+    # mu and vbar are int4, packed two per byte along D; v and t stay int8.
+    assert card.mu_q.shape == (B, N, H, D // 2)
+    assert card.vm_q.shape == (B, N, H, D // 2)
+    assert card.v_q.shape == (B, N, H, D)
     assert card.t_q.shape == (B, N, H, S)
-    assert card.mu_q.dtype == torch.int8 and card.e_q.dtype == torch.uint8
+    assert card.mu_q.dtype == torch.uint8 and card.vm_q.dtype == torch.uint8
+    assert card.v_q.dtype == torch.int8 and card.t_q.dtype == torch.int8
 
 
-def test_bound_holds_through_the_store():
-    """The guarantee, after the card has been through write + gather."""
+def test_estimate_ranks_the_true_hottest_window_through_the_store():
+    """The card still finds the right window after write + gather.
+
+    The Cauchy-Schwarz *bound* this used to assert is gone with ``eps``: the
+    fused gate is a top-k on the point estimate and never implemented a margin,
+    so the bound was built, stored and discarded. What has to survive the round
+    trip is the ranking, which is what the cap consumes.
+    """
     st = _store()
     k_post = _demote(st)
     q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(7)) * 1.5
     slots = st.table.active_order(st._n_active)
     card = Sketch(*st.table.gather_sketch(slots))
-    bound, _, _ = gate_and_score(q, card, st._anchor, SCALING)
+    _, est = gate_and_score(q, card, st._anchor, SCALING)
 
     order = st.table.slot_wid.gather(1, slots)
     kk = _true_max_logit(k_post, order)
     qg = q.reshape(B, H, 2, D)
     true = SCALING * torch.einsum("bnhwd,bhrd->bhrnw", kk, qg).reshape(
         B, H * 2, N, S).amax(-1)
-    assert (true - bound).amax() <= 1e-4
+    assert est.argmax(-1).eq(true.argmax(-1)).float().mean() > 0.9
 
 
 # ---------------------------------------------------------------------------
@@ -124,30 +134,36 @@ def test_bound_holds_through_the_store():
 # ---------------------------------------------------------------------------
 
 
-def test_infinite_margin_selects_every_window():
+def test_ratio_one_selects_every_window():
+    """The no-op arm, through the store: 1.0 is "read everything" on the one
+    implementation, which is what makes it a provable no-op rather than a second
+    code path that has to be kept in step."""
     st = _store()
     _demote(st)
     keep, logmass, slots = st.gate_and_select(
-        torch.randn(B, H * 2, D), SCALING, float("inf"))
+        torch.randn(B, H * 2, D), SCALING, 1.0)
     assert keep.shape == (B, H, N) and keep.all()
     assert logmass.shape == (B, H * 2, N) and slots.shape == (B, N)
 
 
-def test_margin_is_monotone_through_the_store():
+def test_ratio_is_monotone_through_the_store():
     st = _store()
     _demote(st)
     q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(8))
-    counts = [st.gate_and_select(q, SCALING, m)[0].sum().item()
-              for m in (0.25, 1.0, 4.0, 64.0)]
+    counts = [st.gate_and_select(q, SCALING, r)[0].sum().item()
+              for r in (0.25, 0.5, 0.75, 1.0)]
     assert counts == sorted(counts)
 
 
-def test_cap_bounds_the_work_through_the_store():
+def test_ratio_bounds_the_work_through_the_store():
+    """The cap binds on the KV head, which is the unit of work: one program
+    loads a window once for its whole GQA group."""
     st = _store()
     _demote(st)
-    keep, _, _ = st.gate_and_select(torch.randn(B, H * 2, D), SCALING,
-                                    float("inf"), max_windows=2)
-    assert keep.sum(-1).max().item() <= 2 * (H * 2 // H)      # union over the group
+    ratio = 2.0 / N
+    keep, _, _ = st.gate_and_select(torch.randn(B, H * 2, D), SCALING, ratio)
+    import math as _m
+    assert keep.sum(-1).max().item() <= max(1, _m.ceil(ratio * N))
 
 
 def test_logmass_is_returned_for_skipped_windows_too():
@@ -156,8 +172,8 @@ def test_logmass_is_returned_for_skipped_windows_too():
     _demote(st)
     keep, logmass, _ = st.gate_and_select(
         torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(9)),
-        SCALING, margin=0.1)
-    assert not keep.all(), "margin too loose for this test to mean anything"
+        SCALING, 0.25)
+    assert not keep.all(), "ratio too loose for this test to mean anything"
     assert torch.isfinite(logmass).all()
 
 
