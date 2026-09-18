@@ -328,3 +328,85 @@ def test_the_promote_width_is_the_measured_count_not_the_bound():
     assert w is not None and w["evictions"] > 0
     assert 0 <= w["promote_max"] <= w["n_q"], w
     assert w["promote_mean"] <= w["promote_max"], w
+
+
+# ---------------------------------------------------------------------------
+# Shape reads inside the compiled region must be CONCRETE
+# ---------------------------------------------------------------------------
+
+
+def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
+    """A raw ``.shape[i]`` inside the compiled eviction is a lowering failure.
+
+    The eviction compiles with ``dynamic=True`` first
+    (``cache._run_compiled_evict``), so every ``.shape`` read in the region is a
+    **SymInt**. That is fine where the value is only a tensor size, and fatal
+    where it reaches a SCALAR context -- ``torch.arange``'s length, a
+    ``torch.where`` sentinel, a slice bound, a dict key. Inductor is then handed
+    an integer *expression*; the window axis is a token count over
+    ``window_size``, so it arrives as ``((I)//8)`` and CUDA codegen raises
+    ``ValueError: The argument '((I)//8)' is not compatible``.
+
+    **This cannot be caught by compiling on CPU.** The C++ backend takes symbolic
+    ints in stride; only the Triton backend rejects them, so the whole existing
+    Inductor coverage in this file -- which greps for ``cpp_fused`` -- is green
+    while a GPU run dies on every cell. That is exactly what happened: six ERROR
+    rows on the first GPU table after ``c65ccff`` routed a symbolic window count
+    into ``stable_partition``'s ``torch.arange``. So this asserts the INVARIANT
+    at the source instead of the symptom at runtime, the way
+    ``test_no_python_loops_in_hot_path`` does.
+
+    The fix is always the same and always free: wrap the read in ``int()``. It is
+    a no-op in eager and byte-identical, and it adds no recompiles, because the
+    widths involved are already specialized by ``_evict_two_tier_impl``.
+    """
+    import ast
+    import pathlib
+
+    # (file, qualified function name) for everything the compiled body reaches
+    # that reads a single dim off a `.shape`.
+    REGION = [
+        ("modules/windowed_cache/cache.py", "_evict_two_tier_impl"),
+        ("modules/windowed_cache/policy.py", "compute_two_tier_retain"),
+        ("modules/quant/compact.py", "stable_partition"),
+        ("modules/quant/slots.py", "lookup"),
+    ]
+    # `B` is the one axis deliberately left symbolic -- keeping it dynamic is the
+    # entire reason the eviction compiles with `dynamic=True` rather than
+    # recompiling per batch size. It is never used as a scalar.
+    ALLOW = {"B"}
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offenders = []
+    for rel, fname in REGION:
+        tree = ast.parse((root / rel).read_text())
+        fns = [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+               and n.name == fname]
+        assert fns, f"{rel}: no function named {fname} -- did it move or get renamed?"
+        for fn in fns:
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Assign):
+                    continue
+                v = node.value
+                # `X = <expr>.shape[<literal>]`, i.e. ONE dim pulled out as a
+                # scalar. A whole-shape tuple unpack is a different pattern and
+                # is handled by the callers that need concrete members.
+                if not (isinstance(v, ast.Subscript)
+                        and isinstance(v.value, ast.Attribute)
+                        and v.value.attr == "shape"):
+                    continue
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id not in ALLOW:
+                        offenders.append(f"{rel}:{node.lineno}  {t.id} = ...shape[...]")
+
+    assert not offenders, (
+        "a shape dim is read raw inside the compiled eviction:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nUnder `dynamic=True` that is a SymInt. If it reaches a scalar "
+          "context (torch.arange, a torch.where sentinel, a slice bound, a dict "
+          "key) Inductor's CUDA backend raises `The argument '((I)//8)' is not "
+          "compatible` and every perf cell ERRORs. Wrap it in `int()` -- free, "
+          "byte-identical, and no extra recompiles. Add the name to ALLOW only "
+          "if it is provably never used as a scalar (see `B`)."
+    )

@@ -962,6 +962,14 @@ def _run_decode_across_eviction(compile_backend=None, seed=1234):
     from modules.windowed_cache import cache as cache_mod
     from modules.windowed_cache import flash_decode
 
+    # NOTE: both variables below are INERT since 0974687 ("one production path,
+    # no fallbacks") -- `modules/windowed_cache/cache.py` reads no environment
+    # variable at all and compiles the eviction unconditionally. They are still
+    # set/restored so this fixture leaves the process environment as it found it,
+    # but `compile_backend=None` does NOT give an eager eviction any more: both
+    # arms run the same compiled body, so a test here comparing "eager" against
+    # "compiled" is comparing a path to itself. What still does the real work is
+    # the process-global reset below.
     prev = os.environ.get("STICKYKV_COMPILE_EVICT")
     prev_b = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND")
     if compile_backend is not None:

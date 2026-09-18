@@ -279,7 +279,11 @@ class QuantSlotTable:
         hit, slot_of = match.to(torch.uint8).max(-1)
         has_entry = hit.bool()
         is_active = has_entry & self.slot_active.gather(1, slot_of)
-        N = self.slot_wid.shape[1]
+        # CONCRETE: `lookup` runs inside the compiled eviction, and `N` is used
+        # as a SCALAR below (the `where` sentinel and the `ext[:, :N]` bound),
+        # not only as a tensor size. `n_slots` is config-derived and fixed for
+        # the run, so specializing on it costs nothing and never recompiles.
+        N = int(self.slot_wid.shape[1])
         ext = torch.zeros((wids.shape[0], N + 1), dtype=torch.bool,
                           device=wids.device)
         # `N` and `True` as SCALARS: the tensor forms of both (`full_like`,
@@ -465,7 +469,11 @@ class QuantSlotTable:
         # At most one slot per row per window id.
         wid = self.slot_wid
         same = (wid.unsqueeze(2) == wid.unsqueeze(1)) & live.unsqueeze(2) & live.unsqueeze(1)
-        eye = torch.eye(wid.shape[1], dtype=torch.bool, device=wid.device)
+        # `int()` is not load-bearing here -- `validate` is test-only and never
+        # reached from the compiled eviction -- but `torch.eye` is a scalar-size
+        # constructor, so it matches it uniformly and keeps the "no raw shape
+        # read feeds a scalar constructor" sweep clean.
+        eye = torch.eye(int(wid.shape[1]), dtype=torch.bool, device=wid.device)
         assert not bool((same & ~eye).any()), \
             "duplicate window id in one row's slot table"
 

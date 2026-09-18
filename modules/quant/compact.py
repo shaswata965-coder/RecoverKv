@@ -51,30 +51,29 @@ def stable_partition(mask: Tensor) -> Tensor:
     sizes its writes by a worst-case width and masks the value, not the index)
     cannot have two lanes aliasing one slot.
     """
-    n = mask.shape[-1]
+    # CONCRETE. Every caller is inside the compiled eviction, where a raw
+    # `.shape` read is a SymInt, and `torch.arange` below needs a real length --
+    # a symbolic one reaches Inductor as an integer EXPRESSION (the window axis
+    # is a token count over `window_size`, so it arrives as `((I)//8)`) and the
+    # lowering fails. `int()` forces specialization here, which is a no-op in
+    # eager and byte-identical, and costs no extra recompiles: every width passed
+    # in is already specialized by its caller.
+    n = int(mask.shape[-1])
     # `cumsum` on a bool promotes to int64 on its own, so the explicit `.to()`
     # this used to do was a whole extra elementwise pass over the mask for a
     # dtype the next op would have produced anyway.
     csum = mask.cumsum(-1)                               # trues at or before i
     n_true = csum[..., -1:]                              # trues in the row
-    idx = _arange_like(csum, n)
+    # NOT cached in a module-global dict. That saved one small `arange` kernel in
+    # EAGER and was a hazard everywhere else: the eviction is always compiled, so
+    # the tensor this line produces is created while Dynamo traces, and stashing
+    # it in a global keyed by a (possibly symbolic) length means a later call can
+    # read back a tensor from a dead tracing context. Inside Inductor an `arange`
+    # is not a kernel at all -- it fuses into the consumer as an index expression
+    # -- so the cache bought nothing on the path that matters.
+    idx = torch.arange(n, device=mask.device).expand_as(csum)
     # true  -> its rank among trues;  false -> n_true + its rank among falses.
     # (falses at or before i) - 1 == i - csum[i], which saves the second scan.
     dest = torch.where(mask, csum - 1, n_true + idx - csum)
     order = torch.empty_like(csum)
     return order.scatter_(-1, dest, idx)
-
-
-#: ``arange`` is a kernel, and this one is the same ``0..n-1`` on every
-#: eviction. Keyed by (n, device) and never mutated -- callers only read it and
-#: `scatter_` copies out of it.
-_ARANGE: dict = {}
-
-
-def _arange_like(ref: Tensor, n: int) -> Tensor:
-    key = (n, ref.device)
-    out = _ARANGE.get(key)
-    if out is None:
-        out = torch.arange(n, device=ref.device)
-        _ARANGE[key] = out
-    return out.expand(ref.shape)

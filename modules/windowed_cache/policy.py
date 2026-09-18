@@ -173,7 +173,20 @@ class EvictionPolicy:
             Shape ``[B, W_retained]``, window indices to keep.
         """
         B = window_scores.shape[0]
-        W_total = window_scores.shape[2]
+        # CONCRETE, for the same reason `_evict_two_tier_impl` makes its copy of
+        # this exact value concrete (`cache.py`: ``W = int(...shape[2])``). This
+        # function runs INSIDE the compiled eviction, so off a ``.shape`` this is
+        # a SymInt under ``torch.compile``; ``evictable_w`` inherits it, and the
+        # compaction below needs it as a real length (``torch.arange``), not as a
+        # symbolic expression. Leaving it symbolic is what produced
+        # ``ValueError: The argument '((I)//8)' is not compatible`` — the window
+        # axis is a token count over ``window_size``, so the expression Inductor
+        # was handed was literally a floor division by ``ws``.
+        #
+        # This costs NO extra recompiles: `cache.py` already specializes on this
+        # same dim of this same tensor, so the guard exists either way. `B` is
+        # deliberately left symbolic — that is the one axis `dynamic=True` is for.
+        W_total = int(window_scores.shape[2])
         device = window_scores.device
 
         # Number of local and evictable windows

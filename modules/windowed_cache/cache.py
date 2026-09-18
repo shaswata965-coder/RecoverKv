@@ -478,23 +478,42 @@ def _build_compiled_evict(dynamic: bool):
 
 
 _EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never silently runs the eager
-body under a compiled label -- the whole point of the flag is to MEASURE the
-compiled path, and a quiet eager run would report eager numbers as if compiled.
-So this raises rather than falling back.
+body under a compiled label -- the point is to MEASURE the compiled path, and a
+quiet eager run would report eager numbers as if compiled. So this raises rather
+than falling back.
+  THERE IS NO WAY TO TURN IT OFF. Compilation is unconditional (see the banner
+at the top of this module): `_evict_two_tier` always calls the compiled body, on
+every backend and every device. `STICKYKV_COMPILE_EVICT`, `--compile-evict` and
+`STICKYKV_COMPILE_EVICT_BACKEND` were deleted in 0974687 ("one production path,
+no fallbacks") and this text used to still advertise all three -- so a failure
+here sent you after knobs that no longer exist. This module reads NO environment
+variable. `perf_runner` still SETS `STICKYKV_COMPILE_EVICT=1`, which nothing
+reads; it records intent, it does not control anything. A lowering failure is
+therefore a total outage until it is fixed, which is why the diagnosis below is
+the only path forward.
   What this is: torch.compile / Inductor could not lower
-WindowedCache._evict_two_tier_impl on this build. The known torch<=2.6 causes --
-a symbolic `((I)//ws)` guard and an `aten.amin` StarDep from a single-sided
-clamp -- are addressed in the body (concrete shape ints + a two-sided clamp). If
-it still fails, the traceback names the op that did not lower.
-  To get numbers now: rerun with STICKYKV_COMPILE_EVICT=0 (or --compile-evict 0).
-That runs the EAGER eviction -- correct, just launch-bound -- so the ~81%
-eviction launch budget is not cut and TPOT stays high.
-  To diagnose the lowering: the FULL Inductor traceback (which names the exact
-aten op / source line) is in evict_compile_traceback() and is written by the perf
-runner to <output_dir>/evict_compile_error_*.txt -- read that first. Also
-TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape,
-and try STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen --
-if THAT works the failure is Inductor codegen, not the traced graph)."""
+WindowedCache._evict_two_tier_impl on this build. Both attempts are reported --
+`dynamic=True` first, then `dynamic=False` after a `torch._dynamo.reset()` (the
+reset is load-bearing: without it Dynamo reuses the code object's frame state and
+the "static" retry gets automatic-dynamic promoted straight back, so it re-raises
+the identical symbolic error). The message recorded below is the SECOND attempt's.
+  The known causes are addressed at the source, and each has a named home:
+    * a symbolic `((I)//ws)` guard -- every shape-derived value used as a SCALAR
+      is forced concrete with `int()`: `T_body`/`W` here, `W_total` in
+      `policy.compute_two_tier_retain`, `n` in `compact.stable_partition`, `N` in
+      `QuantSlotTable.lookup`. A raw `.shape` read that reaches `torch.arange`,
+      a `torch.where` sentinel, a slice bound or a dict key is the bug; `B` is
+      the one axis deliberately left symbolic.
+    * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
+  If it still fails, the traceback names the op that did not lower.
+  To diagnose: the FULL Inductor traceback (which names the exact aten op /
+source line) is in evict_compile_traceback() and is written by the perf runner to
+<output_dir>/evict_compile_error_*.txt -- read that first. Then
+TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape.
+  To reproduce on a CPU box, with no GPU: `pytest
+tests/test_evict_graph_breaks.py -k dynamic` compiles this body with
+`dynamic=True`, which is what makes the shape ints symbolic. That is the test
+that catches this class of failure before a GPU run does."""
 
 
 def _cuda_oom_cause(exc: BaseException) -> Optional[BaseException]:
@@ -594,6 +613,24 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
         if not _EVICT_COMPILE_TRIED_STATIC:
             _EVICT_COMPILE_TRIED_STATIC = True
             try:
+                # RESET FIRST, or the retry is not a retry. `torch.compile` keys
+                # its caches on the code object, and `_evict_two_tier_impl` is
+                # the same one we just failed on: Dynamo's per-code-object frame
+                # state still records those dims as having varied, so
+                # `dynamic=False` gets automatic-dynamic promoted right back and
+                # the "static" attempt re-raises the identical symbolic error.
+                # That is why a `((I)//8)` lowering failure was reported twice
+                # and read as one — the message the runner prints is the STATIC
+                # attempt's, recorded only after this branch has run.
+                #
+                # `reset()` is process-global, and that is acceptable here only
+                # because the eviction is the ONLY `torch.compile` in this repo
+                # (it also clears Dynamo's counters, which `perf_runner` reads —
+                # but this path has already failed, and the failure's own
+                # traceback is what gets recorded). Imported locally: `torch`
+                # alone does not bring `torch._dynamo` in on every build.
+                import torch._dynamo as _td
+                _td.reset()
                 _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=False)
                 _COMPILED_EVICT_FN(cache, layer_idx, step)
                 _announce_evict_path_once(compiled=True)
@@ -2400,7 +2437,12 @@ class WindowedCache(_HFCacheBase):
             )
 
         # --- 5. Gather scores + ids to the retained merged axis -------------
-        H_q = state.window_scores.shape[1]
+        # Only an `expand` size below, which tolerates a SymInt -- but `H_q` is
+        # the model's query-head count and never varies within a run, so making
+        # it concrete costs zero recompiles and keeps the "no raw scalar shape
+        # read in this region" rule absolute rather than case-by-case. `B` is the
+        # sole exception, and it is the one that would actually cost recompiles.
+        H_q = int(state.window_scores.shape[1])
         idx_w = retained_idx.unsqueeze(1).expand(B, H_q, -1)
         state.window_scores = torch.gather(
             state.window_scores, dim=-1, index=idx_w
