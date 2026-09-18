@@ -47,6 +47,15 @@ fired` says the gate ran on every fused layer, and `read_fraction` is
 `quant_gate_ratio` **as realised**. `gated == 0` with a large `fired` is the
 silent no-cards case, which looks exactly like success everywhere else.
 
+**A perf run now carries that proof.** `perf_runner` records the counters into
+the npz (`diagnostics.<config>.gate`) and `print_perf_table.py` prints one of
+three lines under every table: the gate ran on all N fused layers with its
+realised read fraction, or it did not gate, or the fused kernel never fired at
+all. **If that line is missing, the table above it is not a gated number.** Until
+2026-09-18 the runner recorded the eviction's counters and not the gate's, so
+there was no way to tell — which is how eight commits of ungated numbers passed
+for results.
+
 ### There is no on/off knob, by design
 
 `quant_sketch_enabled` is derived (`quant_ratio > 0`). `quant_gate_ratio = 1.0`

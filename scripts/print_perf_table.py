@@ -174,6 +174,45 @@ def _match_index(names, wanted: str | None) -> int | None:
     return 0 if len(names) else None
 
 
+def _gate_note(npz_dir: Path, config: str | None) -> list:
+    """Whether the read gate actually ran, straight off the npz.
+
+    A latency table cannot show this and a reader cannot infer it: a run that
+    did NOT gate reads the whole int2 tier, produces correct output, and
+    finishes at a perfectly plausible TPOT. This branch shipped exactly that for
+    eight commits. So the table says it out loud or the number is unattributed.
+    """
+    for _, _, _, path in _cells(npz_dir):
+        data = _load(path)
+        if data is None or "metadata_json" not in data:
+            continue
+        try:
+            meta = json.loads(str(data["metadata_json"][0]))
+            diags = meta.get("diagnostics", {}) or {}
+        except Exception:
+            return []
+        for name, d in diags.items():
+            if config and config.lower() not in name.lower():
+                continue
+            g = (d or {}).get("gate") or {}
+            if not g:
+                continue
+            fired, gated = g.get("fired", 0), g.get("gated", 0)
+            rf = g.get("read_fraction")
+            if not fired:
+                return ["  !! the fused decode kernel never fired: this table is "
+                        "the materialize path, NOT the gated one."]
+            if gated != fired:
+                return [f"  !! read gate ran {gated} times against {fired} fused "
+                        f"layers -- some layers did not gate, so this is not the "
+                        f"shipped method."]
+            return [f"  read gate: ran on all {fired} fused layers, realised read "
+                    f"fraction {'n/a' if rf is None else f'{rf:.3f}'} "
+                    f"(quant_gate_ratio as measured, not as configured)"]
+        return []
+    return []
+
+
 def build_table(npz_dir: Path, config: str | None, stat: str,
                 throughput: str = "both") -> str:
     fn = {"median": np.median, "mean": np.mean}[stat]
@@ -278,6 +317,11 @@ def build_table(npz_dir: Path, config: str | None, stat: str,
         hint = f" matching --config {config!r}" if config else ""
         lines.append(f"(no perf npz found in {npz_dir}{hint})")
         return "\n".join(lines)
+
+    gate_lines = _gate_note(npz_dir, config)
+    if gate_lines:
+        lines.append("")
+        lines.extend(gate_lines)
 
     if notes:
         lines.append("")

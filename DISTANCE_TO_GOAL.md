@@ -319,6 +319,90 @@ like a control arm and were not one.
 
 ---
 
+## 5.2 Will the gate fire on the next run? — verified 2026-09-18
+
+The question this section answers is "if I run the sweep now, am I timing the
+gated method at the config I asked for?" It is asked because the honest answer
+has been *no* before, and nothing in a latency table showed it.
+
+### The Q tier is non-empty in every cell, so the gate arms
+
+The gate only arms where `store.num_active_windows > 0`. Resolved through the
+real `WindowedCacheConfig.resolve` for the whole grid — budget 0.20, sink 5,
+q in {0.70, 0.30}, gate in {0.10, 0.25}, local in {64, 128}, ws in {8, 16, 32},
+across all three shapes — **72 of 72 cells resolve with a live Q tier**, and the
+realised read fraction tracks the request:
+
+| q | ws | local | N_q @4096 | n_sel @0.25 | realised |
+|---|---|---|---|---|---|
+| 0.70 | 8 | 128 | 247 | 62 | 25.1% |
+| 0.70 | 32 | 128 | 103 | 26 | 25.2% |
+| 0.30 | 8 | 128 | 107 | 27 | 25.2% |
+| 0.30 | 32 | 128 | 42 | 11 | 26.2% |
+
+At gate 0.10 the realised fraction runs 10.0–11.9%; the drift is `max(1, ceil())`
+on a small `N_q` and is arithmetic, not slippage. The thinnest cell is q=0.30,
+ws=32, local=128 at **N_q=42** — still a real tier, but it is the cell where the
+gate has least to select from, so read its row with that in mind.
+
+### The knob reaches the cache
+
+`--gate-ratio` → `GATE_RATIO` → `quant_gate_ratio` in the generated YAML →
+`perf_runner` → `quant_gate_ratio_kwargs(WCC, ...)` → `WindowedCacheConfig`.
+`run_perf_table.sh` re-reads its own generated config and asserts the value
+survived, specifically so the `6b8a188` bug (the knob inert in every runner)
+cannot recur silently.
+
+### The run now PROVES it, which it did not before
+
+`perf_runner` recorded the eviction path's counters and **not**
+`flash_decode.stats()`. So a run that never gated — reading the whole tier,
+correct output, plausible TPOT — was indistinguishable from one that did. That
+is not a hypothetical: it is what this branch shipped for eight commits.
+
+Fixed: the gate's counters are reset after warmup, recorded into the npz under
+`diagnostics.<config>.gate`, and printed under the table as one of three lines.
+
+```
+read gate: ran on all 192 fused layers, realised read fraction 0.252
+!! read gate ran 0 times against 192 fused layers -- ... not the shipped method.
+!! the fused decode kernel never fired: ... the materialize path, NOT the gated one.
+```
+
+**If the first line is not there, the number above it is not a gated number.**
+
+### It is the fastest path this repo has — not the fastest possible
+
+What the next run measures is: int4 cards (272 B/head, the §6.1 frontrunner,
+landed), the gate as the only Q-tier read path with no ungated arm, a host path
+measured at 3 launches and 2 copies per layer per step (§5.1), and a
+layer-major compiled eviction.
+
+What it does **not** include, and what therefore still stands between this and
+the goal:
+
+* **§6.2, the scattered reads** — the kernel at 7.03 ms against a 0.58 ms
+  roofline. Untouched. This is the factor that matters.
+* the two open fusions (gate as a kernel prologue, score permutation into the
+  epilogue) — ~2% together, §5.1.
+
+### Three preconditions, all outside the config
+
+The fused path needs **flash-attn** and **Triton on CUDA**; without either, the
+cell errors rather than quietly running something else. Prompts must be
+equal-length — a padding `attention_mask` sends transformers down
+`flash_attn_varlen_func`, which this patch does not own, and the run raises
+`FusedDecodeNotReached`. The sweep's `--data-source wikitext-103` chunks to
+exactly `prefill_len`, so this holds.
+
+### This table is a new baseline
+
+int4 moved `bytes_per_q_window` 9,632 → 8,608, so the cache holds more at the
+same budget. Like `ac128e8` and `8a8cdc0` before it, **rows either side of this
+change are not comparable cell-for-cell.**
+
+---
+
 ## 6. What to do next
 
 ### 6.1 Shrink the card to int4 — **FRONTRUNNER**
