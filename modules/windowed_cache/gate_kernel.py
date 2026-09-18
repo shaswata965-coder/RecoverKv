@@ -144,6 +144,38 @@ def _sorted_pick(top: Tensor) -> Tensor:
     return top.sort(dim=-1).values
 
 
+#: Winning ``(BLOCK_W, num_warps)`` per geometry, its measured ladder, and the
+#: signatures already announced. Same contract as ``decode_kernel``'s: the search
+#: runs once per signature and every later launch is one dict hit.
+#:
+#: **What a rung can and cannot move.** ``BLOCK_W`` is provably bit-identical:
+#: each program owns a disjoint span of output columns and every reduction here
+#: -- the ``logsumexp`` over ``WS`` and the ``max`` over ``REP`` -- lives entirely
+#: inside one window, so which program owns which window changes nothing about
+#: the arithmetic. ``num_warps`` is NOT: it changes the lane layout of the
+#: ``tl.sum`` over ``HEAD_DIM``, so ``est`` and ``logmass`` move in their last
+#: bits, and ``est`` feeds a top-k. A last-bit move can therefore swap the k-th
+#: and (k+1)-th window when the two are already tied to ~1e-7 -- windows whose
+#: estimated mass is equal to seven digits. That is the same class of
+#: perturbation the tile ladder next door already ships, and the same one
+#: ``score_kernel`` already autotunes ``num_warps`` across in prefill; it is
+#: recorded here rather than hidden because it is the ONE property this search
+#: moves.
+_GATE_CHOICE: dict = {}
+_GATE_TIMINGS: dict = {}
+_GATE_ANNOUNCED: set = set()
+
+
+def gate_choice() -> dict:
+    """``{sig: (BLOCK_W, num_warps)}`` -- the gate's chosen launch, per geometry."""
+    return dict(_GATE_CHOICE)
+
+
+def gate_timings() -> dict:
+    """``{sig: [((BLOCK_W, num_warps), ms), ...]}`` -- what the search measured."""
+    return {k: list(v) for k, v in _GATE_TIMINGS.items()}
+
+
 def gate_window_tiles(rows: int, n_windows: int, sm_count: int) -> int:
     """``BLOCK_W`` — how many windows one gate program owns.
 
@@ -296,24 +328,52 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     from .decode_kernel import _scratch
     logm = _scratch("logm", (B, HQ, NW), torch.float32, q.device)
     est = _scratch("est", (B, HKV, NW), torch.float32, q.device)
-    block_w = gate_window_tiles(B * HKV, NW, _sm_count(q.device))
-    _gate_kernel[(B, HKV, -(-NW // block_w))](
-        q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
-        est, logm,
-        q.stride(0), q.stride(1),
-        mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
-        v_q.stride(0), v_q.stride(1), v_q.stride(2),
-        mu_s.stride(0), mu_s.stride(1), mu_s.stride(2),
-        t_q.stride(0), t_q.stride(1), t_q.stride(2),
-        anchor.stride(0), anchor.stride(1),
-        logm.stride(0), logm.stride(1),
-        est.stride(0), est.stride(1),
-        NW, HQ // HKV, scaling,
-        HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
-        BLOCK_D=triton.next_power_of_2(D),
-        BLOCK_W=block_w,
-        num_warps=4,
-    )
+    # `BLOCK_W` and `num_warps` are MEASURED, not derived -- the same change
+    # `decode_kernel` §5.3 made to its tile ladder, for the same reason. This
+    # kernel reads 16 MB of cards per layer at the headline cell and takes 3.63 ms
+    # doing it (~140 GB/s on a 1555 GB/s part, 2026-09-19 profile), which is the
+    # same gather-bound, occupancy-starved shape the decode kernel is in. Until
+    # now it ran at whatever `gate_window_tiles` derived and at Triton's DEFAULT
+    # four warps -- a value never chosen, only inherited.
+    #
+    # `gate_window_tiles` is kept as the ladder's first entry rather than deleted:
+    # it encodes the "fill the machine" floor, and at B=1 (8 rows) that floor is
+    # the whole argument for splitting the window axis at all. What it cannot do
+    # is price the split, which is what the search adds.
+    from .decode_kernel import _search_rungs
+    derived = gate_window_tiles(B * HKV, NW, _sm_count(q.device))
+    ladder = [(derived, 4)]
+    ladder += [(bw, nw) for bw in (16, 32, 64, 128) for nw in (4, 8)
+               if (bw, nw) != (derived, 4)]
+
+    def _launch(rung):
+        block_w, num_warps = rung
+        _gate_kernel[(B, HKV, -(-NW // block_w))](
+            q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
+            est, logm,
+            q.stride(0), q.stride(1),
+            mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
+            v_q.stride(0), v_q.stride(1), v_q.stride(2),
+            mu_s.stride(0), mu_s.stride(1), mu_s.stride(2),
+            t_q.stride(0), t_q.stride(1), t_q.stride(2),
+            anchor.stride(0), anchor.stride(1),
+            logm.stride(0), logm.stride(1),
+            est.stride(0), est.stride(1),
+            NW, HQ // HKV, scaling,
+            HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
+            BLOCK_D=triton.next_power_of_2(D),
+            BLOCK_W=block_w,
+            num_warps=num_warps,
+        )
+
+    # `NW` is exact in the signature, not bucketed as `Sfp` is in the decode
+    # kernel: the active window count is FROZEN between evictions (design §10
+    # moves the active set only there), so it takes one value per budget regime
+    # and an exact key costs no extra searches while a bucketed one could serve a
+    # tile chosen for a tier 40% larger.
+    sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV))
+    _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, sig, ladder,
+                  _launch, "read gate tiling")
     # `est` already carries the group max, so this is a bare top-k. Sorted
     # ascending -- free to the result, not free to the memory system; the whole
     # argument is in `_sorted_pick`.

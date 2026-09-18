@@ -261,10 +261,21 @@ Requires transformers 4.47.x (`utils/cache_factory.py` refuses newer),
 flash-attn, and Triton on CUDA. `quant_budget_mode: tokens` is for latency tables
 only; quote memory and quality against `bytes`.
 
-Two lines the run prints are worth reading every time: `[StickyKV] eviction path:
-{'eager': n, 'compiled': m}` — `eager > 0` means the run measured the path it was
-trying to replace — and `[StickyKV] fused decode tiling: target_keys=…`, which
-says whether the kernel got its top shared-memory rung.
+Three lines the run prints are worth reading every time:
+
+* `[StickyKV] eviction path: COMPILED two-tier eviction ACTIVE` — and note that
+  this banner is necessary, not sufficient. Being *called* through a compiled
+  callable is not being *compiled*; Dynamo can fall back to eager silently, and
+  did, on every run recorded before 2026-09-19 (`DISTANCE_TO_GOAL.md` §10.2).
+  The eviction now raises outright when that happens, so a run that finishes is
+  the proof, not the banner.
+* `[StickyKV] fused decode tiling tuned sig=… -> (target_keys, num_stages,
+  num_warps) | …ms …ms …` — the tile is now **timed**, not first-fit, so this
+  line carries every rung's measured time. The margin between first and second
+  is the part worth reading.
+* `[StickyKV] read gate tiling tuned sig=… -> (BLOCK_W, num_warps) | …` — the
+  same, for the gate's launch, which until 2026-09-19 was a heuristic and a
+  default.
 
 ---
 

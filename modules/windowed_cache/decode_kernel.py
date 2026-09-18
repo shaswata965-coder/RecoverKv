@@ -1067,41 +1067,195 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Shared-memory fit ladder
+# Tile search -- shared-memory fit AND measured time
 # ---------------------------------------------------------------------------
 
-#: ``(target_keys, num_stages)`` rungs, fastest first. Bigger tiles mean fewer
+#: ``(target_keys, num_stages, num_warps)`` rungs. Bigger tiles mean fewer
 #: serial iterations (§5.3's whole point) but more ``tl.dot`` operand staging in
 #: shared memory. An A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands
 #: before staging, so the top rung does not fit everywhere -- hence a ladder
-#: rather than a constant. Every rung is numerically identical; only speed
-#: differs.
+#: rather than a constant.
 #:
-#: ``(64, 1)`` is the rung this ladder was missing. ``num_stages`` is not free:
-#: Triton's software pipeliner allocates that many copies of the loop's
-#: shared-memory operands, so dropping 2 -> 1 roughly halves the staging at the
-#: SAME tile. Without it a kernel that just missed ``(64, 2)`` fell straight to
-#: ``target_keys=32`` and **doubled its serial Q-tier iterations** -- 23 -> 45 at
-#: ``ws=8`` -- to buy shared memory one fewer stage would also have bought.
+#: ``num_stages`` is not free: Triton's software pipeliner allocates that many
+#: copies of the loop's shared-memory operands, so dropping 2 -> 1 roughly halves
+#: the staging at the SAME tile. Without ``(64, 1)`` a kernel that just missed
+#: ``(64, 2)`` fell straight to ``target_keys=32`` and **doubled its serial
+#: Q-tier iterations** -- 23 -> 45 at ``ws=8`` -- to buy shared memory one fewer
+#: stage would also have bought.
 #:
-#: That is not hypothetical for the GATED variant, which is the shipped one:
-#: ``GATED`` is a ``constexpr``, so it is a separate compile, and it stages
-#: strictly more than the ungated kernel (the ``SEL`` loads, ``LOGM``, the
-#: prologue and the §5 fill). It is exactly the variant most likely to have been
-#: pushed off the top rung.
+#: ``num_warps`` was never passed at all, so every launch ran at Triton's
+#: default of 4 regardless of tile. At ``BLOCK_T=64`` and ``HEAD_DIM=128`` that
+#: is a guess, not a choice, and it is the one launch parameter with no cost
+#: model here at all -- so it is searched rather than asserted.
 #:
-#: The order asserts that a full tile at one stage beats a half tile at two --
-#: i.e. that serial iteration count dominates latency hiding here, which is what
-#: an 8.8x-off-roofline kernel looks like when it is not bandwidth-bound. The
-#: ladder only falls on ``OutOfResources``, it never benchmarks, so that ordering
-#: run the table twice, compare.
-_FIT_LADDER = [(64, 2), (64, 1), (32, 2), (32, 1), (16, 2), (16, 1)]
+#: **The ladder is now TIMED, not first-fit.** It used to stop at the first rung
+#: that merely *launched*, which asserts that a full tile at one stage beats a
+#: half tile at two -- i.e. that serial iteration count dominates latency hiding.
+#: The 2026-09-19 profile says that assertion was wrong in the direction that
+#: matters: at ``target_keys=64`` the ~128 KB of staged operands leave room for
+#: **one block per SM**, so the Q-tier loop's ~14 dependent tiles run with
+#: nothing co-resident to cover their latency, and the kernel lands at ~190 GB/s
+#: on a 1555 GB/s part (97.2% GPU busy, so this is the kernel's own time, not a
+#: host gap). A smaller tile trades iteration count for occupancy, and which way
+#: that trade falls is a measurement, not a derivation.
+#:
+#: Ordering therefore no longer carries meaning -- every entry is timed and the
+#: fastest wins. It is kept tile-major only so the announcement reads in the
+#: order the shared-memory argument above discusses.
+_FIT_LADDER = [
+    (64, 2, 4), (64, 2, 8),
+    (64, 1, 4), (64, 1, 8),
+    (32, 2, 4), (32, 2, 8),
+    (32, 1, 4), (32, 1, 8),
+    (16, 2, 4), (16, 2, 8),
+    (16, 1, 4), (16, 1, 8),
+]
 
 
 #: Winning rung per geometry signature, so the search runs once per process.
 _FIT_CHOICE: dict = {}
 
+#: Every rung's measured milliseconds, per signature, kept so a profile can print
+#: the search rather than just its verdict. A rung that did not fit is absent --
+#: that absence IS the shared-memory result.
+_FIT_TIMINGS: dict = {}
+
 _FIT_ANNOUNCED: set = set()
+
+
+def fit_choice() -> dict:
+    """``{sig: rung}`` -- the tile rung chosen per geometry. A copy.
+
+    ``scripts/profile_decode.py`` prints this: the kernel announces its choice
+    once per geometry, in warmup, which scrolls away above whatever a profile is
+    being read for. It asked for this accessor before it existed, inside a bare
+    ``except Exception: pass``, so the one line the tuning step needs was the one
+    line a profile did not carry.
+    """
+    return dict(_FIT_CHOICE)
+
+
+def fit_timings() -> dict:
+    """``{sig: [(rung, ms), ...]}`` -- what the search measured. A copy.
+
+    The verdict without the margin is not reviewable: a rung that won by 30% and
+    a rung that won by 0.5% call for different next moves, and only this says
+    which happened.
+    """
+    return {k: list(v) for k, v in _FIT_TIMINGS.items()}
+
+
+#: Launches per timed sample, and samples per rung. Small on purpose: the whole
+#: search is ``len(_FIT_LADDER) * (_TUNE_WARMUP + _TUNE_ITERS)`` launches of a
+#: ~0.5 ms kernel, i.e. tens of milliseconds, and it runs ONCE per geometry. The
+#: cost that is not small is Triton's JIT -- one compile per rung it reaches --
+#: which is why the harness's warmup exists (``perf_shapes.py`` runs enough
+#: decode steps to cross the first eviction precisely so JIT and autotune land in
+#: warmup rather than in measurement run 0) and why Triton's on-disk cache makes
+#: it a once-per-machine cost rather than a once-per-run one.
+_TUNE_WARMUP = 1
+_TUNE_ITERS = 3
+
+
+def _time_launch(launch, warmup: int = _TUNE_WARMUP,
+                 iters: int = _TUNE_ITERS) -> float:
+    """Mean device milliseconds for ``launch()``, or raise what it raised.
+
+    One event pair around ``iters`` launches, not ``iters`` pairs: the kernel
+    under test is sub-millisecond and per-launch event overhead would be a
+    visible share of what is being compared. The warmup launch absorbs Triton's
+    JIT for a rung this process has not compiled yet, so the compile never lands
+    inside the timed region.
+
+    **The launches are performed on the caller's real tensors.** That is safe
+    because the kernel only ever ``tl.store``s to ``OUT`` / ``WSUM`` / ``WMAX``
+    and never loads them -- it accumulates in registers -- so running it n times
+    leaves exactly what running it once leaves. Timing against scratch copies
+    would need a full duplicate of the fp tier, which is the largest thing on the
+    step, to measure a kernel whose whole problem is memory.
+    """
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        launch()
+    end.record()
+    end.synchronize()
+    return float(start.elapsed_time(end)) / max(iters, 1)
+
+
+def _search_rungs(choice: dict, timed: dict, announced: set, sig,
+                  ladder, launch, label: str, key=None):
+    """Time every rung that fits; cache and return the fastest. Once per ``sig``.
+
+    ``launch(rung)`` must run the kernel and return ``None``; it is called
+    repeatedly, so it must be idempotent (see :func:`_time_launch`).
+
+    ``key(rung)`` maps a rung to the launch it actually produces, and rungs that
+    collapse onto one are timed once. Distinct rungs are NOT distinct kernels:
+    ``window_tiling`` floors ``target_keys // ws``, so at ``ws=128`` the 64, 32
+    and 16 rungs all yield ``BLOCK_NW=1, BLOCK_T=128`` and differ in nothing the
+    kernel can see. Timing them separately would buy three identical numbers for
+    three Triton compiles, and the compile is the expensive half of this search.
+
+    A rung that raises ``OutOfResources`` is skipped -- that is the shared-memory
+    half of the search and it is unchanged. Any other exception propagates: a
+    tuner that swallowed a real error would silently tune around a bug.
+
+    **The winner is re-launched before returning**, so the values the caller goes
+    on to use come from the rung every subsequent step will use. Rungs differ in
+    tile order, which reassociates the online-softmax accumulation and moves the
+    output in its last bits; returning a losing rung's numbers would make the
+    step that happened to run the search numerically different from its
+    neighbours for no reason.
+
+    Kernel-or-error: if no rung fits, this raises with the whole ladder, because
+    a decode kernel that cannot launch must fail loudly (invariant 3).
+    """
+    known = choice.get(sig)
+    if known is not None:
+        launch(known)
+        return known
+
+    timings = []
+    seen = set()
+    last: Optional[BaseException] = None
+    for rung in ladder:
+        k = rung if key is None else key(rung)
+        if k in seen:
+            continue
+        seen.add(k)
+        try:
+            ms = _time_launch(lambda r=rung: launch(r))
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            last = exc
+            continue
+        timings.append((rung, ms))
+
+    if not timings:
+        raise RuntimeError(
+            f"{label}: no tile fits in shared memory at any rung. Tried "
+            f"{ladder} for sig={sig}. Last error: {last}"
+        )
+
+    best = min(timings, key=lambda t: t[1])[0]
+    choice[sig] = best
+    timed[sig] = sorted(timings, key=lambda t: t[1])
+    launch(best)
+    if sig not in announced:
+        announced.add(sig)
+        ranked = " ".join(
+            f"{r}={ms:.3f}ms" for r, ms in sorted(timings, key=lambda t: t[1])
+        )
+        print(f"[StickyKV] {label} tuned sig={sig} -> {best} "
+              f"({len(timings)}/{len(ladder)} rungs timed; the rest did not fit "
+              f"or duplicate one that did) | {ranked}")
+    return best
 
 
 def _is_out_of_resources(exc: BaseException) -> bool:
@@ -1125,20 +1279,6 @@ def _is_out_of_resources(exc: BaseException) -> bool:
             return True
         cur = cur.__cause__ or cur.__context__
     return False
-
-
-def _announce_fit(sig, target_keys: int, num_stages: int,
-                  block_nw: int, block_t: int) -> None:
-    """Say which rung won, once per geometry. Never silent: the tile size is a
-    performance fact a reader of a perf table needs, and a run that quietly
-    dropped to the smallest tile would otherwise look like the kernel simply
-    being slow."""
-    if sig in _FIT_ANNOUNCED:
-        return
-    _FIT_ANNOUNCED.add(sig)
-    print(f"[StickyKV] fused decode tiling: target_keys={target_keys} "
-          f"num_stages={num_stages} -> BLOCK_NW={block_nw} BLOCK_T={block_t} "
-          f"(ws={sig[0]}, head_dim={sig[1]})")
 
 
 def _decode_triton(
@@ -1324,65 +1464,71 @@ def _decode_triton(
     if _EXP2[0]:
         scaling = scaling * _LOG2E
 
-    # Shared-memory fit ladder (see _FIT_LADDER). §5.3 widened the Q-tier tile
-    # from one window (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows,
-    # which quadrupled the `tl.dot` operand staging -- k_rlo/k_rhi go from
-    # [64,16] to [64,64] and vv from [16,128] to [64,128]. At BLOCK_T=64 that is
-    # ~128 KB of dot operands before Triton's pipelining multiplies it, and an
-    # A100 has 163 KB of shared memory per SM. The first GPU run of this kernel
-    # hit exactly that: "Required: 176128, Hardware limit: 166912".
+    # Tile search (see _FIT_LADDER). §5.3 widened the Q-tier tile from one window
+    # (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows, which quadrupled
+    # the `tl.dot` operand staging -- k_rlo/k_rhi go from [64,16] to [64,64] and
+    # vv from [16,128] to [64,128]. At BLOCK_T=64 that is ~128 KB of dot operands
+    # before Triton's pipelining multiplies it, and an A100 has 163 KB of shared
+    # memory per SM. The first GPU run of this kernel hit exactly that:
+    # "Required: 176128, Hardware limit: 166912".
     #
-    # So the tile size is CHOSEN, not assumed: try the fastest rung, and step
-    # down on OutOfResources. This is a tuning search, not a correctness
-    # fallback -- every rung computes bit-identical results, only the tiling and
-    # the pipeline depth differ -- and the winner is cached per geometry so the
-    # search runs once. If no rung fits, it raises with the whole ladder, because
-    # a decode kernel that cannot launch must fail loudly (invariant 3).
+    # That arithmetic says which rungs FIT. It does not say which is FASTEST, and
+    # until 2026-09-19 this loop conflated the two: it took the first rung that
+    # launched. The profile settles it -- at ~128 KB of operands only one block is
+    # resident per SM, so the Q-tier loop runs with nothing to hide its latency,
+    # and the kernel sits at ~12% of memory bandwidth at 97.2% GPU busy. Whether
+    # a smaller tile's extra iterations cost less than its extra occupancy buys
+    # is not derivable from the staging arithmetic, so it is measured.
+    #
+    # `_search_rungs` owns the whole policy: it times every rung that fits, caches
+    # the winner per signature, re-launches the winner so the caller's values come
+    # from the rung the steady state will use, and raises if nothing fits. At
+    # steady state this is one dict hit and one launch -- the same work the
+    # first-fit path did.
+    #
     # `gated` joins the signature: GATED is a constexpr, so the two variants are
     # separate compiles with different register and staging pressure, and a rung
-    # that fit one is not evidence about the other.
-    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated))
-    rungs = ([_FIT_CHOICE[sig]] if _FIT_CHOICE.get(sig) is not None
-             else _FIT_LADDER)
-    last: Optional[BaseException] = None
-    for target_keys, num_stages in rungs:
+    # that fit one is not evidence about the other. `B`, `Sfp` and `n_sel` join it
+    # too, and they did not have to under first-fit: a FIT is shape-independent
+    # (staging is a function of the tile), but a TIME is not -- the grid is
+    # `B * H_kv` and the serial chain is `Sfp` and `n_sel` long. `Sfp` and `n_sel`
+    # are bucketed by bit length so the fp store's one-token-per-step growth
+    # between evictions does not re-trigger the search every step; `B` is exact
+    # because it moves the grid.
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length())
+
+    def _launch(rung):
+        target_keys, num_stages, num_warps = rung
         BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
-        try:
-            _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
-                COS, SIN, SEL, LOGM,
-                VM, VMS, VANC,
-                out, wsum, wmax,
-                scaling,
-                H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
-                q.stride(0), q.stride(1), q.stride(2),
-                k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
-                v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
-                selb, selh,
-                HEAD_DIM=D, HALF=half, WS=ws,
-                BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
-                BLOCK_W=BLOCK_W,
-                PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
-                GROUP_K=gk, GROUP_V=gv,
-                GATED=gated, LOG2E=_LOG2E,
-                num_stages=num_stages,
-            )
-        except BaseException as exc:                     # noqa: BLE001
-            if not _is_out_of_resources(exc):
-                raise
-            last = exc
-            continue
-        if _FIT_CHOICE.get(sig) != (target_keys, num_stages):
-            _FIT_CHOICE[sig] = (target_keys, num_stages)
-            _announce_fit(sig, target_keys, num_stages, BLOCK_NW, BLOCK_T)
-        return out, wsum
+        _two_tier_decode_kernel[grid](
+            q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
+            COS, SIN, SEL, LOGM,
+            VM, VMS, VANC,
+            out, wsum, wmax,
+            scaling,
+            H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
+            q.stride(0), q.stride(1), q.stride(2),
+            k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
+            v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
+            selb, selh,
+            HEAD_DIM=D, HALF=half, WS=ws,
+            BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
+            BLOCK_W=BLOCK_W,
+            PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+            GROUP_K=gk, GROUP_V=gv,
+            GATED=gated, LOG2E=_LOG2E,
+            num_stages=num_stages, num_warps=num_warps,
+        )
 
-    raise RuntimeError(
-        "fused decode could not fit in shared memory at any tile size. Tried "
-        f"(target_keys, num_stages) = {_FIT_LADDER} for ws={ws}, head_dim={D}, "
-        f"BLOCK_R={BLOCK_R}. Last error: {last}"
+    _search_rungs(
+        _FIT_CHOICE, _FIT_TIMINGS, _FIT_ANNOUNCED, sig, _FIT_LADDER, _launch,
+        "fused decode tiling",
+        key=lambda r: (window_tiling(ws, r[0]),
+                       _pow2_at_least(min(W_phys, r[0]), floor=16), r[1], r[2]),
     )
+    return out, wsum
 
 
 

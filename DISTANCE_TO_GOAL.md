@@ -157,6 +157,11 @@ Being strict about this is the point of the document.
 | int4 cards are accuracy-neutral at ratio 0.25 | **measured on a CPU fixture** — `two_tier_window_reference`, the gated kernel's own statement, against itself ungated |
 | int4 cards are faster | **not measured.** No GPU here. Justified by bytes only |
 | "The 24% regression is the gate" | **not attributable** — see below |
+| The step is kernel-bound: **97.2% GPU busy** at 4096/B=32 | **measured** — the 2026-09-19 profile (§10) |
+| The decode kernel is 13.7× off roofline, the gate 11.0× | **measured** (time) against **arithmetic** (bytes) — §10.1 |
+| The compiled eviction was running **eager** on every recorded run | **measured** — `Inductor kernels 0.000 ms/step`, §10.2 |
+| The decode kernel gets `target_keys=64 num_stages=2` | **measured** — §10.3. It is also the ladder's worst-occupancy rung |
+| Timing the tile ladder / gate launch makes anything faster | **not measured.** No GPU here. The searches are landed, unrun (§10.7) |
 
 ### The confound in the 24% number
 
@@ -180,11 +185,25 @@ real 76.3 ms step, GPU busy is **63% — mixed**, not the 32.6% that read
 "host-bound". `profile_decode.py` now times an unprofiled window. Anything that
 reasoned from "host-bound" needs re-reading.
 
+**And at the headline cell it is 97.2%** (§10.1), which closes the question
+rather than merely correcting it: at 4096/B=32 there is no host gap to attack.
+The flat-TPOT-across-batch signature that first suggested one has a second and
+now confirmed cause — a kernel whose critical path is batch-invariant, which is
+what `grid = (B * H_kv,)` over a serial tile loop produces.
+
 ### Never run at all
 
-Stage-0-style questions that no GPU session has answered: the eviction's fused
-kernel timing on CUDA, the tile rung the decode kernel actually gets, and the
-two external baselines (§7).
+Stage-0-style questions that no GPU session has answered. Two were answered on
+2026-09-19 and one of them answered "it never ran":
+
+* ~~the tile rung the decode kernel actually gets~~ — **`target_keys=64
+  num_stages=2`** (§10.3), which is the ladder's worst-occupancy rung and was
+  chosen by first-fit, never by time.
+* ~~the eviction's fused kernel timing on CUDA~~ — **there was no fused kernel**
+  (§10.2). Dynamo had fallen back to eager, silently, on every run recorded in
+  this document. The fused eviction's cost remains unmeasured, but for a
+  different reason than before.
+* the two external baselines (§7) — still never run.
 
 ---
 
@@ -593,6 +612,9 @@ for.
 | `lookup` walks its match 3× not 6× (`513b3d1`) | ~500 MB traffic, ~330 MB peak transient per eviction | measured |
 | CUDA graph deleted | removes the OOM and six ERROR rows; loses nothing | measured |
 | 21 env knobs, eager fork, FlashInfer, PyTorch oracle deleted | no speed change; every number now says which method it came from | structural |
+| Eviction no longer specialises the graph on `layer_idx` / `step`; eager fallback now raises (§10.2) | the compiled eviction was **running eager on every recorded run** — its real value is still unmeasured | measured (that it was eager); unmeasured (the fix) |
+| Decode tile ladder timed instead of first-fit, `num_warps` searched (§10.3) | the chosen rung is the ladder's worst-occupancy one; unknown whether a better exists | unmeasured |
+| Read gate's `BLOCK_W` / `num_warps` searched instead of derived (§10.4) | 8.2% of the step, never tuned | unmeasured |
 
 **None of these moved a latency cell.** The grid work is a memory change; the
 op-count work removes ~15 extern calls from a step that has ~1,650 launches. An
@@ -674,3 +696,220 @@ So "bytes spends 99%" was never the claim that got corrected. What was corrected
 is what 99% was 99% *of*. **Utilisation is a check on the resolver, not on the
 format.** Only the window's price can be wrong about the format, which is why it
 now lives in the module that defines the layout.
+
+---
+
+## 10. The 2026-09-19 GPU profile, and the three things it changed
+
+`scripts/profile_decode.py --prefill 4096 --batch 32 --steps 24 --warmup 12` on
+the shipped config (`n_q=230`, `W_retained=273`, gate live at `read_fraction
+0.252`). This is the first profile taken at the headline cell on the gated path,
+and it answers two of the three questions §4 listed as **never run at all**.
+
+### 10.1 What it says
+
+```
+  wall               45.69 ms/step   (profiler OFF -- the real step)
+  CUDA kernels       44.41 ms/step
+  GPU busy            97.2 %
+  kernel launches     1762 /step
+  path        armed=1920 fired=1920 gated=1920  read_fraction=0.252
+```
+
+| bucket | ms/step | share | launches |
+|---|---|---|---|
+| **ours: two-tier decode** | **17.74** | **40.0%** | 32 |
+| model: GEMM | 11.18 | 25.2% | 290 |
+| **ours: read gate** | **3.63** | 8.2% | 32 |
+| elementwise | 4.12 | 9.3% | 822 |
+| memory: index/gather | 3.66 | 8.2% | 79 |
+| memory: copy/cat | 2.08 | 4.7% | 339 |
+| reduction | 1.04 | 2.4% | 70 |
+| sort/topk | 0.84 | 1.9% | 65 |
+
+**Three readings, in order of how much they change what to do next.**
+
+**(a) The step is kernel-bound, not host-bound, and now firmly.** 97.2% GPU busy
+retires the last of the host-gap framing for good — §4's correction of the
+32.6% figure to 63% was already moving this way; at the headline cell there is
+essentially no gap left to close. *Nothing is to be won by issuing fewer
+launches.* 1,762 launches per step are fully covered by the work they issue.
+
+**(b) Our cache costs three times what the model does.** The model side is
+finished: 11.18 ms against the 10.3 ms weights-read floor is ~92% of
+theoretical, and no KV method touches it. Ours is 21.37 ms of named kernels plus
+most of the 11.75 ms of shared copy/index/sort/elementwise. The two-tier decode
+kernel alone costs **more than every GEMM in the model put together**.
+
+**(c) Both of our kernels are ~12× off their own roofline, in the same way.**
+Priced from bytes at this exact geometry:
+
+| | traffic/step | roofline @1555 GB/s | measured | off by |
+|---|---|---|---|---|
+| two-tier decode | 2.02 GB | 1.30 ms | 17.74 ms | **13.7×** |
+| read gate | 0.51 GB | 0.33 ms | 3.63 ms | **11.0×** |
+
+That independently reproduces §2's 12×-off measurement from a different
+direction, and it says the problem is not one bad kernel — it is the same
+gather-bound, occupancy-starved shape in both. §6.2 (contiguous reads) is the
+structural answer and still needs a GPU. What follows is the part that did not.
+
+### 10.2 The compiled eviction was not compiling — and could not be seen
+
+```
+torch._dynamo hit config.cache_size_limit (8)
+   function: '_evict_two_tier_impl' (cache.py:2187)
+   last reason: 0/0: L['layer_idx'] == 0   # self._states[layer_idx]
+...
+  eviction: 3 compiled / 0 eager runs, Inductor kernels 0.000 ms/step
+```
+
+`_evict_two_tier_impl` took `layer_idx` and opened with
+`self._evict_targets(layer_idx)`, which indexes `self._states` — **a Python
+list**. Dynamo specialises on the integer's value, so it built one graph per
+layer. The first eviction runs per layer, 32 times, which blew the default
+`cache_size_limit` of 8 at layer 8; Dynamo's response to that limit is to run
+the frame **eagerly**. Every eviction after it — including all 39 joint ones,
+which are the ones that matter — ran eager under a "compiled" label.
+
+**`_EVICT_STATS` cannot see this and never could.** It counts calls to the
+compiled *callable*, and the callable was called; it was Dynamo underneath that
+declined. So the counter said `3 compiled / 0 eager` while Inductor emitted zero
+kernels. A `TorchDispatchMode` could not see it either — §5.1's caveat already
+notes that a dispatch counter observes the op chain *before* Inductor fuses it,
+which is exactly why its counts were "identical with the compile flag on and
+off". That identity was not evidence of anything; it was the blind spot.
+
+This invalidates one claim outright and softens another:
+
+* §5.1's *"it is layer-major, compiled unconditionally, and takes one sync"* —
+  the first and third held, the second did not, on the runs that produced these
+  numbers.
+* the eviction's contribution to the step has never been measured **fused**.
+  Whatever the eager chain costs today is an upper bound on what the fused one
+  will.
+
+**Fix, three parts, all at the source:**
+
+1. **`layer_idx` and `step` no longer cross into the graph.** The body takes the
+   resolved `(state, store, policy)` plus one `joint` bool. Resolving the
+   targets, dropping the stale `_fused_ctx` entries and recording telemetry all
+   moved to `_evict_two_tier`, outside the compiled region. `step` was only ever
+   the telemetry argument and is gone from the body entirely — an integer that
+   increments every eviction is an integer Dynamo specialises on, and it had no
+   business in a graph. Telemetry's input (the pre-eviction score axis, which
+   step 5 of the body overwrites) is returned rather than recorded in place.
+2. **`_EVICT_CACHE_SIZE_LIMIT = 64`**, applied to whichever of Dynamo's
+   recompile-limit config names the installed version has. The remaining
+   specialisations are the shape ones the body asks for *on purpose* — it makes
+   its control ints concrete with `int()` so Inductor gets integers instead of
+   symbols. A limit is not a budget to spend; it is where Dynamo stops
+   compiling, so it is set well clear of the handful expected.
+3. **An eager eviction is now a hard error.** The body opens with
+   `if not torch.compiler.is_compiling(): raise`. Under Dynamo that is a
+   trace-time constant, so the branch folds away and nothing reaches the graph;
+   on a cache *hit* the Python body is never entered at all, so the steady-state
+   cost is exactly zero. It executes only when Dynamo has fallen back — which is
+   precisely the case that used to be silent. The message names the three things
+   that cause it (recompile limit, compilation disabled process-wide, an
+   untraceable construct) and says plainly that no knob makes an eager eviction
+   acceptable.
+
+Point 3 is the durable half. Points 1 and 2 fix the cause we found; point 3
+means the *class* of failure cannot recur unseen.
+
+### 10.3 The decode tile was chosen by first-fit, never by time
+
+`_FIT_LADDER` existed to pick a tile that fits in shared memory, and its own
+docstring conceded the rest: *"The ladder only falls on `OutOfResources`, it
+never benchmarks, so that ordering [is an assertion] — run the table twice,
+compare."* Nobody ran it twice. The profile shows it took the top rung,
+`target_keys=64 num_stages=2`.
+
+That is the rung with the **worst occupancy in the ladder**. At `BLOCK_T=64` the
+`tl.dot` operands stage ~128 KB against an A100's 163 KB/SM, so exactly **one
+block is resident per SM** and the Q-tier loop's ~14 dependent tiles run with
+nothing co-resident to hide their latency. A kernel 13.7× off roofline at 97%
+busy is what that looks like. Whether a smaller tile's extra iterations cost
+less than its extra occupancy buys is **not derivable** from the staging
+arithmetic — which is all the ladder ever had.
+
+So the ladder is now timed. `_search_rungs` times every rung that fits, caches
+the winner per geometry, and re-launches the winner so the caller's values come
+from the rung the steady state will use. `num_warps` joins the search: it was
+never passed at all, so every launch to date ran at Triton's default of 4 — a
+value inherited, never chosen. `score_kernel` already autotunes `num_warps` in
+prefill, so this is the repo's own precedent, not a new idea.
+
+The signature gained `B`, `Sfp` and `n_sel`, which first-fit did not need: a
+*fit* is shape-independent (staging is a function of the tile), but a *time* is
+not — the grid is `B * H_kv` and the serial chain is `Sfp` and `n_sel` long.
+`Sfp` and `n_sel` are bucketed by bit length so the fp store's one-token-per-step
+growth between evictions does not re-trigger the search.
+
+### 10.4 The read gate was never tuned at all
+
+3.63 ms/step, 11× off roofline, and its two launch parameters were a heuristic
+and a default: `gate_window_tiles` derived `BLOCK_W` from an occupancy rule of
+thumb, and `num_warps=4` was hardcoded. It now goes through the same
+`_search_rungs`, with the derived value kept as the ladder's **first** entry —
+the heuristic encodes a real floor ("fill the machine", which at B=1's 8 rows is
+the whole argument for splitting the window axis), it just cannot price it.
+
+### 10.5 What this costs, and the one property it moves
+
+**Runtime: nothing.** At steady state a search is one dict hit and one launch —
+the same work first-fit did. The search itself is ~19 launches of a
+sub-millisecond kernel, once per signature.
+
+**Warmup: up to one Triton compile per rung, once per machine.** That is the real
+price. It is bounded by deduplicating rungs that collapse onto the same launch
+(`window_tiling` floors `target_keys // ws`, so at `ws=128` the 64/32/16 rungs
+are the same kernel), it lands in the warmup the harness already reserves for
+JIT, and Triton's on-disk cache makes it once-per-machine rather than
+once-per-run.
+
+**The one property that moves: `num_warps` changes the lane layout of the
+reductions, so `wsum`, `est` and `logmass` move in their last bits.** Stated
+plainly because it is the only thing here that is not byte-identical:
+
+* `BLOCK_W` in the gate is **provably** bit-identical — each program owns a
+  disjoint span of output columns and every reduction lives inside one window.
+* `BLOCK_T`/`BLOCK_NW` in the decode kernel reassociate the online softmax. That
+  is not new: the ladder has always been free to step rungs, and `_sorted_pick`
+  already documents the same effect for selection order.
+* `num_warps` is a new axis of that same kind. Where it lands on a discrete
+  decision — `est` feeds a top-k, `wsum` feeds the eviction ranking — a last-bit
+  move can only change the outcome for two windows already tied to ~1e-7.
+
+**No quality claim crosses this change** until a LongBench run says so, and a
+`--gate-ratio 1.0` control still controls what it always did.
+
+### 10.6 Considered and not done, with reasons
+
+| idea | why not |
+|---|---|
+| **Fold the gate in as a decode-kernel prologue** (§5.1 fusion 1) | ~1.3% by §5.1's own sizing, and the top-k cannot fold in at all — the gate splits the window axis across programs, so no program sees the whole card set. It also risks dropping the decode kernel's rung, which is now a *measured* quantity and therefore an expensive one to disturb. |
+| **Fold the score permutation into the kernel epilogue** (§5.1 fusion 2) | 0.23 ms/step measured (`_scatter_gather_elementwise_kernel`, n=32/step) — 0.5%. It needs the *inverse* of `order` (a `gather` maps destination→source; a kernel store needs source→destination), and an `order` that is not a strict permutation would scatter scores onto the wrong windows silently. Not worth that failure mode for 0.5%. |
+| **Replace the gate's `topk` + `sort` with a Triton selection kernel** | 1.22 ms/step (`gatherTopK` 0.43 + two `radixSortKVInPlace` 0.79) = 2.7%. An exact in-kernel top-k needs its own tie-break rule, and `torch.topk`'s is unspecified — so this trades a measured 2.7% for a change in *which windows are read* in the tie case. Revisit after §6.2, which may remove the reason to care. |
+| **Shrink the demote width** | Retired by measurement: `fresh mean=188.95 of n_q=230, fill=100%`. The cap is already close to the real count. (The promote side was live and is already fixed.) |
+| **CUDA graphs** | Still deleted, and 97.2% GPU busy is the strongest form of the argument yet: there is no host gap left to record. |
+
+### 10.7 What to check on the next GPU run
+
+1. `[StickyKV] fused decode tiling tuned sig=... -> ...` and
+   `[StickyKV] read gate tiling tuned sig=... -> ...`, plus the per-rung
+   milliseconds `profile_decode.py` now prints under each. **The margin is the
+   result**: a rung that wins by 30% and one that wins by 0.5% call for
+   different next moves.
+2. `eviction: N compiled / 0 eager runs, Inductor kernels X ms/step over Y
+   launches/step` with **X and Y non-zero**. If they are still zero the eviction
+   is still not fusing, and the body now raises rather than letting that pass.
+3. Whether the "shared/other" 11.75 ms bucket shrinks once the eviction fuses.
+   That is the first honest measurement of what the compiled eviction is worth —
+   every previous one measured the eager chain.
+
+**None of 10.2–10.4 has been measured on a GPU.** They are a silent-fallback
+repair and two searches replacing two assumptions; the searches cannot be wrong
+about which rung is faster, but whether a faster rung *exists* is exactly what no
+one has ever asked the hardware.

@@ -137,9 +137,19 @@ one per-window block is the real fix and needs a GPU to verify.
   per-step re-gather, no device sync. The two fusions still open (gate as a
   kernel prologue; score permutation into the epilogue) are worth ~2% together.
   The remaining factor of two is inside the kernel, not around it.
+  **The 2026-09-19 profile closes this: 97.2% GPU busy at 4096/B=32** (§10.1).
+  There is no host gap left to attack. Our two kernels are 13.7× and 11.0× off
+  their own rooflines and cost three times what the whole model's GEMMs do — the
+  work is *inside* them.
 * **A `TorchDispatchMode` sees the eviction's op chain BEFORE Inductor fuses
   it** — counts are identical with the compile flag on and off. Eviction byte
   totals taken that way are an upper bound, not a GPU measurement.
+  **That identity was also the blind spot**: the eviction was not fusing at all
+  (§10.2), and neither the dispatch counter nor `_EVICT_STATS` could see it —
+  the counter runs before Inductor, and the stats count calls to the compiled
+  *callable*, which Dynamo had quietly declined to compile. Only
+  `Inductor kernels … ms/step` in `profile_decode.py` shows it. The body now
+  raises if it ever runs eager, so this cannot recur unseen.
 
 ## Two traps in the harness
 

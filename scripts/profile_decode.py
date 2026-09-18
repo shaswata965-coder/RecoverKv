@@ -552,25 +552,56 @@ def main() -> None:
     # once per geometry, which happens in warmup and scrolls away above whatever
     # is being read -- so the one line DECODE_NEXT.md §5 step 1 says to read was
     # the one line a profile did not carry.
-    try:
-        from modules.windowed_cache.decode_kernel import _FIT_LADDER, fit_choice
-        chosen = fit_choice()
-        if chosen:
-            print("\n  decode tiling (target_keys x num_stages), per geometry:")
-            top = _FIT_LADDER[0]
-            for sig, rung in sorted(chosen.items()):
-                ws, hd, block_r, has_q, gated = sig
-                where = "" if rung == top else (
-                    f"   <- NOT the top rung {top[0]}x{top[1]}; "
-                    f"{top[0] / rung[0]:.0f}x the serial Q-tier iterations")
-                print(f"    ws={ws} head_dim={hd} BLOCK_R={block_r} "
-                      f"q_tier={bool(has_q)} gated={gated}"
-                      f"  ->  {rung[0]}x{rung[1]}{where}")
-            if any(r != top for r in chosen.values()):
-                print("    A lower rung is a shared-memory fact, not a verdict: "
-                      "re-run the table to price them.")
-    except Exception:  # pragma: no cover - diagnostics must never fail a run
-        pass
+    def _print_search(title, choice_fn, timings_fn, fmt_sig, fmt_rung):
+        """One tuner's verdict AND its margin. Never swallowed silently.
+
+        This block used to sit inside a bare ``except Exception: pass`` while
+        importing a ``fit_choice`` that did not exist -- so the one line the
+        tuning step needs was the one line a profile never carried, and nothing
+        said why. A diagnostic must not fail the run, but it must say when it
+        cannot answer.
+        """
+        try:
+            chosen, timed = choice_fn(), timings_fn()
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            print(f"\n  {title}: unavailable ({type(exc).__name__}: {exc})")
+            return
+        if not chosen:
+            print(f"\n  {title}: nothing tuned (the kernel never ran)")
+            return
+        print(f"\n  {title}:")
+        for sig, rung in sorted(chosen.items(), key=lambda kv: str(kv[0])):
+            ranked = timed.get(sig, [])
+            best_ms = ranked[0][1] if ranked else None
+            # The margin is the point: a rung that won by 30% and one that won
+            # by 0.5% call for different next moves.
+            margin = ""
+            if len(ranked) > 1 and best_ms:
+                margin = (f"   ({100.0 * (ranked[1][1] - best_ms) / best_ms:.1f}% "
+                          f"clear of {fmt_rung(ranked[1][0])})")
+            ms = f"  {best_ms:.3f} ms" if best_ms else ""
+            print(f"    {fmt_sig(sig)}  ->  {fmt_rung(rung)}{ms}{margin}")
+            for r, t in ranked:
+                mark = " *" if r == rung else "  "
+                print(f"        {mark} {fmt_rung(r):<18} {t:.3f} ms")
+
+    from modules.windowed_cache import decode_kernel as _dk
+    from modules.windowed_cache import gate_kernel as _gk
+
+    _print_search(
+        "decode tiling (target_keys x num_stages x num_warps), per geometry",
+        _dk.fit_choice, _dk.fit_timings,
+        lambda s: (f"ws={s[0]} head_dim={s[1]} BLOCK_R={s[2]} q_tier={bool(s[3])} "
+                   f"gated={s[4]} B={s[5]} Sfp~2^{s[6]} n_sel~2^{s[7]}"),
+        lambda r: f"{r[0]}x{r[1]}x{r[2]}w",
+    )
+    _print_search(
+        "read gate tiling (BLOCK_W x num_warps), per geometry",
+        _gk.gate_choice, _gk.gate_timings,
+        lambda s: (f"NW={s[0]} H_kv={s[1]} head_dim={s[2]} ws={s[3]} B={s[4]} "
+                   f"rep={s[5]}"),
+        lambda r: f"BLOCK_W={r[0]}x{r[1]}w",
+    )
 
     # What the eviction's worst-case width actually bought (DECODE_NEXT.md D1).
     # Printed here, after both timed windows, because reading it syncs once.
