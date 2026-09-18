@@ -511,14 +511,13 @@ def _token_scores_triton(
     scaling: float,
     lse: Tensor,
     *,
-    block_m: int = 64,
-    block_n: int = 64,
     out_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     """Launch the fused Stage-B kernel. Returns ``[B, H_q, S]`` (``out_dtype``).
 
-    ``lse`` is ``[B, H_q, T]`` fp32. Grid is ``(⌈S/block_n⌉, B·H_q)``: one
-    program per key block per (batch, query-head).
+    ``lse`` is ``[B, H_q, T]`` fp32. Grid is ``(⌈S/BLOCK_N⌉, B·H_q)`` with
+    ``BLOCK_N`` from the autotuner's winning config: one program per key block
+    per (batch, query-head).
     """
     if not _HAS_TRITON:
         raise RuntimeError("Triton not available; use backend='torch'.")
@@ -534,8 +533,15 @@ def _token_scores_triton(
     # exp(s·scale − L) == exp2(s·(scale·log2 e) − L·log2 e). Folding the base
     # change into `scaling` here keeps the [BLOCK_M, BLOCK_N] tile arithmetic
     # byte-for-byte the same shape of work; only the transcendental changes.
-    use_exp2 = _score_exp2_enabled()
-    eff_scale = scaling * LOG2E if use_exp2 else scaling
+    #
+    # ALWAYS. This read `_score_exp2_enabled()`, which went with
+    # STICKYKV_SCORE_EXP2 in 0974687 while the call site stayed -- so every
+    # prefill on CUDA raised NameError, and nothing on a CPU box could see it
+    # because this function refuses non-CUDA tensors two lines above. The knob's
+    # default was on, so the behaviour is on; `USE_EXP2` remains a kernel
+    # constexpr because the kernel is also called directly by its own tests.
+    use_exp2 = True
+    eff_scale = scaling * LOG2E
     common = (
         q, k, lse, out,
         eff_scale,
@@ -545,20 +551,16 @@ def _token_scores_triton(
         out.stride(0), out.stride(1), out.stride(2),
         T, S, S - T, H_q, num_groups,
     )
-    if True:
-        # BLOCK_N is chosen by the autotuner, so the grid must read it from the
-        # winning config's meta at launch (Triton evaluates this lambda per config).
-        grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)
-        _score_kernel_tuned[grid](
-            *common, HEAD_DIM=D, IS_CAUSAL=(T > 1), USE_EXP2=use_exp2,
-        )
-    else:
-        grid = (triton.cdiv(S, block_n), B * H_q)
-        _score_kernel[grid](
-            *common, HEAD_DIM=D,
-            BLOCK_M=block_m, BLOCK_N=block_n, IS_CAUSAL=(T > 1),
-            USE_EXP2=use_exp2,
-        )
+    # BLOCK_N is chosen by the autotuner, so the grid must read it from the
+    # winning config's meta at launch (Triton evaluates this lambda per config).
+    # The fixed-tile launch that used to sit behind an `if True: … else:` here is
+    # gone with STICKYKV_SCORE_AUTOTUNE: it was unreachable, and it took
+    # `block_m`/`block_n` with it -- a caller passing them was pinning a tile
+    # that production had already stopped reading.
+    grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)
+    _score_kernel_tuned[grid](
+        *common, HEAD_DIM=D, IS_CAUSAL=(T > 1), USE_EXP2=use_exp2,
+    )
     return out
 
 

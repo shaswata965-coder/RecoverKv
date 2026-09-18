@@ -484,7 +484,15 @@ def install_score_hooks(
                         and tuple(cand.shape) == want
                     ):
                         lse = cand.to(device=q.device)
-                    elif _lse_strict():
+                    else:
+                        # ALWAYS raise. This was `elif _lse_strict()`, a knob
+                        # deleted in 0974687 whose call site stayed -- so an
+                        # L-reuse miss raised NameError from inside the handler
+                        # for it. The knob's "off" degraded to compute_lse, a
+                        # second O(N^2) pass whose fp32 block is 32 GB at
+                        # 4096/batch-32 and is why that cell OOMed, so there was
+                        # never a correct off.
+                        #
                         # The MISS the capture itself cannot see. A latched
                         # capture raises at its own call site; this catches the
                         # other two failures: the patched symbol was never
@@ -516,14 +524,14 @@ def install_score_hooks(
                             )
                         raise RuntimeError(
                             f"L-reuse MISS at layer {lidx} (source "
-                            f"{lse_label!r}): {what} STICKYKV_LSE_STRICT is on, "
-                            "so this is a hard error rather than a silent "
-                            "fallback to compute_lse. Cheapest remedy: "
-                            "STICKYKV_LSE_BACKEND=flash — the same kernel, asked "
-                            "for the softmax_lse it already computed, so the "
-                            "attention output stays bit-identical. See "
-                            "PREFILL_PLAN.md Stage 1. STICKYKV_LSE_STRICT=0 "
-                            "restores the degrade."
+                            f"{lse_label!r}): {what} This is a hard error, not a "
+                            "silent fallback to compute_lse: that fallback is a "
+                            "second O(N^2) pass per layer whose fp32 block is "
+                            "32 GB at 4096/batch-32, so it does not get to "
+                            "happen quietly. The capture is the fix — the same "
+                            "flash kernel, asked for the softmax_lse it already "
+                            "computed, so the attention output stays "
+                            "bit-identical."
                         )
 
                 token_scores = compute_token_scores(

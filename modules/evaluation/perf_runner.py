@@ -1904,8 +1904,12 @@ class PerfRunner:
                     "precisely so the varying window count does not retrigger "
                     "compilation; this is compile latency inside the timings.",
                     c.get("name"), dyn["frames_ok"])
-        # Cleanup
-        del model
+        # Cleanup. `model = None` and not `del model`: the nested helpers above
+        # close over `model`, and a `del` in this scope makes every one of those
+        # references read as unbound to a static checker -- which is how the
+        # checker that would have caught `_score_exp2_enabled` gets drowned in
+        # false positives. Dropping the reference frees exactly the same bytes.
+        model = None
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         return measurements

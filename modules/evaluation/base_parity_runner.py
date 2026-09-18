@@ -175,6 +175,7 @@ class BaseParityRunner:
             all_step_ws = [[] for _ in range(Bc)]   # per-step (non-cumulative)
             gen_toks = [[] for _ in range(Bc)]
             input_ids = tokens.clone()
+            next_tok = None          # loop-carried; step 0 uses input_ids
             pkv = DynamicCache()
             with torch.no_grad():
                 for step in range(gen_len):
