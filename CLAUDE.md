@@ -14,6 +14,16 @@ kernel — is infrastructure that exists so the gate can run. Every int2 window
 carries a card written once at demotion; the decode step scores all cards from
 two dot products and dequantizes only the windows worth opening.
 
+### It is the only read path, and that is enforced
+
+`_run_fused` **raises** when a fused layer arrives without cards. There is no
+ungated arm: both arming sites already require a non-empty Q tier, so a
+card-less fused layer is a store holding a tier it cannot select over — a
+misconfiguration, not a mode. Reading the whole tier there would be *correct*
+and would look exactly like success, which is the one failure this path must
+refuse. `quant_gate_ratio = 1.0` is how you ask for a full read; it selects
+every window through the same code.
+
 ### It is wired. Check, don't assume.
 
 The live path is `cache.update()` → `flash_decode.set_pending` →
@@ -46,16 +56,37 @@ already expresses "read everything" through the same code, which makes it a
 
 ## The finding that governs decode work
 
-**A window's card costs 400 B/head. The 8 tokens it summarises cost 512 B, and a
-full window 804 B. The card is 78% of the data it replaces.**
+**A card must be read for every window on every step, while a window is only
+opened if selected. So the gate costs `card + ratio * window` against `window`,
+and break-even is `1 - card/window`.** That one line is the whole economics, and
+it is why the card's *width* — not the gate's cleverness — decides whether the
+feature pays.
 
-The tokens are stored at 2 bits per number; the card at 8, and it holds three
-full-length int8 vectors. The summary is written at four times the precision of
-what it summarises.
+At int8 the card was 400 B/head against the 804 B of token data it stands in for
+(512 B of 2-bit K+V plus a 292 B grid): **78% of what it replaces**, break-even
+at a 0.50 read ratio, and measurably worth nothing at the shipped 0.25. The
+summary was written at four times the precision of what it summarised.
 
-Consequences, all in `DISTANCE_TO_GOAL.md` §2:
+**`mu` and `vbar` are now int4** (packed two per byte), which is the §6.1
+frontrunner landed:
 
-* break-even is a **0.50** read ratio, not something small;
+| | int8 | **int4 (now)** |
+|---|---|---|
+| card / head | 400 B | **272 B** |
+| `bytes_per_q_window` | 9,632 B | **8,608 B** |
+| break-even ratio | 0.50 | **0.66** |
+| fp/q price ratio | 3.40 | **3.81** |
+
+`v` stays int8 and must: it is the deviation *direction*, and at int4 the hot
+token stops being the best-fit token, which is the one property the card exists
+for. `t` is 10 B and cannot shrink either. Accuracy at ratio 0.25 is identical
+to five decimals (0.00004 median relative output error, both encodings, 8
+seeds); at 0.10 it is 0.00166 vs 0.00151. **Not yet measured on a GPU** — the
+speed claim is bytes-only.
+
+Consequences that still hold, from `DISTANCE_TO_GOAL.md` §2:
+
+* break-even is a **read ratio**, not something small — 0.66 now, not 0.50;
 * at 0.25 the gate saves ~3% of the kernel's traffic, because the compressed tier
   is only ~13% of what decode reads — the full-detail tier is the other 87%;
 * **measured, `--gate-ratio 1.0` ties with 0.25 to within 0.2–1.6% of TPOT**
@@ -65,8 +96,11 @@ Consequences, all in `DISTANCE_TO_GOAL.md` §2:
   pass.
 
 **The cause is the memory layout, not the idea.** Do not respond to this by
-weakening the gate; respond by making the card cheap (int4 — §6.1, the
-frontrunner, accuracy measured neutral) and the selected reads contiguous (§6.2).
+weakening the gate. The card is cheap now (int4, above); **what is left is §6.2,
+making the selected reads contiguous** — that attacks the 7.03 ms, where int4
+attacked the 3%. A window's fields live in six separate tensors plus four card
+tensors, so one selected window is ten scattered fetches; interleaving them into
+one per-window block is the real fix and needs a GPU to verify.
 
 ## How to read a decode number here
 
@@ -81,6 +115,22 @@ frontrunner, accuracy measured neutral) and the selected reads contiguous (§6.2
   *memory* at B=1, not latency (§8).
 * **A change that adds per-layer host work to save Q-tier bytes is a net loss by
   default.**
+
+## Two traps in the harness
+
+* **The test suite is ~87/880 failing on this branch, and they are stale tests,
+  not broken code** — deleted modules (`windowed_eager_cache`), deleted symbols
+  (`_tile_override`, `_compile_evict_enabled`), deleted control arms, changed
+  signatures. It is not a usable regression net until they are repaired. Repair
+  the file you are about to change before changing it; `test_sketch.py` and
+  `test_sketch_store.py` were done that way and are green. Two assertions in
+  them had been vacuous for months because `.norm(-1)` is a p-norm over every
+  axis, not `dim=-1`.
+* **A perf npz is named `perf_prefill{P}_gen{G}_bs{B}.npz` — shape and batch,
+  nothing about the config.** Two configs written to one `OUT_DIR` overwrite
+  each other and the table prints the survivor under whichever name it finds.
+  Sweeps go through `scripts/run_perf_sweep.sh`, which gives each config its own
+  directory, validates the grid up front, and is resumable.
 
 ## Standing rules
 
