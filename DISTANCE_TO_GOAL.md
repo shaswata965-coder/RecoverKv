@@ -23,6 +23,13 @@ TPOT_steady in seconds. **Flash** is FullKV with `flash_attention_2`. **Best** i
 the published table (`DECODE_HISTORY §1`, budget 0.50 / local 64) — the fastest
 this project has ever been. **Now** is the 2026-09-16 run.
 
+**Nothing in this table has moved since 2026-09-16, and nothing below it has
+been timed on a GPU.** Every commit since then is either a memory change, a
+correctness fix or an op-count cut; the arithmetic for what they do to a decode
+step is in §"What the landed work and proposal 3 do to the operating point", and
+it comes to **±0.4 ms on a 76.3 ms step** — inside run-to-run noise. The next
+`run_perf_table.sh` is what replaces this table, not this document.
+
 | shape | B | Flash | best ever | vs Flash | now | vs Flash |
 | --- | --- | --- | --- | --- | --- | --- |
 | 4096/256 | 32 | 0.086 | 0.0626 | **1.37x faster** | 0.0763 | **1.13x faster** |
@@ -182,6 +189,9 @@ for an sm80 target and passes.
 | The eviction's fusion, re-measured | 3 breaks (all the deliberate `.item()`), 22 fused kernels, nothing extern but `sort`/`searchsorted`/`cumsum`. **Item 2's 9.34 ms was already recovered by `6e83a2c`** | measured, CPU Inductor |
 | `--gate-ratio` reaching the config (`a39124f`) | It was parsed, printed and operating-point-checked, but never written into the generated YAML: both arms of the gate A/B ran at 0.25 | read off the generated config |
 | `eval_efficiency.yaml`'s fourth arm | `quant_memoize_read: false` priced a memo that is unreachable, so it duplicated `ours_b50_q50`. Now `quant_gate_ratio: 1.0`, the control `TARGET_GAP §4` said did not exist | structural |
+| Two dead call sites (`c51c1ae`) | `0974687` deleted 21 knobs and left two of their READERS. Both on CUDA-only lines, so the CPU suite could not see them; a six-cell perf table died on every row with `NameError: _score_exp2_enabled`. Guarded now by a static undefined-name check over `modules`/`utils`/`scripts` | measured, the hard way |
+| `lookup` walks its match 3x, not 6x (`513b3d1`) | ~500 MB of traffic and ~330 MB of peak transient per eviction | measured (op + byte profile) |
+| Three micro-fixes in the eviction | −6 launching ops of 186 | measured |
 
 **What did not change: any latency cell.** Item 1 is a memory change and item 2
 turned out to be a verification. See "Where that lands" below, where the estimate
@@ -443,6 +453,47 @@ makes the 25% read buy only 25% of the bytes (§3).
 (The ablation simulates int4 by coarsening the existing int8 codes against the
 same scale; a real int4 encoder re-fits the scale to the narrower range, so these
 are conservative.)
+
+### What the landed work and proposal 3 do to the operating point
+
+Resolved off `config.resolve` at the perf table's point (budget 0.20, local 128,
+q 0.70, `bytes`, ws 8, H=8, D=128). `keys` is what a decode step attends over per
+row; `Q KB/step` is what the gated kernel reads from the Q tier per row per layer
+— **every card, plus the codes of the selected windows**; `sel` is how many
+windows the Q loop iterates over.
+
+| shape | variant | keys | sel | Q KB/step |
+|---|---|---|---|---|
+| 4096/256 | 2026-09-16 (fp16 grid, 400 B card) | 1813 | 46 | 951 |
+| | one-byte grid — **landed** | 2117 (+17%) | 55 (+20%) | 1036 (+9%) |
+| | + simpler cards, ratio 0.25 | 2325 (+28%) | 62 (+35%) | 914 (−4%) |
+| | + simpler cards, **same `sel`** (ratio 0.186) | 2325 (+28%) | 46 (0%) | **814 (−14%)** |
+| 2048/512 | 2026-09-16 | 989 | 23 | 480 |
+| | one-byte grid — landed | 1149 (+16%) | 28 | 529 (+10%) |
+| | + simpler cards, same `sel` (0.181) | 1261 (+28%) | 23 (0%) | **414 (−14%)** |
+| 1048/1048 | 2026-09-16 | 789 | 18 | 374 |
+| | one-byte grid — landed | 909 (+15%) | 22 | 410 (+10%) |
+| | + simpler cards, same `sel` (0.184) | 997 (+26%) | 18 (0%) | **321 (−14%)** |
+
+Two things fall out of this that were not obvious before the arithmetic:
+
+**The grid narrowing raised the per-step read.** More windows fit, and the card
+of *every* window is read on *every* step, so cards went 572 → 691 KB while the
+codes read fell 377 → 347. Net +9%. The memory win was real and the decode cost
+of it was not free — that is the gate's fixed cost, and §"The 25% read does not
+buy 25%" predicted exactly this.
+
+**The card is the only lever that pushes both ways.** Proposal 3 cuts the fixed
+cost by a third, so it is the first change here that gives *more* context and
+*less* per-step read at once: −4% at the shipped ratio, −14% if the ratio is
+re-pinned to hold the selected count.
+
+**And the ratio is the dial nobody has turned.** `quant_gate_ratio` is a
+fraction, so every window the budget buys is automatically spent on more Q-loop
+iterations — 46 → 55 → 62 across the rows above, on a kernel measured at 12x off
+its roofline and therefore iteration-bound, not byte-bound. Holding the *count*
+instead converts a memory win into context at flat decode work. That is a config
+choice, not a code change.
 
 ### Verdict
 
