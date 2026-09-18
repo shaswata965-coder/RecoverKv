@@ -205,7 +205,12 @@ def build_sketch(
     keeping the column invited a reader to think one was available.
     """
     k = keys.to(torch.float32)
-    N, H, ws, D = k.shape
+    # ``N`` is the flattened row axis (``B * n`` from ``demote_many``) and stays
+    # symbolic with ``B``; ``H``/``D`` are model constants and are forced, because
+    # this is inside the compiled eviction and they are ``expand`` extents below.
+    # ``ws`` was unpacked and never read.
+    N = k.shape[0]
+    H, D = int(k.shape[1]), int(k.shape[3])
     anc = _align_anchor(anchor, k[..., 0, :])
 
     mu = k.mean(dim=-2)                                        # sweep 1

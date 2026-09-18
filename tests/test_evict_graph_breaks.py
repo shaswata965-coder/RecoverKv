@@ -359,26 +359,61 @@ def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
     The fix is always the same and always free: wrap the read in ``int()``. It is
     a no-op in eager and byte-identical, and it adds no recompiles, because the
     widths involved are already specialized by ``_evict_two_tier_impl``.
+
+    **A whole-shape unpack counts.** The first version of this guard matched only
+    ``x = t.shape[i]`` and said in a comment that ``B, H, T, D = t.shape`` was "a
+    different pattern ... handled by the callers". It is not a different pattern
+    -- it is the same symbolic read wearing a different AST -- and that exemption
+    is precisely what let the live bug through: ``014c40b`` put ``int()`` on four
+    subscript reads, declared ``compute_two_tier_retain`` fixed, and the offender
+    in that function was ``B, _, W = window_scores.shape``. The guard passed and
+    every GPU cell still ERRORed. Both forms are matched now.
     """
     import ast
     import pathlib
 
-    # (file, qualified function name) for everything the compiled body reaches
-    # that reads a single dim off a `.shape`.
+    # (file, function, names allowed to stay symbolic) for everything the
+    # compiled body reaches that reads a dim off a `.shape`.
+    #
+    # The allowed set is ALWAYS the row axis and nothing else: `B`, or the
+    # flattened `B * n` that `demote_many` hands `build_sketch` as `N`. Keeping
+    # the row axis dynamic is the entire reason the eviction compiles with
+    # `dynamic=True` rather than recompiling per batch size, and it is never used
+    # as a scalar -- only as a tensor size that broadcasting already agrees on.
     REGION = [
-        ("modules/windowed_cache/cache.py", "_evict_two_tier_impl"),
-        ("modules/windowed_cache/policy.py", "compute_two_tier_retain"),
-        ("modules/quant/compact.py", "stable_partition"),
-        ("modules/quant/slots.py", "lookup"),
+        ("modules/windowed_cache/cache.py", "_evict_two_tier_impl", {"B"}),
+        ("modules/windowed_cache/cache.py", "_compact", {"B"}),
+        ("modules/windowed_cache/policy.py", "compute_two_tier_retain", {"B"}),
+        ("modules/quant/compact.py", "stable_partition", set()),
+        ("modules/quant/slots.py", "lookup", set()),
+        ("modules/quant/store.py", "promote_many", {"B"}),
+        ("modules/quant/store.py", "demote_many", {"B"}),
+        ("modules/quant/sketch.py", "build_sketch", {"N"}),
     ]
-    # `B` is the one axis deliberately left symbolic -- keeping it dynamic is the
-    # entire reason the eviction compiles with `dynamic=True` rather than
-    # recompiling per batch size. It is never used as a scalar.
-    ALLOW = {"B"}
+
+    def _shape_read(v):
+        """`<expr>.shape` or `<expr>.shape[...]`, else None."""
+        if isinstance(v, ast.Subscript):
+            v = v.value
+        return v if (isinstance(v, ast.Attribute) and v.attr == "shape") else None
+
+    def _names(target):
+        """The bare `Name` targets of an assignment, tuple unpacks included.
+
+        `_` is dropped: a throwaway is never read, so it cannot reach a scalar
+        context. Everything else that gets a name gets checked.
+        """
+        if isinstance(target, ast.Name):
+            names = [target.id]
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            names = [e.id for e in target.elts if isinstance(e, ast.Name)]
+        else:
+            names = []
+        return [n for n in names if n != "_"]
 
     root = pathlib.Path(__file__).resolve().parent.parent
     offenders = []
-    for rel, fname in REGION:
+    for rel, fname, allow in REGION:
         tree = ast.parse((root / rel).read_text())
         fns = [n for n in ast.walk(tree)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -388,25 +423,27 @@ def test_scalar_shape_reads_in_the_compiled_region_are_int_forced():
             for node in ast.walk(fn):
                 if not isinstance(node, ast.Assign):
                     continue
-                v = node.value
-                # `X = <expr>.shape[<literal>]`, i.e. ONE dim pulled out as a
-                # scalar. A whole-shape tuple unpack is a different pattern and
-                # is handled by the callers that need concrete members.
-                if not (isinstance(v, ast.Subscript)
-                        and isinstance(v.value, ast.Attribute)
-                        and v.value.attr == "shape"):
+                # `X = t.shape[i]` (one dim) and `A, B, C = t.shape` (the whole
+                # shape) are the SAME hazard: every name bound is a SymInt under
+                # `dynamic=True`. An `int(...)` wrapper is a Call, not a
+                # Subscript/Attribute, so a forced read never reaches here.
+                if _shape_read(node.value) is None:
                     continue
                 for t in node.targets:
-                    if isinstance(t, ast.Name) and t.id not in ALLOW:
-                        offenders.append(f"{rel}:{node.lineno}  {t.id} = ...shape[...]")
+                    for name in _names(t):
+                        if name not in allow:
+                            offenders.append(
+                                f"{rel}:{node.lineno}  {name} <- {fname}: raw .shape read")
 
     assert not offenders, (
         "a shape dim is read raw inside the compiled eviction:\n  "
         + "\n  ".join(offenders)
-        + "\n\nUnder `dynamic=True` that is a SymInt. If it reaches a scalar "
-          "context (torch.arange, a torch.where sentinel, a slice bound, a dict "
-          "key) Inductor's CUDA backend raises `The argument '((I)//8)' is not "
-          "compatible` and every perf cell ERRORs. Wrap it in `int()` -- free, "
-          "byte-identical, and no extra recompiles. Add the name to ALLOW only "
-          "if it is provably never used as a scalar (see `B`)."
+        + "\n\nUnder `dynamic=True` that is a SymInt, whether it came from "
+          "`t.shape[i]` or from a `a, b, c = t.shape` unpack. If it reaches a "
+          "scalar context (torch.arange, a torch.where sentinel, a slice bound, "
+          "a reshape extent, a dict key) Inductor's CUDA backend raises `The "
+          "argument '((I)//8)' is not comparable` and every perf cell ERRORs. "
+          "Wrap it in `int()` -- free, byte-identical, and no extra recompiles. "
+          "Add a name to that function's allow-set ONLY if it is the row axis "
+          "(see `B`), which is the one axis `dynamic=True` exists for."
     )

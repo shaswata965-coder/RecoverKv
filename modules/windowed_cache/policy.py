@@ -173,19 +173,14 @@ class EvictionPolicy:
             Shape ``[B, W_retained]``, window indices to keep.
         """
         B = window_scores.shape[0]
-        # CONCRETE, for the same reason `_evict_two_tier_impl` makes its copy of
-        # this exact value concrete (`cache.py`: ``W = int(...shape[2])``). This
-        # function runs INSIDE the compiled eviction, so off a ``.shape`` this is
-        # a SymInt under ``torch.compile``; ``evictable_w`` inherits it, and the
-        # compaction below needs it as a real length (``torch.arange``), not as a
-        # symbolic expression. Leaving it symbolic is what produced
-        # ``ValueError: The argument '((I)//8)' is not compatible`` — the window
-        # axis is a token count over ``window_size``, so the expression Inductor
-        # was handed was literally a floor division by ``ws``.
-        #
-        # This costs NO extra recompiles: `cache.py` already specializes on this
-        # same dim of this same tensor, so the guard exists either way. `B` is
-        # deliberately left symbolic — that is the one axis `dynamic=True` is for.
+        # CONCRETE for uniformity with :meth:`compute_two_tier_retain`, which
+        # needs it (``torch.arange`` bounds, ``min()``, slice bounds). NOT for
+        # the compiled eviction: this is the ``quant_ratio == 0`` single-tier
+        # path, reached only from ``cache.py``'s non-quantized branch, and the
+        # compiled body never calls it. ``014c40b`` patched this function
+        # believing it was the two-tier one and left the real ``((I)//8)``
+        # source — ``W`` in ``compute_two_tier_retain`` — raw; the ``int()``
+        # stays because it is free, the claim does not.
         W_total = int(window_scores.shape[2])
         device = window_scores.device
 
@@ -286,7 +281,23 @@ class EvictionPolicy:
             Shape ``[B, W_retained]`` — 0 = fp, 1 = Q, aligned with
             ``retained_idx``.
         """
-        B, _, W = window_scores.shape
+        # CONCRETE ``W``, symbolic ``B``. This is the root of the ``((I)//8)``
+        # lowering failure, and it hid behind a WHOLE-SHAPE TUPLE UNPACK: this
+        # function runs inside the compiled eviction, so under ``dynamic=True``
+        # every member of ``window_scores.shape`` is a SymInt, and ``W`` is the
+        # one that reaches SCALAR contexts — ``torch.arange``'s two bounds below,
+        # :meth:`tier_counts`'s three ``min()``s, and the slice bounds on
+        # ``mean``/``order``/``stable_partition``. Left symbolic, Inductor is
+        # handed an integer EXPRESSION for each; the window axis is a token count
+        # over ``window_size``, so it arrives as ``((I)//8)`` and the lowering
+        # dies with ``The argument '((I)//8)' is not comparable``.
+        #
+        # ``_evict_two_tier_impl`` forces this SAME dim of this SAME tensor two
+        # frames up (``W = int(state.window_scores.shape[2])``), so the guard
+        # exists either way and this costs ZERO extra recompiles. ``B`` stays
+        # symbolic on purpose — it is the one axis ``dynamic=True`` is for.
+        B = window_scores.shape[0]
+        W = int(window_scores.shape[2])
         device = window_scores.device
 
         k_fp, n_q, local_w = self.tier_counts(W)

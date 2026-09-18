@@ -273,7 +273,14 @@ class QuantizedStore:
             eviction never rebases positions.
         """
         self._invalidate()
-        B, n = slot_idx.shape
+        # ``n`` CONCRETE: this runs inside the compiled eviction and ``n`` is a
+        # reshape extent below (``B * n`` and ``[B, n, H, S, D]``), so a SymInt
+        # here becomes a symbolic ``i // n``-shaped index expression in the
+        # generated kernel. It is a ``_EVICT_WIDTH_LADDER`` rung, already
+        # specialized by the ``.item()`` in ``_evict_widths``, so forcing it
+        # costs no recompile. ``B`` stays symbolic.
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
         # Flatten (row, lane) into the quantizers' leading window axis. They
@@ -333,7 +340,14 @@ class QuantizedStore:
         position_ranges : ``[B, n, window]`` int64
         """
         self._invalidate()
-        B, n = slot_idx.shape
+        # ``n`` CONCRETE: this runs inside the compiled eviction and ``n`` is a
+        # reshape extent below (``B * n`` and ``[B, n, H, S, D]``), so a SymInt
+        # here becomes a symbolic ``i // n``-shaped index expression in the
+        # generated kernel. It is a ``_EVICT_WIDTH_LADDER`` rung, already
+        # specialized by the ``.item()`` in ``_evict_widths``, so forcing it
+        # costs no recompile. ``B`` stays symbolic.
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
         k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(slot_idx)

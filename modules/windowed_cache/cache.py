@@ -499,11 +499,20 @@ the "static" retry gets automatic-dynamic promoted straight back, so it re-raise
 the identical symbolic error). The message recorded below is the SECOND attempt's.
   The known causes are addressed at the source, and each has a named home:
     * a symbolic `((I)//ws)` guard -- every shape-derived value used as a SCALAR
-      is forced concrete with `int()`: `T_body`/`W` here, `W_total` in
+      is forced concrete with `int()`: `H_kv`/`T_fp`/`D`/`W` here, `W` in
       `policy.compute_two_tier_retain`, `n` in `compact.stable_partition`, `N` in
-      `QuantSlotTable.lookup`. A raw `.shape` read that reaches `torch.arange`,
-      a `torch.where` sentinel, a slice bound or a dict key is the bug; `B` is
-      the one axis deliberately left symbolic.
+      `QuantSlotTable.lookup`, `n` in `QuantizedStore.promote_many`/`demote_many`,
+      `H`/`D` in `sketch.build_sketch`. A raw `.shape` read that reaches
+      `torch.arange`, a `torch.where` sentinel, a slice bound, a reshape extent
+      or a dict key is the bug; `B` (and the flattened `B * n`) is the one axis
+      deliberately left symbolic. BOTH forms count -- `x = t.shape[i]` AND
+      `a, b, c = t.shape`. The unpack is how this failure survived `014c40b`:
+      that commit forced four subscript reads and named
+      `policy.compute_two_tier_retain` as fixed, but the `int()` landed on
+      `compute_retain_window_indices` (the `quant_ratio == 0` single-tier path,
+      which the compiled body never calls) while the real offender,
+      `B, _, W = window_scores.shape`, was an unpack and went unseen -- by the
+      patch and by the AST guard, which exempted unpacks by name.
     * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
   If it still fails, the traceback names the op that did not lower.
   To diagnose: the FULL Inductor traceback (which names the exact aten op /
@@ -2192,7 +2201,6 @@ class WindowedCache(_HFCacheBase):
         dtype = state.key_states.dtype
         device = state.key_states.device
 
-        B, H_kv, T_fp, D = state.key_states.shape
         # CONCRETE ints for the integer index arithmetic below — arange sizes,
         # window ranks, clamp bounds, and the ``//ws`` token→window map. Off a
         # tensor ``.shape`` these are Python ints in eager but SymInts under
@@ -2205,7 +2213,18 @@ class WindowedCache(_HFCacheBase):
         # compacts to the budget every ``ws`` steps, so this specializes to a
         # handful of shapes during the fill phase and is stable at steady state
         # (which is why the compiled body is worth its recompiles — design §5).
-        T_body = int(T_fp) - num_sink
+        #
+        # Read one dim at a time, NOT as ``B, H_kv, T_fp, D = ...shape``. An
+        # unpack of the whole shape is the same symbolic read wearing a different
+        # AST, and it is where the guard used to have a blind spot: the four
+        # ``int()``s ``014c40b`` added all went on ``x = t.shape[i]`` forms while
+        # the live offender — ``B, _, W = window_scores.shape`` in
+        # ``policy.compute_two_tier_retain`` — was an unpack and sailed through.
+        B = state.key_states.shape[0]
+        H_kv = int(state.key_states.shape[1])
+        T_fp = int(state.key_states.shape[2])
+        D = int(state.key_states.shape[3])
+        T_body = T_fp - num_sink
         W = int(state.window_scores.shape[2])
         # Eviction rewrites the Q tier AND compacts the fp store's positions, so
         # every memoized fused hand-off for this layer is stale. store.version
