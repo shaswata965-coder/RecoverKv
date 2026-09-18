@@ -356,6 +356,105 @@ it now lives in the module that defines the layout.
 
 ---
 
+## What the step is made of, and which of three proposals is worth it
+
+Measured on 2026-09-18 with a dispatch counter (launching ops only — `view`,
+`slice`, `expand` are metadata and are not a launch) and, separately, by bytes
+at a real head geometry (H=8, D=128, ws=8, N_q=276, one row, one layer).
+
+| | launching ops |
+|---|---|
+| steady decode step | **5** (the KV append; already minimal) |
+| eviction step | **186** (layer-major: once for all L, every `ws` steps) |
+
+So the eviction is ~82% of the cache's amortized launches, which is what the
+repo has said all along. By bytes, one eviction touches 27.7 MB:
+
+| MB | what | where |
+|---|---|---|
+| 8.3 | the RoPE table for the **whole** Q tier | `decode_kernel.py:185` |
+| 8.6 | the fp store rebuild + replace | `cache.py`, `state.py` |
+| 3.4 | the cards gather (8 fields) | `slots.py` |
+| 1.7 | the codes + grid gather (11 fields) | `slots.py` |
+
+**The largest single item is a redundant pass.** A Q window's positions are
+frozen for life (§5), so its `cos`/`sin` never change — yet the table is rebuilt
+for every active window at every eviction, when only the handful that entered
+the tier are new. The two gathers have the same shape of waste. Making the fused
+context *incremental* is worth more than any of the three proposals below and
+changes nothing about what the cache keeps; it is not done here because it is a
+kernel-visible change and this box has no GPU.
+
+Landed instead (`e9d4a2a`): `lookup` now walks its `[B, W, N]` match three times
+instead of six — 167 MB at B·L=1024, and it was reduced six ways and handed out
+for a seventh. ~500 MB of traffic and ~330 MB of peak transient per eviction.
+
+### The three proposals
+
+**1. Freeze the rank between evictions.** A frozen rank skips the score sort, the
+tier re-assignment and most of the id→slot resolution — but not sealing the new
+window, not the fp-store rebuild, and not the context rebuild, which are the
+expensive two-thirds. Optimistically ~30% of an eviction, and only on the frozen
+ones: at one re-rank in four that is ~2% of a decode step. It is also the only
+one of the three that **changes which windows the cache keeps**, so it cannot
+land without a LongBench run. Worst ratio of the three.
+
+**2. Only use cards for generation.** Measured on `two_tier_window_reference`
+(the CPU statement of the kernel, gated epilogue included), against the same
+function ungated — exact attention over the keys the cache holds:
+
+| read ratio | windows read | median rel err | p95 | B/head/window read |
+|---|---|---|---|---|
+| 1.00 | 96 | 0.0000 | 0.0000 | 1204 |
+| 0.50 | 48 | 0.0000 | 0.162 | 802 |
+| 0.25 (shipped) | 24 | 0.0001 | 0.575 | 601 |
+| 0.10 | 10 | 0.0063 | 0.942 | 483 |
+| 0.03 | 3 | 0.532 | 0.976 | 425 |
+| cards only (1) | 1 | **0.908** | 0.982 | 400 |
+
+A 0.9 relative error is an output unrelated to the truth. The cards are a
+**selector, not a substitute**: the epilogue's calibration is measured *on the
+windows that were read*, so with nothing read there is nothing to calibrate
+against, and a sum of centroids cannot represent variation inside a window. The
+fixture is pessimistic (its fp tier is 8 windows of 104, where production's holds
+the top-ranked ones), so the absolute numbers are a lower bound on quality — but
+the trend is the answer, and it is steep well before the cards-only end.
+
+**3. Simpler cards.** Same harness, same truth:
+
+| card | B/head | err @ 0.25 | err @ 1 window |
+|---|---|---|---|
+| shipped (mu, v, t, vbar int8) | 400 | 0.0001 | 0.908 |
+| drop `t` | 390 | **0.787** | 1.041 |
+| `mu` int4 | 336 | 0.0001 | 0.909 |
+| **`mu` + `vbar` int4** | **272** | **0.0001** | 0.910 |
+| `mu` int4, no `t` | 326 | 0.788 | 1.054 |
+
+**The smallest field in the card is the one that cannot go.** `t` is 10 bytes of
+400 and dropping it costs four orders of magnitude of accuracy — without the
+per-token projection the model is a centroid again, which is the failure the card
+was designed around. The two `D`-length vectors, which are 64% of the card, take
+int4 for nothing measurable: **400 → 272 B/head**, a window 9632 → 8608 B, i.e.
+**+12% more retained context at the same byte budget**, on top of the +21% the
+grid narrowing bought. It also cuts the gate's fixed cost by a third — the card
+is the one thing read for *every* window on *every* step, which is exactly what
+makes the 25% read buy only 25% of the bytes (§3).
+
+(The ablation simulates int4 by coarsening the existing int8 codes against the
+same scale; a real int4 encoder re-fits the scale to the narrower range, so these
+are conservative.)
+
+### Verdict
+
+**Do 3, skip 1 and 2.** It is the only one of the three that is accuracy-neutral
+as measured, it is a storage change rather than a policy change, and it lands on
+the memory axis — which is where the goal is winnable at all (§"Where that
+lands") and where KIVI and QEvict are strongest. 1 buys ~2% of a step for an
+accuracy risk that needs a GPU run to price. 2 is not a speed-versus-accuracy
+trade at all; it is a 0.9 relative error.
+
+---
+
 ## Two of the three baselines have never been run
 
 The goal names Flash, int2 KIVI and QEvict. Only Flash is measurable in this
