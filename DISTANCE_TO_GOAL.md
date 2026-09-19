@@ -1081,6 +1081,61 @@ Routing verified against six cases — happy path, bail-then-recover, bail-twice
 rescue-already-spent, lowering failure, OOM — confirming a bail never sets the
 sticky flag and that lowering/OOM behaviour is unchanged.
 
+### 10.11 Fourth run — the counter broke the sweep. Do not instrument this path.
+
+```
+BackendCompilerFailed: backend='_counting_inductor' raised:
+IndexError: list assignment index out of range
+```
+
+Every cell. The counting wrapper from §10.10 was wrong: the string `"inductor"`
+is **not** a bare call to `compile_fx`. It resolves through
+`torch._dynamo.backends.registry`, which supplies calling conventions a
+hand-rolled wrapper does not, and `compile_fx` writes back into the
+`example_inputs` list it is handed.
+
+**The number it existed to get was already free.** Dynamo publishes its graph
+tally in `torch._dynamo.utils.counters`, which `_dynamo_diagnosis` was *already*
+reading for `frames` — and which produced `{'total': 10, 'ok': 9}` in §10.9
+without any interference at all. The wrapper bought a number that cost nothing
+and paid for it with the whole sweep.
+
+The backend is removed. The tally now comes from `counters["stats"]`, read-only.
+
+**The standing rule this earns: do not instrument the eviction's compile path.
+Observe it from the counters.** Every intervention in that path this session has
+broken something new — four runs, four different failures. The path is load
+bearing and it is hostile to wrappers.
+
+One number did improve: TPOT at 4096/257 B=1 went 0.2162 → **0.1700**, which is
+the §10.10 recurrence gate and bail-retry taking effect. It is still ~3× the
+~0.055 that the eager eviction produced, which is the point §10.10 makes.
+
+### 10.12 Where this actually stands
+
+Four GPU runs, four failures, and the table still has one row. What is now
+established, and what it implies:
+
+1. **The eviction never compiled on this build** (§10.9) — so every decode number
+   in this document was measured eager, and `_EVICT_STATS` said "compiled"
+   throughout.
+2. **When it does compile, it recompiles per eviction** (§10.10) and costs
+   0.17–0.22 TPOT against eager's ~0.055.
+3. **The step is 97.2% GPU busy and kernel-bound** (§10.1). The compiled
+   eviction exists to collapse *launches*. If launches are not the bottleneck,
+   its premise is weak on this build — and it demonstrably costs compile time.
+
+Points 2 and 3 together are the uncomfortable conclusion: **on this build, at
+these shapes, the compiled eviction may not be worth having.** That is a
+design-level call, not a bug fix, and it contradicts "compiled unconditionally,
+one production path" — so it is recorded here rather than acted on.
+
+The measurement that decides the cheaper question — whether the recompiles are
+the cost — is one line in the next failure's diagnosis (`GRAPHS BUILT`). If it
+reads ~2× the eviction count, dropping the `int()` forcing on `T_fp` and `W`
+collapses them to one graph, and that is the fix. That change is still not
+shipped, for the reason given in §10.10.
+
 ---
 
 **None of 10.2–10.4 has been measured on a GPU, and the one run that tried made
