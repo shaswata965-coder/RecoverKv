@@ -972,8 +972,50 @@ eviction has never run for more than a handful of evictions in any recorded
 sweep. Reverting §10.2 restores those numbers — it does not restore their
 meaning.
 
-**Still open:** which of the three causes it is. The next run answers it from
-the error text alone.
+### 10.9 Resolved, second run — a torch default flipped under the code
+
+The diagnosis did its job on the first try. `table_v9`, 2026-09-19 09:30:
+
+```
+frames: {'total': 10, 'ok': 9}
+top graph breaks (CAUSE 3 if one of these is new):
+    9x  Could not guard on data-dependent expression u0 <= 0 (unhinted: u0 <= 0)
+Caused by: if need <= 0 or bound <= 0:   # cache.py:168 in _evict_widths
+```
+
+**CAUSE 3, and it was never about anything I changed.** `_evict_widths` reads
+three widths with one `.tolist()` and then branches on them. Its own docstring
+states the intended cost — *"that `.item()` costs one graph break in the
+compiled eviction — two Inductor graphs instead of one"* — and
+`tests/test_evict_graph_breaks.py:258` pins it down to the recorded message,
+*"Unsupported Tensor.item() call with `capture_scalar_outputs=False`"*.
+
+**`capture_scalar_outputs` has defaulted to `True` since torch 2.6.** Under it
+`.tolist()` stops graph-breaking and returns an *unbacked* symint; the branch
+becomes a guard on `u0 <= 0` that Dynamo cannot resolve; and Dynamo's response
+to an unresolvable guard is not a graph break — it abandons the frame and runs
+the whole eviction eager.
+
+So the eviction has been running eager on this torch build for as long as this
+build has been in use, and `_EVICT_STATS` reported "compiled" the entire time.
+§10.2's fix was necessary and insufficient: it removed a real specialisation
+blow-up, but the frame was being abandoned for a different reason underneath.
+
+**Why the config is the right fix and not a workaround.** The width is what
+`_compact` allocates with, and `_evict_widths` exists precisely to pay one host
+sync for a real integer — a width that is ever too small routes overflow to a
+dump column and silently drops work. A symbolic width cannot size that
+allocation without a guard, and the guard is the thing that cannot be resolved.
+The sync is the point; the break that comes with it is the designed structure.
+`_scalar_outputs_off` restores it as a **scoped** `config.patch` around the
+compiled callable, mirroring `_emulating_precision_casts` — nothing else the
+host compiles is affected.
+
+The diagnosis now recognises this failure by name, so if the patch ever stops
+reaching the trace it says so rather than re-deriving it.
+
+**What is still unmeasured:** whether a genuinely compiled eviction is faster.
+Every decode number in this document predates one.
 
 ---
 

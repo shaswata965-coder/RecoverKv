@@ -466,6 +466,57 @@ def _emulating_precision_casts(fn):
     return inductor_config.patch("emulate_precision_casts", True)(fn)
 
 
+def _scalar_outputs_off(fn):
+    """Wrap ``fn`` so ``.item()`` / ``.tolist()`` GRAPH-BREAK instead of going symbolic.
+
+    **This is the fix for the 2026-09-19 total outage, and it is a torch default
+    that flipped under code written for the other one.**
+
+    :func:`_evict_widths` reads three widths with one ``.tolist()`` and then
+    branches on them::
+
+        needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
+        ...
+        if need <= 0 or bound <= 0:
+
+    Its docstring states the intended cost out loud -- *"that .item() costs one
+    graph break in the compiled eviction -- two Inductor graphs instead of one"*
+    -- and ``tests/test_evict_graph_breaks.py`` was written against exactly that,
+    down to the recorded message ``Unsupported Tensor.item() call with
+    capture_scalar_outputs=False``.
+
+    Under ``capture_scalar_outputs=True`` -- **the default since torch 2.6** --
+    ``.tolist()`` stops breaking and returns an *unbacked* symint instead. The
+    branch above then becomes a guard on ``u0 <= 0`` that Dynamo cannot resolve,
+    and its response is not a graph break: it abandons the frame and runs the
+    whole eviction EAGER. Measured on the 2026-09-19 run::
+
+        frames: {'total': 10, 'ok': 9}
+        9x  Could not guard on data-dependent expression u0 <= 0
+        Caused by: if need <= 0 or bound <= 0:   # cache.py:168 in _evict_widths
+
+    **Capturing this scalar symbolically is not merely unhelpful, it is
+    incompatible with the design.** The width is what ``_compact`` allocates
+    with, and ``_evict_widths`` exists precisely to pay one host sync for a real
+    integer, because a width that is ever too small routes overflow to a dump
+    column and silently drops work. A symbolic width cannot size that allocation
+    without a guard, and the guard is the thing that cannot be resolved. So the
+    sync is the point, and the break that comes with it is the designed
+    structure -- not a wart to be optimised away by a config default.
+
+    Scoped, not global, mirroring :func:`_emulating_precision_casts`:
+    ``config.patch`` is entered per call and restores the process default on
+    exit, so nothing else the host compiles is affected.
+    """
+    try:
+        from torch._dynamo import config as dynamo_config
+    except Exception:  # pragma: no cover - no Dynamo on this build
+        return fn
+    if not hasattr(dynamo_config, "capture_scalar_outputs"):
+        return fn  # pragma: no cover - torch-version dependent
+    return dynamo_config.patch("capture_scalar_outputs", False)(fn)
+
+
 #: Dynamo graphs this one code object may hold before the recompile limit fires.
 #:
 #: The default is 8, and the eviction blew it: the body used to take ``layer_idx``
@@ -577,6 +628,17 @@ def _dynamo_diagnosis() -> str:
             top = sorted(breaks.items(), key=lambda kv: -kv[1])[:5]
             lines.append("  top graph breaks (CAUSE 3 if one of these is new):")
             lines.extend(f"      {n}x  {r}" for r, n in top)
+            # The one we have already diagnosed and fixed. If it is back, the
+            # scoped patch in `_scalar_outputs_off` is not reaching the trace.
+            if any("data-dependent" in r or "u0" in r for r, _ in top):
+                lines.append(
+                    "  !! a data-dependent guard is back. That is the KNOWN "
+                    "2026-09-19 outage: `_evict_widths` branches on a "
+                    "`.tolist()` width, which must GRAPH-BREAK. Check that "
+                    "`_scalar_outputs_off` is still wrapping the compiled "
+                    "callable and that capture_scalar_outputs reads False "
+                    "during the trace."
+                )
     except Exception as exc:  # pragma: no cover
         lines.append(f"  (dynamo counters unreadable: {type(exc).__name__}: {exc})")
 
@@ -598,8 +660,14 @@ def _build_compiled_evict(dynamic: bool):
     backend = None
     if backend is not None:
         kw["backend"] = backend
-    return _emulating_precision_casts(
-        torch.compile(WindowedCache._evict_two_tier_impl, **kw))
+    # Both wrappers are scoped `config.patch`es entered per call. `_scalar_
+    # outputs_off` is outermost because it governs DYNAMO (whether `.tolist()`
+    # breaks the graph at all) while `_emulating_precision_casts` governs
+    # INDUCTOR (how the resulting graphs lower), so the former has to be in
+    # effect while the latter's graphs are being traced.
+    return _scalar_outputs_off(
+        _emulating_precision_casts(
+            torch.compile(WindowedCache._evict_two_tier_impl, **kw)))
 
 
 _EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never silently runs the eager
