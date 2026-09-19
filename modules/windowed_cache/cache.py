@@ -763,8 +763,9 @@ the identical symbolic error). The message recorded below is the SECOND attempt'
       heuristics and can expose another (it did, twice).
     * `IndexError: list assignment index out of range` in
       `_functorch/_aot_autograd/runtime_wrappers.py::merge_view_inputs` --
-      **this is the one firing as of 2026-09-19, and it is an UPSTREAM bug, not
-      a lowering failure in the usual sense.** AOTAutograd builds "synthetic
+      **FIXED 2026-09-19 by moving the store write out of the graph; read this
+      before putting one back.** It is an UPSTREAM bug, not a lowering failure
+      in the usual sense. AOTAutograd builds "synthetic
       bases" when graph inputs are VIEWS ALIASING A COMMON BASE and at least one
       is mutated, and it mis-sizes `post_processed_calling_convention_meta`.
       This body is made of exactly that shape: `_LayerStateView` ->
@@ -775,12 +776,18 @@ the identical symbolic error). The message recorded below is the SECOND attempt'
       break -- so it is reachable only when that break exists, which is to say
       only when `capture_scalar_outputs` is False. With it True (the torch 2.6
       default) there is no break and Dynamo abandons the whole frame to eager
-      instead. **Both roads end at "not compiled", by two independent
-      mechanisms.** Two candidate fixes, neither attempted: (A) remove the break
-      -- compute the widths in the UNCOMPILED caller between two compiled
-      halves, so the sync happens in Python and no region carries a
-      data-dependent branch; (B) break the input aliasing that feeds the resumed
-      region. (A) is the correct structure and a substantial refactor.
+      instead. Both roads ended at "not compiled", by two independent
+      mechanisms.
+      **The fix was (B), and the aliasing pair is named exactly:**
+      `replace_body` does `_key_buf[:, :, num_sink:n] = body_key`, mutating the
+      BASE that `state.key_states` is a VIEW of -- and the region reads that
+      view, as `body_k`. Three such pairs (key / value / positions); the
+      `replace` branch is worse, reading `state.key_states` and reallocating in
+      one expression. Both now run in `_evict_two_tier`, outside the graph, and
+      the compiled body returns the compacted body instead of installing it.
+      **The invariant to keep: the compiled eviction may mutate the slot table
+      (separate allocations) but must never write a buffer it reads a view of.**
+      Putting such a write back re-breaks the build.
     * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
     * a symbolic scalar reaching `torch.arange`, a `torch.where` sentinel, a
       slice bound or a reshape extent. Still a real hazard class, just NOT the
@@ -853,7 +860,7 @@ def _cuda_oom_cause(exc: BaseException) -> Optional[BaseException]:
     return None
 
 
-def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
+def _run_compiled_evict(cache, state, store, policy, step: int):
     """Run one eviction through ``torch.compile``, or RAISE. Kernel-or-error: no
     eager fallback (a silent eager run under a compiled label defeats the whole
     measurement -- the design intent). On success ``cache`` is mutated in place
@@ -891,7 +898,7 @@ def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
     if _COMPILED_EVICT_FN is None:
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
     try:
-        out = _COMPILED_EVICT_FN(cache, state, store, policy, joint)
+        out = _COMPILED_EVICT_FN(cache, state, store, policy)
         _announce_evict_path_once(compiled=True)
         _EVICT_STATS["compiled"] += 1
         return out
@@ -914,7 +921,7 @@ def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
         import torch._dynamo as _td
         _td.reset()
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
-        out = _COMPILED_EVICT_FN(cache, state, store, policy, joint)
+        out = _COMPILED_EVICT_FN(cache, state, store, policy)
         _announce_evict_path_once(compiled=True)
         _EVICT_STATS["compiled"] += 1
         return out
@@ -954,7 +961,7 @@ def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
                 import torch._dynamo as _td
                 _td.reset()
                 _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=False)
-                out = _COMPILED_EVICT_FN(cache, state, store, policy, joint)
+                out = _COMPILED_EVICT_FN(cache, state, store, policy)
                 _announce_evict_path_once(compiled=True)
                 _EVICT_STATS["compiled"] += 1
                 return out
@@ -2495,10 +2502,14 @@ class WindowedCache(_HFCacheBase):
         scatter / quantize launches were never fused at all.
 
         So everything that needs the layer's identity happens HERE, outside the
-        graph: resolving the targets, dropping the stale fused hand-offs, and
-        recording telemetry. What the body gets is the objects themselves plus one
-        ``joint`` bool -- and that bool is a real branch (``replace_body`` versus
-        ``replace`` are different tensor ops), so it is worth its two graphs.
+        graph: resolving the targets, dropping the stale fused hand-offs,
+        installing the compacted body, and recording telemetry. What the body
+        gets is the three objects and nothing else.
+
+        **The ``joint`` bool went the same way, on 2026-09-19.** It selected
+        ``replace_body`` versus ``replace``, and both of those are now the
+        caller's -- so the body no longer branches on it at all, and dropping it
+        removes a specialisation axis: one graph per shape instead of two.
         """
         state, store, policy = self._evict_targets(layer_idx)
 
@@ -2515,15 +2526,53 @@ class WindowedCache(_HFCacheBase):
             self._fused_ctx[layer_idx] = None
 
         # Compiled-or-raise. No eager fallback by design.
-        scores_before, retained_idx = _run_compiled_evict(
-            self, state, store, policy, layer_idx is None, step)
+        joint = layer_idx is None
+        (scores_before, retained_idx,
+         new_k, new_v, new_pos, n_q) = _run_compiled_evict(
+            self, state, store, policy, step)
+
+        # --- install the compacted body, OUTSIDE the graph -------------------
+        # This is deliberately not in the compiled body: writing a buffer that
+        # the same graph reads a view of is what made it uncompilable (the
+        # `merge_view_inputs` IndexError -- see `_evict_two_tier_impl` step 4b
+        # and `_EVICT_COMPILE_HELP`). Three slice-assignments gain nothing from
+        # being traced.
+        num_sink = self.resolved.num_sink_tokens
+        if joint:
+            # Layer-major: the buffer is already at its steady capacity (the
+            # per-layer first eviction is what sized it), so the compacted body
+            # goes straight in behind the sink prefix, which the rebuild carried
+            # through byte-identically at the same offsets. That skips the three
+            # full-store `cat`s below — ~2.9 GB of transient at 4096/batch-32
+            # once the row axis carries all 32 layers — and the reallocation
+            # `replace` performs whenever the target size moves.
+            state.replace_body(num_sink, new_k, new_v, new_pos)
+        else:
+            # Per-layer: this IS the first eviction, where `replace`
+            # reallocating from the prompt capacity down to the budget is the
+            # point — it is what releases the prompt-sized buffer.
+            # `join`, not `torch.cat`: same tensor, but a cat is lowered through
+            # Inductor's `pointwise_cat` on CUDA, the single source of the
+            # `Identity` node behind the `((I)//8)` failure. Kept here even out
+            # of the graph so the two branches stay the same operation.
+            state.replace(
+                join(state.key_states[:, :, :num_sink, :], new_k, 2),
+                join(state.value_states[:, :, :num_sink, :], new_v, 2),
+                join(state.position_ids[:, :num_sink], new_pos, 1),
+            )
+
+        # Only now is `state.seq_length` the compacted length.
+        store.commit_active_count(n_q)
+        policy.set_total_after_compaction(
+            state.seq_length + store.num_active_tokens
+        )
 
         # Telemetry is per layer by contract and lives outside the graph for the
         # same reason as the rest of this method. It is also the one consumer of
         # the PRE-eviction score axis, which step 5 of the body overwrites -- so
         # the body hands the tensor back rather than recording it.
         if not isinstance(self.telemetry, NullTelemetry):
-            if layer_idx is None:
+            if joint:
                 self._record_joint_scores(step, scores_before, retained_idx)
             else:
                 self.telemetry.record_scores(
@@ -2532,23 +2581,27 @@ class WindowedCache(_HFCacheBase):
         return None
 
     def _evict_two_tier_impl(
-        self, state, store, policy, joint: bool
-    ) -> Tuple[Tensor, Tensor]:
+        self, state, store, policy
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]:
         """One two-tier eviction (design §5), per row, entirely on device.
 
         **This is the compiled body, and its whole parameter list is chosen so
         Dynamo builds ONE graph for it.** It takes the resolved
-        ``(state, store, policy)`` rather than a ``layer_idx`` that would index a
-        Python list, and it does not take ``step`` at all -- ``step`` was only
-        ever the telemetry argument, and an integer that increments every
-        eviction is an integer Dynamo can specialise on. Both are now the
-        caller's business; see :meth:`_evict_two_tier` for what that cost before.
+        ``(state, store, policy)`` and nothing else: no ``layer_idx`` (it would
+        index a Python list), no ``step`` (an integer that increments every
+        eviction is one Dynamo specialises on), and since 2026-09-19 no ``joint``
+        bool either, because the branch it selected now runs in the caller.
 
-        Returns the PRE-eviction ``window_scores`` and the retained merged-window
-        indices, which is what the caller records as telemetry. They are returned
-        rather than recorded here because step 5 below overwrites
-        ``state.window_scores``, so after this body runs the telemetry input no
-        longer exists.
+        **It is also pure with respect to the fp buffers**, which is what makes
+        it compilable at all -- see step 4b. It may mutate the slot table, whose
+        fields are separate allocations, but it never writes a buffer it has read
+        a view of.
+
+        Returns ``(scores_before, retained_idx, new_k, new_v, new_pos, n_q)``.
+        The first two are the caller's telemetry input, returned rather than
+        recorded here because step 5 overwrites ``state.window_scores``. The next
+        three are the compacted body for the caller to install. ``n_q`` is the
+        active-window count to commit once it has.
 
         **The row axis is opaque here**, which is what makes the layer-major
         decode path (§4.1) a change of caller rather than of body: every
@@ -2844,28 +2897,35 @@ class WindowedCache(_HFCacheBase):
                 tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
             )
 
-        if joint:
-            # Layer-major: the buffer is already at its steady capacity (the
-            # per-layer first eviction is what sized it), so the compacted body
-            # goes straight in behind the sink prefix, which this rebuild carries
-            # through byte-identically at the same offsets. That skips the three
-            # full-store `cat`s below — ~2.9 GB of transient at 4096/batch-32 once
-            # the row axis carries all 32 layers — and the reallocation `replace`
-            # performs whenever the target size moves.
-            state.replace_body(num_sink, new_k, new_v, new_pos)
-        else:
-            # Per-layer: this IS the first eviction, where `replace` reallocating
-            # from the prompt capacity down to the budget is the point — it is
-            # what releases the prompt-sized buffer.
-            # `join`, not `torch.cat`: same tensor, but a cat here is lowered
-            # through Inductor's `pointwise_cat` on CUDA, which is the single
-            # source of the `Identity` node behind the `((I)//8)` failure.
-            state.replace(
-                join(state.key_states[:, :, :num_sink, :], new_k, 2),
-                join(state.value_states[:, :, :num_sink, :], new_v, 2),
-                join(state.position_ids[:, :num_sink], new_pos, 1),
-            )
-
+        # --- 4b. The store write is the CALLER's, and that is the 2026-09-19
+        # fix. It used to happen right here, and it is what made this graph
+        # uncompilable:
+        #
+        #   `replace_body` does `self._key_buf[:, :, num_sink:n] = body_key`,
+        #   mutating the BASE that `state.key_states` is a VIEW of -- and this
+        #   region reads that view, as `body_k`. So Inductor lifted both the
+        #   base and the view as graph inputs with the base mutated, which is
+        #   exactly the shape AOTAutograd builds "synthetic bases" for, and
+        #   `merge_view_inputs` mis-sizes its metadata list on it:
+        #
+        #       _aot_autograd/runtime_wrappers.py:1442 in merge_view_inputs
+        #           post_processed_calling_convention_meta[k] = v
+        #       IndexError: list assignment index out of range
+        #
+        # Three aliasing pairs, all mutated: key/value/positions. The `replace`
+        # branch is worse -- it reads `state.key_states` AND reallocates the
+        # buffer in the same expression.
+        #
+        # So the compiled region now ends as pure compute: it RETURNS the
+        # compacted body and touches no buffer it has read a view of. Three
+        # slice-assignments have nothing to gain from being in a graph anyway,
+        # and `replace_body`'s own aliasing assertion is a host check that only
+        # really runs out here.
+        #
+        # **The invariant this establishes, and the one to keep:** the compiled
+        # eviction may mutate the slot table (separate allocations, no aliasing)
+        # but must never write a buffer it reads a view of. Adding such a write
+        # back into this region re-breaks the build.
         # --- 5. Gather scores + ids to the retained merged axis -------------
         # Only an `expand` size below, which tolerates a SymInt -- but `H_q` is
         # the model's query-head count and never varies within a run, so making
@@ -2882,11 +2942,10 @@ class WindowedCache(_HFCacheBase):
         ).contiguous()
 
         # --- 6. Commit counts; policy total tracks T_fp + T_q ---------------
-        store.commit_active_count(n_q)
-        policy.set_total_after_compaction(
-            state.seq_length + store.num_active_tokens
-        )
-        return scores_before, retained_idx
+        # `commit_active_count` and `set_total_after_compaction` move out with
+        # the write: the latter reads `state.seq_length`, which only becomes
+        # correct once the caller has installed the compacted body.
+        return scores_before, retained_idx, new_k, new_v, new_pos, n_q
 
     def reorder_cache(self, beam_idx: Tensor) -> None:
         """Beam search is out of scope (v1)."""

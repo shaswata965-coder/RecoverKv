@@ -1165,15 +1165,51 @@ is caused by anything in this branch.** §10.9's patch only moved which one
 fires. The stickiness is now *correct*: this is a genuine build property, so
 cells 2–6 refusing is the designed behaviour working as intended.
 
-Two candidate fixes, **neither attempted**:
+### The fix, 2026-09-19 — the aliasing pair, named exactly
 
-- **(A) Remove the break.** Compute the widths in the *uncompiled* caller,
-  between two compiled halves, so the host sync happens in Python and no region
-  carries a data-dependent branch. This is the correct structure — it makes
-  explicit what the graph break does implicitly — and it is a substantial
-  refactor of a 300-line body.
-- **(B) Break the input aliasing** feeding the resumed region. Smaller, but
-  which views to detach is not knowable without running it.
+`state.replace_body` does:
+
+```python
+self._key_buf[:, :, num_sink:n] = body_key
+```
+
+It **mutates the base that `state.key_states` is a view of** — and the same
+region reads that view, as `body_k = state.key_states[:, :, num_sink:, :]`.
+Three such pairs (key / value / positions). The `replace` branch is worse still:
+it reads `state.key_states` *and* reallocates the buffer in one expression.
+
+That is the synthetic-base pattern verbatim, so this was candidate (B), and it
+did not need guessing which views to detach — the traceback named the call and
+the buffer write is the only mutation of an aliased base in the region.
+
+**The compiled body is now pure with respect to the fp buffers.** It returns
+`(scores_before, retained_idx, new_k, new_v, new_pos, n_q)`; `_evict_two_tier`
+installs the compacted body, commits the active count, and sets the policy total
+— all outside the graph. Three slice-assignments gain nothing from being traced,
+and `replace_body`'s own aliasing assertion is a host check that only really runs
+out there.
+
+**Two things fell out of it.** The `joint` bool selected `replace_body` versus
+`replace`; with both in the caller the body no longer branches on it, so the
+parameter is gone and with it a specialisation axis — **one graph per shape
+instead of two**. And the body now takes exactly `(self, state, store, policy)`:
+no `layer_idx`, no `step`, no `joint`.
+
+**The invariant this establishes**, recorded in `_EVICT_COMPILE_HELP` and beside
+the code: *the compiled eviction may mutate the slot table — whose fields are
+separate allocations — but must never write a buffer it reads a view of.*
+Putting such a write back re-breaks the build.
+
+Verified here at AST level (no GPU): the body's signature is exactly those four
+arguments; `layer_idx`, `step` and `joint` appear in no live `Name` node;
+`.replace_body`, `.replace`, `.telemetry`, `.commit_active_count` and
+`.set_total_after_compaction` are called nowhere in it; the caller performs every
+one of them; and the body's 6-tuple return matches the caller's unpack. What is
+**not** verified is that it compiles — that needs the GPU.
+
+**The graph break stays.** It is the designed structure (`_evict_widths` pays one
+host sync for a real integer) and `tests/test_evict_graph_breaks.py` pins it. It
+was never the bug; it only decided which region the aliasing blew up in.
 
 ### Where five runs leave this
 
