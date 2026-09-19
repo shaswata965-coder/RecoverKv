@@ -1,5 +1,30 @@
 # RecoverKv — working notes for Claude
 
+## The branch rule
+
+**`int2_clustered_rep` is the working branch. Every command, every measurement
+and every analysis happens on it.** It is not the repository's configured
+GitHub default — that is still `quant_batched_fixed_int2_eviction`, an
+abandoned Sep-9 line — and the mismatch is a live trap: a stale local ref
+pointing at the *old* `int2_clustered_rep` (an unrelated Sep-14 history where
+the gate has **zero non-test callers**) reads as a plausible checkout and
+produces confident, wrong analysis of code that is not this code.
+
+So before quoting anything, check you are on the branch AND that the branch is
+current:
+
+```bash
+git branch --show-current                  # expect: int2_clustered_rep
+git fetch origin int2_clustered_rep
+git rev-list --left-right --count int2_clustered_rep...origin/int2_clustered_rep
+```
+
+A nonzero right-hand number means your ref is behind and anything you conclude
+from the tree may describe a different codebase. The cheapest positive check
+that you are on the right line is the gate reachability grep below: on this
+branch it returns `flash_decode.py`, and on the abandoned line it returns
+nothing.
+
 `DISTANCE_TO_GOAL.md` is the live status document. Read it before proposing any
 decode work; it holds the current numbers and what is measured vs. argued. This
 file holds the things that are easy to get wrong *while* reading it.

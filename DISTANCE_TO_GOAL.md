@@ -1569,3 +1569,150 @@ things worse before §10.8's fixes.** They are a silent-fallback
 repair and two searches replacing two assumptions; the searches cannot be wrong
 about which rung is faster, but whether a faster rung *exists* is exactly what no
 one has ever asked the hardware.
+
+---
+
+## 11. What we are testing next, and the goal *(2026-09-19, later)*
+
+§10 is the record of seven runs. This section is the opposite: the two things
+that are **not** established, the runs that settle them, and the number we are
+trying to move. Nothing here is a result.
+
+### 11.1 The goal: 1.2× on the decode step
+
+Against §10.1's profile at 4096/B=32 — **44.41 ms/step of kernels, 45.69 ms
+wall, 97.2% GPU busy** — the target is **37.0 ms/step**, i.e. −7.4 ms. Three
+items get there, and all three are measured or derived from measured
+quantities. None needs a kernel rewrite:
+
+| # | change | Δ ms | cumulative | status |
+|---|---|---|---|---|
+| 0 | tile tuning (§10.14) | −4.45 | 1.11× | **already in the tree** |
+| 1 | `_FIT_LADDER` reorder → untuned geometries | −2.10 | 1.17× | not started |
+| 2 | the compiled eviction stops costing | −1.5 … −2.0 | **1.22×** | run 11.2 first |
+
+**Item 0 is banked and currently invisible.** A later profile of the same cell
+measured decode 17.74 → **14.48** ms and the gate 3.63 → **2.44** ms, with the
+model's GEMMs flat. The tile search works. It does not show up in TPOT because
+of item 1.
+
+**Item 1 is §10.14's missing 4.7 points, and the cause is now named.**
+`_first_fit` returns the first rung that *fits*, and `_FIT_LADDER`'s first entry
+is `(64,2,4)` — measured **9th of 11**, 1.45× slower than the winner `(32,2,4)`.
+Its docstring says *"ordering therefore no longer carries meaning — every entry
+is timed"*; that is true for tuned geometries and false for every untuned one,
+which is exactly the population §10.14 fingered. Two independent profiles
+corroborate: the profiler, whose single signature gets tuned, sees a **10%**
+step win; the perf table, full of untuned signatures, sees **1.4%**.
+
+This is **not** `_LAST_WINNER` (§10.15), which exported a runtime per-geometry
+winner and cost 12%. A static reorder keeps the whole ladder walk and only
+changes which rung is tried first. §10.15 still earns the caution, so it needs
+the matched-pair control — free, since both runs publish every rung.
+
+Beyond 1.2×: the decode kernel is still **11.1× off roofline** (14.48 vs 1.30
+ms). §6.2 is unchanged as the main event; 1.5× there is another −4.8 ms, or
+~1.40× overall.
+
+### 11.2 Run 1 — is the compiled eviction worth anything?
+
+It is the one perf-affecting change in this repo that has **never had a control
+arm** (§10.0.4, §10.12, §10.14 each say so). It now has one. Two commands, one
+flag apart, **two `OUT_DIR`s** — the npz is named
+`perf_prefill{P}_gen{G}_bs{B}.npz`, shape and batch only, so one directory per
+arm or the second overwrites the first:
+
+```bash
+# shipped
+CUDA_VISIBLE_DEVICES=0 OUT_DIR=outputs/table_v10_compiled bash scripts/run_perf_table.sh \
+  --model /path/to/llama-3.1-8b-instruct \
+  --shapes "4096/256 1048/1048 2048/512" --batches "1 32" \
+  --data-source wikitext-103 --throughput all \
+  --cooldown 3 --clock-lock true --evict-control-arm false
+
+# control arm
+CUDA_VISIBLE_DEVICES=0 OUT_DIR=outputs/table_v10_controlarm bash scripts/run_perf_table.sh \
+  --model /path/to/llama-3.1-8b-instruct \
+  --shapes "4096/256 1048/1048 2048/512" --batches "1 32" \
+  --data-source wikitext-103 --throughput all \
+  --cooldown 3 --clock-lock true --evict-control-arm true
+```
+
+Every row records `path_mode` (`compiled` / `control-arm-eager`), so an arm run
+can never be filed as a shipped run.
+
+| outcome | reading | what follows |
+|---|---|---|
+| eager ≤ compiled | the compile buys nothing — what §10.14 already implies, and what a 97.2%-busy step predicts | delete the path; item 2 is free |
+| compiled < eager | it pays | keep it and bound its recompiles (§10.10: `T_fp`, `W`) |
+
+Prior: v8 (eager evict) 0.0570 against v9 (compiled evict) 0.0589 at the
+headline cell says eager is ~3.3% ahead. This is the run that makes that
+attributable rather than confounded with the tile search.
+
+`--cooldown 3 --clock-lock true` means these rows are **not** cell-by-cell
+comparable to `table_v9`, which was taken without them. A vs B remain
+comparable to each other, which is the comparison that matters.
+
+### 11.3 Run 2 — the profile, per arm
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python scripts/profile_decode.py \
+  --config outputs/table_v10_compiled/_perf_table.generated.yaml \
+  --prefill 4096 --batch 32 --steps 24 --warmup 12 --top 40 --compile-evict 1
+# ... and --compile-evict 0 against the control-arm directory
+```
+
+Read it in this order:
+
+1. **`GPU busy`.** If it prints `!! IMPOSSIBLE`, stop — kernel self time cannot
+   exceed the wall on one stream, so a non-kernel event is in the numerator and
+   no bucket below is trustworthy. The script now refuses a verdict there
+   instead of printing one.
+2. **`COMPILATION INSIDE THE MEASURED WINDOW`.** If present, that profile is not
+   a steady-state step and its ms/step are an average of the step and the
+   compiler. Expected absent on the control arm by construction.
+3. **`eviction:`** — `N compiled`, or `CONTROL ARM -- N eager run(s)`.
+4. **Wall ms/step, A vs B.** That is the compiled eviction's price.
+
+### 11.4 What made this necessary
+
+A profile of this exact cell came back at **525.81 ms/step** against §10.1's
+45.69, reporting `GPU busy 203.9%` and the verdict *"KERNEL-BOUND … the kernels
+themselves are slow"*. Busy above 100% is impossible on one stream, and that was
+the tell: `gpu_us` was counting things that are not kernels.
+
+* **The ATen operator view.** `key_averages()` returns the op *and* the kernels
+  it launched, both carrying self device time.
+* **Compilation ranges.** `dynamo_timed` wraps compiles in a `record_function`
+  whose self device time is the CUDA time of everything nested inside it. Five
+  such rows summed to **726.8 ms/step**, three of them with **n < 1 launch in
+  the whole window** — a kernel with no launches cannot have time.
+
+Strip them: 345.1 ms/step of real kernels over a 525.81 ms wall = **65.6%
+busy**, i.e. a ~180 ms/step host gap sitting in `cudaDeviceSynchronize` (196.37
+ms/step) from the autotuner. The opposite conclusion to the one printed — and
+the kernels, the thing the verdict pointed at, were the only part that had got
+*faster*.
+
+Both over-counts are now filtered, an impossible `busy` refuses a verdict, and
+compile ranges are reported separately rather than silently dropped — excluding
+them without saying so would have removed the symptom and kept the disease.
+
+**Still not fixed, and stated in the code:** nothing bounds the eviction's
+recompiles. `T_fp` and `W` (`cache.py:2695`, `:2698`) are `int()`-forced, so they
+specialise **even under `dynamic=True`**, and neither is on a ladder the way
+`_EVICT_WIDTH_LADDER` already puts the widths. §10.10 named this and §10.14
+marked it refuted on `unique_graphs: 0` — both readings are right, because they
+measured different regimes: a 512-step perf cell settles, a 60-step profile
+never does. If run 11.2 keeps the compiled path, this is the next fix.
+
+### 11.5 The order, and why not to reverse it
+
+1. **Run 11.2.** Cheapest, and it either deletes a moving part or justifies one.
+2. **Item 1, the ladder reorder** — the largest measured-but-unclaimed win.
+3. **Then §6.2**, contiguous reads, which is where the rest is.
+
+Do not start at 3. It is the biggest number on the page and the only one that
+needs a kernel rewrite to collect, and the two cheaper items above it are
+already paid for.
