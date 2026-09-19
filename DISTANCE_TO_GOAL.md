@@ -1298,6 +1298,56 @@ rule — *every perf-affecting change gets a control arm, and a claim is stated
 against it* — is the thing it has never had. Giving it one is the honest next
 step, and it is a design decision, not a bug fix.
 
+### 10.15 `_LAST_WINNER` cost 12% and is reverted
+
+The seventh run, with §10.14's prior-seeded default as the only change:
+
+| cell | v9 | with `_LAST_WINNER` | Δ |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0553 | 0.0614 | +11.0% |
+| 4096/257 B=32 | 0.0589 | 0.0655 | +11.2% |
+| 2048/513 B=1 | 0.0557 | 0.0620 | +11.3% |
+| 2048/513 B=32 | 0.0561 | 0.0634 | +13.0% |
+| 1048/1049 B=1 | 0.0551 | 0.0616 | +11.8% |
+| 1048/1049 B=32 | 0.0562 | 0.0635 | +13.0% |
+
+**The paired rung timings are what make this attributable**, and they are worth
+keeping as a technique — both runs publish the whole ladder, so every rung is a
+matched pair at a fixed geometry:
+
+| | median drift, run to run |
+|---|---|
+| decode rungs (11 paired) | **−0.7%** |
+| gate rungs (8 paired) | +7.6% |
+| TTFT (6 cells) | −1.2% … +6.0% |
+
+So the decode kernel is **identical** between the runs and prefill is
+**unchanged** — the machine and the model path are fine. Nothing that gets
+*printed* moved, and yet the step slowed 12%. The only quantity that can move
+without appearing in any printed number is the rung used at geometries the
+search never tuned, which is exactly and only what `_LAST_WINNER` changed.
+
+**The reasoning behind it was wrong**, and the run says so directly. It assumed
+a rung selects "the occupancy / iteration-count trade for this kernel on this
+card, which moves with the hardware, not with the window count." If that were
+true, exporting one geometry's winner everywhere would be free. It is not: the
+trade evidently **does** move with the geometry — which is the whole reason the
+search is keyed per signature in the first place. Seeding one geometry's answer
+across all of them contradicts the premise of the thing it was trying to help.
+
+Reverted. The ladder walk is the default again for an untuned geometry: it takes
+a rung known to be mediocre at the tuned geometry (9th of 11 there), but
+mediocre-and-local beats good-somewhere-else, and 12% is the price of the
+difference.
+
+**What stands:** per-signature tuning (§10.14's 31% and 5% are real, measured at
+their own geometries) and `_TUNE_AFTER`. **What does not:** extrapolating a
+winner across geometries.
+
+The gate's +7.6% across all eight rungs is unexplained and is not this change —
+it is a kernel timing at a fixed config. Worth watching; ~8% of the step, so
+~0.6 points of the 12.
+
 ### Where five runs leave this
 
 | run | result |
