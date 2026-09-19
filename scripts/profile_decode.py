@@ -61,6 +61,131 @@ def _self_device_us(ev) -> float:
     return 0.0
 
 
+#: Substrings that mark a PROFILER RANGE rather than a kernel.
+#:
+#: `torch._dynamo.utils.dynamo_timed` opens a `record_function` range around
+#: compilation, and those ranges come back carrying CUDA self time -- a range's
+#: self device time is the CUDA time of everything nested inside it. Counting
+#: them alongside the kernels they enclose double-counts those kernels.
+#:
+#: Observed on a 2026-09-19 A100 profile at 4096/B=32: five such rows summed to
+#: 726.824 ms/step, three of them with **n < 1 launch in the whole window** (a
+#: kernel with no launches cannot have time -- that is the tell). They pushed
+#: `GPU busy` to 203.9%, which is impossible on one stream, and the script then
+#: printed "KERNEL-BOUND ... the kernels themselves are slow" for a step whose
+#: kernels were in fact the only thing that had got faster.
+#:
+#: Kernels launched *inside* one of these ranges are unaffected: they appear
+#: under their own names as their own rows and are still counted. Only the
+#: enclosing range is dropped.
+_NON_KERNEL_MARKERS = (
+    "(dynamo_timed)",           # every row observed on that profile
+    "CachingAutotuner",         # ... and the individual names, in case the
+    "compile_fx",               #     "(dynamo_timed)" suffix ever changes
+    "create_aot_dispatcher",
+    "compile_inner",
+    "_recursive_",
+    "Torch-Compiled Region",
+    "TorchDynamo Cache Lookup",
+    "CompiledFunction",
+    "AOTAutograd",
+    "dynamo",
+    "inductor",
+)
+
+
+def _is_compile_range(ev) -> bool:
+    """True for a compilation / autotuning profiler range (see
+    :data:`_NON_KERNEL_MARKERS`)."""
+    return any(m in str(ev.key) for m in _NON_KERNEL_MARKERS)
+
+
+def _is_device_event(ev) -> bool:
+    """True for a CUDA KERNEL event; false for the ATen op that launched it.
+
+    ``key_averages()`` returns BOTH views, and both carry self device time. A
+    leaf op's self device time IS the time of the kernels it launched, and those
+    kernels then report it again under their own names. Summing the lot
+    double-counts every kernel in the step -- which is what ``gpu_us`` did here:
+    it summed every event unconditionally, so ``CUDA kernels``, ``kernel
+    launches`` and therefore the ``GPU busy %`` this script exists to report
+    were all inflated by close to 2x.
+
+    ``device_type`` is the real signal. The name check is a fallback for a build
+    that does not expose it: the operator view is namespaced (``aten::``,
+    ``autograd::``), device events are not. Memcpy/Memset are device events and
+    are deliberately NOT excluded by it.
+    """
+    # FIRST, and ahead of device_type: a compilation range is never a kernel,
+    # whatever the profiler tags it as. On the build that produced the profile
+    # above these ranges passed the device-type arm.
+    if _is_compile_range(ev):
+        return False
+    dt = getattr(ev, "device_type", None)
+    if dt is not None:
+        try:
+            from torch.autograd import DeviceType
+            return dt == DeviceType.CUDA
+        except Exception:  # pragma: no cover - torch-version dependent
+            pass
+    return not str(ev.key).startswith(
+        ("aten::", "autograd::", "torch::", "nn.Module", "Optimizer",
+         "ProfilerStep", "cudaLaunch", "cudaMemcpy", "cudaStream",
+         "cudaDevice", "cudaEvent", "cudaHost"))
+
+
+def _dynamo_counters() -> dict:
+    """Dynamo's own compile tally, or ``{}``. Read-only, no side effects."""
+    try:
+        from torch._dynamo.utils import counters
+        return {k: int(v) for k, v in dict(counters.get("stats", {})).items()}
+    except Exception:  # pragma: no cover - torch-version dependent
+        return {}
+
+
+def _print_compile_contamination(evs, wall_us: float, n: int) -> None:
+    """Say, out loud, if COMPILATION happened inside the measured window.
+
+    Excluding the ranges from the kernel totals without reporting them would
+    remove the symptom and keep the disease: a window in which Inductor is still
+    compiling and autotuning is ~10x slower than a steady step and would
+    otherwise carry no line saying why.
+
+    The signature to recognise:
+      * `CachingAutotuner.benchmark_all_configs` ranges at all;
+      * `Memcpy DtoD` and `cudaMemcpyAsync` at hundreds per step -- Inductor
+        cloning mutated arguments between benchmark repetitions;
+      * a `cudaDeviceSynchronize` per repetition.
+
+    The eviction fires once per `window_size` steps, so a short warmup holds
+    only one or two of them. If a NEW graph is built per eviction, no warmup
+    length absorbs it and the recompile axis is the bug, not the warmup.
+    """
+    ranges = [(_self_device_us(e), e.count, e.key)
+              for e in evs if _is_compile_range(e) and _self_device_us(e) > 0]
+    counters = _dynamo_counters()
+    if not ranges and not counters:
+        return
+    print("\n  -- COMPILATION INSIDE THE MEASURED WINDOW " + "-" * 31)
+    if counters:
+        print(f"  dynamo/inductor counters: {counters}")
+    if ranges:
+        total = sum(us for us, _, _ in ranges)
+        print(f"  compile/autotune ranges:  {total / n / 1000:.2f} ms/step "
+              f"across {len(ranges)} range(s), EXCLUDED from the totals above.")
+        for us, cnt, key in sorted(ranges, reverse=True)[:6]:
+            print(f"      {us / n / 1000:8.3f} ms/step  n={cnt / n:7.1f}  "
+                  f"{str(key)[:52]}")
+        print(f"  -> THIS PROFILE IS NOT A STEADY-STATE STEP. Compilation is "
+              f"~{total / max(wall_us, 1.0) * 100:.0f}% of the wall,\n"
+              "     so every ms/step above is an average of the step and the "
+              "compiler.\n"
+              "     Do NOT quote it. Before reaching for --warmup: if a new "
+              "graph is built\n"
+              "     per eviction, no warmup is long enough and the recompile "
+              "axis is the bug.")
+
+
 def _perf_cell_quant(cfg) -> float:
     """quant_ratio as the benchmarked cell sets it (perf.configs[0] first)."""
     try:
@@ -176,8 +301,17 @@ def main() -> None:
         hooks.remove()
 
     evs = prof.key_averages()
-    gpu_us = sum(_self_device_us(e) for e in evs)
-    n_launch = sum(e.count for e in evs if _self_device_us(e) > 0)
+    # KERNELS ONLY. This used to sum every event, which counted each kernel
+    # twice (once under its own name, once under the aten:: op that launched
+    # it) and counted compilation ranges as kernels on top. See
+    # _is_device_event / _NON_KERNEL_MARKERS.
+    kernels = [e for e in evs if _is_device_event(e) and _self_device_us(e) > 0]
+    gpu_us = sum(_self_device_us(e) for e in kernels)
+    n_launch = sum(e.count for e in kernels)
+    # The same work seen from the operator side. Reported, never added.
+    op_us = sum(_self_device_us(e) for e in evs
+                if not _is_device_event(e) and not _is_compile_range(e)
+                and _self_device_us(e) > 0)
 
     # Host-side stalls. A sync does not cost a launch's ~5 us -- it drains the
     # queue, so it converts every downstream launch's CPU cost from hidden to
@@ -196,10 +330,37 @@ def main() -> None:
     print("=" * 74)
     print(f"  wall            {wall_us / n / 1000:8.2f} ms/step")
     print(f"  CUDA kernels    {gpu_us / n / 1000:8.2f} ms/step")
+    if op_us > 0:
+        print(f"  (ATen op view   {op_us / n / 1000:8.2f} ms/step  -- the same "
+              "kernels seen from\n                            the operator "
+              "side. NOT added: key_averages()\n                            "
+              "returns both, and summing them double-counts.)")
     busy = gpu_us / max(wall_us, 1.0)
     print(f"  GPU busy        {busy * 100:8.1f} %   <-- THE number")
+    # NOTE: `wall_us` is the PROFILED wall, so this UNDER-reads -- CPU+CUDA
+    # activity tracing costs tens of microseconds per launch and all of it
+    # lands in the denominator. A mixed step can therefore read as host-bound
+    # here. Treat `busy` as a lower bound until this times an unprofiled window
+    # separately.
     print(f"  kernel launches {n_launch / n:8.0f} /step")
-    if busy < 0.5:
+    # A verdict is only printed when the number it rests on is POSSIBLE. Kernel
+    # self time cannot exceed wall time on one stream, so busy > 100% does not
+    # mean "very busy" -- it means something that is not a kernel is in the
+    # numerator, and every number below inherits the error.
+    if busy > 1.0:
+        print("  -> !! IMPOSSIBLE: kernel self time EXCEEDS the wall. One "
+              "stream cannot be\n"
+              "        more than 100% busy, so a non-kernel event is being "
+              "counted as a\n"
+              "        kernel and NOTHING below can be trusted. Check the rows "
+              "with\n"
+              "        near-zero launches (n~0.0) in the top-N list -- a range "
+              "carries the\n"
+              "        CUDA time of everything nested in it. Add the offender "
+              "to\n"
+              "        _NON_KERNEL_MARKERS. No host/kernel verdict for this "
+              "run.")
+    elif busy < 0.5:
         print("  -> HOST-BOUND. The GPU idles most of the step; launches and "
               "syncs are the budget.")
     elif busy > 0.85:
@@ -208,6 +369,8 @@ def main() -> None:
     else:
         print("  -> MIXED. Both terms are real; fix the larger one first.")
 
+    _print_compile_contamination(evs, wall_us, n)
+
     if syncs:
         print("\n  host stalls (each drains the queue and exposes downstream "
               "launch cost):")
@@ -215,7 +378,8 @@ def main() -> None:
             print(f"    {k:<32} {c / n:7.1f} /step   {us / n / 1000:7.2f} ms/step")
 
     print(f"\n  top {args.top} kernels by CUDA self time:")
-    ranked = sorted(((e, _self_device_us(e)) for e in evs), key=lambda r: -r[1])
+    ranked = sorted(((e, _self_device_us(e)) for e in kernels),
+                    key=lambda r: -r[1])
     for e, us in ranked[:args.top]:
         if us <= 0:
             break
