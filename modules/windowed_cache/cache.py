@@ -696,18 +696,17 @@ def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
     _raise_dynamo_cache_limit()
-    # NO custom backend. A counting wrapper around `compile_fx` was tried on
-    # 2026-09-19 and broke every cell with
-    # `BackendCompilerFailed: backend='_counting_inductor' raised:
-    #  IndexError: list assignment index out of range`.
-    # The string "inductor" is not a bare call to `compile_fx`: it resolves
-    # through `torch._dynamo.backends.registry`, which supplies calling
-    # conventions a hand-rolled wrapper does not. The graph count it was there
-    # to get is already published read-only in `torch._dynamo.utils.counters`
-    # (see `_dynamo_diagnosis`), so the wrapper bought a number that was free
-    # and paid for it with the whole sweep.
+    # NO custom backend -- but NOT for the reason first recorded here. A counting
+    # wrapper around `compile_fx` was tried on 2026-09-19 and the sweep failed
+    # with `IndexError: list assignment index out of range`; that was blamed on
+    # the wrapper. **It was not the wrapper.** The next run, with the wrapper
+    # removed, raised the identical error under stock `backend='inductor'`. The
+    # cause is `merge_view_inputs` (see `_EVICT_COMPILE_HELP`).
     #
-    # **Do not instrument this call path.** Observe it from the counters.
+    # The wrapper is still gone, on its own merits: the graph count it existed
+    # to collect is already published read-only in `torch._dynamo.utils.counters`
+    # (see `_dynamo_diagnosis`), so it bought a free number and added a moving
+    # part to the one path in this repo that cannot afford one.
     kw: Dict[str, Any] = {"dynamic": dynamic}
     # Both wrappers are scoped `config.patch`es entered per call. `_scalar_
     # outputs_off` is outermost because it governs DYNAMO (whether `.tolist()`
@@ -762,6 +761,26 @@ the identical symbolic error). The message recorded below is the SECOND attempt'
       this graph, which is what makes the failure impossible rather than
       unlikely; it asserts ZERO because removing one cat changes the fusion
       heuristics and can expose another (it did, twice).
+    * `IndexError: list assignment index out of range` in
+      `_functorch/_aot_autograd/runtime_wrappers.py::merge_view_inputs` --
+      **this is the one firing as of 2026-09-19, and it is an UPSTREAM bug, not
+      a lowering failure in the usual sense.** AOTAutograd builds "synthetic
+      bases" when graph inputs are VIEWS ALIASING A COMMON BASE and at least one
+      is mutated, and it mis-sizes `post_processed_calling_convention_meta`.
+      This body is made of exactly that shape: `_LayerStateView` ->
+      `joint.key_states` -> `_key_buf`, plus the `body_k` / `body_v` /
+      `body_pos` slices of the same buffer.
+      It fires in the RESUMED region (`torch_dynamo_resume_in_..._at_2701`, at
+      `store.demote_many`), i.e. the half created by `_evict_widths`' `.tolist()`
+      break -- so it is reachable only when that break exists, which is to say
+      only when `capture_scalar_outputs` is False. With it True (the torch 2.6
+      default) there is no break and Dynamo abandons the whole frame to eager
+      instead. **Both roads end at "not compiled", by two independent
+      mechanisms.** Two candidate fixes, neither attempted: (A) remove the break
+      -- compute the widths in the UNCOMPILED caller between two compiled
+      halves, so the sync happens in Python and no region carries a
+      data-dependent branch; (B) break the input aliasing that feeds the resumed
+      region. (A) is the correct structure and a substantial refactor.
     * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
     * a symbolic scalar reaching `torch.arange`, a `torch.where` sentinel, a
       slice bound or a reshape extent. Still a real hazard class, just NOT the

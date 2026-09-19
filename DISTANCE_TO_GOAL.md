@@ -1081,31 +1081,25 @@ Routing verified against six cases — happy path, bail-then-recover, bail-twice
 rescue-already-spent, lowering failure, OOM — confirming a bail never sets the
 sticky flag and that lowering/OOM behaviour is unchanged.
 
-### 10.11 Fourth run — the counter broke the sweep. Do not instrument this path.
+### 10.11 Fourth run — I blamed the counter. **It was not the counter.**
 
 ```
 BackendCompilerFailed: backend='_counting_inductor' raised:
 IndexError: list assignment index out of range
 ```
 
-Every cell. The counting wrapper from §10.10 was wrong: the string `"inductor"`
-is **not** a bare call to `compile_fx`. It resolves through
-`torch._dynamo.backends.registry`, which supplies calling conventions a
-hand-rolled wrapper does not, and `compile_fx` writes back into the
-`example_inputs` list it is handed.
+Every cell. I concluded the counting wrapper from §10.10 was at fault, removed
+it, and wrote a standing rule on that basis.
 
-**The number it existed to get was already free.** Dynamo publishes its graph
-tally in `torch._dynamo.utils.counters`, which `_dynamo_diagnosis` was *already*
-reading for `frames` — and which produced `{'total': 10, 'ok': 9}` in §10.9
-without any interference at all. The wrapper bought a number that cost nothing
-and paid for it with the whole sweep.
+**The fifth run raised the identical error under stock `backend='inductor'`.**
+The wrapper was never the cause, the rule was not earned, and both are corrected
+here — §10.13 has what it actually is.
 
-The backend is removed. The tally now comes from `counters["stats"]`, read-only.
-
-**The standing rule this earns: do not instrument the eviction's compile path.
-Observe it from the counters.** Every intervention in that path this session has
-broken something new — four runs, four different failures. The path is load
-bearing and it is hostile to wrappers.
+Removing the wrapper was still right, on its own merits: the graph tally it
+existed to collect is already published read-only in
+`torch._dynamo.utils.counters`, which `_dynamo_diagnosis` was *already* reading
+for `frames`. It bought a free number and added a moving part to a path that
+cannot afford one. The tally now comes from `counters["stats"]`.
 
 One number did improve: TPOT at 4096/257 B=1 went 0.2162 → **0.1700**, which is
 the §10.10 recurrence gate and bail-retry taking effect. It is still ~3× the
@@ -1135,6 +1129,78 @@ the cost — is one line in the next failure's diagnosis (`GRAPHS BUILT`). If it
 reads ~2× the eviction count, dropping the `int()` forcing on `T_fp` and `W`
 collapses them to one graph, and that is the fix. That change is still not
 shipped, for the reason given in §10.10.
+
+---
+
+## 10.13 The eviction is not compilable on this build, by two independent routes
+
+The fifth run's full traceback, under **stock** `backend='inductor'`:
+
+```
+cache.py:2757 in torch_dynamo_resume_in__evict_two_tier_impl_at_2701
+    store.demote_many(
+  _aot_autograd/runtime_wrappers.py:1023 in pre_compile
+    flat_args_with_synthetic_bases, synthetic_base_info = merge_view_inputs(
+  _aot_autograd/runtime_wrappers.py:1442 in merge_view_inputs
+    post_processed_calling_convention_meta[k] = v
+IndexError: list assignment index out of range
+```
+
+This is an **upstream AOTAutograd bug**. It builds "synthetic bases" when graph
+inputs are views aliasing a common base and at least one is mutated, and
+mis-sizes its metadata list. This body is made of precisely that shape:
+`_LayerStateView` → `joint.key_states` → `_key_buf`, plus the `body_k` /
+`body_v` / `body_pos` slices of the same buffer.
+
+**It fires only in the RESUMED region** — the half created by `_evict_widths`'
+`.tolist()` break. Which closes the loop on §10.9:
+
+| `capture_scalar_outputs` | what happens |
+|---|---|
+| `True` (torch 2.6 default) | no break; Dynamo abandons the whole frame → **eager** |
+| `False` (§10.9's patch) | break; region 2 → `merge_view_inputs` → **IndexError** |
+
+**Both roads end at "not compiled", by two independent mechanisms, and neither
+is caused by anything in this branch.** §10.9's patch only moved which one
+fires. The stickiness is now *correct*: this is a genuine build property, so
+cells 2–6 refusing is the designed behaviour working as intended.
+
+Two candidate fixes, **neither attempted**:
+
+- **(A) Remove the break.** Compute the widths in the *uncompiled* caller,
+  between two compiled halves, so the host sync happens in Python and no region
+  carries a data-dependent branch. This is the correct structure — it makes
+  explicit what the graph break does implicitly — and it is a substantial
+  refactor of a 300-line body.
+- **(B) Break the input aliasing** feeding the resumed region. Smaller, but
+  which views to detach is not knowable without running it.
+
+### Where five runs leave this
+
+| run | result |
+|---|---|
+| 1–2 | eager bail, no table |
+| 3 | eager bail at B=32; TPOT 0.2162 |
+| 4 | wrapper blamed, wrongly; TPOT 0.1700 |
+| 5 | same error under stock inductor; TPOT 0.2037 |
+
+The one row that prints is 3–4× *slower* than the eager baseline, because the
+compiled path pays recompiles it never amortises (§10.10).
+
+Three established facts now point one way:
+
+1. the eviction has **never** compiled on this build (§10.9, §10.13);
+2. when forced toward compiling, it costs 0.17–0.22 TPOT against eager's ~0.055
+   (§10.10);
+3. the step is **97.2% GPU busy and kernel-bound** (§10.1), so the launch
+   collapsing the compiled eviction exists to buy is not the bottleneck.
+
+**This is now a design question, not a bug.** "Compiled unconditionally, one
+production path, no fallbacks" is a deliberate stance, and on this build it
+yields a total outage in service of an optimisation the profile says is not
+needed. Changing it means saying so openly and renaming the counters that
+currently claim "compiled" — it is not something to do quietly, and it is not
+mine to decide.
 
 ---
 
