@@ -1122,6 +1122,10 @@ _FIT_TIMINGS: dict = {}
 
 _FIT_ANNOUNCED: set = set()
 
+#: How many times each signature has been seen, so a geometry is only tuned once
+#: it has proved it will recur (:data:`_TUNE_AFTER`).
+_FIT_SEEN: dict = {}
+
 
 def fit_choice() -> dict:
     """``{sig: rung}`` -- the tile rung chosen per geometry. A copy.
@@ -1161,6 +1165,27 @@ def fit_timings() -> dict:
 _TUNE_WARMUP = 1
 _TUNE_ITERS = 3
 
+#: How many times a geometry must RECUR before it is worth timing.
+#:
+#: The first version of this searched on a signature's first sight, and that was
+#: measured wrong on 2026-09-19: at 4096/B=1 it took TPOT to 0.1917. The cause is
+#: that a decode run does not hold one geometry. The Q tier fills at one window
+#: per ``ws`` steps, so ``n_sel`` climbs across the whole run, and the perf
+#: runner itself warns when a cell is shorter than the fill ("needs ~744 steps
+#: ... and this cell runs 512"). Every signature change was a fresh 12-rung
+#: search, i.e. up to 12 Triton JIT compiles, landing INSIDE the measured window.
+#: Before the search existed only one rung was ever compiled per geometry, so
+#: this was a pure regression of my own making.
+#:
+#: Requiring recurrence fixes both halves. A fill-phase geometry is seen once and
+#: never tuned -- it takes the first rung that fits, exactly the old cost. A
+#: steady-state geometry recurs every step, so it is tuned once and the winner
+#: serves the rest of the run. It also tunes at a REPRESENTATIVE point: tuning on
+#: first sight measured the rungs at ``n_sel = 1``, where every rung runs one
+#: Q-tier iteration and the comparison is dominated by the fp body -- a tuning
+#: point that says nothing about the loop being tuned.
+_TUNE_AFTER = 3
+
 
 def _time_launch(launch, warmup: int = _TUNE_WARMUP,
                  iters: int = _TUNE_ITERS) -> float:
@@ -1192,7 +1217,36 @@ def _time_launch(launch, warmup: int = _TUNE_WARMUP,
     return float(start.elapsed_time(end)) / max(iters, 1)
 
 
-def _search_rungs(choice: dict, timed: dict, announced: set, sig,
+def _first_fit(ladder, launch, label: str, sig, key=None):
+    """Launch the first rung that fits, compiling nothing else. The old policy.
+
+    This is what a geometry gets until it has proved it will recur
+    (:data:`_TUNE_AFTER`). It is not a fallback -- it is the cheap arm of the
+    search, and it exists because compiling twelve rungs for a shape that is
+    about to change is strictly worse than compiling one.
+    """
+    seen_keys = set()
+    last: Optional[BaseException] = None
+    for rung in ladder:
+        k = rung if key is None else key(rung)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        try:
+            launch(rung)
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            last = exc
+            continue
+        return rung
+    raise RuntimeError(
+        f"{label}: no tile fits in shared memory at any rung. Tried "
+        f"{ladder} for sig={sig}. Last error: {last}"
+    )
+
+
+def _search_rungs(choice: dict, timed: dict, announced: set, seen: dict, sig,
                   ladder, launch, label: str, key=None):
     """Time every rung that fits; cache and return the fastest. Once per ``sig``.
 
@@ -1232,6 +1286,12 @@ def _search_rungs(choice: dict, timed: dict, announced: set, sig,
         launch(known)
         return known
 
+    # Only time a geometry that has proved it will recur -- see _TUNE_AFTER.
+    n = seen.get(sig, 0) + 1
+    seen[sig] = n
+    if n < _TUNE_AFTER:
+        return _first_fit(ladder, launch, label, sig, key)
+
     timings = []
     seen = set()
     last: Optional[BaseException] = None
@@ -1265,8 +1325,8 @@ def _search_rungs(choice: dict, timed: dict, announced: set, sig,
             f"{r}={ms:.3f}ms" for r, ms in sorted(timings, key=lambda t: t[1])
         )
         print(f"[StickyKV] {label} tuned sig={sig} -> {best} "
-              f"({len(timings)}/{len(ladder)} rungs timed; the rest did not fit "
-              f"or duplicate one that did) | {ranked}")
+              f"(after {n} sightings; {len(timings)}/{len(ladder)} rungs timed, "
+              f"the rest did not fit or duplicate one that did) | {ranked}")
     return best
 
 
@@ -1535,8 +1595,8 @@ def _decode_triton(
         )
 
     _search_rungs(
-        _FIT_CHOICE, _FIT_TIMINGS, _FIT_ANNOUNCED, sig, _FIT_LADDER, _launch,
-        "fused decode tiling",
+        _FIT_CHOICE, _FIT_TIMINGS, _FIT_ANNOUNCED, _FIT_SEEN, sig, _FIT_LADDER,
+        _launch, "fused decode tiling",
         key=lambda r: (window_tiling(ws, r[0]),
                        _pow2_at_least(min(W_phys, r[0]), floor=16), r[1], r[2]),
     )

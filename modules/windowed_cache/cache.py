@@ -484,24 +484,110 @@ def _emulating_precision_casts(fn):
 _EVICT_CACHE_SIZE_LIMIT = 64
 
 
+#: The recompile-limit config names Dynamo has used across versions. Both the
+#: per-code-object limit and the process-wide accumulated one matter, and both
+#: have been renamed, so every spelling is tried and the ones that exist are read
+#: back into the diagnosis.
+_DYNAMO_LIMIT_NAMES = (
+    "cache_size_limit", "accumulated_cache_size_limit",
+    "recompile_limit", "accumulated_recompile_limit",
+)
+
+
 def _raise_dynamo_cache_limit() -> None:
     """Give the eviction's code object room for its shape specialisations.
 
-    Idempotent and cheap; called from :func:`_build_compiled_evict` rather than at
-    import so a process that never evicts never touches Dynamo's config.
+    Idempotent and cheap; called before every compiled eviction rather than once
+    at build, because a `torch._dynamo.reset()` or another library's
+    `config.patch` can put a limit back between evictions and the cost of
+    re-checking is four attribute reads.
+
+    **Only ever raised, never lowered** -- a caller that deliberately set a
+    higher limit keeps it, and Dynamo's `accumulated_*` limits default to 256,
+    well above ours.
     """
     import torch._dynamo as _td
 
     # `hasattr` first: `torch._dynamo.config` is a ConfigModule that rejects
-    # unknown names, and the two limits have been renamed across versions. Only
-    # ever raised, never lowered, so a caller that deliberately set a higher one
-    # keeps it.
-    for name in ("cache_size_limit", "accumulated_cache_size_limit",
-                 "recompile_limit", "accumulated_recompile_limit"):
+    # unknown names.
+    for name in _DYNAMO_LIMIT_NAMES:
         if not hasattr(_td.config, name):
             continue
         if getattr(_td.config, name) < _EVICT_CACHE_SIZE_LIMIT:
             setattr(_td.config, name, _EVICT_CACHE_SIZE_LIMIT)
+
+
+def _dynamo_diagnosis() -> str:
+    """Dynamo's own state, read at the moment an eviction ran eager.
+
+    This exists because the first version of the eager check named three
+    possible causes and gave the reader no way to tell which. That cost a whole
+    GPU run: the failure said "one of these three" and the evidence needed to
+    choose was sitting in `torch._dynamo` the entire time. A diagnostic that
+    names a suspect list is not a diagnostic.
+
+    Everything here is read defensively -- this runs on a path that is already
+    failing, and a diagnosis that raises while diagnosing is worse than none.
+    """
+    lines = []
+    try:
+        import torch._dynamo as _td
+
+        limits = {n: getattr(_td.config, n, None) for n in _DYNAMO_LIMIT_NAMES}
+        lines.append(
+            "  limits now: "
+            + ", ".join(f"{n}={v}" for n, v in limits.items() if v is not None)
+            + f"   (this module raises them to {_EVICT_CACHE_SIZE_LIMIT})"
+        )
+        # If a limit reads BELOW ours, `_raise_dynamo_cache_limit` did not take
+        # -- a different config object, a ConfigModule that ignored the write, or
+        # something lowered it afterwards. That is cause 1 and it is now provable
+        # rather than inferred.
+        low = [n for n, v in limits.items()
+               if v is not None and v < _EVICT_CACHE_SIZE_LIMIT]
+        if low:
+            lines.append(
+                f"  !! {low} read BELOW {_EVICT_CACHE_SIZE_LIMIT}: the raise did "
+                "not take. THIS IS CAUSE 1 and it is a bug in "
+                "_raise_dynamo_cache_limit, not in your run."
+            )
+        for flag in ("disable", "suppress_errors"):
+            v = getattr(_td.config, flag, None)
+            if v:
+                lines.append(f"  !! torch._dynamo.config.{flag}={v}  <- CAUSE 2")
+    except Exception as exc:  # pragma: no cover - diagnosis must not raise
+        lines.append(f"  (dynamo config unreadable: {type(exc).__name__}: {exc})")
+
+    try:
+        import os as _os
+        for env in ("TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE"):
+            if _os.environ.get(env):
+                lines.append(f"  !! {env}={_os.environ[env]}  <- CAUSE 2")
+    except Exception:  # pragma: no cover
+        pass
+
+    try:
+        from torch._dynamo.utils import counters as _counters
+
+        frames = dict(_counters.get("frames", {}))
+        if frames:
+            lines.append(f"  frames: {frames}   (ok << total means Dynamo bailed)")
+        breaks = _counters.get("graph_break", {})
+        if breaks:
+            top = sorted(breaks.items(), key=lambda kv: -kv[1])[:5]
+            lines.append("  top graph breaks (CAUSE 3 if one of these is new):")
+            lines.extend(f"      {n}x  {r}" for r, n in top)
+    except Exception as exc:  # pragma: no cover
+        lines.append(f"  (dynamo counters unreadable: {type(exc).__name__}: {exc})")
+
+    lines.append(
+        f"  evictions compiled before this one: {_EVICT_STATS['compiled']}. "
+        "If that is large and this is the first failure, the graph count grew "
+        "with the SHAPES -- the body forces int() on W and T_fp, which move at "
+        "every eviction until the Q tier stops filling, so a run that never "
+        "reaches steady state mints a graph per eviction."
+    )
+    return "\n".join(lines)
 
 
 def _build_compiled_evict(dynamic: bool):
@@ -661,6 +747,11 @@ def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
             f"build ({_EVICT_COMPILE_FAILED}); refusing the eviction at decode "
             f"step {step}.\n" + _EVICT_COMPILE_HELP
         )
+    # Before EVERY call, not only at build: a `torch._dynamo.reset()` (this
+    # function performs one on the static retry) or another library's
+    # `config.patch` can put a limit back between evictions, and re-checking is
+    # four attribute reads against a body that runs once per `ws` steps.
+    _raise_dynamo_cache_limit()
     if _COMPILED_EVICT_FN is None:
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
     try:
@@ -2342,8 +2433,9 @@ class WindowedCache(_HFCacheBase):
                 "the two-tier eviction ran EAGER. It is compiled-or-error by "
                 "design: the compiled body exists to fuse ~360 pointwise / "
                 "gather / scatter / quantize launches into a handful of kernels, "
-                "and an eager run reports eager numbers under a compiled label. "
-                "Dynamo fell back without raising, which it does for exactly "
+                "and an eager run reports eager numbers under a compiled label.\n"
+                "\nWHAT DYNAMO SAYS, RIGHT NOW:\n" + _dynamo_diagnosis() + "\n"
+                "\nDynamo fell back without raising, which it does for exactly "
                 "three reasons:\n"
                 "  1. the recompile limit -- look for 'torch._dynamo hit "
                 "config.cache_size_limit' in the log, then find what is "

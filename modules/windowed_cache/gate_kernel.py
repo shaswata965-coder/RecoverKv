@@ -164,6 +164,7 @@ def _sorted_pick(top: Tensor) -> Tensor:
 _GATE_CHOICE: dict = {}
 _GATE_TIMINGS: dict = {}
 _GATE_ANNOUNCED: set = set()
+_GATE_SEEN: dict = {}
 
 
 def gate_choice() -> dict:
@@ -372,8 +373,8 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     # and an exact key costs no extra searches while a bucketed one could serve a
     # tile chosen for a tier 40% larger.
     sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV))
-    _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, sig, ladder,
-                  _launch, "read gate tiling")
+    _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, _GATE_SEEN,
+                  sig, ladder, _launch, "read gate tiling")
     # `est` already carries the group max, so this is a bare top-k. Sorted
     # ascending -- free to the result, not free to the memory system; the whole
     # argument is in `_sorted_pick`.

@@ -918,7 +918,67 @@ plainly because it is the only thing here that is not byte-identical:
    That is the first honest measurement of what the compiled eviction is worth —
    every previous one measured the eager chain.
 
-**None of 10.2–10.4 has been measured on a GPU.** They are a silent-fallback
+### 10.8 The first GPU run, 2026-09-19 — it broke the table (`table_v9`)
+
+Reported honestly because §10.7 said what to check and the answer was "worse".
+
+| cell | result |
+|---|---|
+| 4096/257 B=1 | ran. **TPOT 0.1917** |
+| 4096/257 B=32 | `RuntimeError: the two-tier eviction ran EAGER` at decode step 48 |
+| everything after | sticky "already failed on this build" |
+
+The gate was fine throughout — `ran on all 24576 fused layers, realised read
+fraction 0.251`.
+
+**Two separate faults, both introduced by §10.2–10.4.**
+
+**(a) The tile search fired during the fill phase, and that is the 0.1917.** The
+signature carried `n_sel.bit_length()`, and a decode run does not hold one
+geometry: the Q tier fills at one window per `ws` steps, and the perf runner
+warns in this very log that the cell is shorter than the fill (*"needs ~744
+steps ... and this cell runs 512"*). So `n_sel` climbed across the whole run,
+the signature changed roughly five times **inside the measured window**, and
+each change ran a fresh 12-rung timed search — up to twelve Triton JIT compiles
+per change. Before the search existed, exactly one rung was compiled per
+geometry. This was a pure self-inflicted regression, and it also tuned at
+`n_sel = 1`, where every rung runs one Q-tier iteration and the comparison says
+nothing about the loop being tuned.
+
+**Fixed by `_TUNE_AFTER`: a geometry is only timed once it has been seen three
+times.** A fill-phase shape is seen once and takes the first rung that fits —
+exactly the old cost. A steady-state shape recurs every step, so it is tuned
+once, at a representative point, and the winner serves the rest of the run.
+
+**(b) The eviction still ran eager, and the error could not say why.** The check
+named three causes and gave no way to choose between them — which cost this
+entire run. The failure timing rules out the obvious reading: the B=1 cell
+survived ~32 distinct fill-phase shapes, so the limit raise to 64 *did* take
+effect, and the B=32 cell then failed at its **7th** eviction. A simple
+"limit is still 8" cannot produce both.
+
+**Fixed by making the error carry Dynamo's own state** (`_dynamo_diagnosis`):
+the live limits and whether our raise actually took (cause 1, now *provable*
+rather than inferred), `config.disable` / `TORCHDYNAMO_DISABLE` (cause 2), and
+the top graph-break reasons with frame counts (cause 3). Verified against four
+stubbed states — healthy flags nothing, each cause is named — and it cannot
+raise while diagnosing. The limit is also now re-applied before **every**
+compiled eviction, not once at build, since the static retry performs a
+`torch._dynamo.reset()` in between.
+
+**What this run did establish, and it matters:** every decode number in this
+document up to `table_v8` was measured with an **eager** eviction. The compiled
+eviction has never run for more than a handful of evictions in any recorded
+sweep. Reverting §10.2 restores those numbers — it does not restore their
+meaning.
+
+**Still open:** which of the three causes it is. The next run answers it from
+the error text alone.
+
+---
+
+**None of 10.2–10.4 has been measured on a GPU, and the one run that tried made
+things worse before §10.8's fixes.** They are a silent-fallback
 repair and two searches replacing two assumptions; the searches cannot be wrong
 about which rung is faster, but whether a faster rung *exists* is exactly what no
 one has ever asked the hardware.
