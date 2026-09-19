@@ -1217,14 +1217,45 @@ def _time_launch(launch, warmup: int = _TUNE_WARMUP,
     return float(start.elapsed_time(end)) / max(iters, 1)
 
 
+#: The most recent TUNED rung per kernel, used as the default for a geometry
+#: that has not earned a search yet.
+#:
+#: This exists because the 2026-09-19 run measured what "first fit" actually
+#: picks, and it is bad: at the headline geometry the ladder's top rung came
+#: **9th of 11**, 1.45x slower than the winner (0.351 ms vs 0.242 ms per layer).
+#: Before that run the ordering was an argument; now it is a measurement, and
+#: walking the ladder from the top is walking towards the wrong end.
+#:
+#: A tuned winner from a NEARBY geometry is a far better prior than the top of
+#: the ladder, because what the rung is really choosing is the occupancy /
+#: iteration-count trade for this kernel on this card -- which moves with the
+#: hardware, not with the window count. If it does not fit at the new geometry
+#: it raises ``OutOfResources`` and the ladder walk proceeds as before, so this
+#: can only change which rung is tried FIRST.
+_LAST_WINNER: dict = {}
+
+
 def _first_fit(ladder, launch, label: str, sig, key=None):
-    """Launch the first rung that fits, compiling nothing else. The old policy.
+    """Launch the best rung available without compiling the whole ladder.
 
     This is what a geometry gets until it has proved it will recur
     (:data:`_TUNE_AFTER`). It is not a fallback -- it is the cheap arm of the
     search, and it exists because compiling twelve rungs for a shape that is
     about to change is strictly worse than compiling one.
+
+    It tries :data:`_LAST_WINNER` first and the ladder afterwards. See that
+    constant for why the ladder's own order is the wrong prior.
     """
+    prior = _LAST_WINNER.get(label)
+    if prior is not None:
+        try:
+            launch(prior)
+            return prior
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            # Does not fit at this geometry; fall through to the ladder.
+
     seen_keys = set()
     last: Optional[BaseException] = None
     for rung in ladder:
@@ -1318,6 +1349,8 @@ def _search_rungs(choice: dict, timed: dict, announced: set, seen: dict, sig,
     best = min(timings, key=lambda t: t[1])[0]
     choice[sig] = best
     timed[sig] = sorted(timings, key=lambda t: t[1])
+    # The prior for every geometry of this kernel that has not earned a search.
+    _LAST_WINNER[label] = best
     launch(best)
     if sig not in announced:
         announced.add(sig)

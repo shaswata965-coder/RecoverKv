@@ -1211,6 +1211,93 @@ one of them; and the body's 6-tuple return matches the caller's unpack. What is
 host sync for a real integer) and `tests/test_evict_graph_breaks.py` pins it. It
 was never the bug; it only decided which region the aliasing blew up in.
 
+---
+
+## 10.14 The table ran. Two findings, one of them against me.
+
+Sixth run, `table_v9`, all six cells:
+
+| cell | v8 TPOT (eager evict, untuned tile) | now | Δ |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0545 | 0.0553 | +1.5% |
+| **4096/257 B=32** | **0.0570** | **0.0589** | **+3.3%** |
+| 2048/513 B=1 | 0.0550 | 0.0557 | +1.3% |
+| **2048/513 B=32** | **0.0569** | **0.0561** | **−1.4%** |
+| 1048/1049 B=1 | 0.0546 | 0.0551 | +0.9% |
+| 1048/1049 B=32 | 0.0562 | 0.0562 | 0.0% |
+
+A wash. But the two instrumented lines underneath it are not.
+
+### §10.10's "recompile storm" is REFUTED
+
+```
+eviction path: {'eager': 0, 'compiled': 285}
+dynamo: {'graph_breaks': 0, 'frames_total': 0, 'frames_ok': 0, 'unique_graphs': 0}
+```
+
+`perf_runner` zeroes those counters **after warmup**, so they measure the
+measured window only. All four are zero. The eviction is **fully fused — not one
+graph break — with zero recompiles inside the timings.**
+
+So §10.10's diagnosis was wrong. There was no recompile storm; the 0.17–0.22
+TPOT of runs 3–5 was compilation churning against a broken build, not a steady
+state. **The compiled eviction, working exactly as designed, is worth nothing
+measurable** — which is what §10.1's 97.2% GPU-busy reading predicted, because
+collapsing launches cannot help a step that is kernel-bound.
+
+### The tile search works, and first-fit was picking the 9th-best rung
+
+```
+fused decode tiling tuned -> (32, 2, 4)
+  (32,2,4)=0.242  (32,1,4)=0.281  (64,2,8)=0.301  (64,1,4)=0.303  (16,2,4)=0.303
+  (64,1,8)=0.329  (32,2,8)=0.332  (32,1,8)=0.335  (64,2,4)=0.351  (16,*,8)=0.41
+read gate tiling tuned -> (16, 4)
+  (16,4)=0.076  (16,8)=0.079  (32,8)=0.079  (32,4)=0.080  ...  (128,4)=0.102
+```
+
+**`(64, 2, 4)` — the rung first-fit always took — came 9th of 11, 1.45× slower
+than the winner.** §10.3 predicted exactly this (the top rung is the one whose
+~128 KB of staged operands leaves one block per SM) and the ladder's own
+docstring had called its ordering an assertion. It was, and it was wrong.
+
+The gate's derived heuristic came 4th of 8; the winner is 5% better.
+
+### Why the win did not reach TPOT — and the leak it exposes
+
+At 2048/B=32, 0.351 → 0.242 ms/layer is 3.49 ms of a 56.9 ms step: **6.1%
+available, 1.4% observed.** ~4.7 points missing.
+
+**Only one decode signature was announced as tuned in that cell.** A signature
+must recur `_TUNE_AFTER` times to earn a search, and every step on a signature
+that has not runs `_first_fit` — which walks the ladder from the top and lands
+on `(64, 2, 4)`, now measured as the 9th-best rung.
+
+So the fix: **`_LAST_WINNER` — an untuned geometry now starts from the best rung
+already measured for that kernel, not from the top of the ladder.** What a rung
+really selects is the occupancy / iteration-count trade for this kernel on this
+card, which moves with the hardware, not with the window count, so a nearby
+tuned winner is a far better prior than a position in a hand-ordered list. If it
+does not fit at the new geometry it raises `OutOfResources` and the ladder walk
+proceeds exactly as before — this can only change which rung is tried *first*.
+
+Verified against a stub seeded with this run's real measurements: a tuned
+geometry still costs one dict hit and one launch; a brand-new geometry takes the
+prior in one launch instead of the ladder's 1.45×-slower top; a prior that does
+not fit falls through; and a different kernel does not inherit it.
+
+### Where that leaves the two changes
+
+| change | verdict |
+|---|---|
+| **Measured tile rungs** | **works** — 31% off the decode kernel, 5% off the gate, both measured. Worth more once `_LAST_WINNER` extends it to untuned geometries. |
+| **Compiled eviction** | **buys nothing** — fully fused, zero recompiles, TPOT unchanged. Consistent with a kernel-bound step. |
+
+The compiled eviction still has **no control arm**, which is why it went this
+long without anyone knowing it neither ran nor paid. The repo's own standing
+rule — *every perf-affecting change gets a control arm, and a claim is stated
+against it* — is the thing it has never had. Giving it one is the honest next
+step, and it is a design decision, not a bug fix.
+
 ### Where five runs leave this
 
 | run | result |
