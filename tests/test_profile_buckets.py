@@ -155,6 +155,11 @@ def test_aten_ops_are_not_counted_as_kernels():
 
 def test_device_type_wins_over_the_name_when_torch_exposes_it():
     """The name check is a fallback. A device event keeps its name whatever it is."""
+    # SKIP, not fail, where torch is absent. This box has no torch and no GPU by
+    # contract (CLAUDE.md: "Triton cannot run on this dev box"), and a red bar
+    # that only means "wrong machine" is what made the suite unusable as a
+    # regression net. Where torch exists this runs exactly as before.
+    pytest.importorskip("torch")
     from torch.autograd import DeviceType
 
     from profile_decode import _is_device_event
@@ -190,12 +195,14 @@ def test_the_double_count_from_the_real_profile_is_removed():
 # ---------------------------------------------------------------------------
 
 
-def _verdict(agg, n, compiled, eager, monkeypatch):
+def _verdict(agg, n, compiled, eager, monkeypatch, control_arm=0):
     """Run the verdict printer against a synthetic rollup + path counters."""
     import profile_decode as pd
+    pytest.importorskip("torch")   # cache_mod imports torch at module scope
     from modules.windowed_cache import cache as cache_mod
     monkeypatch.setattr(cache_mod, "_EVICT_STATS",
-                        {"compiled": compiled, "eager": eager})
+                        {"compiled": compiled, "eager": eager,
+                         "control_arm": control_arm})
     pd._print_evict_fusion_verdict(agg, n)
 
 
@@ -242,3 +249,152 @@ def test_a_window_that_mixed_both_paths_says_so(capsys, monkeypatch):
     _verdict({"ours: compiled evict": {"us": 100.0, "n": 4.0}}, 1,
              compiled=2, eager=1, monkeypatch=monkeypatch)
     assert "MIXED eviction paths" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# compilation ranges are not kernels (the 2026-09-19 "203.9% busy" profile)
+# ---------------------------------------------------------------------------
+
+#: The five `other`-bucket rows from the 4096/B=32 profile, verbatim, with the
+#: per-step microseconds they reported over its 24 steps. Three have n < 1
+#: launch in the WHOLE window: a kernel with no launches cannot have time, which
+#: is the structural tell that these are ranges.
+_REAL_COMPILE_ROWS = [
+    ("CachingAutotuner.benchmark_all_configs (dynamo_timed)", 343_295.0 * 24, 58),
+    ("compile_fx_inner (dynamo_timed)", 268_588.0 * 24, 1),
+    ("_compile.compile_inner (dynamo_timed)", 58_345.0 * 24, 1),
+    ("create_aot_dispatcher_function (dynamo_timed)", 56_318.0 * 24, 1),
+    ("_recursive_joint_graph_passes (dynamo_timed)", 279.0 * 24, 1),
+]
+
+
+def test_compile_ranges_are_not_counted_as_kernels():
+    """The rows that made `GPU busy` read 203.9%, which is impossible."""
+    from profile_decode import _is_compile_range, _is_device_event
+
+    for key, us, cnt in _REAL_COMPILE_ROWS:
+        ev = _Ev(key, us, cnt)
+        assert _is_compile_range(ev), f"{key} not recognised as a compile range"
+        assert not _is_device_event(ev), f"{key} still counted as a kernel"
+
+
+def test_a_compile_range_is_rejected_even_when_tagged_as_a_device_event():
+    """Hard reject, ahead of ``device_type``.
+
+    On the build that produced the profile these ranges carried CUDA self time
+    and passed the device-type arm. A range's self device time is the CUDA time
+    of everything nested inside it, so trusting the tag double-counts the very
+    kernels it encloses.
+    """
+    torch = pytest.importorskip("torch")
+    from torch.autograd import DeviceType
+
+    from profile_decode import _is_device_event
+
+    ev = _Ev("compile_fx_inner (dynamo_timed)", 268_588.0, 1)
+    ev.device_type = DeviceType.CUDA
+    assert _is_device_event(ev) is False
+
+
+def test_real_kernels_are_not_swept_up_by_the_markers():
+    """The markers must not eat the kernels the compiler PRODUCED.
+
+    `triton_*_fused_*` are Inductor's output — the eviction's actual work — and
+    they are the thing the `ours: compiled evict` bucket is counting. A marker
+    list that caught them would hide exactly what it was added to reveal.
+    """
+    from profile_decode import _is_compile_range, _is_device_event
+
+    for kern in ("triton_poi_fused_add_gather_mul_21",
+                 "triton_red_fused__to_copy_mul_sub_sum_11",
+                 "_two_tier_decode_kernel", "_gate_kernel",
+                 "ampere_fp16_s16816gemm_fp16_256x64_ldg8_f2f_stages_64x3_tn",
+                 "void at::native::vectorized_elementwise_kernel<4, ...>",
+                 "Memcpy DtoD (Device -> Device)"):
+        ev = _Ev(kern, 1000.0, 32)
+        assert not _is_compile_range(ev), f"{kern} wrongly marked a compile range"
+        assert _is_device_event(ev), f"{kern} dropped from the kernels"
+
+
+def test_the_impossible_busy_number_reconciles_once_ranges_are_dropped():
+    """1071.94 - 726.82 = 345.1 ms/step, i.e. 65.6% busy, not 203.9%."""
+    from profile_decode import _is_device_event
+
+    n = 24
+    evs = [_Ev(k, us, c) for k, us, c in _REAL_COMPILE_ROWS]
+    # the real kernels from the same profile, ms/step -> us over 24 steps
+    for key, ms in (("_two_tier_decode_kernel", 14.480),
+                    ("_gate_kernel", 2.441),
+                    ("triton_poi_fused_add_gather_mul_21", 105.541),
+                    ("ampere_fp16_s16816gemm_fp16_256x64_ldg8_f2f_stages", 10.952),
+                    ("void at::native::vectorized_elementwise_kernel<4, ...>", 171.580),
+                    ("Memcpy DtoD (Device -> Device)", 35.699),
+                    ("void at::native::index_elementwise_kernel<128, 4, ...>", 2.536),
+                    ("void at::native::radixSortKVInPlace", 0.832),
+                    ("void at::native::reduce_kernel<512, 1, ...>", 0.934),
+                    ("void at::native::silu_kernel", 0.117)):
+        evs.append(_Ev(key, ms * 1000.0 * n, 32 * n))
+
+    gpu_us = sum(e.self_device_time_total for e in evs if _is_device_event(e))
+    steady_us = 525.81 * 1000.0 * n            # the unprofiled wall
+
+    assert abs(gpu_us / n / 1000.0 - 345.11) < 0.5, (
+        "the compile ranges are still in the kernel total")
+    busy = gpu_us / steady_us
+    assert 0.60 < busy < 0.70, f"busy={busy:.3f}, expected ~0.656"
+    assert busy < 1.0, "a single stream cannot be more than 100% busy"
+
+
+def test_compile_inside_the_window_is_reported_not_silently_dropped(capsys):
+    """Excluding the ranges must not make a 10x-slow profile look normal.
+
+    Before this, the ONLY reason a compile-contaminated window was noticeable
+    was that the ranges had leaked into the kernel table. Fixing that leak
+    without this printer would have removed the symptom and kept the disease.
+    """
+    from profile_decode import _print_compile_contamination
+
+    n = 24
+    evs = [_Ev(k, us, c) for k, us, c in _REAL_COMPILE_ROWS]
+    _print_compile_contamination(evs, steady_us=525.81 * 1000.0 * n, n=n)
+    out = capsys.readouterr().out
+
+    assert "NOT A STEADY-STATE STEP" in out
+    assert "CachingAutotuner" in out
+    assert "726" in out or "727" in out, "the ms/step total is not reported"
+    # It must NOT send the reader straight at --warmup; that is the reflex that
+    # hides a per-eviction recompile, which no warmup length can absorb.
+    assert "10.10" in out and "dynamic=True" in out
+
+
+def test_a_clean_window_prints_no_contamination_block(capsys):
+    from profile_decode import _print_compile_contamination
+
+    evs = [_Ev("_two_tier_decode_kernel", 14_480.0, 32),
+           _Ev("_gate_kernel", 2_441.0, 32)]
+    _print_compile_contamination(evs, steady_us=45_690.0, n=1)
+    assert capsys.readouterr().out == ""
+
+
+# ---------------------------------------------------------------------------
+# the control arm is reported as a reference, never as a fault
+# ---------------------------------------------------------------------------
+
+
+def test_the_control_arm_is_not_reported_as_a_broken_compiled_run(capsys,
+                                                                  monkeypatch):
+    """An eager run BY REQUEST is the reference arm, not a fusion failure."""
+    _verdict({}, 1, compiled=0, eager=0, monkeypatch=monkeypatch, control_arm=3)
+    out = capsys.readouterr().out
+
+    assert "CONTROL ARM" in out and "3 eager run(s)" in out
+    assert "COMPILED BUT NOT FUSED" not in out
+    assert "NO EVICTION RAN" not in out, (
+        "the arm ran three evictions; reporting none is the opposite of true")
+
+
+def test_a_control_arm_window_with_compiled_runs_in_it_is_called_out(capsys,
+                                                                     monkeypatch):
+    _verdict({}, 1, compiled=2, eager=0, monkeypatch=monkeypatch, control_arm=3)
+    out = capsys.readouterr().out
+    assert "MIXED" in out and "Not a clean arm" in out
