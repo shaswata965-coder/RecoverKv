@@ -24,24 +24,34 @@ TPOT_steady in seconds, 4096-token prompts unless stated. **Flash** is FullKV
 with `flash_attention_2`. **Best** is the published table (budget 0.50, local 64).
 **Now** is the 2026-09-16 run (budget 0.20, local 128).
 
-| shape | B | Flash | best ever | vs Flash | now | vs Flash |
+| shape | B | Flash | best ever | vs Flash | **now (v9, 2026-09-19)** | vs Flash |
 |---|---|---|---|---|---|---|
-| 4096/256 | 32 | 0.086 | 0.0626 | **1.37× faster** | 0.0763 | **1.13× faster** |
-| 2048/512 | 32 | 0.055 | 0.0531 | 1.04× faster | 0.0644 | 1.17× slower |
-| 1024/1024 | 32 | 0.043 | 0.0488 | 1.13× slower | 0.0586 | 1.36× slower |
-| 4096/256 | 1 | ~0.024 | 0.0471 | 1.96× slower | 0.0566 | 2.36× slower |
-| 2048/512 | 1 | ~0.024 | 0.0468 | 1.95× slower | 0.0574 | 2.39× slower |
-| 1024/1024 | 1 | ~0.024 | 0.0467 | 1.95× slower | 0.0573 | 2.39× slower |
+| 4096/256 | 32 | 0.086 | 0.0626 | **1.37× faster** | **0.0589** | **1.46× faster** |
+| 2048/512 | 32 | 0.055 | 0.0531 | 1.04× faster | 0.0561 | 1.02× slower |
+| 1024/1024 | 32 | 0.043 | 0.0488 | 1.13× slower | 0.0562 | 1.31× slower |
+| 4096/256 | 1 | ~0.024 | 0.0471 | 1.96× slower | 0.0553 | 2.30× slower |
+| 2048/512 | 1 | ~0.024 | 0.0468 | 1.95× slower | 0.0557 | 2.32× slower |
+| 1024/1024 | 1 | ~0.024 | 0.0467 | 1.95× slower | 0.0551 | 2.30× slower |
 
-Two things this says plainly:
+Three things this says plainly:
 
 **"Beat Flash across all" was never close.** Even at our best, four of six cells
 lost. The one comfortable win is the long-prompt, large-batch cell — which is the
 cell the method is *for*, and the only one the headline ever quoted.
 
-**Nothing in this table has moved since 2026-09-16.** Every commit since is a
-memory change, a correctness fix or an op-count cut. The next
-`run_perf_table.sh` replaces this table; this document does not.
+**The "now" column moved for the first time since 2026-09-16, and only because
+the 2026-09-16 numbers were taken at a different operating point.** The v9 row
+is `bytes` mode at budget 0.20 / local 128, the same as the 0.0763 it replaces,
+so those two are comparable: 0.0763 → 0.0589 at the headline cell. The `best
+ever` column is budget 0.50 / local 64 and is **not** comparable to either.
+
+**Almost none of that came from this session's code.** §10.0.1 has the
+controlled comparison — against an identically-configured run (v8: 0.0570 at the
+headline cell), the current head is a **wash**: four cells worse by +0.9% …
++3.3%, one unchanged, one better by −1.4%. What the session produced is
+measurement,
+not speed: §10.0 is the summary, and three of its findings are corrections of
+claims elsewhere in this document.
 
 ---
 
@@ -161,7 +171,12 @@ Being strict about this is the point of the document.
 | The decode kernel is 13.7× off roofline, the gate 11.0× | **measured** (time) against **arithmetic** (bytes) — §10.1 |
 | The compiled eviction was running **eager** on every recorded run | **measured** — `Inductor kernels 0.000 ms/step`, §10.2 |
 | The decode kernel gets `target_keys=64 num_stages=2` | **measured** — §10.3. It is also the ladder's worst-occupancy rung |
-| Timing the tile ladder / gate launch makes anything faster | **not measured.** No GPU here. The searches are landed, unrun (§10.7) |
+| Timing the tile ladder makes the decode kernel **1.45×** faster, the gate **1.05×** | **measured** — the full ladder, both kernels, §10.0.3 |
+| That win reaching TPOT | **NOT measured to arrive.** 6.1% available at 2048/B=32, 1.4% observed; ~4.7 points unexplained (§10.0.3) |
+| The compiled eviction is fully fused with zero recompiles | **measured** — `graph_breaks: 0, unique_graphs: 0` after warmup (§10.0.4) |
+| The compiled eviction is worth anything | **measured to be worth nothing** — v9 ≈ v8 at every cell. And it still has no control arm |
+| Extrapolating a tuned rung across geometries | **measured to cost 12%.** Reverted (§10.15) |
+| This session's net effect on TPOT | **measured: a wash** (4 cells +0.9% … +3.3%, 1 unchanged, 1 at −1.4%) |
 
 ### The confound in the 24% number
 
@@ -613,8 +628,11 @@ for.
 | CUDA graph deleted | removes the OOM and six ERROR rows; loses nothing | measured |
 | 21 env knobs, eager fork, FlashInfer, PyTorch oracle deleted | no speed change; every number now says which method it came from | structural |
 | Eviction no longer specialises the graph on `layer_idx` / `step`; eager fallback now raises (§10.2) | the compiled eviction was **running eager on every recorded run** — its real value is still unmeasured | measured (that it was eager); unmeasured (the fix) |
-| Decode tile ladder timed instead of first-fit, `num_warps` searched (§10.3) | the chosen rung is the ladder's worst-occupancy one; unknown whether a better exists | unmeasured |
-| Read gate's `BLOCK_W` / `num_warps` searched instead of derived (§10.4) | 8.2% of the step, never tuned | unmeasured |
+| Decode tile ladder timed instead of first-fit, `num_warps` searched (§10.3) | **1.45× on the decode kernel** — the first-fit rung is 9th of 11 (§10.0.3) | measured |
+| Read gate's `BLOCK_W` / `num_warps` searched instead of derived (§10.4) | **1.05× on the gate** — the derived heuristic is 4th of 8 | measured |
+| Eviction body made pure w.r.t. the fp buffers (§10.13) | the eviction **compiles for the first time on this build** — fully fused, zero recompiles | measured |
+| `_LAST_WINNER`, extrapolating a tuned rung across geometries (§10.15) | **−12% TPOT. Reverted.** The rung's trade moves with the geometry | measured |
+| Net effect of the whole session on TPOT | **a wash** vs an identically-configured run (§10.0.1) | measured |
 
 **None of these moved a latency cell.** The grid work is a memory change; the
 op-count work removes ~15 extern calls from a step that has ~1,650 launches. An
@@ -699,14 +717,183 @@ now lives in the module that defines the layout.
 
 ---
 
-## 10. The 2026-09-19 GPU profile, and the three things it changed
+## 10. The 2026-09-19 decode session — findings, values, meaning
+
+**Read §10.0 for the conclusions. §10.1–10.15 are the record of how they were
+reached, seven GPU runs including the wrong turns, kept because three of the
+conclusions are corrections of earlier ones in this same document.**
+
+---
+
+## 10.0 What seven runs established
+
+### 10.0.1 The table, end to end
+
+Llama-3.1-8B, A100-80GB, `bytes` budget mode, `cache_budget=0.20`, `q=0.70`,
+`ws=8`, gate at `quant_gate_ratio=0.25`. TPOT_steady, seconds:
+
+| cell | **v8** eager evict, untuned tile | **v9** compiled evict, tuned tile | **v10** + `_LAST_WINNER` *(reverted)* |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0545 | 0.0553 | 0.0614 |
+| 4096/257 B=32 | **0.0570** | 0.0589 | 0.0655 |
+| 2048/513 B=1 | 0.0550 | 0.0557 | 0.0620 |
+| 2048/513 B=32 | 0.0569 | **0.0561** | 0.0634 |
+| 1048/1049 B=1 | 0.0546 | 0.0551 | 0.0616 |
+| 1048/1049 B=32 | 0.0562 | 0.0562 | 0.0635 |
+
+**v9 is the current head and is a wash against v8** — four cells worse by
++0.9% … +3.3%, one unchanged, one better by −1.4%. **v10 was +11–13% everywhere
+and is reverted** (§10.15).
+
+TTFT moved within ±6% with mixed signs, and `peak_GB` is identical to the
+0.01 GB at every cell. `steadyKV_GB` drifted at the three B=32 cells (−1.50,
+−0.25, −0.49 GB; B=1 unchanged), which is the allocator, not a footprint change.
+**Nothing here is a prefill or a memory story.**
+
+### 10.0.2 Where a decode step goes — the profile that had never been run
+
+`profile_decode.py`, 4096/B=32, 45.69 ms/step wall, 44.41 ms of CUDA kernels:
+
+| bucket | ms/step | share | launches |
+|---|---|---|---|
+| **our two-tier decode kernel** | **17.74** | **40.0%** | 32 |
+| model GEMM | 11.18 | 25.2% | 290 |
+| **our read gate** | **3.63** | 8.2% | 32 |
+| elementwise | 4.12 | 9.3% | 822 |
+| index / gather | 3.66 | 8.2% | 79 |
+| copy / cat | 2.08 | 4.7% | 339 |
+| reduction | 1.04 | 2.4% | 70 |
+| sort / topk | 0.84 | 1.9% | 65 |
+
+**GPU busy 97.2%. 1,762 launches/step, all covered by the work they issue.**
+
+*Meaning.* Three things follow, and they govern everything else here:
+
+1. **The step is kernel-bound, not host-bound.** The flat-TPOT-across-batch
+   signature that suggested a host gap has a second cause, which the profiler's
+   own docstring predicted: a kernel whose critical path is batch-invariant,
+   which is what `grid = (B * H_kv,)` over a serial tile loop produces. *Nothing
+   is won by issuing fewer launches.*
+2. **Our cache costs ~3× what the model does.** The model side is finished —
+   11.18 ms against a 10.3 ms weights-read floor is ~92% of theoretical. The
+   two-tier decode kernel alone costs more than every GEMM in the model.
+3. **Both our kernels are ~12× off their own rooflines, the same way.** Priced
+   from bytes at this geometry: decode 2.02 GB/step → 1.30 ms roofline vs 17.74
+   measured (**13.7×**); gate 0.51 GB → 0.33 ms vs 3.63 (**11.0×**). That
+   independently reproduces §2's 12× from a different direction, and says the
+   problem is not one bad kernel but one shared shape: gather-bound,
+   occupancy-starved reads. **That is §6.2, and it is still the main event.**
+
+### 10.0.3 The tile rungs — measured, and the first-fit rung is bad
+
+Both kernels now time every rung that fits, once per geometry, and publish the
+whole ladder. At 2048/B=32, ms per layer per step:
+
+```
+decode  (32,2,4)=0.242  (32,1,4)=0.281  (64,2,8)=0.301  (64,1,4)=0.303
+        (16,2,4)=0.303  (64,1,8)=0.329  (32,2,8)=0.332  (32,1,8)=0.335
+        (64,2,4)=0.351  <- what first-fit always took
+        (16,1,8)=0.406  (16,2,8)=0.417
+gate    (16,4)=0.076  (16,8)=0.079  (32,8)=0.079  (32,4)=0.080  <- the heuristic
+        (64,8)=0.080  (64,4)=0.090  (128,8)=0.092  (128,4)=0.102
+```
+
+| | old choice | measured winner | gain |
+|---|---|---|---|
+| decode kernel | `(64,2,4)` 0.351 ms — **9th of 11** | `(32,2,4)` 0.242 ms | **1.45×** |
+| read gate | `(32,4)` 0.080 ms — 4th of 8 | `(16,4)` 0.076 ms | 1.05× |
+
+*Meaning.* §10.3 predicted exactly this: the top rung stages ~128 KB of `tl.dot`
+operands against an A100's 163 KB/SM, so **one block is resident per SM** and
+the Q-tier loop runs with nothing to hide its latency. The ladder's own docstring
+called its ordering an assertion — *"it never benchmarks, so that ordering… run
+the table twice, compare"*. It was an assertion, and it was wrong by 45%.
+
+**But the win does not reach TPOT.** At 2048/B=32, 0.351 → 0.242 ms/layer is
+3.49 ms of a 56.9 ms step: **6.1% available, 1.4% observed.** Two candidate
+explanations, unresolved: only some signatures are tuned (a signature must recur
+`_TUNE_AFTER`=3 times), and a kernel timed back-to-back in isolation may not
+shorten a step proportionally. **Extrapolating one geometry's winner to others
+was tried to close this and cost 12%** (§10.15) — the trade a rung selects moves
+with the geometry, which is the whole reason the search is keyed per signature.
+
+### 10.0.4 The compiled eviction — three findings, all against prior belief
+
+```
+eviction path: {'eager': 0, 'compiled': 285}
+dynamo: {'graph_breaks': 0, 'frames_total': 0, 'frames_ok': 0, 'unique_graphs': 0}
+```
+
+`perf_runner` zeroes those counters **after warmup**, so they cover the measured
+window only.
+
+1. **It had never compiled on this build** (§10.9, §10.13), by two independent
+   mechanisms — `capture_scalar_outputs` defaulting True since torch 2.6 made
+   `_evict_widths`' `.tolist()` an unresolvable guard that abandoned the frame;
+   and with that fixed, an aliased-view mutation hit an AOTAutograd bug.
+   `_EVICT_STATS` reported `compiled` throughout, because it counts *calls to
+   the compiled callable*, not compiles. **Every decode number in this document
+   before v9 was measured with an eager eviction.**
+2. **Now that it compiles, it is fully fused with zero recompiles** — not one
+   graph break, no compilation inside the timings.
+3. **And it is worth nothing measurable.** v9 ≈ v8 at every cell.
+
+*Meaning.* Consistent with §10.0.2: the compiled eviction exists to collapse
+~360 launches, and launches are not the bottleneck on a 97.2%-busy step. **This
+is now a design question, not a bug** — "compiled unconditionally, one
+production path, no fallbacks" is a deliberate stance that, on this build,
+produced a five-run total outage in service of an optimisation the profile says
+is not needed. It still has **no control arm**, which is the one thing this
+repo's own standing rules require of every perf-affecting change, and precisely
+why it went this long with nobody knowing it neither ran nor paid.
+
+### 10.0.5 The eviction's widths, measured
+
+```
+fresh (quantize+sketch)  max=230  mean=188.95  of n_q=230   fill=100.0%
+promote (dequant+RoPE)   max=  2  mean=  0.21             fill=0.9%
+```
+
+*Meaning.* The demote cap is already right — a hypothesis that it was a ~99×
+overcompute is retired. The promote side was sized by its bound and masked away
+99%; that one was live and is fixed.
+
+### 10.0.6 The gate fires, everywhere, at the configured ratio
+
+`gated=49152 fired=49152`, `read_fraction 0.251–0.258` against
+`quant_gate_ratio=0.25`, on all 24,576 fused layers in every run. *Meaning:* the
+failure that once left the gate unreachable for eight commits is not recurring,
+and every number in §10.0.1 is a gated number.
+
+### 10.0.7 Three of my own diagnoses, refuted by measurement
+
+Recorded because each was stated confidently in this document before being
+disproved, and the corrections are more useful than the claims:
+
+| claim | what killed it |
+|---|---|
+| "Decode is host-bound; collapse launches" | GPU busy **97.2%** (§10.1) |
+| "The eviction recompiles per eviction; that is the TPOT cost" | `graph_breaks: 0, unique_graphs: 0` in the measured window (§10.14) |
+| "The counting backend caused the IndexError" | the next run raised it under **stock** `backend='inductor'` (§10.11) |
+
+### 10.0.8 What is open
+
+1. **§6.2, making the selected reads contiguous.** Both kernels are ~12× off
+   roofline from scattered fetches. This is the only item sized to matter.
+2. **The 4.7 points of tile win that do not reach TPOT** (§10.0.3).
+3. **A control arm for the compiled eviction** — ~30 lines, one run, settles
+   whether to keep it at all.
+4. **The gate's +7.6% across all eight rungs** between v9 and v10 — a
+   fixed-config kernel timing, so not a code change. Unexplained; ~0.6 points.
+
+---
+
+## 10.1 The profile in full
 
 `scripts/profile_decode.py --prefill 4096 --batch 32 --steps 24 --warmup 12` on
 the shipped config (`n_q=230`, `W_retained=273`, gate live at `read_fraction
 0.252`). This is the first profile taken at the headline cell on the gated path,
 and it answers two of the three questions §4 listed as **never run at all**.
-
-### 10.1 What it says
 
 ```
   wall               45.69 ms/step   (profiler OFF -- the real step)
