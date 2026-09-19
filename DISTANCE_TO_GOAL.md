@@ -1017,6 +1017,70 @@ reaching the trace it says so rather than re-deriving it.
 **What is still unmeasured:** whether a genuinely compiled eviction is faster.
 Every decode number in this document predates one.
 
+### 10.10 Third run — the fix worked and revealed the real problem
+
+`table_v9` again. Still one cell, still an error at B=32 — and **TPOT went UP
+again**: 0.1917 → 0.1845 → **0.2162**. That third number is the finding.
+
+**One root cause, two symptoms, and neither was introduced by §10.2–10.4.** The
+compiled body forces `int()` on two shapes that move at *every* eviction:
+
+```
+cache.py:2551  T_fp = int(state.key_states.shape[2])      <- grows while filling
+cache.py:2554  W    = int(state.window_scores.shape[2])   <- grows while filling
+```
+
+`H_kv`, `D` and `H_q` are model constants, and the `_evict_widths` widths are
+quantised onto `_EVICT_WIDTH_LADDER`, so region 2 is bounded. `T_fp` and `W`
+are not. At 4096/257 B=1 that is ~32 evictions during the fill, so up to 32
+distinct `(T_fp, W)` pairs, **× 2 regions** either side of `_evict_widths`'
+deliberate break — roughly **64 Inductor compiles, all inside the measured
+window**.
+
+* **TPOT 0.2162** — ~64 Inductor compiles over 255 steps is ~0.15–0.25 s/step.
+  It got *worse* across the three runs because §10.9 finally let it compile at
+  all; before that it bailed to eager and paid no compile cost.
+* **The B=32 error at step 40** (was 48, was 80) — the B=1 cell spends the
+  **process-wide** recompile budget and B=32 bails almost immediately. The step
+  number moves run to run because the budget is shared and the shape order
+  differs.
+
+**This inverts the premise of the compiled eviction.** `_evict_two_tier`'s
+docstring argues *"it fires once per `ws` steps, so a compile / recompile
+amortizes"*. That is false while the store is filling — and the perf runner
+warns, in the same log, that these cells never leave the fill phase. On this
+build, at these shapes, **eager (~0.055) beats compiled (0.216)** because
+compile cost dominates.
+
+**What landed, and what deliberately did not.**
+
+The obvious fix is to drop the `int()` forcing and let `dynamic=True` make
+`T_fp` and `W` symbolic — 32 graphs collapse to one. It is **not** in this
+commit. It contradicts a named hazard class in `_EVICT_COMPILE_HELP` *and*
+`test_scalar_shape_reads_in_the_compiled_region_are_int_forced`, and this
+session has been confident and wrong three times. It needs the graph count
+first. So:
+
+1. **`_counting_inductor` tallies the graphs Inductor actually builds.**
+   `_EVICT_STATS["compiled"]` counts *calls*, which says nothing about compiles.
+   If `graphs` reads ~2× the eviction count, the diagnosis above is confirmed
+   and dropping the `int()`s is the fix. If it reads ~2, the diagnosis is wrong
+   and the cost is elsewhere. One number instead of another argument.
+2. **A Dynamo bail is no longer filed as a build failure.** `EvictionRanEager`
+   is now its own type. A *lowering* failure is a build property and stays
+   sticky; a *bail* is a run property — its commonest cause is a budget spent by
+   an earlier cell — and routing it into the sticky flag is what turned one
+   failing cell into five untried ones.
+3. **One reset-and-retry per measured run.** On a bail, `torch._dynamo.reset()`
+   (the only thing that returns a fresh budget), rebuild, retry once. Safe on
+   the same step: the check sits at the top of the body, before any mutation.
+   Cleared by `reset_evict_path_stats`, so each cell can recover once from
+   another cell's spending while a cell that bails twice still fails loudly.
+
+Routing verified against six cases — happy path, bail-then-recover, bail-twice,
+rescue-already-spent, lowering failure, OOM — confirming a bail never sets the
+sticky flag and that lowering/OOM behaviour is unchanged.
+
 ---
 
 **None of 10.2–10.4 has been measured on a GPU, and the one run that tried made

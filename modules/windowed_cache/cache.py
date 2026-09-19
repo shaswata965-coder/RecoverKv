@@ -77,7 +77,13 @@ _EVICT_COMPILE_TRIED_STATIC = False
 #: became unconditional nothing increments it, so a nonzero value means an eager
 #: fallback was reintroduced somewhere and the run's numbers are not the
 #: compiled path's.
-_EVICT_STATS = {"eager": 0, "compiled": 0}
+_EVICT_STATS = {"eager": 0, "compiled": 0, "graphs": 0}
+
+#: One-shot flag for the reset-and-retry on a Dynamo bail. Not sticky like
+#: :data:`_EVICT_COMPILE_FAILED`: a bail is a run property, so it gets exactly
+#: one rescue per process and then becomes a real error rather than an infinite
+#: reset loop that would recompile the world on every eviction.
+_EVICT_BAIL_RETRIED = {"done": False}
 
 #: Sticky record of a torch.compile failure on the eviction, process-global and
 #: NOT cleared by :func:`reset_evict_path_stats` — a build that cannot lower the
@@ -245,9 +251,18 @@ def evict_compile_traceback() -> Optional[str]:
 
 def reset_evict_path_stats() -> None:
     """Zero the per-path counters. Does NOT clear the sticky compile-failure flag
-    (that is a property of the build, not of one measured run)."""
+    (that is a property of the build, not of one measured run).
+
+    It DOES clear the one-shot bail rescue, and that is the right granularity:
+    the recompile budget is process-wide, so a cell can arrive with it already
+    spent by the cell before. One rescue per measured run means each cell can
+    recover once from someone else's spending, while a cell that bails twice on
+    its own still fails loudly instead of resetting the world every eviction.
+    """
     _EVICT_STATS["eager"] = 0
     _EVICT_STATS["compiled"] = 0
+    _EVICT_STATS["graphs"] = 0
+    _EVICT_BAIL_RETRIED["done"] = False
 
 
 class _LayerStateView:
@@ -466,6 +481,20 @@ def _emulating_precision_casts(fn):
     return inductor_config.patch("emulate_precision_casts", True)(fn)
 
 
+class EvictionRanEager(RuntimeError):
+    """The compiled eviction body executed in Python instead of being traced.
+
+    A distinct type because it is a **run** property, not a **build** property,
+    and the two must not share a fate. A lowering failure says "this build
+    cannot lower this graph" -- true for every later cell, which is why
+    :data:`_EVICT_COMPILE_FAILED` is sticky. A Dynamo bail says "Dynamo declined
+    this frame right now", and the commonest reason is that the process-wide
+    recompile budget is already spent by an EARLIER cell. Filing that as a build
+    failure is what turned one failing cell into five untried ones on the
+    2026-09-19 sweep.
+    """
+
+
 def _scalar_outputs_off(fn):
     """Wrap ``fn`` so ``.item()`` / ``.tolist()`` GRAPH-BREAK instead of going symbolic.
 
@@ -643,6 +672,12 @@ def _dynamo_diagnosis() -> str:
         lines.append(f"  (dynamo counters unreadable: {type(exc).__name__}: {exc})")
 
     lines.append(
+        f"  INDUCTOR GRAPHS BUILT SO FAR: {_EVICT_STATS['graphs']}  <- if this "
+        f"is ~2x the eviction count, the body is minting a graph per eviction "
+        f"(T_fp and W are int()-forced and both move while the Q tier fills), "
+        f"and the compile time IS the TPOT regression."
+    )
+    lines.append(
         f"  evictions compiled before this one: {_EVICT_STATS['compiled']}. "
         "If that is large and this is the first failure, the graph count grew "
         "with the SHAPES -- the body forces int() on W and T_fp, which move at "
@@ -652,14 +687,36 @@ def _dynamo_diagnosis() -> str:
     return "\n".join(lines)
 
 
+def _counting_inductor(gm, example_inputs):
+    """Inductor, plus a tally of how many graphs it was asked to build.
+
+    This is the measurement the 2026-09-19 sweep needed and did not have.
+    ``_EVICT_STATS["compiled"]`` counts CALLS through the compiled callable,
+    which says nothing about how many times Inductor ran -- and the suspicion
+    that needs settling is precisely that the body mints a graph per eviction,
+    because it forces ``int()`` on ``T_fp`` and ``W`` and both move at every
+    eviction while the Q tier is still filling.
+
+    If that is right, this counter reads ~2x the eviction count (two regions,
+    either side of ``_evict_widths``' deliberate break) and the compile time is
+    the whole of the TPOT regression. If it reads ~2, the diagnosis is wrong and
+    the cost is somewhere else. One number, either way -- which is better than
+    another round of argument.
+
+    ``compile_fx`` is exactly what the string ``"inductor"`` resolves to, so this
+    is the same backend with a counter in front.
+    """
+    from torch._inductor.compile_fx import compile_fx
+
+    _EVICT_STATS["graphs"] += 1
+    return compile_fx(gm, example_inputs)
+
+
 def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
     _raise_dynamo_cache_limit()
-    kw: Dict[str, Any] = {"dynamic": dynamic}
-    backend = None
-    if backend is not None:
-        kw["backend"] = backend
+    kw: Dict[str, Any] = {"dynamic": dynamic, "backend": _counting_inductor}
     # Both wrappers are scoped `config.patch`es entered per call. `_scalar_
     # outputs_off` is outermost because it governs DYNAMO (whether `.tolist()`
     # breaks the graph at all) while `_emulating_precision_casts` governs
@@ -823,6 +880,29 @@ def _run_compiled_evict(cache, state, store, policy, joint: bool, step: int):
     if _COMPILED_EVICT_FN is None:
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
     try:
+        out = _COMPILED_EVICT_FN(cache, state, store, policy, joint)
+        _announce_evict_path_once(compiled=True)
+        _EVICT_STATS["compiled"] += 1
+        return out
+    except EvictionRanEager:
+        # A Dynamo BAIL, not a lowering failure -- see EvictionRanEager. The
+        # dominant cause is a spent recompile budget, and the budget is
+        # process-wide: the 2026-09-19 sweep spent it in its FIRST cell (~32
+        # evictions x 2 regions while the Q tier filled) and every later cell
+        # bailed on its first eviction.
+        #
+        # So clear the caches and try once more. `reset()` is the only thing
+        # that gives this code object a fresh budget, it is process-global (safe
+        # here -- the eviction is the only torch.compile in this repo), and the
+        # retry is cheap relative to the sweep it rescues. Safe to retry on the
+        # same step: the check that raised sits at the TOP of the body, before
+        # any mutation, so `cache` is untouched.
+        if _EVICT_BAIL_RETRIED["done"]:
+            raise
+        _EVICT_BAIL_RETRIED["done"] = True
+        import torch._dynamo as _td
+        _td.reset()
+        _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
         out = _COMPILED_EVICT_FN(cache, state, store, policy, joint)
         _announce_evict_path_once(compiled=True)
         _EVICT_STATS["compiled"] += 1
@@ -2497,7 +2577,7 @@ class WindowedCache(_HFCacheBase):
         # this reaches the graph; under an eager fallback it is False and the run
         # stops. One bool test per eviction, i.e. one per `ws` steps.
         if not torch.compiler.is_compiling():
-            raise RuntimeError(
+            raise EvictionRanEager(
                 "the two-tier eviction ran EAGER. It is compiled-or-error by "
                 "design: the compiled body exists to fuse ~360 pointwise / "
                 "gather / scatter / quantize launches into a handful of kernels, "
