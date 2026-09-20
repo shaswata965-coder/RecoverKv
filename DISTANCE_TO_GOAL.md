@@ -1587,13 +1587,19 @@ quantities. None needs a kernel rewrite:
 
 | # | change | Δ ms | cumulative | status |
 |---|---|---|---|---|
-| 0 | tile tuning (§10.14) | −4.45 | 1.11× | **already in the tree** |
-| 1 | `_FIT_LADDER` reorder → untuned geometries | −2.10 | 1.17× | not started |
-| 2 | the compiled eviction stops costing | −1.5 … −2.0 | **1.22×** | run 11.2 first |
+| 0 | tile tuning (§10.14) | −3.90 | 1.096× | **measured, §11.7** |
+| 1 | `_FIT_LADDER` reorder → untuned geometries | −2.10 | 1.156× | not started |
+| 2 | ~~the compiled eviction stops costing~~ | — | — | **DEAD — it EARNS ~10%, §11.9** |
+| 3 | ~10% off the decode kernel (it is 11.1× off roofline) | −1.44 | **1.20×** | §6.2 territory |
 
-**Item 0 is banked and currently invisible.** A later profile of the same cell
-measured decode 17.74 → **14.48** ms and the gate 3.63 → **2.44** ms, with the
-model's GEMMs flat. The tile search works. It does not show up in TPOT because
+**Item 2 was retired by measurement on 2026-09-20 and its Δ was wrong in sign.**
+The control arm says the compiled eviction is worth **6.4–11.2%** of TPOT, not
+−1.5 ms of cost (§11.9). The 1.2× now needs item 1 plus a *modest* slice of the
+decode kernel, rather than item 1 plus a deletion.
+
+**Item 0 is banked and now measured twice** (§11.7, §11.9): decode 17.74 →
+**14.42–14.47** ms and the gate 3.63 → **2.44** ms, with the model's GEMMs flat,
+on both arms. The tile search works. Its full value does not reach TPOT because
 of item 1.
 
 **Item 1 is §10.14's missing 4.7 points, and the cause is now named.**
@@ -1614,7 +1620,7 @@ Beyond 1.2×: the decode kernel is still **11.1× off roofline** (14.48 vs 1.30
 ms). §6.2 is unchanged as the main event; 1.5× there is another −4.8 ms, or
 ~1.40× overall.
 
-### 11.2 Run 1 — is the compiled eviction worth anything? *(half-run; see §11.6)*
+### 11.2 Run 1 — is the compiled eviction worth anything? **ANSWERED: yes, ~10% (§11.9)**
 
 It is the one perf-affecting change in this repo that has **never had a control
 arm** (§10.0.4, §10.12, §10.14 each say so). It now has one. Two commands, one
@@ -1643,12 +1649,15 @@ can never be filed as a shipped run.
 
 | outcome | reading | what follows |
 |---|---|---|
-| eager ≤ compiled | the compile buys nothing — what §10.14 already implies, and what a 97.2%-busy step predicts | delete the path; item 2 is free |
-| compiled < eager | it pays | keep it and bound its recompiles (§10.10: `T_fp`, `W`) |
+| eager ≤ compiled | the compile buys nothing | delete the path |
+| **compiled < eager** | **it pays** | **keep it, and bound its recompiles (§10.10: `T_fp`, `W`)** |
 
-Prior: v8 (eager evict) 0.0570 against v9 (compiled evict) 0.0589 at the
-headline cell says eager is ~3.3% ahead. This is the run that makes that
-attributable rather than confounded with the tile search.
+The prior stated here was that v8 (eager) 0.0570 against v9 (compiled) 0.0589
+made eager ~3.3% ahead. **That prior was wrong**, because those two rows also
+differ in the tile search. The run came back the other way: eager is 6.4–11.2%
+*slower*. See §11.9 — and note that the prior was the majority view in this
+document, held across three sections, which is the case for running the arm
+rather than reasoning about it.
 
 `--cooldown 3 --clock-lock true` means these rows are **not** cell-by-cell
 comparable to `table_v9`, which was taken without them. A vs B remain
@@ -1805,18 +1814,118 @@ captured this run. Raise `--warmup` until no graphs are built in window 1, then
 re-read it. Given 40.51 ms of kernels against §10.1's 45.69 ms wall, ~97% busy
 remains the expectation, but that is arithmetic, not a measurement.
 
-### 11.8 The order, and why not to reverse it
+### 11.9 The control arm ran. **The compiled eviction wins ~10%.** *(2026-09-20)*
 
-1. **Finish §11.2 — run the control arm.** §11.6 ran only the compiled half, so
-   the question it exists to answer is still open, and the eviction is now a
-   measured 3.029 ms/step (7.5% of GPU time) rather than a hypothetical. One
-   command; it either deletes a moving part or justifies one.
-2. **Re-take the profile with a bigger `--warmup`**, until no graphs are built
-   in window 1 (§11.7). Everything about that profile was good except the one
-   number it exists to print.
-3. **Item 1, the ladder reorder** — the largest measured-but-unclaimed win.
-4. **Then §6.2**, contiguous reads, which is where the rest is.
+`table_v10_controlarm`, `--evict-control-arm true`. Provenance is unambiguous:
 
-Do not start at 4. It is the biggest number on the page and the only one that
-needs a kernel rewrite to collect, and the three cheaper items above it are
-already paid for or nearly so.
+```
+eviction path: {'eager': 0, 'compiled': 0, 'control_arm': 285} | mode: control-arm-eager
+dynamo: {'graph_breaks': 0, 'frames_total': 0, 'frames_ok': 0, 'unique_graphs': 0}
+read gate: gated (gated=49152 fired=49152 read_fraction=0.258)
+```
+
+The `eager` tripwire stayed at 0 while `control_arm` counted all 285 — the arm
+did not disarm the alarm, which is what it was separated for. Both arms gated.
+
+TPOT_steady, seconds, one variable apart:
+
+| cell | compiled | control arm (eager) | eager is |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0552 | 0.0604 | **+9.4% slower** |
+| 4096/257 B=32 | **0.0590** | **0.0628** | **+6.4% slower** |
+| 2048/513 B=1 | 0.0555 | 0.0611 | +10.1% slower |
+| 2048/513 B=32 | 0.0562 | 0.0625 | +11.2% slower |
+| 1048/1049 B=1 | 0.0554 | 0.0607 | +9.6% slower |
+| 1048/1049 B=32 | 0.0565 | 0.0627 | +11.0% slower |
+
+**Median +9.8%, every cell in the same direction.** The compiled eviction is
+worth keeping and the question is closed.
+
+#### This refutes §10.14, and the reason it does is instructive
+
+§10.14 concluded *"the compiled eviction, working exactly as designed, is worth
+nothing measurable"* from v8 (eager evict, **untuned** tile) ≈ v9 (compiled
+evict, **tuned** tile). Two variables moved between those rows in opposite
+directions and cancelled. The wash was real; the conclusion drawn from it was
+not. §10.0.4 and §10.12 inherited it, and this document twice proposed deleting
+the path on that basis. **A control arm is the difference between a wash and a
+cancellation, and this is what it was for.**
+
+#### The win is on the HOST, and its GPU kernels are *more* expensive
+
+The control-arm profile is the first fully valid one in this section — positive
+profiler overhead, no compilation in either window, so the §11.7 guard does not
+fire:
+
+```
+wall               43.34 ms/step   (profiler OFF)
+wall, profiled    105.06 ms/step   (+61.72 ms of overhead)
+CUDA kernels       39.54 ms/step
+GPU busy            91.2 %
+kernel launches     1762 /step
+```
+
+Against the compiled arm's kernel table:
+
+| bucket | compiled | eager arm | Δ |
+|---|---|---|---|
+| ours: two-tier decode | 14.469 | 14.424 | −0.045 |
+| ours: read gate | 2.439 | 2.438 | −0.001 |
+| ours: compiled evict | **3.029** | — | −3.029 |
+| model: GEMM | 10.962 | 10.959 | −0.003 |
+| memory: index/gather | 2.547 | **3.606** | **+1.059** |
+| elementwise | 3.213 | **4.081** | **+0.868** |
+| memory: copy/cat | 1.941 | 2.032 | +0.091 |
+| reduction | 0.958 | 1.031 | +0.073 |
+| sort/topk | 0.833 | 0.841 | +0.008 |
+| **CUDA kernels** | **40.51** | **39.54** | **−0.97** |
+| launches/step | 1726 | 1762 | +36 |
+
+Read that carefully, because it is the opposite of the obvious story:
+
+* the eager eviction's work is exactly where it should be — **+2.02 ms**
+  scattered across `index/gather`, `elementwise` and `copy/cat`, versus the
+  **3.03 ms** the fused bucket costs;
+* so **Inductor's fused kernels are ~1 ms/step MORE GPU time than the eager
+  ATen ones they replace**;
+* and the compiled arm is still ~10% faster on TPOT.
+
+The gap is host time. The eager arm runs at **91.2% busy — a 3.80 ms/step host
+gap** — and issues 36 more launches per step. Collapsing those recovers more
+than the extra GPU time costs. For the compiled arm to beat the eager wall of
+43.34 ms it needs only >93.5% busy, and §10.1 measured 97.2%.
+
+#### What this corrects elsewhere
+
+**§10.1's reading (a) needs qualifying.** *"Nothing is to be won by issuing
+fewer launches"* was drawn from a 97.2%-busy profile of the compiled path — a
+step that was already launch-collapsed. Measured on the *un*collapsed path
+there is 8.8% of gap, and collapsing launches is exactly what recovers it. The
+claim is true of the shipped configuration and false as a general statement
+about this step; the launches that mattered had already been removed by the
+thing being evaluated.
+
+**§11.1 item 2 is dead** and its sign was wrong. The 1.2× now comes from item 1
+plus a modest slice of the decode kernel, not from a deletion.
+
+### 11.8 The order from here *(revised 2026-09-20, after §11.9)*
+
+Both §11.2 questions are answered. What is left:
+
+1. **Item 1, the `_FIT_LADDER` reorder** — the largest measured-but-unclaimed
+   win, −2.10 ms, and the cheapest thing on this page. `_first_fit` takes the
+   ladder's first entry, which every profile in §11 measures as the 9th-best
+   rung of 11.
+2. **Re-take the compiled-arm profile with a bigger `--warmup`** (§11.7). The
+   control arm gave us a clean 91.2%-busy reading; the compiled arm still has
+   no valid wall, and the two are not comparable until it does.
+3. **§6.2, contiguous reads.** Now the *only* remaining item, and the 1.2×
+   needs just ~10% of it (−1.44 ms of the decode kernel's 14.42, which sits
+   11.1× off its roofline). The rest of §6.2 is what takes this past 1.2×.
+
+Two things NOT to do, both retired by measurement:
+
+* **Do not delete the compiled eviction.** §11.9: it earns 6.4–11.2%.
+* **Do not chase the shared bucket on launch count alone.** It is 11.60 ms
+  (29.3%) on the eager arm and issued by both sides; a kernel name cannot say
+  which. That needs `--trace`, not a guess.
