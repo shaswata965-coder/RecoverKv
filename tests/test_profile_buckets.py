@@ -398,3 +398,100 @@ def test_a_control_arm_window_with_compiled_runs_in_it_is_called_out(capsys,
     _verdict({}, 1, compiled=2, eager=0, monkeypatch=monkeypatch, control_arm=3)
     out = capsys.readouterr().out
     assert "MIXED" in out and "Not a clean arm" in out
+
+
+# ---------------------------------------------------------------------------
+# the two timing windows must be the same KIND of step (2026-09-20)
+# ---------------------------------------------------------------------------
+
+
+def _verdict_chain(gpu_us, steady_us, wall_us, dyn_before, dyn_after, n=24):
+    """Reproduce main()'s verdict branch. Kept in lockstep with it by
+    test_the_verdict_branch_matches_the_script below."""
+    busy = gpu_us / max(steady_us, 1.0)
+    compiled_in_w1 = {k: dyn_after.get(k, 0) - v
+                      for k, v in (dyn_before or {}).items()
+                      if dyn_after.get(k, 0) != v}
+    for k, v in (dyn_after or {}).items():
+        if k not in (dyn_before or {}):
+            compiled_in_w1[k] = v
+    if wall_us < steady_us or compiled_in_w1:
+        return "not-comparable", compiled_in_w1
+    if busy > 1.0:
+        return "impossible", compiled_in_w1
+    if busy < 0.5:
+        return "host-bound", compiled_in_w1
+    if busy > 0.85:
+        return "kernel-bound", compiled_in_w1
+    return "mixed", compiled_in_w1
+
+
+def test_the_2026_09_20_run_is_refused_not_called_host_bound():
+    """The run that printed `GPU busy 1.7% -> HOST-BOUND`.
+
+    Window 1 (unprofiled) measured 2357.34 ms/step while window 2 (profiled)
+    measured 136.32 -- profiling cannot make a step 17x faster, so the two
+    windows were not running the same thing. Dynamo built 18 graphs in window
+    1. The GPU was not idling; the denominator was compiling.
+    """
+    n = 24
+    v, compiled = _verdict_chain(
+        gpu_us=40.51 * 1000 * n,
+        steady_us=2357.34 * 1000 * n,
+        wall_us=136.32 * 1000 * n,
+        dyn_before={"calls_captured": 0, "unique_graphs": 0},
+        dyn_after={"calls_captured": 2361, "unique_graphs": 18})
+    assert v == "not-comparable", f"got {v} -- this run must not yield a verdict"
+    assert compiled["unique_graphs"] == 18
+
+
+def test_negative_profiler_overhead_alone_is_enough():
+    """Tracing only ever ADDS cost. A faster profiled window is a tell on its
+    own, even if the counters happen to be unavailable (they return {} on a
+    build that does not expose them)."""
+    v, _ = _verdict_chain(gpu_us=40_000, steady_us=100_000, wall_us=90_000,
+                          dyn_before={}, dyn_after={})
+    assert v == "not-comparable"
+
+
+def test_compilation_in_window_one_alone_is_enough():
+    """Plausible wall ordering, but graphs were built in the denominator."""
+    v, _ = _verdict_chain(gpu_us=44_000, steady_us=46_000, wall_us=60_000,
+                          dyn_before={"unique_graphs": 4},
+                          dyn_after={"unique_graphs": 7})
+    assert v == "not-comparable"
+
+
+def test_a_clean_run_still_gets_its_verdict():
+    """§10.1's profile: 44.41 ms of kernels over a 45.69 ms wall, no compiles.
+    The guard must not swallow the reading it exists to protect."""
+    n = 24
+    counters = {"calls_captured": 2361, "unique_graphs": 18}   # stable = fine
+    v, compiled = _verdict_chain(
+        gpu_us=44.41 * 1000 * n, steady_us=45.69 * 1000 * n,
+        wall_us=70.0 * 1000 * n, dyn_before=counters, dyn_after=dict(counters))
+    assert v == "kernel-bound", f"got {v}"
+    assert compiled == {}, "stable counters must not read as compilation"
+
+
+def test_the_impossible_branch_is_still_reachable():
+    n = 24
+    v, _ = _verdict_chain(gpu_us=1071.94 * 1000 * n, steady_us=525.81 * 1000 * n,
+                          wall_us=1997.65 * 1000 * n,
+                          dyn_before={}, dyn_after={})
+    assert v == "impossible"
+
+
+def test_the_verdict_branch_matches_the_script():
+    """The helper above duplicates main()'s logic, so pin the two together:
+    if the script's branch order or conditions change, this fails."""
+    import inspect
+
+    import profile_decode as pd
+    src = inspect.getsource(pd.main)
+    for needle in ("windows_differ = wall_us < steady_us or bool(compiled_in_w1)",
+                   "if windows_differ:",
+                   "elif busy > 1.0:",
+                   "elif busy < 0.5:",
+                   "elif busy > 0.85:"):
+        assert needle in src, f"verdict chain changed: {needle!r} not in main()"

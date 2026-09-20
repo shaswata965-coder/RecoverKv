@@ -1572,7 +1572,7 @@ one has ever asked the hardware.
 
 ---
 
-## 11. What we are testing next, and the goal *(2026-09-19, later)*
+## 11. What we are testing, what the first run said, and the goal
 
 §10 is the record of seven runs. This section is the opposite: the two things
 that are **not** established, the runs that settle them, and the number we are
@@ -1614,7 +1614,7 @@ Beyond 1.2×: the decode kernel is still **11.1× off roofline** (14.48 vs 1.30
 ms). §6.2 is unchanged as the main event; 1.5× there is another −4.8 ms, or
 ~1.40× overall.
 
-### 11.2 Run 1 — is the compiled eviction worth anything?
+### 11.2 Run 1 — is the compiled eviction worth anything? *(half-run; see §11.6)*
 
 It is the one perf-affecting change in this repo that has **never had a control
 arm** (§10.0.4, §10.12, §10.14 each say so). It now has one. Two commands, one
@@ -1707,12 +1707,116 @@ marked it refuted on `unique_graphs: 0` — both readings are right, because the
 measured different regimes: a 512-step perf cell settles, a 60-step profile
 never does. If run 11.2 keeps the compiled path, this is the next fix.
 
-### 11.5 The order, and why not to reverse it
+### 11.6 First GPU run of §11.2 — the compiled arm *(2026-09-20)*
 
-1. **Run 11.2.** Cheapest, and it either deletes a moving part or justifies one.
-2. **Item 1, the ladder reorder** — the largest measured-but-unclaimed win.
-3. **Then §6.2**, contiguous reads, which is where the rest is.
+`table_v10_compiled`, all six cells, gate verdict **`ran on all 24576 fused
+layers, realised read fraction 0.251`**. TPOT_steady, seconds:
 
-Do not start at 3. It is the biggest number on the page and the only one that
-needs a kernel rewrite to collect, and the two cheaper items above it are
-already paid for.
+| cell | v9 | **v10 compiled** | Δ |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0553 | 0.0552 | −0.2% |
+| 4096/257 B=32 | 0.0589 | **0.0590** | +0.2% |
+| 2048/513 B=1 | 0.0557 | 0.0555 | −0.4% |
+| 2048/513 B=32 | 0.0561 | 0.0562 | +0.2% |
+| 1048/1049 B=1 | 0.0551 | 0.0554 | +0.5% |
+| 1048/1049 B=32 | 0.0562 | 0.0565 | +0.5% |
+
+A wash against v9, which is the expected result for the *shipped* arm — it is
+the same configuration plus `--cooldown 3 --clock-lock true`, and those make it
+not cell-by-cell comparable to v9 anyway. **The control arm has not been run.
+§11.2 is half-done and its question is still open.**
+
+One warning fired that matters:
+
+```
+config ours_q0.70: dynamo compiled 1 frame(s) during the MEASURED runs
+(counters are zeroed after warmup, so this is recompilation). The eviction is
+compiled dynamic=True precisely so a varying window count does not retrigger
+compilation; this is compile latency inside the timings.
+```
+
+**That is §11.4's open item, now observed on the perf runner rather than argued
+from a profile.** `dynamic=True` did not prevent it, which is exactly what
+`int()`-forcing `T_fp` and `W` predicts.
+
+### 11.7 The profile: the kernels are the best yet, and `busy` was junk
+
+Same cell, `--compile-evict 1`. **The bucket table is the cleanest this repo
+has taken** — every prediction in §11.1 landed:
+
+| bucket | §10.1 | **now** | Δ |
+|---|---|---|---|
+| ours: two-tier decode | 17.74 | **14.469** | **−3.27** |
+| ours: read gate | 3.63 | **2.439** | **−1.19** |
+| ours: compiled evict | 0.00 | 3.029 | +3.03 |
+| model: GEMM | 11.18 | 10.962 | −0.22 |
+| elementwise | 4.12 | 3.213 | −0.91 |
+| memory: index/gather | 3.66 | 2.547 | −1.11 |
+| memory: copy/cat | 2.08 | 1.941 | −0.14 |
+| reduction | 1.04 | 0.958 | −0.08 |
+| sort/topk | 0.84 | 0.833 | −0.01 |
+| **CUDA kernels** | **44.41** | **40.51** | **−3.90 (1.096×)** |
+
+Launches 1762 → 1726. Host stalls collapsed: `cudaMemcpyAsync` 64.9/step at
+0.64 ms, `cudaDeviceSynchronize` 0.1/step at 0.02 ms.
+
+Three readings:
+
+1. **§11.1 item 0 is confirmed at the predicted size.** Decode −3.27 against a
+   predicted −3.26, gate −1.19 against a predicted −1.19. The tile search is
+   real and it is banked.
+2. **The eviction now genuinely fuses** — 3.029 ms/step over **14
+   launches/step**, `3 compiled / 0 eager`. §10.7's check finally reads
+   non-zero. It is 7.5% of GPU time, and whether that is worth paying is
+   precisely what the missing control arm answers.
+3. **The net is 1.096×, not 1.11×**, because the eviction's +3.03 ms is new
+   cost that §11.1's arithmetic did not carry. Item 1 (the ladder reorder) and
+   the control arm are what close the rest.
+
+**But the headline number was garbage, and in a new way.** The run printed:
+
+```
+wall             2357.34 ms/step   (profiler OFF -- the real step)
+wall, profiled    136.32 ms/step   (-2221.03 ms of profiler overhead)
+GPU busy             1.7 %   <-- THE number
+-> HOST-BOUND. The GPU idles most of the step
+```
+
+The GPU was not idling. `busy` divides window 2's kernel time by window 1's
+wall, and the two windows were not the same kind of step: **Dynamo built 18
+graphs during window 1** (`{'calls_captured': 2361, 'unique_graphs': 18}`),
+so the denominator was compiling while the numerator was not. A **negative
+profiler overhead is the tell** — tracing only ever adds cost.
+
+This is §11.4's failure in the opposite direction, and it is the more dangerous
+one: a busy of 203.9% is obviously impossible, while 1.7% reads as a *discovery*
+and sends the work at launches and syncs. The compile-contamination block did
+fire, and only because of the Dynamo counters — the compile ranges themselves
+were in the unprofiled window, so no kernel row could ever have shown them.
+
+**Fixed:** the script now snapshots Dynamo's counters across window 1 and
+refuses a host/kernel verdict when either tell is present — a profiled window
+faster than the unprofiled one, or graphs built in the denominator. It says
+which tell fired, and that the kernel table is still valid (it is window 2
+alone; only `busy` and the wall are spoiled).
+
+**Still unknown: the real `busy` at this cell.** No clean unprofiled wall was
+captured this run. Raise `--warmup` until no graphs are built in window 1, then
+re-read it. Given 40.51 ms of kernels against §10.1's 45.69 ms wall, ~97% busy
+remains the expectation, but that is arithmetic, not a measurement.
+
+### 11.8 The order, and why not to reverse it
+
+1. **Finish §11.2 — run the control arm.** §11.6 ran only the compiled half, so
+   the question it exists to answer is still open, and the eviction is now a
+   measured 3.029 ms/step (7.5% of GPU time) rather than a hypothetical. One
+   command; it either deletes a moving part or justifies one.
+2. **Re-take the profile with a bigger `--warmup`**, until no graphs are built
+   in window 1 (§11.7). Everything about that profile was good except the one
+   number it exists to print.
+3. **Item 1, the ladder reorder** — the largest measured-but-unclaimed win.
+4. **Then §6.2**, contiguous reads, which is where the rest is.
+
+Do not start at 4. It is the biggest number on the page and the only one that
+needs a kernel rewrite to collect, and the three cheaper items above it are
+already paid for or nearly so.
