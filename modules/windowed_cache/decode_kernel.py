@@ -317,6 +317,7 @@ def two_tier_window_reference(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tensor] = None,
+    splits: int = 1,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -497,17 +498,9 @@ def two_tier_window_reference(
                 selm, p, torch.zeros_like(p)).sum(dim=-1, keepdim=True))
             wmax.scatter_(-1, wcol, m_new.unsqueeze(-1))
 
-    # 1. sink prologue -- softmax only
-    for s0 in range(0, max(num_sink, 0), BLOCK_T):
-        tile(s0, num_sink, -1, 0)
-    # 2. fp body -- whole-window tiles from num_sink
-    for w0 in range(0, n_body_win, block_nw):
-        tile(num_sink + w0 * ws, body_end, w0, n_body_win - w0)
-    # 3. Q tier -- whole-window tiles, through the gate's selection when given
-    if sel is None:
-        for w0 in range(0, n_q_win, block_nw):
-            tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
-    else:
+    sel_q = None
+    n_sel = 0
+    if sel is not None:
         if sel.shape[0] != B or sel.shape[1] != H_kv:
             raise ValueError(
                 f"sel must be [B, H_kv, n_sel] = [{B}, {H_kv}, *], got "
@@ -519,8 +512,87 @@ def two_tier_window_reference(
                 "The gate selects a subset of the tier it is handed; a larger "
                 "selection means sel was built against a different store.")
         sel_q = sel.to(torch.long).repeat_interleave(H_q // H_kv, dim=1)
-        for w0 in range(0, n_sel, block_nw):
-            q_tile_gated(w0, sel_q, n_sel)
+
+    # ---- SPLIT-KV: partition the WINDOW axis across `splits` programs --------
+    #
+    # Mirrors the kernel's phase 1. Each split owns a contiguous chunk of the
+    # body windows and a contiguous chunk of the Q windows, accumulates its own
+    # `(acc, l, m)`, and writes `wsum`/`wmax` for **its own windows only** --
+    # which is why the partition is over windows and not over keys: a window
+    # split across two programs would need its score reduced across them, and
+    # every column here is written exactly once.
+    #
+    # The sinks go to split 0 alone. They emit no window score (the scorer
+    # strips them before windowing), so they only have to land in exactly one
+    # split's softmax, and splitting them would buy nothing -- `num_sink` is 5.
+    #
+    # Everything BELOW the merge is untouched by this. `out = acc / l` and the
+    # whole epilogue need the GLOBAL lse and a full pass over `W_phys`, so they
+    # stay where they are and run once, after the partials are combined. That
+    # is the property that makes split-KV tractable on this kernel at all.
+    for _split_bound, _name in ((splits, "splits"),):
+        if not isinstance(_split_bound, int) or _split_bound < 1:
+            raise ValueError(f"{_name} must be a positive int, got {_split_bound!r}")
+
+    def _chunk(n: int, i: int, k: int) -> Tuple[int, int]:
+        """Contiguous chunk ``i`` of ``n`` items over ``k`` splits.
+
+        Remainder goes to the low splits, so chunk sizes differ by at most one
+        and the partition is a partition -- every window in exactly one chunk.
+        """
+        base, rem = divmod(n, k)
+        lo = i * base + min(i, rem)
+        return lo, lo + base + (1 if i < rem else 0)
+
+    parts = []
+    for sp in range(splits):
+        # Reset this split's running softmax. The closures mutate these through
+        # `nonlocal`, so rebinding here is what gives each split its own state.
+        # Constructed exactly as lines above do -- no `device=`, because this
+        # oracle is CPU-side and the originals it mirrors take none.
+        m = torch.full((B, H_q), NEG, dtype=torch.float32)
+        l = torch.zeros((B, H_q), dtype=torch.float32)
+        acc = torch.zeros((B, H_q, D), dtype=torch.float32)
+
+        # 1. sink prologue -- softmax only, split 0 only
+        if sp == 0:
+            for s0 in range(0, max(num_sink, 0), BLOCK_T):
+                tile(s0, num_sink, -1, 0)
+        # 2. fp body -- this split's chunk of the body windows
+        lo_b, hi_b = _chunk(n_body_win, sp, splits)
+        for w0 in range(lo_b, hi_b, block_nw):
+            tile(num_sink + w0 * ws, num_sink + hi_b * ws, w0, hi_b - w0)
+        # 3. Q tier -- this split's chunk, through the gate's selection when given
+        if sel is None:
+            lo_q, hi_q = _chunk(n_q_win, sp, splits)
+            for w0 in range(lo_q, hi_q, block_nw):
+                tile(body_end + w0 * ws, min(S, body_end + hi_q * ws),
+                     n_body_win + w0, hi_q - w0)
+        else:
+            lo_q, hi_q = _chunk(n_sel, sp, splits)
+            for w0 in range(lo_q, hi_q, block_nw):
+                q_tile_gated(w0, sel_q, hi_q)
+        parts.append((acc, l, m))
+
+    # ---- merge the partials: the standard log-sum-exp combine ---------------
+    #
+    # At `splits == 1` this is `acc, l, m = parts[0]` with one multiply by
+    # exp(m - m) == 1, so it is a **provable no-op** -- the property that makes
+    # `splits=1` the control arm for this change.
+    if splits == 1:
+        acc, l, m = parts[0]
+    else:
+        _exp = torch.exp2 if exp2 else torch.exp
+        m = torch.stack([p[2] for p in parts], 0).amax(0)
+        l = torch.zeros_like(parts[0][1])
+        acc = torch.zeros_like(parts[0][0])
+        for a_s, l_s, m_s in parts:
+            # A split that saw no key has m_s == -inf and l_s == 0. exp(-inf -
+            # m) is 0 for finite m, but -inf - -inf is NaN, so the empty-
+            # everywhere case is selected away rather than computed.
+            w = torch.where(m_s > NEG, _exp(m_s - m), torch.zeros_like(m_s))
+            l = l + l_s * w
+            acc = acc + a_s * w.unsqueeze(-1)
 
     out = acc / l.unsqueeze(-1)
     lse = m + (torch.log2 if exp2 else torch.log)(l)

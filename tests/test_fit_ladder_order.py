@@ -163,7 +163,14 @@ def test_the_tuned_winner_does_not_depend_on_ladder_order():
     rung, so both orders must agree on the minimum -- if they do not, the
     search has an order dependence and the 1.4%-vs-6.1% gap has another cause.
     """
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
+    # `_search_rungs` times each rung through `_time_launch`, which calls
+    # torch.cuda.synchronize(). importorskip("torch") is not enough -- a CPU
+    # torch imports fine and then raises "Found no NVIDIA driver" here. This
+    # test passed on the GPU box and failed on the dev box for exactly that
+    # reason, which is the guard being wrong, not the code.
+    if not torch.cuda.is_available():
+        pytest.skip("_search_rungs times rungs on the device; needs CUDA")
     from modules.windowed_cache import decode_kernel as dk
 
     ms = dict(MEASURED_MS)
