@@ -1588,9 +1588,15 @@ quantities. None needs a kernel rewrite:
 | # | change | Δ ms | cumulative | status |
 |---|---|---|---|---|
 | 0 | tile tuning (§10.14) | −3.90 | 1.096× | **measured, §11.7** |
-| 1 | `_FIT_LADDER` reorder → untuned geometries | −2.10 | 1.156× | not started |
+| 1 | ~~`_FIT_LADDER` reorder → untuned geometries~~ | **~0** | — | **MEASURED A TIE, §11.12** |
 | 2 | ~~the compiled eviction stops costing~~ | — | — | **DEAD — it EARNS ~10%, §11.9** |
-| 3 | ~10% off the decode kernel (it is 11.1× off roofline) | −1.44 | **1.20×** | §6.2 territory |
+| 3 | **split-KV** on the decode kernel (~11 ms of it is batch-invariant) | −1.44 for 1.2×, more available | **1.20×** | **decided by §11.11** |
+
+**Two of the three original items are now retired by measurement, both against
+the estimate written here.** Item 1 predicted −2.10 ms and delivered a tie
+(§11.12); item 2 predicted a −1.5 ms saving from deletion and the thing earns
+10% (§11.9). Item 3 is the only one left, it is larger than it was sized at,
+and §11.11 changed what it is.
 
 **Item 2 was retired by measurement on 2026-09-20 and its Δ was wrong in sign.**
 The control arm says the compiled eviction is worth **6.4–11.2%** of TPOT, not
@@ -1990,29 +1996,134 @@ per geometry, and `B` is already in the signature.
 
 That is one perf run with `--batches "1 8 32"` and no code change at all.
 
-### 11.8 The order from here *(revised 2026-09-20, after §11.9)*
+### 11.12 Run A: the ladder reorder is a tie *(2026-09-20)*
 
-Both §11.2 questions are answered. What is left:
+`v11_measured` against `v11_legacy`, one flag apart, same node, same session:
 
-1. **Item 1 is LANDED** (`c647ab3`): the ladder is ordered by measurement,
-   `STICKYKV_FIT_LADDER=legacy` / `--fit-ladder legacy` is its control arm, and
-   the arm is recorded in the npz. **It needs its A/B run** — one pair, two
-   `OUT_DIR`s, same shape as §11.2's.
-2. **Re-take the compiled-arm profile with a bigger `--warmup`** (§11.7). The
-   control arm gave us a clean 91.2%-busy reading; the compiled arm still has
-   no valid wall, and the two are not comparable until it does.
-3. **Run the tile ladder at `--batches "1 8 32"`** (§11.10). No code change; it
-   separates the two candidate mechanisms for item 3 and decides whether the
-   next kernel change is split-KV or §6.2. Doing it before either rewrite is
-   the difference between a measurement and a preference.
-4. **Then the kernel change that measurement selects.** On current evidence
-   that is **split-KV, not §6.2** — the kernel is at 2.37 waves and 79%
-   machine utilisation at B=32, and 7.4% at B=1, so it is occupancy-starved
-   before it is scatter-bound.
+| cell | measured-arm | legacy-arm | Δ |
+|---|---|---|---|
+| 4096/257 B=1 | 0.0589 | 0.0604 | −2.5% |
+| 4096/257 B=32 | 0.0630 | 0.0632 | −0.3% |
+| 2048/513 B=1 | 0.0593 | 0.0593 | 0.0% |
+| 2048/513 B=32 | 0.0606 | 0.0607 | −0.2% |
+| 1048/1049 B=1 | 0.0591 | 0.0590 | +0.2% |
+| 1048/1049 B=32 | 0.0607 | 0.0608 | −0.2% |
 
-Two things NOT to do, both retired by measurement:
+*(arm labelling per the `fit_ladder` field in each run's `run_perf_table.env`.)*
 
-* **Do not delete the compiled eviction.** §11.9: it earns 6.4–11.2%.
-* **Do not chase the shared bucket on launch count alone.** It is 11.60 ms
-  (29.3%) on the eager arm and issued by both sides; a kernel name cannot say
-  which. That needs `--trace`, not a guess.
+**Median 0.2%; five of six cells inside ±0.3%. A tie.** §11.1 predicted −2.10
+ms (−4.7%). The prediction was wrong, and the hypothesis behind it — that
+untuned geometries taking a mediocre fallback rung is where §10.14's missing
+4.7 points went — is **not supported**.
+
+The reorder stays as the default: it replaces an asserted fallback with a
+measured one, it costs nothing, and `STICKYKV_FIT_LADDER=legacy` keeps the arm.
+But it is not a win and must not be quoted as one.
+
+**Do not compare either arm against `table_v10`.** Both v11 runs are uniformly
++6.7…+7.8% slower than `table_v10_compiled` (median +6.8%), and that flatness
+across three shapes and two batch sizes is the signature of a machine, not a
+code change — a ladder reorder touches only untuned geometries and would land
+unevenly. The node moved between the runs (`amilan034` → `amilan035`). The v11
+A/B is internally valid; v11-vs-v10 is not a comparison.
+
+### 11.11 Run B settles it: the decode kernel is grid-limited *(2026-09-20)*
+
+`table_v11_batchsweep`, 4096/257, `--batches "1 8 32"`, gate `ran on all 24576
+fused layers, read fraction 0.251`.
+
+| B | blocks (`B*H_kv`) | waves on 108 SMs | TPOT | ΔTPOT | dec tok/s | scaling | of linear |
+|---|---|---|---|---|---|---|---|
+| 1 | 8 | 0.07 → **1 wave** | 0.0542 | — | 18.4 | — | — |
+| 8 | 64 | 0.59 → **1 wave** | 0.0553 | **+2.0%** | 144.7 | 7.86× | **98%** |
+| 32 | 256 | 2.37 → **3 waves** | 0.0584 | **+5.6%** | 548.3 | 3.79× | **95%** |
+
+**The cost appears exactly when the wave count does.** B=1→8 is 8× the work
+inside a single wave and costs 2.0%; B=8→32 is 4× the work but crosses from one
+wave to three, and costs 5.6% — more cost for less work. That is wave
+quantisation, and nothing else produces it.
+
+Throughput is **93% of linear across a 32× batch** (18.4 → 548.3 tok/s). A
+kernel that is bandwidth- or compute-bound cannot do that; one that was idling
+can.
+
+#### The decomposition
+
+Fitting `T(B) = fixed + k·B` over the three points gives **k = 0.135 ms per
+batch element**, so only **4.34 ms of the entire B=32 step scales with batch**
+— 7% of it. The GEMMs account for ~0.7 ms of that (they sit at their
+weight-read floor at B=1 and become compute-bound by B=32), leaving ≲3.6 ms for
+everything else that is batch-proportional.
+
+**Our decode kernel measures 14.42 ms at B=32.** Its work is 100% proportional
+to B — every row attends over its own cache. If it scaled, it would swing ~14
+ms across this range. The whole step swings 4.2 ms. So **~11 ms of that kernel
+is paid regardless of batch size**, which is the definition of a critical path
+that does not use the machine.
+
+#### This decides item 3: split-KV, not §6.2
+
+§11.10 put the two candidates side by side and named the discriminator. Run B
+answers it, and by a stronger route than the ladder spread: contiguity (§6.2)
+changes the cost of a fetch, and no change to fetch cost produces a step that is
+93% batch-invariant. Only the grid does. **Item 3 is split-KV.**
+
+§6.2 is not refuted — it is deferred. Contiguous reads are worth more once the
+machine is full, and they remain the right second move.
+
+#### It also corrects §8
+
+§8 says "B=1 is not winnable" and attributes it to the weights floor: 16.06 GB
+per step → ~10.3 ms/token on an A100, independent of cache size. **The floor is
+not what we are hitting.** At B=1 we measure **54.2 ms**, which is 5.3× that
+floor; Flash sits near 24 ms, 2.3× it. The ~30 ms/step that separates us at B=1
+is fixed per-step cost, most of it a kernel running on 8 of 108 SMs — not
+bandwidth.
+
+So the B=1 claim should be restated. It is not "B=1 is structurally lost, claim
+memory instead"; it is "B=1 is lost **to a grid we chose**, and split-KV is the
+thing that would test it." That is a different and more honest sentence, and it
+is the one item on this page that could move a cell we have never won.
+
+#### What is still missing
+
+The three `fused decode tiling tuned sig=…` ladders were not captured. The
+table evidence above is stronger and more direct, so this does not block the
+conclusion, but the ladders would show the spread collapsing at low B from the
+kernel's own side. Worth grabbing on the next run.
+
+### 11.8 The order from here *(revised 2026-09-20, after §11.11)*
+
+All three of §11.2's and §11.10's questions are answered. What is left is one
+kernel change and the measurements that would defend it.
+
+1. **Split-KV on the decode kernel** (§11.11). The only remaining item, and the
+   only one on this page that could move a cell we have never won. Partition
+   the `n_sel + Sfp` keys into `S` chunks, `grid = (B * H_kv * S,)`, and merge
+   the partial `(acc, l, m)` triples with the usual log-sum-exp combine. At
+   B=32, S=4 takes 256 blocks to 1024; at B=1, 8 to 32.
+   * It is a Triton change **plus its CPU reference** — `two_tier_window_
+     reference` must mirror the split, and the tests must pin the reference
+     before the kernel is trusted. That is the repo's contract and it is what
+     makes this a reviewable change rather than a hopeful one.
+   * It reassociates the online softmax, so `wsum`/`est` move in their last
+     bits — the same class as the tile ladder and `_sorted_pick` (§10.5). No
+     quality claim crosses it without a LongBench run.
+   * `S=1` is its control arm and is a provable no-op, exactly as
+     `--gate-ratio 1.0` is the gate's.
+2. **Re-take the compiled-arm profile with `--warmup 40`** (§11.7). Still the
+   one number we do not have: the compiled arm has no valid wall. Cheap, and it
+   also re-checks whether a graph is still built per eviction.
+3. **§6.2, contiguous reads.** Deferred, not refuted (§11.11). Worth more once
+   the machine is full.
+
+**A standing caveat on everything above.** The node moved mid-session
+(`amilan034` → `amilan035`) and cost a uniform ~6.8%. Cross-run comparisons are
+only valid within a node. Every claim in §11.9–§11.12 is an A/B taken in one
+session on one node, which is why they survive that.
+
+**What none of this has touched:** quality. Every number in §11 is TPOT. The
+tile ladder and split-KV both move the last bits of the window scores, and
+`ac128e8`/`8a8cdc0` already broke comparability of the older quality rows. A
+LongBench run at the shipped operating point is the missing half of the story,
+and it has not been taken since those commits.
