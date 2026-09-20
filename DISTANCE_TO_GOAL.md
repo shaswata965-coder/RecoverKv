@@ -1908,20 +1908,107 @@ thing being evaluated.
 **§11.1 item 2 is dead** and its sign was wrong. The 1.2× now comes from item 1
 plus a modest slice of the decode kernel, not from a deletion.
 
+### 11.10 Item 3 — and why it is probably NOT §6.2 *(2026-09-20)*
+
+Item 3 is "~10% off the decode kernel", and §6.2 (make the selected reads
+contiguous) has been the assumed mechanism since §2. **The measurements now
+point somewhere else, and the redirection is worth more than the 10%.**
+
+#### The kernel is occupancy-starved before it is scatter-bound
+
+`grid = (B * H_kv,)`. On an A100's 108 SMs:
+
+| | blocks | waves | machine utilisation |
+|---|---|---|---|
+| B=1 | 8 | 0.07 | **7.4%** |
+| B=32 | 256 | 2.37 | **79.0%** — the tail wave fills 40 of 108 SMs |
+
+Three independent observations line up behind that and not behind scatter:
+
+1. **The tile search.** `(32,2,4)` beats `(64,2,4)` by 1.20×, and §10.3's
+   explanation is occupancy: at `BLOCK_T=64` the ~128 KB of staged `tl.dot`
+   operands leave **one block resident per SM**. A kernel that gets faster when
+   you *shrink the tile* is occupancy-limited, not bandwidth-limited. A
+   scatter-bound kernel would not care.
+2. **Batch invariance.** TPOT is 0.0552 at B=1 and 0.0590 at B=32 — a 32×
+   increase in work for +6.9%. §3 records the same thing from the other side (a
+   run holding 2.5× more keys ran 22% *faster*). That is the signature of a
+   grid that does not grow with the work, which is exactly `B * H_kv` over a
+   serial tile loop. `profile_decode.py`'s own docstring predicted it.
+3. **§8's "B=1 is not winnable".** At B=1 the kernel uses 7.4% of the machine.
+   That is not a weights-bandwidth floor, it is an empty GPU.
+
+Contiguity reduces the *cost per fetch*. Occupancy decides whether there is
+anything to hide that cost behind. On a kernel at 2.37 waves with a 37%-full
+tail wave, there is not — so §6.2 would be paying for a layout rewrite to speed
+up fetches the machine is already idle waiting on.
+
+#### The cheaper candidate, and it is the standard one
+
+**Split the key axis across blocks** — FlashDecoding-style split-KV: partition
+the `n_sel + Sfp` keys into `S` chunks, give each its own block
+(`grid = (B * H_kv * S,)`), and add a second pass that combines the partial
+`(acc, l, m)` triples by the usual log-sum-exp merge. At B=32, S=4 takes the
+grid from 256 to 1024 blocks (9.5 waves, 94% utilisation); at B=1 from 8 to 32.
+
+Why this is the better first move:
+
+* **It does not touch the stored format.** §6.2 changes `slots.py`,
+  `store.py`, the eviction's gather, the gate and the decode kernel together;
+  split-KV is the decode kernel plus its CPU reference. Under this repo's rules
+  that is the difference between a change that can be reviewed and one that
+  cannot.
+* **It is the only candidate that explains B=1**, which is half the goal (§8).
+* **It composes with §6.2** rather than replacing it. If contiguity is also
+  worth something, it is worth more once the machine is full.
+
+The one thing to watch: splitting reassociates the online softmax, so `wsum`
+and `est` move in their last bits — the same class of change `_sorted_pick`
+and the tile ladder already document (§10.5). It is a last-bit move on values
+that feed a top-k, so it can only change an outcome for windows already tied to
+~1e-7. It still needs the LongBench run before any quality claim crosses it.
+
+#### What is NOT being shipped here, and why
+
+**Neither rewrite is in this commit.** Both are Triton changes, this box has no
+GPU and no Triton, and the repo's contract is that a kernel ships unvalidated
+*but its algorithm does not* — every kernel has a CPU reference that tests pin
+(`two_tier_window_reference`, `gate_reference`, `gated_decode_step`). Shipping
+a layout or grid change blind means shipping the reference change blind with
+it, and the failure mode of a wrong stride is **plausible wrong numbers**, not
+a crash. That is the one failure this codebase keeps paying for.
+
+What is needed first is one measurement that separates the two mechanisms, and
+it is cheap because the harness already takes it: **run the existing tile ladder
+at B=1 and B=8 as well as B=32.** The ladder already publishes every rung's time
+per geometry, and `B` is already in the signature.
+
+* If the winning rung and the spread are roughly **batch-invariant**, the
+  kernel is latency-bound inside a block → scatter (§6.2) is the mechanism.
+* If the spread **collapses at low B** (every rung the same, because the
+  machine is empty either way), the grid is the mechanism → split-KV.
+
+That is one perf run with `--batches "1 8 32"` and no code change at all.
+
 ### 11.8 The order from here *(revised 2026-09-20, after §11.9)*
 
 Both §11.2 questions are answered. What is left:
 
-1. **Item 1, the `_FIT_LADDER` reorder** — the largest measured-but-unclaimed
-   win, −2.10 ms, and the cheapest thing on this page. `_first_fit` takes the
-   ladder's first entry, which every profile in §11 measures as the 9th-best
-   rung of 11.
+1. **Item 1 is LANDED** (`c647ab3`): the ladder is ordered by measurement,
+   `STICKYKV_FIT_LADDER=legacy` / `--fit-ladder legacy` is its control arm, and
+   the arm is recorded in the npz. **It needs its A/B run** — one pair, two
+   `OUT_DIR`s, same shape as §11.2's.
 2. **Re-take the compiled-arm profile with a bigger `--warmup`** (§11.7). The
    control arm gave us a clean 91.2%-busy reading; the compiled arm still has
    no valid wall, and the two are not comparable until it does.
-3. **§6.2, contiguous reads.** Now the *only* remaining item, and the 1.2×
-   needs just ~10% of it (−1.44 ms of the decode kernel's 14.42, which sits
-   11.1× off its roofline). The rest of §6.2 is what takes this past 1.2×.
+3. **Run the tile ladder at `--batches "1 8 32"`** (§11.10). No code change; it
+   separates the two candidate mechanisms for item 3 and decides whether the
+   next kernel change is split-KV or §6.2. Doing it before either rewrite is
+   the difference between a measurement and a preference.
+4. **Then the kernel change that measurement selects.** On current evidence
+   that is **split-KV, not §6.2** — the kernel is at 2.37 waves and 79%
+   machine utilisation at B=32, and 7.4% at B=1, so it is occupancy-starved
+   before it is scatter-bound.
 
 Two things NOT to do, both retired by measurement:
 
