@@ -1352,9 +1352,17 @@ def _device_sms(default: int = _SPLITS_FALLBACK_SMS) -> int:
     return default
 
 
+#: The env string, latched at import. `_resolve_splits` runs once per layer per
+#: step (32x at L=32), and `os.environ.get(...).strip().lower()` allocates two
+#: strings every time -- the same objection this module already records against
+#: reading `_EXP2` on the launch path. The GEOMETRY still varies per call; only
+#: the knob is fixed for the process.
+_DECODE_SPLITS_RAW = [os.environ.get(_DECODE_SPLITS_ENV, "").strip().lower()]
+
+
 def _resolve_splits(B: int, H_kv: int, n_q_iter: int, n_body_win: int) -> int:
     """Splits for this geometry. 1 unless asked for."""
-    raw = os.environ.get(_DECODE_SPLITS_ENV, "").strip().lower()
+    raw = _DECODE_SPLITS_RAW[0]
     if raw in ("", "1", "off", "false", "no"):
         return 1
     # Never split finer than there is work: the window axis is what is being
@@ -1391,7 +1399,7 @@ def _resolve_splits(B: int, H_kv: int, n_q_iter: int, n_body_win: int) -> int:
 
 def decode_splits_setting() -> str:
     """What this process was ASKED for, for a run's provenance."""
-    return os.environ.get(_DECODE_SPLITS_ENV, "").strip().lower() or "1"
+    return _DECODE_SPLITS_RAW[0] or "1"
 
 
 def _resolve_fit_ladder():

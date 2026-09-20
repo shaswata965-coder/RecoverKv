@@ -137,10 +137,19 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("STICKYKV_DECODE_SPLITS", raising=False)
 
 
-def _resolve():
+def _resolve(monkeypatch=None):
+    """The resolver, with the import-latched env string re-read.
+
+    The knob is latched at import (it is read once per layer per step), so a
+    test that only sets the environment would be testing the latch from
+    whenever this module was first imported. Re-seeding it here is what makes
+    these tests exercise the value they set.
+    """
     pytest.importorskip("torch")
-    from modules.windowed_cache.decode_kernel import _resolve_splits
-    return _resolve_splits
+    from modules.windowed_cache import decode_kernel as dk
+    dk._DECODE_SPLITS_RAW[0] = os.environ.get(
+        "STICKYKV_DECODE_SPLITS", "").strip().lower()
+    return dk._resolve_splits
 
 
 @pytest.mark.parametrize("raw", ["", "1", "off", "false", "no", "OFF"])
@@ -218,7 +227,8 @@ def test_a_nonpositive_count_raises(monkeypatch, bad):
 
 def test_the_setting_is_reported_for_provenance(monkeypatch):
     pytest.importorskip("torch")
-    from modules.windowed_cache.decode_kernel import decode_splits_setting
-    assert decode_splits_setting() == "1"
-    monkeypatch.setenv("STICKYKV_DECODE_SPLITS", "auto")
-    assert decode_splits_setting() == "auto"
+    from modules.windowed_cache import decode_kernel as dk
+    dk._DECODE_SPLITS_RAW[0] = ""
+    assert dk.decode_splits_setting() == "1"
+    dk._DECODE_SPLITS_RAW[0] = "auto"
+    assert dk.decode_splits_setting() == "auto"
