@@ -1936,11 +1936,20 @@ class PerfRunner:
             dyn = _dynamo_counters()
             compile_failed = _evict_compile_failed()
             path_mode = _evict_path_mode()
+            # The decode tile ladder's order travels with the row for the same
+            # reason path_mode does: it is a control arm, and a row measured on
+            # one arm must never be readable as the other.
+            try:
+                from modules.windowed_cache.decode_kernel import fit_ladder_order
+                ladder_order = fit_ladder_order()
+            except Exception:  # pragma: no cover - import-path dependent
+                ladder_order = "unknown"
             diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn,
                                 "compile_failed": compile_failed,
-                                "path_mode": path_mode}
-            log.info("eviction path: %s | mode: %s | dynamo: %s",
-                     ev or "n/a", path_mode, dyn or "n/a")
+                                "path_mode": path_mode,
+                                "fit_ladder_order": ladder_order}
+            log.info("eviction path: %s | mode: %s | tile ladder: %s | dynamo: %s",
+                     ev or "n/a", path_mode, ladder_order, dyn or "n/a")
             if path_mode == "control-arm-eager":
                 log.warning(
                     "config %s: CONTROL ARM -- the eviction ran EAGER by request "

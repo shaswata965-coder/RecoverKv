@@ -83,6 +83,13 @@
 #                   A control-arm run records path_mode=control-arm-eager and
 #                   its rows are EAGER rows; they are the reference, not the
 #                   shipped path.
+#   FIT_LADDER      measured | legacy                       (default: measured)
+#                   Order of the decode tile ladder. Irrelevant to a TUNED
+#                   geometry -- every rung is timed. It decides the fallback
+#                   for an UNTUNED one, which is a constant across the run:
+#                   `measured` starts at (32,2,4); `legacy` at (64,2,4), which
+#                   three profiles rank 5th-to-9th of 11. `legacy` is the
+#                   CONTROL ARM for that change. Separate OUT_DIR per arm.
 #   (No LSE_STRICT. It is unconditional now -- an L-reuse miss raises -- so the
 #   flag was parsed and then never read, which is worse than not having it.)
 #
@@ -161,6 +168,7 @@ COOLDOWN="${COOLDOWN:-0}"
 CLOCK_LOCK="${CLOCK_LOCK:-false}"
 THROUGHPUT="${THROUGHPUT:-both}"
 EVICT_CONTROL_ARM="${EVICT_CONTROL_ARM:-false}"
+FIT_LADDER="${FIT_LADDER:-measured}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -186,6 +194,7 @@ while [[ $# -gt 0 ]]; do
     --clock-lock)           CLOCK_LOCK="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
     --evict-control-arm|--compile-evict-off) EVICT_CONTROL_ARM="$2"; shift 2;;
+    --fit-ladder)           FIT_LADDER="$2"; shift 2;;
     # The whole banner, found rather than hard-coded: a fixed end line silently
     # truncated the help every time the header grew, and then did it again when
     # EVICT_CONTROL_ARM was added past line 96. `2,/^# ===/p` stops at the
@@ -229,6 +238,11 @@ case "$BACKEND" in
   flash_attn) ATTN_IMPL="flash_attention_2";;
   eager)      ATTN_IMPL="eager";;
   *) echo "error: --backend must be flash_attn or eager, got '$BACKEND'." >&2; exit 2;;
+esac
+
+case "$FIT_LADDER" in
+  measured|legacy) export STICKYKV_FIT_LADDER="$FIT_LADDER";;
+  *) echo "error: --fit-ladder must be measured or legacy, got '$FIT_LADDER'." >&2; exit 2;;
 esac
 
 case "$EVICT_CONTROL_ARM" in
@@ -332,6 +346,7 @@ YAML
   echo "cooldown_s: $COOLDOWN  clock_locking: $CLOCK_LOCK"
   echo "throughput_columns: $THROUGHPUT"
   echo "evict_control_arm: $EVICT_CONTROL_ARM  (STICKYKV_EVICT_CONTROL_ARM=$STICKYKV_EVICT_CONTROL_ARM)"
+  echo "fit_ladder: $FIT_LADDER  (STICKYKV_FIT_LADDER=$STICKYKV_FIT_LADDER)"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
