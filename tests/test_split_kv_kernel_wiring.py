@@ -150,13 +150,50 @@ def test_the_default_is_off(monkeypatch, raw):
     assert _resolve()(32, 8, 60, 200) == 1
 
 
-def test_auto_fills_the_machine_at_low_batch_and_backs_off_at_high(monkeypatch):
+def test_auto_splits_harder_where_the_grid_is_emptier(monkeypatch):
     monkeypatch.setenv("STICKYKV_DECODE_SPLITS", "auto")
     r = _resolve()
-    # B=1: 8 blocks -> wants many splits;  B=32: 256 blocks -> already enough
-    assert r(1, 8, 60, 200) > r(32, 8, 60, 200), (
-        "auto must split harder where the grid is emptier")
-    assert r(32, 8, 60, 200) == 1, "B=32 is already 256 blocks; auto should stop"
+    assert r(1, 8, 60, 200) > r(8, 8, 60, 200) > r(32, 8, 60, 200)
+
+
+def test_auto_maximises_UTILISATION_not_block_count(monkeypatch):
+    """The property the first version of this heuristic got wrong.
+
+    It targeted a flat 216 blocks, which returned S=1 at B=32 -- where 256
+    blocks over 108 SMs is 2.37 waves and the tail fills 40 of them, i.e. 79%
+    of the machine. It also chose S=16 at B=1 (128 blocks, two waves, 59%)
+    over S=13 (104 blocks, one wave, 96%). Both were worse than available, so
+    the test asserts the outcome and not the formula.
+    """
+    import math
+    monkeypatch.setenv("STICKYKV_DECODE_SPLITS", "auto")
+    from modules.windowed_cache.decode_kernel import _device_sms
+    r, sms = _resolve(), _device_sms()
+
+    def util(blocks):
+        return blocks / (math.ceil(blocks / sms) * sms) * 100.0
+
+    for B in (1, 8, 32):
+        got = r(B, 8, 60, 200)
+        best = max(util(B * 8 * n) for n in range(1, 17))
+        assert util(B * 8 * got) >= best - 5.0, (
+            f"B={B}: auto picked S={got} at {util(B*8*got):.0f}% when "
+            f"{best:.0f}% was reachable")
+        # and it must not pay for splits it does not need
+        assert all(util(B * 8 * n) < util(B * 8 * got) - 1e-9
+                   for n in range(1, got)), (
+            f"B={B}: a smaller split count reaches the same utilisation")
+
+
+def test_auto_does_not_leave_the_headline_cell_unsplit(monkeypatch):
+    """B=32 is the cell the 1.2x target is defined at.
+
+    256 blocks is 2.37 waves, not a full machine. An `auto` that returns 1
+    here hands the headline cell its own control arm and the run measures
+    nothing.
+    """
+    monkeypatch.setenv("STICKYKV_DECODE_SPLITS", "auto")
+    assert _resolve()(32, 8, 60, 200) > 1
 
 
 def test_splits_never_exceed_the_work(monkeypatch):

@@ -1318,12 +1318,38 @@ _FIT_LADDER_LEGACY = [
 #: branch is constexpr-folded, no buffer is allocated, one launch on the old
 #: grid), so it is both the default and the control arm.
 #:
-#: `auto` targets ~2 waves of the largest A100 (216 blocks) and never splits
-#: finer than the work allows -- a split with no window in it costs a launch
-#: and contributes an empty partial.
+#: `auto` maximises the fraction of the machine the grid actually fills, and
+#: never splits finer than the work allows -- a split with no window in it
+#: costs a launch and contributes an empty partial.
+#:
+#: **It is wave quantisation that matters, not raw block count**, and the first
+#: version of this got that wrong: it targeted a flat 216 blocks and so
+#: returned S=1 at B=32, where 256 blocks over 108 SMs is 2.37 waves and the
+#: tail wave fills 40 of 108 -- 79% of the machine, which the flat target
+#: called finished. It also picked S=16 at B=1 (128 blocks, 2 waves, 59%) when
+#: S=13 (104 blocks, one wave) fills 96%. Both were worse than available.
+#:
+#: Utilisation is `blocks / (ceil(blocks / SMs) * SMs)`. Among the split counts
+#: within `_SPLITS_TIE` points of the best, the SMALLEST wins: each extra split
+#: adds a partial to store, a partial to reload and a merge iteration, and
+#: that cost is **unmeasured**. Which is also why `auto` is a starting point
+#: and not an answer -- NEXT_RUNS.md sweeps S explicitly at the headline cell,
+#: because where the real optimum sits depends on exactly that overhead.
 _DECODE_SPLITS_ENV = "STICKYKV_DECODE_SPLITS"
-_SPLITS_TARGET_BLOCKS = 216
 _SPLITS_MAX = 16
+_SPLITS_TIE = 5.0
+_SPLITS_FALLBACK_SMS = 108          # A100; only used if the device cannot say
+
+
+def _device_sms(default: int = _SPLITS_FALLBACK_SMS) -> int:
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            return int(_t.cuda.get_device_properties(
+                _t.cuda.current_device()).multi_processor_count)
+    except Exception:  # pragma: no cover - device dependent
+        pass
+    return default
 
 
 def _resolve_splits(B: int, H_kv: int, n_q_iter: int, n_body_win: int) -> int:
@@ -1335,8 +1361,20 @@ def _resolve_splits(B: int, H_kv: int, n_q_iter: int, n_body_win: int) -> int:
     # partitioned, so `splits > windows` just makes empty programs.
     cap = max(1, min(_SPLITS_MAX, max(n_q_iter, n_body_win, 1)))
     if raw == "auto":
-        want = -(-_SPLITS_TARGET_BLOCKS // max(B * H_kv, 1))
-        return max(1, min(cap, want))
+        sms = _device_sms()
+        base = max(B * H_kv, 1)
+
+        def _util(n: int) -> float:
+            blocks = base * n
+            waves = -(-blocks // sms)          # ceil
+            return blocks / (waves * sms) * 100.0
+
+        scored = [(n, _util(n)) for n in range(1, cap + 1)]
+        best = max(u for _, u in scored)
+        # Smallest split count that gets within _SPLITS_TIE points of the best:
+        # extra splits buy occupancy and cost merge work, and only the first
+        # half of that trade is known.
+        return min(n for n, u in scored if u >= best - _SPLITS_TIE)
     try:
         want = int(raw)
     except ValueError:
