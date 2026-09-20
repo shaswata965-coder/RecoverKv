@@ -200,6 +200,72 @@ re-measures it with both walls valid.
 
 ---
 
+## 3b. Run D — split-KV, the one that is supposed to pay
+
+Item 3 (§11.11). `grid = (B*H_kv,)` is 8 blocks at B=1 on a 108-SM A100;
+split-KV partitions the window axis so it becomes `B*H_kv*S`.
+
+**Read this before running it.** The kernel could not be executed on the box it
+was written on — `triton` imports there, `torch.cuda.is_available()` is False.
+What *is* validated is the algorithm (the CPU reference carries `splits` and 23
+tests pin it, including that `splits=1` is bit-identical and that the window
+ranking does not move) and the wiring (22 tests, each negative-tested by
+breaking it). The kernel itself rests on that plus review. **`--decode-splits 1`
+is the default and a provable no-op**, so the shipped path is unchanged until
+you ask for otherwise.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 OUT_DIR=outputs/v12_split1 bash scripts/run_perf_table.sh \
+  --model "$MODEL" \
+  --shapes "4096/256 1048/1048 2048/512" --batches "1 32" \
+  --data-source wikitext-103 --throughput all \
+  --cooldown 3 --clock-lock true --decode-splits 1
+
+CUDA_VISIBLE_DEVICES=0 OUT_DIR=outputs/v12_splitauto bash scripts/run_perf_table.sh \
+  --model "$MODEL" \
+  --shapes "4096/256 1048/1048 2048/512" --batches "1 32" \
+  --data-source wikitext-103 --throughput all \
+  --cooldown 3 --clock-lock true --decode-splits auto
+```
+
+### The first thing to check is CORRECTNESS, not speed
+
+A split that drops or double-counts a window produces a plausible number, not a
+crash. Before reading any timing:
+
+* `read gate: ran on all 24576 fused layers, realised read fraction 0.251` must
+  appear on **both**, unchanged. The gate runs before the split and must be
+  untouched by it.
+* `decode splits: 1` / `auto` in the `eviction path:` log line, and
+  `decode_splits` in each `run_perf_table.env`. If both say 1, the arms never
+  differed.
+* **If the two arms' TPOT differ by more than ~15% in either direction at
+  B=32, suspect correctness before celebrating or despairing.** The honest
+  check is a quality run; the cheap one is that `peak_GB` and `steadyKV_GB`
+  should be identical between arms — split-KV changes the grid, not the cache.
+
+### Then the speed
+
+| B | blocks at S=1 | at S=auto | expectation |
+|---|---|---|---|
+| 1 | 8 | up to 128 | **the big one** — 7.4% of the machine today |
+| 32 | 256 | 256 (auto stops) | little or nothing; it is already 2.37 waves |
+
+So the shape to look for is **B=1 improving and B=32 roughly flat**. That
+asymmetry is the prediction; if B=32 moves a lot and B=1 does not, the model of
+§11.11 is wrong and the number needs explaining before it is quoted.
+
+A profile of the split arm, for where the time actually went:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 STICKYKV_DECODE_SPLITS=auto python scripts/profile_decode.py \
+  --config outputs/v12_splitauto/_perf_table.generated.yaml \
+  --prefill 4096 --batch 1 --steps 24 --warmup 40 --top 40 --compile-evict 1
+```
+
+B=1, not 32 — that is where the grid is empty and where the change is supposed
+to show.
+
 ## 4. Reprinting without re-measuring
 
 Any npz directory can be re-tabled on a CPU:

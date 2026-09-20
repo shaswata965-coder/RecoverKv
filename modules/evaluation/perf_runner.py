@@ -1940,16 +1940,22 @@ class PerfRunner:
             # reason path_mode does: it is a control arm, and a row measured on
             # one arm must never be readable as the other.
             try:
-                from modules.windowed_cache.decode_kernel import fit_ladder_order
+                from modules.windowed_cache.decode_kernel import (
+                    decode_splits_setting, fit_ladder_order,
+                )
                 ladder_order = fit_ladder_order()
+                splits_set = decode_splits_setting()
             except Exception:  # pragma: no cover - import-path dependent
-                ladder_order = "unknown"
+                ladder_order = splits_set = "unknown"
             diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn,
                                 "compile_failed": compile_failed,
                                 "path_mode": path_mode,
-                                "fit_ladder_order": ladder_order}
-            log.info("eviction path: %s | mode: %s | tile ladder: %s | dynamo: %s",
-                     ev or "n/a", path_mode, ladder_order, dyn or "n/a")
+                                "fit_ladder_order": ladder_order,
+                                "decode_splits": splits_set}
+            log.info("eviction path: %s | mode: %s | tile ladder: %s | "
+                     "decode splits: %s | dynamo: %s",
+                     ev or "n/a", path_mode, ladder_order, splits_set,
+                     dyn or "n/a")
             if path_mode == "control-arm-eager":
                 log.warning(
                     "config %s: CONTROL ARM -- the eviction ran EAGER by request "

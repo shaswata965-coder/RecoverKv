@@ -90,6 +90,14 @@
 #                   `measured` starts at (32,2,4); `legacy` at (64,2,4), which
 #                   three profiles rank 5th-to-9th of 11. `legacy` is the
 #                   CONTROL ARM for that change. Separate OUT_DIR per arm.
+#   DECODE_SPLITS   1 | N | auto   split-KV on the decode kernel (default: 1)
+#                   1 = OFF and is the CONTROL ARM: every split branch is
+#                   constexpr-folded, no partial buffer is allocated, one
+#                   launch on the old grid -- a provable no-op. N or `auto`
+#                   partitions the window axis so the grid becomes B*H_kv*N.
+#                   The kernel could not be run on the box it was written on;
+#                   the A/B against 1 is what makes any number from it real.
+#                   Separate OUT_DIR per arm.
 #   (No LSE_STRICT. It is unconditional now -- an L-reuse miss raises -- so the
 #   flag was parsed and then never read, which is worse than not having it.)
 #
@@ -169,6 +177,7 @@ CLOCK_LOCK="${CLOCK_LOCK:-false}"
 THROUGHPUT="${THROUGHPUT:-both}"
 EVICT_CONTROL_ARM="${EVICT_CONTROL_ARM:-false}"
 FIT_LADDER="${FIT_LADDER:-measured}"
+DECODE_SPLITS="${DECODE_SPLITS:-1}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -195,6 +204,7 @@ while [[ $# -gt 0 ]]; do
     --throughput)           THROUGHPUT="$2"; shift 2;;
     --evict-control-arm|--compile-evict-off) EVICT_CONTROL_ARM="$2"; shift 2;;
     --fit-ladder)           FIT_LADDER="$2"; shift 2;;
+    --decode-splits)        DECODE_SPLITS="$2"; shift 2;;
     # The whole banner, found rather than hard-coded: a fixed end line silently
     # truncated the help every time the header grew, and then did it again when
     # EVICT_CONTROL_ARM was added past line 96. `2,/^# ===/p` stops at the
@@ -239,6 +249,15 @@ case "$BACKEND" in
   eager)      ATTN_IMPL="eager";;
   *) echo "error: --backend must be flash_attn or eager, got '$BACKEND'." >&2; exit 2;;
 esac
+
+# Validated HERE as well as in _resolve_splits, so a typo costs a second
+# rather than a model load. The Python side still raises -- this is the cheap
+# gate, not the authoritative one.
+case "$DECODE_SPLITS" in
+  auto|[1-9]|1[0-6]) ;;
+  *) echo "error: --decode-splits must be 1-16 or 'auto', got '$DECODE_SPLITS'." >&2; exit 2;;
+esac
+export STICKYKV_DECODE_SPLITS="$DECODE_SPLITS"
 
 case "$FIT_LADDER" in
   measured|legacy) export STICKYKV_FIT_LADDER="$FIT_LADDER";;
@@ -347,6 +366,7 @@ YAML
   echo "throughput_columns: $THROUGHPUT"
   echo "evict_control_arm: $EVICT_CONTROL_ARM  (STICKYKV_EVICT_CONTROL_ARM=$STICKYKV_EVICT_CONTROL_ARM)"
   echo "fit_ladder: $FIT_LADDER  (STICKYKV_FIT_LADDER=$STICKYKV_FIT_LADDER)"
+  echo "decode_splits: $DECODE_SPLITS  (STICKYKV_DECODE_SPLITS=$STICKYKV_DECODE_SPLITS)"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="

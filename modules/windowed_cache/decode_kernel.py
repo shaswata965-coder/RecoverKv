@@ -653,6 +653,7 @@ if _HAS_TRITON:
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
         VM, VMS, VANC,             # value centroids: int4-packed u8 [B,n,H_kv,D//2], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
+        PACC, PL, PM,              # split-KV partials: fp32 [B,H_kv,SPLITS,BLOCK_R,D] / [..,BLOCK_R] x2
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
         sqb, sqh, sqd,
@@ -664,6 +665,7 @@ if _HAS_TRITON:
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
         GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
+        SPLITS: tl.constexpr, PHASE: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -709,9 +711,21 @@ if _HAS_TRITON:
         asserts those tensors are contiguous, so it is a checked contract rather
         than an assumption.
         """
+        # SPLIT-KV. `SPLITS` and `PHASE` are constexpr, so at the shipped
+        # SPLITS=1 / PHASE=0 every branch below folds away and this kernel is
+        # byte-for-byte the pre-split one: `sp` is 0, the chunk bounds are the
+        # full ranges, no partial is written or read, and the epilogue runs
+        # inline exactly as before. That is what makes SPLITS=1 the control arm
+        # (§11.11) rather than a nominally-similar second path.
+        #
+        # PHASE 0 = attend + epilogue in one launch (the SPLITS=1 path)
+        #       1 = attend only; write this split's (acc, l, m) partial
+        #       2 = merge the partials, then epilogue. Grid is B*H_kv here.
         pid = tl.program_id(0)
-        b = pid // H_kv
-        kv = pid % H_kv
+        sp = pid % SPLITS
+        bh = pid // SPLITS
+        b = bh // H_kv
+        kv = bh % H_kv
 
         offs_r = tl.arange(0, BLOCK_R)
         r_mask = offs_r < rep
@@ -733,6 +747,22 @@ if _HAS_TRITON:
         m = tl.full([BLOCK_R], -float("inf"), tl.float32)
         l = tl.zeros([BLOCK_R], tl.float32)
         acc = tl.zeros([BLOCK_R, HEAD_DIM], tl.float32)
+
+        # This split's contiguous chunk of the WINDOW axis. The partition is
+        # over windows, not keys, so every WSUM/WMAX column is written by
+        # exactly one split and needs no cross-split reduction -- see the CPU
+        # oracle's `_chunk`, which this mirrors term for term:
+        #     lo(i) = i*base + min(i, rem);  hi(i) = lo(i+1)
+        # Written with two `minimum`s and no conditional so it is the same
+        # expression on both sides. At SPLITS=1 it is (0, n) exactly.
+        _bb = n_body_win // SPLITS
+        _br = n_body_win % SPLITS
+        lo_b = sp * _bb + tl.minimum(sp, _br)
+        hi_b = (sp + 1) * _bb + tl.minimum(sp + 1, _br)
+        # Keys past this split's last window belong to the next split. Masking
+        # by Sfp alone would let the chunk's final tile read into it and double
+        # count those keys in the merged softmax.
+        body_hi = tl.minimum(Sfp, num_sink + hi_b * WS)
 
         # Derived strides -- contiguous by contract (see the dispatcher's check).
         wsb = H_q * W_phys
@@ -773,9 +803,14 @@ if _HAS_TRITON:
         # ---- 1. sink prologue: softmax only, emits no window score -----------
         # Sinks are not represented in window scores (the scorer strips them
         # before windowing), so they contribute to `out` and the LSE, nothing else.
-        for s0 in range(0, num_sink, BLOCK_T):
+        # Split 0 alone takes the sinks. They emit no window score (the scorer
+        # strips them before windowing), so they only have to land in exactly
+        # one split's softmax; num_sink is 5, so splitting them buys nothing.
+        # At SPLITS=1, `sp` is `pid % 1` and this folds to always-true.
+        _sink_n = num_sink if sp == 0 else 0
+        for s0 in range(0, _sink_n, BLOCK_T):
             offs_n = s0 + offs_t
-            nmask = offs_n < num_sink
+            nmask = offs_n < _sink_n
             kf = tl.load(KFP + b * kfb + kv * kfh + offs_n[:, None] * kfs
                          + offs_d[None, :] * kfd,
                          mask=nmask[:, None], other=0.0).to(tl.float32)
@@ -792,10 +827,10 @@ if _HAS_TRITON:
             m = m_new
 
         # ---- 2. fp body: whole-window tiles, starting at num_sink -------------
-        for w0 in range(0, n_body_win, BLOCK_NW):
+        for w0 in range(lo_b, hi_b, BLOCK_NW):
             key0 = num_sink + w0 * WS
             offs_n = key0 + offs_t
-            nmask = in_tile & (offs_n < Sfp)
+            nmask = in_tile & (offs_n < body_hi)
             kf = tl.load(KFP + b * kfb + kv * kfh + offs_n[:, None] * kfs
                          + offs_d[None, :] * kfd,
                          mask=nmask[:, None], other=0.0).to(tl.float32)
@@ -823,7 +858,13 @@ if _HAS_TRITON:
         # ---- 3. Q tier: int2 dequant + RoPE in registers, whole-window tiles ---
         # Under GATED, seed the Q columns this program owns: the loop below writes
         # only the selected ones and the epilogue reads them all.
-        if GATED:
+        # SPLITS > 1 moves this to the HOST. Every split would otherwise re-seed
+        # the Q columns, and nothing orders the splits within one launch, so a
+        # later split could zero a column an earlier one had already scored.
+        # The dispatcher seeds once before phase 1 instead; at SPLITS=1 there is
+        # only one program per (b, kv) and the in-kernel seed is kept exactly as
+        # it was.
+        if GATED and SPLITS == 1:
             offs_wi = tl.arange(0, BLOCK_W)
             for wi0 in range(n_body_win, W_phys, BLOCK_W):
                 icols = wi0 + offs_wi
@@ -848,7 +889,11 @@ if _HAS_TRITON:
             n_q_iter = n_sel
         else:
             n_q_iter = n_active
-        for w0 in range(0, n_q_iter, BLOCK_NW):
+        _qb = n_q_iter // SPLITS
+        _qr = n_q_iter % SPLITS
+        lo_q = sp * _qb + tl.minimum(sp, _qr)
+        hi_q = (sp + 1) * _qb + tl.minimum(sp + 1, _qr)
+        for w0 in range(lo_q, hi_q, BLOCK_NW):
             if GATED:
                 # Slot -> active column. Clamp the dereference rather than mask
                 # it: `qmask` already decides what counts, and a clamped widx
@@ -941,6 +986,44 @@ if _HAS_TRITON:
                     keep = r_mask & (w < n_active)
                 tl.store(WSUM + b * wsb + hq * wsh + col, pj, mask=keep)
                 tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=keep)
+
+        # ---- phase boundary --------------------------------------------------
+        if PHASE == 1:
+            # Attend-only: hand this split's running softmax to phase 2 and
+            # stop. The epilogue needs the GLOBAL lse and a full pass over
+            # W_phys, so it cannot run per split.
+            _pb = H_kv * SPLITS * BLOCK_R
+            _ph = SPLITS * BLOCK_R
+            _pr = b * _pb + kv * _ph + sp * BLOCK_R + offs_r
+            tl.store(PL + _pr, l, mask=r_mask)
+            tl.store(PM + _pr, m, mask=r_mask)
+            tl.store(PACC + _pr[:, None] * HEAD_DIM + offs_d[None, :],
+                     acc, mask=r_mask[:, None])
+            return
+
+        if PHASE == 2:
+            # Merge: the standard log-sum-exp combine, mirroring the oracle.
+            # A split that saw no key has m == -inf and l == 0; exp2(-inf - M)
+            # is 0 for finite M but -inf - -inf is NaN, so an all-empty row is
+            # selected away rather than computed.
+            _pb = H_kv * SPLITS * BLOCK_R
+            _ph = SPLITS * BLOCK_R
+            m = tl.full([BLOCK_R], -float("inf"), tl.float32)
+            for _i in range(0, SPLITS):
+                _r = b * _pb + kv * _ph + _i * BLOCK_R + offs_r
+                m = tl.maximum(m, tl.load(PM + _r, mask=r_mask,
+                                          other=-float("inf")))
+            l = tl.zeros([BLOCK_R], tl.float32)
+            acc = tl.zeros([BLOCK_R, HEAD_DIM], tl.float32)
+            for _i in range(0, SPLITS):
+                _r = b * _pb + kv * _ph + _i * BLOCK_R + offs_r
+                _m = tl.load(PM + _r, mask=r_mask, other=-float("inf"))
+                _l = tl.load(PL + _r, mask=r_mask, other=0.0)
+                _a = tl.load(PACC + _r[:, None] * HEAD_DIM + offs_d[None, :],
+                             mask=r_mask[:, None], other=0.0)
+                _w = tl.where(_m > -float("inf"), tl.exp2(_m - m), 0.0)
+                l = l + _l * _w
+                acc = acc + _a * _w[:, None]
 
         out = acc / l[:, None]
         lse = m + tl.log2(l)
@@ -1220,6 +1303,57 @@ _FIT_LADDER_LEGACY = [
     (16, 2, 4), (16, 2, 8),
     (16, 1, 4), (16, 1, 8),
 ]
+
+
+#: How many programs share one (batch, KV head)'s window axis. **1 = off.**
+#:
+#: `STICKYKV_DECODE_SPLITS`: an integer, or `auto`. Default 1.
+#:
+#: Off by default on purpose. §11.11 measured the case FOR splitting -- the
+#: grid is 8 blocks at B=1 on a 108-SM A100, the step is 93% batch-invariant,
+#: ~11 ms of a 14.42 ms kernel is paid regardless of batch -- but the kernel
+#: that implements it cannot be run on the box it was written on. An
+#: unvalidatable change does not become the shipped path on the strength of an
+#: argument, however good the argument. `splits=1` is a provable no-op (every
+#: branch is constexpr-folded, no buffer is allocated, one launch on the old
+#: grid), so it is both the default and the control arm.
+#:
+#: `auto` targets ~2 waves of the largest A100 (216 blocks) and never splits
+#: finer than the work allows -- a split with no window in it costs a launch
+#: and contributes an empty partial.
+_DECODE_SPLITS_ENV = "STICKYKV_DECODE_SPLITS"
+_SPLITS_TARGET_BLOCKS = 216
+_SPLITS_MAX = 16
+
+
+def _resolve_splits(B: int, H_kv: int, n_q_iter: int, n_body_win: int) -> int:
+    """Splits for this geometry. 1 unless asked for."""
+    raw = os.environ.get(_DECODE_SPLITS_ENV, "").strip().lower()
+    if raw in ("", "1", "off", "false", "no"):
+        return 1
+    # Never split finer than there is work: the window axis is what is being
+    # partitioned, so `splits > windows` just makes empty programs.
+    cap = max(1, min(_SPLITS_MAX, max(n_q_iter, n_body_win, 1)))
+    if raw == "auto":
+        want = -(-_SPLITS_TARGET_BLOCKS // max(B * H_kv, 1))
+        return max(1, min(cap, want))
+    try:
+        want = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"{_DECODE_SPLITS_ENV}={raw!r} is not an integer or 'auto'. A "
+            "misspelled knob that silently falls back is how two arms come to "
+            "measure the same thing.") from None
+    if want < 1:
+        raise RuntimeError(
+            f"{_DECODE_SPLITS_ENV}={want} is not a split count; it must be >= 1 "
+            "(1 = off, the control arm).")
+    return min(want, cap)
+
+
+def decode_splits_setting() -> str:
+    """What this process was ASKED for, for a run's provenance."""
+    return os.environ.get(_DECODE_SPLITS_ENV, "").strip().lower() or "1"
 
 
 def _resolve_fit_ladder():
@@ -1660,7 +1794,39 @@ def _decode_triton(
         selb = selh = 0
 
     BLOCK_R = _pow2_at_least(rep)
-    grid = (B * H_kv,)
+
+    # ---- SPLIT-KV -----------------------------------------------------------
+    # `grid = (B * H_kv,)` is 8 blocks at B=1 on a 108-SM A100 and 256 at B=32
+    # (2.37 waves). §11.11 measured the consequence: the step is 93%
+    # batch-invariant and ~11 ms of this 14.42 ms kernel is paid regardless of
+    # batch, on work that is entirely proportional to it. Splitting the window
+    # axis multiplies the grid by `splits`.
+    #
+    # DEFAULT IS 1, i.e. OFF, and that is deliberate. At splits=1 the constexpr
+    # folds every split branch away, no partial buffer is allocated, one kernel
+    # launches on the old grid, and the shipped path is the pre-split path. The
+    # win is a hypothesis until the A/B runs (NEXT_RUNS.md), and an
+    # unvalidatable kernel change does not get to be the default on the
+    # strength of an argument.
+    splits = _resolve_splits(B, H_kv, n_sel if sel is not None else n_active,
+                             n_body_win)
+    if splits > 1:
+        # Seeded on the host, not in the kernel: with several programs per
+        # (b, kv) nothing orders them, so an in-kernel seed could zero a column
+        # another split had already scored. See the SPLITS==1 guard there.
+        if sel is not None:
+            wsum[..., n_body_win:].zero_()
+            wmax[..., n_body_win:].fill_(-float("inf"))
+        pacc = torch.empty((B, H_kv, splits, BLOCK_R, D),
+                           dtype=torch.float32, device=dev)
+        pl = torch.empty((B, H_kv, splits, BLOCK_R),
+                         dtype=torch.float32, device=dev)
+        pm = torch.empty((B, H_kv, splits, BLOCK_R),
+                         dtype=torch.float32, device=dev)
+    else:
+        # Valid pointers the kernel never dereferences: PHASE 0 touches neither.
+        pacc = pl = pm = torch.zeros((1,), dtype=torch.float32, device=dev)
+    grid = (B * H_kv * splits,)
 
     # Base-2 softmax: fold log2(e) into the SCALE, which is a scalar multiplied
     # into the logits the kernel already computes — so the base change costs
@@ -1713,11 +1879,25 @@ def _decode_triton(
         target_keys, num_stages, num_warps = rung
         BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
-        _two_tier_decode_kernel[grid](
+        if splits == 1:
+            _one(rung, BLOCK_NW, BLOCK_T, BLOCK_W, grid, 0)
+        else:
+            # Two launches, and the ORDER is the correctness argument: phase 2
+            # merges what phase 1 wrote. They are separate kernel launches on
+            # the same stream, so the second is ordered after the first -- a
+            # single launch could not give that, which is why this is not one
+            # kernel with an internal barrier.
+            _one(rung, BLOCK_NW, BLOCK_T, BLOCK_W, grid, 1)
+            _one(rung, BLOCK_NW, BLOCK_T, BLOCK_W, (B * H_kv,), 2)
+
+    def _one(rung, BLOCK_NW, BLOCK_T, BLOCK_W, g, phase):
+        target_keys, num_stages, num_warps = rung
+        _two_tier_decode_kernel[g](
             q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
             COS, SIN, SEL, LOGM,
             VM, VMS, VANC,
             out, wsum, wmax,
+            pacc, pl, pm,
             scaling,
             H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
             q.stride(0), q.stride(1), q.stride(2),
@@ -1730,6 +1910,7 @@ def _decode_triton(
             PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
             GROUP_K=gk, GROUP_V=gv,
             GATED=gated, LOG2E=_LOG2E,
+            SPLITS=splits, PHASE=phase,
             num_stages=num_stages, num_warps=num_warps,
         )
 
