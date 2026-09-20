@@ -25,6 +25,10 @@ that you are on the right line is the gate reachability grep below: on this
 branch it returns `flash_decode.py`, and on the abandoned line it returns
 nothing.
 
+`NEXT_RUNS.md` has the exact commands for the runs that are open, what each
+one decides, and what output makes its number trustworthy. Every flag in it was
+checked against the parser — do not add one that was not.
+
 `DISTANCE_TO_GOAL.md` is the live status document. Read it before proposing any
 decode work; it holds the current numbers and what is measured vs. argued. This
 file holds the things that are easy to get wrong *while* reading it.
