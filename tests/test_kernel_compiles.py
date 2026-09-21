@@ -129,7 +129,6 @@ def test_padding_lanes_cannot_reach_the_gate_kernels_reductions(ws):
     token sitting exactly at the window's mean, and every window would be scored
     as if it held one more token than it does. They must be ``-inf``.
     """
-    import math
 
     import torch
 

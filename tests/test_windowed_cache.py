@@ -11,18 +11,16 @@ import ast
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import pytest
 import torch
-from torch import Tensor
 
 from modules.windowed_cache.cache import WindowedCache
 from modules.windowed_cache.config import ResolvedConfig, WindowedCacheConfig
 from modules.windowed_cache.policy import EvictionPolicy
 from modules.windowed_cache.scorer import accumulate, compute_window_scores
 from modules.windowed_cache.state import CacheState
-from modules.windowed_cache.telemetry import NullTelemetry, Telemetry
+from modules.windowed_cache.telemetry import NullTelemetry
 from modules.windowed_cache.hooks import HookHandles
 
 

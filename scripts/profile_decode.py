@@ -61,7 +61,6 @@ split the ``shared/other`` bucket, because it carries the launching stack.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -512,7 +511,7 @@ def main() -> None:
     pkg, attn_impl = resolve_backend(cfg)
 
     print(f"loading {cfg.model.name} (attn={attn_impl}, cache_package={pkg}) ...")
-    tok = AutoTokenizer.from_pretrained(cfg.model.name)
+    AutoTokenizer.from_pretrained(cfg.model.name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.name, torch_dtype=dtype,
         attn_implementation=attn_impl, device_map="auto")

@@ -198,7 +198,7 @@ def main() -> None:
               f"{r['marker_rate']:>6.1f} {r['failed']:>5}")
 
     worst_ci = max((r["ci95"] for r in rows), default=0.0)
-    print(f"\n  Noise floor: with these sample sizes, two budgets differing by less")
+    print("\n  Noise floor: with these sample sizes, two budgets differing by less")
     print(f"  than ~{2 * worst_ci:.1f} points are statistically indistinguishable.")
     if any(r["marker_rate"] < 90.0 for r in rows):
         print("  !! Some runs have marker_rate < 90% -- raise max_new_tokens or add a")

@@ -1113,7 +1113,7 @@ class PerfRunner:
         Never raises: an autopsy that fails must not mask the OOM.
         """
         lines = [
-            f"# CUDA OOM autopsy",
+            "# CUDA OOM autopsy",
             f"# config={name} prefill={prefill_len} batch={batch_size}",
             f"# exception: {type(exc).__name__}: {exc}",
             "",

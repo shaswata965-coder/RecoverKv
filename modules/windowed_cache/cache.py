@@ -27,7 +27,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import os
 import traceback
-import warnings
 
 import torch
 from torch import Tensor
@@ -37,7 +36,7 @@ try:
 except ImportError:
     _HFCacheBase = object  # type: ignore[assignment,misc]
 
-from .config import ResolvedConfig, WindowedCacheConfig
+from .config import WindowedCacheConfig
 from .policy import EvictionPolicy
 from .scorer import accumulate
 from .state import CacheState
@@ -50,7 +49,6 @@ from modules.quant import (
 )
 from modules.quant.effective import rotate_key_window
 from modules.quant.compact import join, stable_partition
-from modules.quant.quantizer import QGrid
 from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
 

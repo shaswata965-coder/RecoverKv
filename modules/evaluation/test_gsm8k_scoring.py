@@ -7,12 +7,10 @@ wrong number, pinned so it cannot come back.
 
 from __future__ import annotations
 
-import math
 
 import pytest
 
 from modules.evaluation.gsm8k_scoring import (
-    Extraction,
     answers_match,
     calculate_metrics,
     extract_answer,

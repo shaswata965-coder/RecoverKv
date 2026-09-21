@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import torch
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-from utils.config import ExperimentConfig, load_config
+from unittest.mock import MagicMock
+from utils.config import ExperimentConfig
 
 
 class TestBaseParityRunner:

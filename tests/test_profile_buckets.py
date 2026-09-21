@@ -286,7 +286,7 @@ def test_a_compile_range_is_rejected_even_when_tagged_as_a_device_event():
     of everything nested inside it, so trusting the tag double-counts the very
     kernels it encloses.
     """
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     from torch.autograd import DeviceType
 
     from profile_decode import _is_device_event

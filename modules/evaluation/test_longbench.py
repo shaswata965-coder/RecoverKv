@@ -6,16 +6,12 @@ CPU-only with mocked models or tiny synthetic snippets.
 from __future__ import annotations
 
 import json
-import math
 import os
-import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pytest
 import torch
 

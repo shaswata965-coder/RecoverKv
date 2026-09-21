@@ -90,7 +90,7 @@ quantisers). Everything here takes ``[N, H, ws, D]`` keys and returns
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple, Tuple
 
 import torch
 from torch import Tensor

@@ -79,7 +79,6 @@ for the stages before it.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import re
 import subprocess

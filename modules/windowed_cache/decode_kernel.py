@@ -48,7 +48,6 @@ Backend contract (mirrors :mod:`score_kernel`)
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Tuple
 
 import torch

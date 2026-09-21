@@ -62,7 +62,7 @@ def test_the_measured_ladder_is_actually_in_measured_order():
     assert set(measured) == set(MEASURED_MS), "ladder and profile data disagree"
     times = [MEASURED_MS[r] for r in measured]
     assert times == sorted(times), (
-        f"ladder is not sorted by measured time:\n  "
+        "ladder is not sorted by measured time:\n  "
         + "\n  ".join(f"{r} = {MEASURED_MS[r]:.3f} ms" for r in measured))
 
 
@@ -140,7 +140,7 @@ def test_first_fit_returns_the_measured_head_when_everything_fits():
 def test_first_fit_walks_past_a_rung_that_does_not_fit():
     pytest.importorskip("torch")
     from modules.windowed_cache.decode_kernel import (
-        _FIT_LADDER, _first_fit, _is_out_of_resources,
+        _FIT_LADDER, _first_fit,
     )
     import triton  # noqa: F401  - OutOfResources lives here
 

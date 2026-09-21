@@ -164,7 +164,6 @@ def _print_scenario(data: dict, label: str, sink: list[str]) -> None:
     err = _mask(data, "error_mask", len(names))
     ttft_ms    = data["ttft_ms"]       # shape (n_configs, n_runs)
     tpot_ms    = data["tpot_ms"]
-    tput       = data["throughput_tokps"]
     e2e_ms_arr = data.get("e2e_latency_ms")
     peak_dev   = data.get("peak_device_used_mb")
     peak_alloc = data.get("peak_memory_mb")

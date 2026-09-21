@@ -6,7 +6,6 @@ computation is correct on synthetic data.
 from __future__ import annotations
 import json
 import numpy as np
-import pytest
 import torch
 from utils.metrics import jaccard_topk
 

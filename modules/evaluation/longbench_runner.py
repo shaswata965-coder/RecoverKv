@@ -13,11 +13,10 @@ Backend routing via ``utils/cache_factory.py``.
 from __future__ import annotations
 
 import gc
-import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
