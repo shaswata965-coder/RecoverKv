@@ -390,6 +390,9 @@ class QuantizedStore:
             cap = max(1, math.ceil(ratio * self._n_active))
 
         slots = self.table.active_order(self._n_active)
+        # The full card, eps included: this is the one path that thresholds on
+        # `bound`, so it is the one path that needs the residual. The fused gate
+        # takes the hot card instead (WindowedCache._gate_ctx).
         card = Sketch(*self.table.gather_sketch(slots))
         bound, logmass, est = gate_and_score(query, card, self._anchor, scaling)
         # Union the GQA group FIRST, then select. The KV head is the unit of

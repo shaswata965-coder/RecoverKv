@@ -45,11 +45,27 @@ from torch import Tensor
 FREE = -1
 """``slot_wid`` sentinel for an unoccupied slot. Real window ids are >= 0."""
 
-SKETCH_FIELDS = (
-    "sk_mu_q", "sk_mu_s", "sk_v_q", "sk_v_s",
-    "sk_t_q", "sk_t_s", "sk_e_q", "sk_e_s",
+SKETCH_HOT_FIELDS = (
+    "sk_mu_q", "sk_mu_s", "sk_v_q", "sk_v_s", "sk_t_q", "sk_t_s",
 )
-"""The rank-1 gate card's columns, in :class:`modules.quant.sketch.Sketch` order.
+"""The card columns the read gate actually reads, in ``Sketch`` order.
+
+``eps`` is absent, and that is the point. It exists to make ``bound`` an upper
+bound; ``bound``'s only consumer is the margin rule, which the fused path
+refuses (``WindowedCache._gate_ctx``), so neither the Triton kernel nor
+``gate_reference`` loads it. Gathering it per eviction epoch was copying 10 B
+per (window, head) into a compacted buffer for nobody. See
+:mod:`modules.quant.sketch`, "What the gate actually reads"."""
+
+SKETCH_EPS_FIELDS = ("sk_e_q", "sk_e_s")
+"""The residual columns. Stored, frozen, and reactivated like every other column
+-- dropping them from the table would foreclose the margin rule to save bytes
+that were never on the read path -- but gathered only by
+:meth:`QuantSlotTable.gather_sketch` with ``with_eps=True``, i.e. by
+``QuantizedStore.gate_and_select``, the one caller that computes a bound."""
+
+SKETCH_FIELDS = SKETCH_HOT_FIELDS + SKETCH_EPS_FIELDS
+"""Every card column, in :class:`modules.quant.sketch.Sketch` order.
 
 They ride the slot table rather than living beside it so they inherit its whole
 lifecycle for free: ``write`` freezes a card at first demotion, ``retain_only``
@@ -129,11 +145,19 @@ class QuantSlotTable:
         # the inner dim is what matters -- and would need a `slots.py` refactor.
         self.sketch = sketch
         if sketch:
+            if S % 2:
+                raise ValueError(
+                    f"sketch cards need an even window_size, got {S}: `t` is "
+                    "packed two int4 codes per byte (sketch.pack_nibbles_last)"
+                )
             self.sk_mu_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
             self.sk_mu_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             self.sk_v_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
             self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_t_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+            # int4, two codes per byte -- the only card column packed below a
+            # whole byte, because it is the only one on the read path that is
+            # ws-sized rather than D-sized. See modules/quant/sketch.py.
+            self.sk_t_q = torch.zeros((B, N, H, S // 2), dtype=torch.uint8, device=device)
             self.sk_t_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             self.sk_e_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
             self.sk_e_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
@@ -342,16 +366,29 @@ class QuantSlotTable:
             take(self.slot_pos),
         )
 
-    def gather_sketch(self, slot_idx: Tensor) -> Tuple[Tensor, ...]:
-        """The eight card fields for ``[B, n]`` slots, keeping the ``[B, n]``
-        leading pair (unlike :meth:`gather`, which flattens it): the gate is a
-        per-(row, window) reduction, not a per-window quantizer op."""
+    def gather_sketch(self, slot_idx: Tensor,
+                      with_eps: bool = True) -> Tuple[Tensor, ...]:
+        """Card fields for ``[B, n]`` slots, keeping the ``[B, n]`` leading pair
+        (unlike :meth:`gather`, which flattens it): the gate is a per-(row,
+        window) reduction, not a per-window quantizer op.
+
+        ``with_eps=False`` returns the six :data:`SKETCH_HOT_FIELDS` — what the
+        gate reads — and skips the two ``eps`` columns entirely. The result is
+        still positionally a :class:`modules.quant.sketch.Sketch`, whose ``e_q``
+        and ``e_s`` default to ``None``, so ``Sketch(*gather_sketch(idx,
+        with_eps=False))`` is a valid hot card.
+
+        The default stays ``True`` because the one caller that computes a
+        ``bound`` — ``QuantizedStore.gate_and_select``, the margin-capable
+        reference — needs the residual, and a silently eps-less card would turn
+        its bound into ``None`` at the point of use rather than here.
+        """
         if not self.sketch:
             raise RuntimeError("this slot table carries no sketch fields")
         fi = self._flat(slot_idx)
         B, n = slot_idx.shape
         out = []
-        for name in SKETCH_FIELDS:
+        for name in (SKETCH_FIELDS if with_eps else SKETCH_HOT_FIELDS):
             st = getattr(self, name)
             flat = st.view(st.shape[0] * st.shape[1], *st.shape[2:])
             out.append(flat[fi].reshape(B, n, *st.shape[2:]))

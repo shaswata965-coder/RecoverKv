@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from modules.quant.sketch import (
+    Sketch,
     _dq_sym,
     _q_sym,
     _q_up,
@@ -24,8 +25,10 @@ from modules.quant.sketch import (
     decode_sketch,
     gate_and_score,
     group_max,
+    pack_nibbles_last,
     select_windows,
     sketch_bytes_per_head,
+    unpack_nibbles_last,
 )
 
 D, WS, HKV = 128, 8, 4
@@ -123,6 +126,79 @@ def test_rank1_beats_centroid_on_reconstruction():
     rank1 = (k - (mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2))).norm(-1)
     centroid = (k - k.mean(-2, keepdim=True)).norm(dim=-1)
     assert rank1.mean() < 0.6 * centroid.mean()
+
+
+def test_nibble_packing_round_trips_every_code():
+    """The packing is a storage format, so it must be exactly invertible.
+
+    ``-8`` is deliberately absent: ``_q_nib`` clamps to ``[-7, 7]`` so the
+    kernel's ``> 7`` sign test is exact rather than a convention.
+    """
+    codes = torch.arange(-7, 8, dtype=torch.int8).repeat(4)[:56].reshape(7, 8)
+    packed = pack_nibbles_last(codes)
+    assert packed.dtype == torch.uint8 and packed.shape == (7, 4)
+    assert torch.equal(unpack_nibbles_last(packed, 8), codes)
+
+
+def test_nibble_packing_rejects_an_odd_last_dim():
+    with pytest.raises(ValueError, match="even last dim"):
+        pack_nibbles_last(torch.zeros(3, 5, dtype=torch.int8))
+
+
+def test_t_is_int4_and_the_bound_absorbs_it():
+    """``t`` at 16 levels, and eps measured against the DECODED t.
+
+    The second half is the guarantee: a coarser projection inflates the residual
+    it is measured against, so the bound still holds for the values actually
+    stored. :func:`test_bound_never_misses` proves that end to end; this pins
+    that the coarseness is real and that eps grew to meet it.
+    """
+    k, a = _fixture(n=64)
+    s = build_sketch(k, a)
+    assert s.t_q.dtype == torch.uint8 and s.t_q.shape[-1] == WS // 2
+    codes = unpack_nibbles_last(s.t_q, WS)
+    assert int(codes.min()) >= -7 and int(codes.max()) <= 7
+    assert int(codes.abs().max()) == 7, "the scale must use the full int4 range"
+
+    _, _, t_h, eps = decode_sketch(s, a)
+    mu_h, v_h, _, _ = decode_sketch(s, a)
+    recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
+    assert (eps + 1e-6 >= (k - recon).norm(dim=-1)).all(), (
+        "eps must cover the residual of the int4-decoded fit, not of the ideal one"
+    )
+
+
+def test_build_sketch_rejects_an_odd_window():
+    k, a = _fixture(n=4, ws=6)
+    build_sketch(k, a)                       # even is fine
+    k, a = _fixture(n=4, ws=5)
+    with pytest.raises(ValueError, match="even window_size"):
+        build_sketch(k, a)
+
+
+def test_a_hot_card_has_no_bound_and_the_same_estimate():
+    """The six-field card the gather hands the gate.
+
+    ``bound`` is the only quantity that needs eps and the only one the shipped
+    path does not use, so its absence must be explicit (``None``) rather than a
+    silently wrong number, and nothing the gate ranks on may move.
+    """
+    k, a = _fixture(n=32)
+    full = _batched(build_sketch(k, a), 2)
+    hot = Sketch(*tuple(full)[:6])
+    q = torch.randn(2, HKV * 2, D, generator=torch.Generator().manual_seed(5)) * 1.5
+    scaling = 1.0 / math.sqrt(D)
+
+    b_full, lm_full, est_full = gate_and_score(q, full, a, scaling)
+    b_hot, lm_hot, est_hot = gate_and_score(q, hot, a, scaling)
+    assert b_full is not None and b_hot is None
+    assert torch.equal(lm_full, lm_hot) and torch.equal(est_full, est_hot)
+
+    # and the cap -- which ranks on `est` -- picks the same windows either way
+    cap = max(1, est_full.shape[-1] // 4)
+    keep_full = select_windows(group_max(est_full, HKV), float("inf"), cap)
+    keep_hot = select_windows(group_max(est_hot, HKV), float("inf"), cap)
+    assert torch.equal(keep_full, keep_hot)
 
 
 def test_int8_direction_is_required_not_a_preference():
@@ -259,9 +335,21 @@ def test_gate_selects_the_window_holding_the_true_argmax():
 
 
 def test_card_size_is_what_the_plan_is_costed_on():
-    assert sketch_bytes_per_head(128, 8) == 280               # 2240 B/window at H=8
+    """Two numbers, because the card has two sizes: stored and read.
+
+    ``eps`` is stored but never fetched by the gate, so the memory claim and the
+    read-traffic claim are costed on different figures and neither may quietly
+    become the other.
+    """
+    assert sketch_bytes_per_head(128, 8) == 276               # 2208 B/window at H=8
+    assert sketch_bytes_per_head(128, 8, eps=False) == 266    # 2128 B/window read
     b_q = (8 * 128 * 8) // 2 + 4 * 8 * 128 + 4 * 8 * 8        # config.py resolve()
-    assert abs(280 * 8 / b_q - 0.265) < 0.002
+    assert abs(276 * 8 / b_q - 0.261) < 0.002
+    assert abs(266 * 8 / b_q - 0.252) < 0.002
+    # int8 `t` and a gathered eps cost 280 B/head; what the two changes removed
+    # is 4 B of read and 10 B of gather per (window, head).
+    assert sketch_bytes_per_head(128, 8) + 4 == 280
+    assert sketch_bytes_per_head(128, 8) - sketch_bytes_per_head(128, 8, eps=False) == 10
 
 
 # ---------------------------------------------------------------------------

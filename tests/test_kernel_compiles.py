@@ -55,7 +55,14 @@ _DECODE_PTRS = {
 
 _GATE_PTRS = {
     **{n: "*fp16" for n in ("Q", "MUS", "VS", "TS", "ANCH")},
-    **{n: "*i8" for n in ("MU", "V", "T")},
+    **{n: "*i8" for n in ("MU", "V")},
+    # `T` is UNSIGNED, and that is load-bearing rather than cosmetic: it holds
+    # two int4 codes per byte, and the kernel widens it to i32 before shifting.
+    # Declared signed, a byte whose high nibble is >= 8 sign-extends and the
+    # arithmetic shift drags ones down into the low code. The tensor really is
+    # uint8 (sketch.pack_nibbles_last), so declaring i8 here would compile a
+    # kernel the runtime never launches.
+    "T": "*u8",
     "EST": "*fp32", "LOGM": "*fp32", "SCALE": "fp32",
 }
 
@@ -106,6 +113,13 @@ def test_the_gate_kernel_compiles(ws):
     of two, so a ``window_size`` of 12 (which ``window_tiling`` documents and
     ``tests/test_window_scores.py`` exercises) could not compile at all. Now the
     axis is padded to ``BLOCK_WS`` and masked.
+
+    It then found a second one, of the same family: the int4 ``t`` unpack named
+    its nibble shift ``sh``, which is already this kernel's scale head-stride
+    argument. Every ``MUS``/``VS``/``TS`` load below it was suddenly indexed by a
+    ``[BLOCK_WS]`` tensor instead of a scalar. No CPU oracle sees that -- the
+    reference does not have strides -- and on a GPU it is a wrong-address read,
+    not a crash.
     """
     _compile(gk._gate_kernel, _GATE_PTRS, dict(
         HEAD_DIM=128, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),

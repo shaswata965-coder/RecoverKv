@@ -45,9 +45,10 @@ loosens it, without iterating.
 
 Encoding, and what measurement decided
 --------------------------------------
-``mu`` and ``v`` are int8 with a per-(window, head) scale; ``t`` int8; ``eps``
-uint8. 280 B per head, 2240 B per window at ``H_kv=8, D=128, ws=8`` — 26.5% of
-``b_q`` (8448 B).
+``mu`` and ``v`` are int8 with a per-(window, head) scale; ``t`` int4, two codes
+per byte; ``eps`` uint8. 276 B per head stored, 2208 B per window at ``H_kv=8,
+D=128, ws=8`` — 26.1% of ``b_q`` (8448 B). The decode scan moves only 266 of
+those bytes; see "What the gate actually reads".
 
 Three encoding choices were measured on synthetic keys carrying massive-
 activation channels and one outlier token per window (``tests/test_sketch.py``
@@ -77,7 +78,41 @@ The bound survives quantisation
 ideal rank-1 fit, and is quantised by rounding **up**. So Cauchy-Schwarz holds
 for the values actually stored, not for the values we wished we had stored.
 :func:`build_sketch` therefore encodes, decodes, and only then measures the
-residual — that order is the guarantee, not an implementation detail.
+residual — that order is the guarantee, not an implementation detail. That order
+is what lets ``t`` be int4 at all: a coarser projection inflates the residual it
+is measured against, so the bound absorbs the loss instead of being violated by
+it.
+
+What the gate actually reads
+----------------------------
+``eps`` is **not on the read path**, and has not been since the gate was fused.
+It exists to make ``bound`` a genuine upper bound, and ``bound`` has exactly one
+consumer: the margin rule in :func:`select_windows`. The shipped gate is a top-k
+on ``est`` — a cap has no safety guarantee from either quantity, so it ranks on
+the more accurate one — and ``WindowedCache._gate_ctx`` refuses a finite margin
+outright. Neither :func:`modules.windowed_cache.gate_kernel.gate_reference` nor
+the Triton kernel behind it ever loads ``eps``.
+
+So the per-step gather takes the six **hot** fields only
+(:data:`modules.quant.slots.SKETCH_HOT_FIELDS`) and leaves ``eps`` in the slot
+table. The field is still written at demotion, still frozen for life, still
+reactivated on re-demotion: dropping it from *storage* would foreclose the margin
+rule to save bytes that were never on the read path. What the split buys is the
+gather — 10 B per (window, head) copied into a compacted buffer once per eviction
+epoch, to be read by nobody.
+
+:class:`Sketch` therefore carries ``e_q``/``e_s`` as **optional**. A card from
+:func:`build_sketch` has them; a card gathered for the gate does not, and
+:func:`gate_and_score` returns ``bound=None`` for it rather than inventing a
+bound it cannot compute.
+
+``t`` is int4 for the same reason ``eps`` left the gather, read from the other
+end: it *is* on the read path. It is ``ws``-sized rather than ``D``-sized, so it
+was never the card's bulk, but 16 levels on a projection coefficient that only
+ever feeds a per-window max and a logsumexp is not where the card's accuracy
+lives — unlike ``v``, where the int4 measurement above is decisive. It halves
+``t`` (8 B -> 4 B at ``ws=8``) and costs the kernel a shift and a mask per token
+against a byte it no longer fetches.
 
 Shapes
 ------
@@ -97,6 +132,8 @@ from torch import Tensor
 __all__ = [
     "Sketch",
     "sketch_bytes_per_head",
+    "pack_nibbles_last",
+    "unpack_nibbles_last",
     "build_sketch",
     "decode_sketch",
     "gate_and_score",
@@ -105,26 +142,41 @@ __all__ = [
 ]
 
 
-def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
+def sketch_bytes_per_head(head_dim: int, window_size: int, *,
+                          eps: bool = True) -> int:
     """Bytes one head's card costs — for the budget arithmetic.
 
-    ``mu`` int8(D) + fp16 scale, ``v`` int8(D) + fp16 scale, ``t`` int8(ws) +
-    fp16 scale, ``eps`` uint8(ws) + fp16 scale.
+    ``mu`` int8(D) + fp16 scale, ``v`` int8(D) + fp16 scale, ``t`` int4(ws) two
+    per byte + fp16 scale, ``eps`` uint8(ws) + fp16 scale.
+
+    ``eps=True`` (the default) is the **stored** card: what one slot costs in the
+    table. ``eps=False`` is what the decode scan actually moves — the gate
+    neither gathers nor reads ``eps`` — so the read-traffic arithmetic is costed
+    on that one.
     """
-    return 2 * (head_dim + 2) + 2 * (window_size + 2)
+    hot = 2 * (head_dim + 2) + (-(-window_size // 2) + 2)
+    return hot + (window_size + 2 if eps else 0)
 
 
 class Sketch(NamedTuple):
-    """One window's card, per head. Leading axis opaque (``N``)."""
+    """One window's card, per head. Leading axis opaque (``N``).
 
-    mu_q: Tensor      # [N, H, D]    int8   — mu - anchor
-    mu_s: Tensor      # [N, H]       fp16
-    v_q: Tensor       # [N, H, D]    int8   — unit deviation direction
-    v_s: Tensor       # [N, H]       fp16
-    t_q: Tensor       # [N, H, ws]   int8   — projection onto v
-    t_s: Tensor       # [N, H]       fp16
-    e_q: Tensor       # [N, H, ws]   uint8  — residual norm, rounded UP
-    e_s: Tensor       # [N, H]       fp16
+    ``e_q``/``e_s`` are **optional**: a card gathered for the read gate omits
+    them (see "What the gate actually reads"), and every consumer on that path
+    — ``est``, ``logmass``, the cap — is defined without them. Only ``bound``
+    needs them, and :func:`gate_and_score` returns ``None`` for it when they are
+    absent instead of guessing. Defaults are ``None`` so ``Sketch(*six)`` builds
+    a hot card directly from :meth:`~modules.quant.slots.QuantSlotTable.gather_sketch`.
+    """
+
+    mu_q: Tensor      # [N, H, D]     int8   — mu - anchor
+    mu_s: Tensor      # [N, H]        fp16
+    v_q: Tensor       # [N, H, D]     int8   — unit deviation direction
+    v_s: Tensor       # [N, H]        fp16
+    t_q: Tensor       # [N, H, ws//2] uint8  — projection onto v, int4 x2/byte
+    t_s: Tensor       # [N, H]        fp16
+    e_q: Optional[Tensor] = None   # [N, H, ws] uint8 — residual, rounded UP
+    e_s: Optional[Tensor] = None   # [N, H]     fp16
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +220,61 @@ def _dq_up(codes: Tensor, scale: Tensor) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
+# nibble packing — two int4 codes per byte, index 0 in the LOW nibble
+# ---------------------------------------------------------------------------
+
+
+def pack_nibbles_last(codes: Tensor) -> Tensor:
+    """Pack signed int4 codes (``-7..7``) two per byte along the **last** axis.
+
+    Code index ``j`` goes into bits ``[4*(j mod 2), +4)`` — index 0 in the low
+    nibble, the same low-index-first convention as
+    :func:`modules.quant.quantizer.pack_crumbs_last`, so a kernel reads both
+    packings the same way. Values ride as two's-complement nibbles.
+
+    ``-8`` is unreachable: :func:`_q_nib` clamps to ``[-7, 7]``. That is what
+    makes the ``> 7`` sign test in :func:`unpack_nibbles_last` exact rather than
+    a convention, and it costs one code out of sixteen on a field whose whole
+    job is to be coarse.
+    """
+    if codes.shape[-1] % 2:
+        raise ValueError(
+            "pack_nibbles_last needs an even last dim, got "
+            f"{codes.shape[-1]}; window_size is validated divisible by 4 for "
+            "int2 crumb packing, so an odd ws cannot reach here from the cache"
+        )
+    lo = codes[..., 0::2].to(torch.uint8) & 0x0F
+    hi = codes[..., 1::2].to(torch.uint8) & 0x0F
+    return (lo | (hi << 4)).to(torch.uint8)
+
+
+def unpack_nibbles_last(packed: Tensor, n: int) -> Tensor:
+    """Inverse of :func:`pack_nibbles_last`; ``n`` = original last-dim length.
+
+    Returns int8 in ``[-7, 7]``. Sign extension goes through int16 because uint8
+    arithmetic wraps before the subtraction can bring the value negative.
+    """
+    p = packed.to(torch.int16)
+    lo = p & 0x0F
+    hi = (p >> 4) & 0x0F
+    out = torch.stack([lo, hi], dim=-1).reshape(*packed.shape[:-1], -1)
+    return torch.where(out > 7, out - 16, out)[..., :n].to(torch.int8)
+
+
+def _q_nib(x: Tensor) -> Tuple[Tensor, Tensor]:
+    """Symmetric int4, packed. Same fit-to-the-stored-fp16-scale discipline as
+    :func:`_q_sym` (design §2) — the codes are rounded against the scale every
+    dequant will use, not against an fp32 one that only exists in this call."""
+    codes, scale = _q_sym(x, bits_max=7)
+    return pack_nibbles_last(codes), scale
+
+
+def _dq_nib(packed: Tensor, scale: Tensor, n: int) -> Tensor:
+    return (unpack_nibbles_last(packed, n).to(torch.float32)
+            * scale.to(torch.float32).unsqueeze(-1))
+
+
+# ---------------------------------------------------------------------------
 # build — one pass, at demotion
 # ---------------------------------------------------------------------------
 
@@ -186,6 +293,11 @@ def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
     """
     k = keys.to(torch.float32)
     N, H, ws, D = k.shape
+    if ws % 2:
+        raise ValueError(
+            f"build_sketch needs an even window_size, got {ws}: `t` is stored "
+            "as two int4 codes per byte"
+        )
     anc = anchor.unsqueeze(0) if anchor.dim() == 2 else anchor   # [1|N, H, D]
 
     mu = k.mean(dim=-2)                                        # sweep 1
@@ -199,12 +311,14 @@ def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
 
     mu_q, mu_s = _q_sym(mu - anc)
     v_q, v_s = _q_sym(v)
-    t_q, t_s = _q_sym(t)
+    t_q, t_s = _q_nib(t)
 
-    # eps against what is ACTUALLY STORED, not against the ideal fit.
+    # eps against what is ACTUALLY STORED, not against the ideal fit. With `t`
+    # at int4 this is load-bearing twice over: the coarser projection lands in
+    # `recon`, so the residual grows to cover it and the bound still holds.
     mu_h = anc + _dq_sym(mu_q, mu_s)
     v_h = _dq_sym(v_q, v_s)
-    t_h = _dq_sym(t_q, t_s)
+    t_h = _dq_nib(t_q, t_s, ws)
     recon = mu_h.unsqueeze(-2) + t_h.unsqueeze(-1) * v_h.unsqueeze(-2)
     e_q, e_s = _q_up((k - recon).norm(dim=-1))
 
@@ -212,13 +326,16 @@ def build_sketch(keys: Tensor, anchor: Tensor) -> Sketch:
 
 
 def decode_sketch(s: Sketch, anchor: Tensor):
-    """``(mu_hat, v_hat, t_hat, eps_hat)`` — the decoded card."""
+    """``(mu_hat, v_hat, t_hat, eps_hat)`` — the decoded card.
+
+    ``eps_hat`` is ``None`` for a hot card (one gathered without ``eps``).
+    """
     anc = anchor.unsqueeze(0) if anchor.dim() == 2 else anchor
     return (
         anc + _dq_sym(s.mu_q, s.mu_s),
         _dq_sym(s.v_q, s.v_s),
-        _dq_sym(s.t_q, s.t_s),
-        _dq_up(s.e_q, s.e_s),
+        _dq_nib(s.t_q, s.t_s, 2 * s.t_q.shape[-1]),
+        None if s.e_q is None else _dq_up(s.e_q, s.e_s),
     )
 
 
@@ -244,7 +361,10 @@ def gate_and_score(
 
     Returns
     -------
-    bound : ``[B, Hq, Nw]`` upper bound on ``max_i scaling * q.k_i``.
+    bound : ``[B, Hq, Nw]`` upper bound on ``max_i scaling * q.k_i``, or ``None``
+        when the card carries no ``eps`` (a hot card, as the gather hands it
+        over). The bound is the one quantity that needs the residual, and the
+        one quantity the shipped path does not use — see the module docstring.
     logmass : ``[B, Hq, Nw]`` ``logsumexp_i(scaling * q.k_i_hat)`` -- what a
         skipped window contributes to ``window_scores``.
     est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``, i.e. the
@@ -252,9 +372,9 @@ def gate_and_score(
         :func:`select_windows` for why the two are not the same quantity.
 
     Both live in the log domain, so they are comparable across windows and cannot
-    overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield **both**: ``t`` and
-    ``eps`` are 10 bytes each and ride in the cache line the vectors already
-    pulled in.
+    overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield **both**: ``t`` is
+    4 bytes at ``ws=8`` and rides in the cache line the vectors already pulled
+    in, and ``eps`` is not fetched at all.
     """
     B, Hq, D = q.shape
     Nw, Hkv = s.mu_q.shape[1], s.mu_q.shape[2]
@@ -264,8 +384,8 @@ def gate_and_score(
 
     mu_r = _dq_sym(s.mu_q, s.mu_s)                                   # [B,Nw,Hkv,D]
     v_h = _dq_sym(s.v_q, s.v_s)
-    t_h = _dq_sym(s.t_q, s.t_s)                                      # [B,Nw,Hkv,ws]
-    e_h = _dq_up(s.e_q, s.e_s)
+    ws = 2 * s.t_q.shape[-1]
+    t_h = _dq_nib(s.t_q, s.t_s, ws)                                  # [B,Nw,Hkv,ws]
 
     qg = qf.reshape(B, Hkv, rep, D)
     a_base = (torch.einsum("bhrd,hd->bhr", qg, anchor) if anchor.dim() == 2
@@ -274,8 +394,6 @@ def gate_and_score(
     g = torch.einsum("bhrd,bnhd->bnhr", qg, v_h)
 
     x = scaling * (m.unsqueeze(-1) + t_h.unsqueeze(-2) * g.unsqueeze(-1))
-    slack = scaling * qn.reshape(B, Hkv, rep)[:, None, :, :, None] \
-        * e_h.unsqueeze(-2)                                          # [B,Nw,Hkv,rep,ws]
 
     def flat(z):                                                     # -> [B,Hq,Nw]
         return z.permute(0, 2, 3, 1).reshape(B, Hq, Nw)
@@ -287,6 +405,14 @@ def gate_and_score(
     # so the reference and the kernel share a shape as well as a result.
     xmax = x.amax(dim=-1, keepdim=True)
     logmass = (xmax + (x - xmax).exp().sum(dim=-1, keepdim=True).log()).squeeze(-1)
+    if s.e_q is None:
+        # Hot card: no residual, so no bound. Building the `[B,Nw,Hkv,rep,ws]`
+        # slack tensor is also the largest intermediate in this function, so the
+        # reference gets cheaper on exactly the path the kernel runs.
+        return None, flat(logmass), flat(x.amax(-1))
+    e_h = _dq_up(s.e_q, s.e_s)
+    slack = scaling * qn.reshape(B, Hkv, rep)[:, None, :, :, None] \
+        * e_h.unsqueeze(-2)                                          # [B,Nw,Hkv,rep,ws]
     return flat((x + slack).amax(-1)), flat(logmass), flat(x.amax(-1))
 
 

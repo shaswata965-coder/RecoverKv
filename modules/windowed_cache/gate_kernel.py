@@ -4,10 +4,14 @@ What it replaces
 ----------------
 Without the gate the decode step dequantizes every active int2 window to find
 out which ones mattered (design §8). This kernel reads each window's card --
-``mu``/``v`` int8 plus two tiny scalars, 280 B per head against a 8448 B window
--- and emits the compacted slot list the Q-tier loop should actually visit, plus
-the log-mass estimate that every **skipped** window contributes to
-``window_scores``.
+``mu``/``v`` int8, ``t`` int4, plus three fp16 scalars, 266 B per head against a
+8448 B window -- and emits the compacted slot list the Q-tier loop should
+actually visit, plus the log-mass estimate that every **skipped** window
+contributes to ``window_scores``.
+
+266, not the stored 276: the card's ``eps`` column is never fetched here (see
+below, and :mod:`modules.quant.sketch`), and the gather that feeds this kernel
+no longer copies it either.
 
 Shape of the work
 -----------------
@@ -73,7 +77,7 @@ def gate_reference(
     mu_q: Tensor, mu_s: Tensor,
     v_q: Tensor, v_s: Tensor,
     t_q: Tensor, t_s: Tensor,
-    e_q: Tensor, e_s: Tensor,
+    e_q: Optional[Tensor], e_s: Optional[Tensor],
     anchor: Tensor,
     scaling: float,
     n_sel: int,
@@ -83,7 +87,13 @@ def gate_reference(
     Parameters
     ----------
     q : ``[B, H_q, D]`` post-RoPE decode query.
-    mu_q .. e_s : card fields, ``[B, Nw, H_kv, ...]``.
+    mu_q .. t_s : card fields, ``[B, Nw, H_kv, ...]``. ``t_q`` is packed int4,
+        so its last dim is ``ws // 2``.
+    e_q, e_s : the residual columns, ``None`` for a hot card. Passed but
+        **unused**: this oracle discards ``bound`` and ranks on ``est``, exactly
+        as the kernel does. They stay in the signature, without defaults, so a
+        card of either width expands positionally through :func:`fused_gate`
+        and nothing downstream can forget to pass one.
     anchor : ``[B, H_kv, D]`` or ``[H_kv, D]``.
     n_sel : windows to keep per ``(row, KV head)``.
 
@@ -166,6 +176,13 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         logsumexp, so a ``ws`` of 12 would score every window as if it held a
         13th token sitting exactly at its mean.
 
+        **``t`` arrives as packed int4**, two codes per byte, low nibble first
+        (``modules.quant.sketch.pack_nibbles_last``). Lane ``w`` reads byte
+        ``w // 2`` and shifts by ``4 * (w % 2)``, so each byte is loaded by the
+        two lanes that share it -- an L1 hit for the second, against a DRAM byte
+        for a separate load. Sign extension is the ``> 7`` test: ``-8`` is
+        unreachable because the encoder clamps to ``[-7, 7]``.
+
         No ``bound`` is computed. The margin rule that needed it has no caller on
         this path (``WindowedCache._gate_ctx`` refuses a finite margin), so the
         bound cost a ``[B, H_q, NW]`` fp32 store and the whole ``eps`` field of
@@ -191,8 +208,16 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
                      mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
         vs = tl.load(VS + b * sb + cols * sn + kv * sh,
                      mask=cm, other=0.0).to(tl.float32)
-        tt = tl.load(T + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                     mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
+        # `nib_shift`, not `sh`: `sh` is this kernel's scale head-stride argument,
+        # and shadowing it here aims the TS/MUS/VS loads at a tensor instead of a
+        # scalar. Caught by tests/test_kernel_compiles.py, which is the only
+        # thing between a mistake like that and a wrong-address read on GPU.
+        byte = w // 2                                   # byte holding lane w
+        nib_shift = (w % 2) * 4                         # 0 = low nibble
+        raw = tl.load(T + b * tb + cols[:, None] * tn + kv * th + byte[None, :],
+                      mask=cm[:, None] & wm[None, :], other=0).to(tl.int32)
+        nib = (raw >> nib_shift[None, :]) & 0xF
+        tt = tl.where(nib > 7, nib - 16, nib).to(tl.float32)
         ts = tl.load(TS + b * sb + cols * sn + kv * sh,
                      mask=cm, other=0.0).to(tl.float32)
 
@@ -233,10 +258,10 @@ def _sm_count(device) -> int:  # pragma: no cover - GPU-only
 def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-only
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
-    mu_q, mu_s, v_q, v_s, t_q, t_s, _e_q, _e_s = card
+    mu_q, mu_s, v_q, v_s, t_q, t_s = card[:6]
     B, NW, HKV, D = mu_q.shape
     HQ = q.shape[1]
-    ws = t_q.shape[-1]
+    ws = 2 * t_q.shape[-1]          # `t` is packed int4, two codes per byte
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
     logm = torch.empty((B, HQ, NW), dtype=torch.float32, device=q.device)
@@ -289,6 +314,11 @@ def fused_gate(
     So on CUDA it raises, like ``fused_two_tier_decode``. ``force_reference``
     remains for tests that want the oracle on purpose.
     """
+    # A hot card (six fields, no eps) and a full one (eight) both expand
+    # positionally once `Sketch` has padded the missing tail with None, which is
+    # exactly what the gather hands over from `with_eps=False`.
+    from modules.quant.sketch import Sketch
+    card = card if isinstance(card, Sketch) else Sketch(*card)
     if force_reference or not q.is_cuda:
         return gate_reference(*( (q,) + tuple(card) + (anchor, scaling, n_sel) ))
     if not _HAS_TRITON:

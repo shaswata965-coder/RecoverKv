@@ -1775,6 +1775,13 @@ class WindowedCache(_HFCacheBase):
         are written once when a window is sealed and reactivated unchanged on
         re-demotion, so between evictions this gather is pure repeat work.
 
+        The gather takes the **hot** card only — six fields, no ``eps``. The
+        fused gate is a top-k on ``est`` and the margin path is refused below,
+        so nothing downstream of here can consume a bound; gathering ``eps``
+        was copying 10 B per (window, head) into a compacted buffer for a reader
+        that does not exist. It stays in the slot table, where the margin-capable
+        reference (``QuantizedStore.gate_and_select``) still finds it.
+
         ``n_sel`` is resolved against the **live** ``n_active`` rather than pinned,
         because ``N_q`` moves with the shape and a fixed count would not be the
         same fraction anywhere.
@@ -1799,7 +1806,7 @@ class WindowedCache(_HFCacheBase):
                 "today has no caller but gated_decode_step (the CPU reference)."
             )
         return {
-            "card": store.table.gather_sketch(idx),
+            "card": store.table.gather_sketch(idx, with_eps=False),
             "anchor": store._anchor,
             "n_sel": max(1, math.ceil(ratio * n)),
         }

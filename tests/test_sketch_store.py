@@ -98,8 +98,52 @@ def test_card_survives_the_table_round_trip():
     slots = st.table.active_order(st._n_active)
     card = Sketch(*st.table.gather_sketch(slots))
     assert card.mu_q.shape == (B, N, H, D)
-    assert card.t_q.shape == (B, N, H, S)
+    assert card.t_q.shape == (B, N, H, S // 2)          # int4, two per byte
     assert card.mu_q.dtype == torch.int8 and card.e_q.dtype == torch.uint8
+    assert card.t_q.dtype == torch.uint8
+
+
+def test_hot_gather_leaves_eps_in_the_table():
+    """``with_eps=False`` is the read path: six fields, and a usable Sketch.
+
+    The gate never consumes a bound (the fused path is a top-k on ``est`` and
+    refuses a finite margin), so the per-epoch gather has no reason to copy the
+    residual. The columns must still be *there* -- the margin-capable reference
+    reads them straight off the table -- so this pins both halves: absent from
+    the gather, present in the store.
+    """
+    st = _store()
+    _demote(st)
+    slots = st.table.active_order(st._n_active)
+
+    hot = st.table.gather_sketch(slots, with_eps=False)
+    assert len(hot) == 6
+    card = Sketch(*hot)
+    assert card.e_q is None and card.e_s is None
+
+    full = st.table.gather_sketch(slots)
+    assert len(full) == 8
+    for a, b in zip(hot, full[:6]):
+        assert torch.equal(a, b), "the hot fields must be the same bytes"
+    assert full[6].numel() > 0 and full[7].numel() > 0
+
+
+def test_hot_card_scores_identically_to_the_full_one():
+    """Dropping eps must not move a single number the gate ranks on."""
+    st = _store()
+    _demote(st)
+    q = torch.randn(B, H * 2, D, generator=torch.Generator().manual_seed(11)) * 1.5
+    slots = st.table.active_order(st._n_active)
+
+    b_full, lm_full, est_full = gate_and_score(
+        q, Sketch(*st.table.gather_sketch(slots)), st._anchor, SCALING)
+    b_hot, lm_hot, est_hot = gate_and_score(
+        q, Sketch(*st.table.gather_sketch(slots, with_eps=False)),
+        st._anchor, SCALING)
+
+    assert b_full is not None and b_hot is None
+    assert torch.equal(lm_full, lm_hot)
+    assert torch.equal(est_full, est_hot)
 
 
 def test_bound_holds_through_the_store():

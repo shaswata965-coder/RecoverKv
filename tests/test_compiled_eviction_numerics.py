@@ -160,3 +160,26 @@ def test_the_gate_bound_still_bounds_under_inductor(compiled):
         assert under == 0, (
             f"seed {seed}: {under} elements dequantise BELOW the value they "
             "encode, so the gate's upper bound is not an upper bound.")
+
+
+def test_the_int4_packing_is_byte_identical_under_inductor():
+    """``t``'s nibble packing, compiled exactly the way the eviction compiles it.
+
+    Unlike everything above, this one does not depend on
+    ``emulate_precision_casts``: packing is integer work, with no fp16 round trip
+    to elide. It is here because it is *new* integer work inside the eviction
+    graph — uint8 masks, shifts and an or — and a miscompiled pack would write
+    cards whose ``t`` the kernel then reads as different numbers entirely, with
+    no assertion anywhere else to notice. Compiled separately from the fixture
+    above because it takes int8 codes, not an fp16 window batch.
+    """
+    packed = _emulating_precision_casts(
+        torch.compile(S.pack_nibbles_last, dynamic=True))
+    for seed in SEEDS:
+        torch.manual_seed(seed)
+        codes = torch.randint(-7, 8, (3, 2, 8), dtype=torch.int8)
+        assert torch.equal(S.pack_nibbles_last(codes), packed(codes)), (
+            f"seed {seed}: the compiled eviction would pack `t` differently "
+            "than the eager reference")
+        assert torch.equal(
+            S.unpack_nibbles_last(S.pack_nibbles_last(codes), 8), codes)

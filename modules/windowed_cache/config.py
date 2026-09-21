@@ -275,8 +275,10 @@ class WindowedCacheConfig:
     # derivation so no reader repeats it.
     #
     # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
-    # operating point the efficiency arithmetic is costed on: the card is 26.5%
-    # of a window, so break-even sits at ~0.735 and 0.25 leaves real headroom.
+    # operating point the efficiency arithmetic is costed on: the card is 25.2%
+    # of a window on the READ path (26.1% stored -- `eps` is written once and
+    # never fetched, see modules/quant/sketch.py), so break-even sits at ~0.748
+    # and 0.25 leaves real headroom.
     # 1.0 dequantizes everything and makes the gate a provable no-op.
     quant_gate_ratio: float = 0.25
     # Delta, in log space. A window also survives when its bound is within Delta

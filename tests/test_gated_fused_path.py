@@ -443,7 +443,9 @@ def test_gate_context_is_built_only_when_it_would_mean_something(margin, ratio, 
         return
     got = WindowedCache._gate_ctx(stub, store, idx, n)
     assert got["n_sel"] == max(1, math.ceil(ratio * n))
-    assert len(got["card"]) == 8 and got["anchor"] is store._anchor
+    # Six, not eight: the gate hands over the HOT card. eps has no consumer on
+    # this path, so gathering it per eviction epoch was pure copy.
+    assert len(got["card"]) == 6 and got["anchor"] is store._anchor
     if ratio >= 1.0:
         assert got["n_sel"] == n, (
             "ratio 1.0 must select every window on the SAME path, not skip the "
