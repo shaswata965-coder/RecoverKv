@@ -1,0 +1,5 @@
+shape        batch    TTFT (s)   TPOT_steady (s)     dec tok/s     e2e tok/s   legacy tok/s    peak_GB   steadyKV_GB
+--------------------------------------------------------------------------------------------------------------------
+4096/257     1           0.406            0.0659          15.2          14.6           14.6      16.13         17.28
+
+  read gate: ran on all 24576 fused layers, realised read fraction 0.251 (quant_gate_ratio as measured, not as configured)
