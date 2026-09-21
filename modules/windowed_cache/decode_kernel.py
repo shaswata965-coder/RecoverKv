@@ -48,7 +48,6 @@ Backend contract (mirrors :mod:`score_kernel`)
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Optional, Tuple
 
@@ -377,7 +376,6 @@ def two_tier_window_reference(
     # `exp2=True` mirrors the kernel's base-2 softmax: log2(e) folds into the
     # scale, so every logit becomes a base-2 exponent and m / wmax / lse are all
     # in base-2 units. p, l, acc and out are unchanged quantities either way.
-    _e = math.exp2 if exp2 else math.exp
     scale_eff = scaling * _LOG2E if exp2 else scaling
     logits = torch.matmul(q5, k.transpose(-2, -1)) * scale_eff    # [B,H_kv,rep,1,S]
     logits = logits.reshape(B, H_q, S)
