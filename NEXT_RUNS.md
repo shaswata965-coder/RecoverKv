@@ -266,6 +266,94 @@ CUDA_VISIBLE_DEVICES=0 STICKYKV_DECODE_SPLITS=auto python scripts/profile_decode
 B=1, not 32 — that is where the grid is empty and where the change is supposed
 to show.
 
+## 3c. Run D is CLOSED, and Run E is the only one that matters now
+
+### What Run D settled
+
+The S sweep ran all sixteen values at 4096/257 bs1, one `OUT_DIR` each
+(`v12_splitsweep/s01..s16`), gate verdict identical across every one:
+
+| | TPOT | vs S=1 | spread |
+|---|---|---|---|
+| **S=1** | **0.0559** | — | the control, and the winner |
+| S=2–9 | 0.0599 | **+7.1%** | 1.8% |
+| S=10–16 | 0.0653 | **+16.9%** | 2.1% |
+
+TTFT across the same sixteen runs — which this knob cannot touch — moved 1.8%
+(1 sd), so that is the noise floor, the plateaus are real, and the variation
+inside each one is not. **Split-KV is closed. `S=1` stays the default.**
+
+The shape is the finding: the penalty is flat across S=2–9, so it is the cost
+of *having* splits, not of how many. And the B=1 profile says why it could
+never have paid — `_two_tier_decode_kernel` is **2.858 ms of a 45.196 ms step,
+6.3%**, and that reading is of the *split* arm, so the control is lower still.
+
+**This also retires §11.11's decomposition.** It inferred "~11 ms of that
+kernel is paid regardless of batch" from a whole-step fit and built split-KV on
+it. The batch-invariance it measured is real; the attribution was not.
+
+### Run E — attribute the 42%
+
+One kernel signature, `vectorized_elementwise_kernel<4, ...>`, is **19.045
+ms/step, 42.1%, at 131 launches of 0.146 ms each**, and the name-based rollup
+cannot say whose it is. Everything else is already sized: the model's GEMMs are
+on the B=1 weight floor, the decode kernel is 6.3%, the eviction is 7.478 ms of
+which one gather is 6.564. So **1.2× can only come out of the elementwise pile,
+that gather, or the host gap**, and only Run E says which.
+
+Take BOTH runs. The first is the timing, the second is the attribution, and
+they are not interchangeable — `--stack` adds per-op CPU cost, so its host gap
+is not a measurement.
+
+```bash
+cd ~/kv_cache/Clustered_efficiency/RecoverKv
+export MODEL=/home/ee/phd/eez228470/llama-3.1-8b-instruct
+CFG=v12_splitsweep/s01/_perf_table.generated.yaml    # the S=1 control arm
+
+# E1 -- timing + trace, no --stack. This is the valid wall.
+CUDA_VISIBLE_DEVICES=0 STICKYKV_DECODE_SPLITS=1 python scripts/profile_decode.py \
+  --config "$CFG" --prefill 4096 --batch 1 --steps 24 --warmup 40 \
+  --top 40 --compile-evict 1 --trace outputs/e1_notstack.json \
+  2>&1 | tee outputs/e1_timing.txt
+
+# E2 -- attribution. --stack makes every cpu_op carry its Python frames.
+CUDA_VISIBLE_DEVICES=0 STICKYKV_DECODE_SPLITS=1 python scripts/profile_decode.py \
+  --config "$CFG" --prefill 4096 --batch 1 --steps 24 --warmup 40 \
+  --top 40 --compile-evict 1 --stack --trace outputs/e2_stack.json \
+  2>&1 | tee outputs/e2_profile.txt
+
+# The analysis. --target-ms is the S=1 TPOT in ms, which turns on the budget.
+python scripts/analyze_decode_trace.py outputs/e2_stack.json \
+  --steps 24 --top 40 --target-ms 55.9 --speedup 1.2 \
+  --csv outputs/e2_matrix.csv | tee outputs/e2_attribution.txt
+```
+
+`analyze_decode_trace.py --selftest` runs anywhere, including a CPU-only box,
+and checks the attribution rules before you spend GPU time on them.
+
+### How to read it — the decision it makes
+
+Section 3, **KERNEL KIND × OWNER**, is the whole run. Find the `elementwise`
+row and read across:
+
+* **Mostly `ours:`** → the headroom is real. The 19 ms is this project's eager
+  cache work, it sits next to an Inductor region that already compiles, and
+  extending that region is the final push. 1.2× is reachable.
+* **Mostly `model: transformers`** → we are near the ceiling at B=1. Stop
+  buying TPOT and take the remaining small wins (host gap, the eviction gather,
+  the two §5.1 fusions), then move the claim to B=32 throughput and memory.
+
+Section 6 prices each candidate against the −9.3 ms that 1.2× needs. **Anything
+under 100% cannot get there alone.**
+
+### Two traps specific to this run
+
+* **`--stack` distorts the host gap.** Take the gap from E1. Section 6 of the
+  analysis will happily compute one from E2's wall; it is not a measurement.
+* **The trace is large** — tens to hundreds of MB for 24 steps. Write it under
+  `outputs/`, not `/tmp`, and do not commit it; the CSV and the text report are
+  the artifacts worth keeping.
+
 ## 4. Reprinting without re-measuring
 
 Any npz directory can be re-tabled on a CPU:

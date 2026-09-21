@@ -1590,7 +1590,7 @@ quantities. None needs a kernel rewrite:
 | 0 | tile tuning (§10.14) | −3.90 | 1.096× | **measured, §11.7** |
 | 1 | ~~`_FIT_LADDER` reorder → untuned geometries~~ | **~0** | — | **MEASURED A TIE, §11.12** |
 | 2 | ~~the compiled eviction stops costing~~ | — | — | **DEAD — it EARNS ~10%, §11.9** |
-| 3 | **split-KV** on the decode kernel (~11 ms of it is batch-invariant) | −1.44 for 1.2×, more available | **1.20×** | **decided by §11.11** |
+| 3 | ~~**split-KV** on the decode kernel~~ | **+7.1% to +16.9%** | — | **DEAD — measured a LOSS at every S, §11.13** |
 
 **Two of the three original items are now retired by measurement, both against
 the estimate written here.** Item 1 predicted −2.10 ms and delivered a tie
@@ -2127,3 +2127,117 @@ tile ladder and split-KV both move the last bits of the window scores, and
 `ac128e8`/`8a8cdc0` already broke comparability of the older quality rows. A
 LongBench run at the shipped operating point is the missing half of the story,
 and it has not been taken since those commits.
+
+---
+
+### 11.13 Run D is closed: split-KV LOSES, and the profile says why *(2026-09-21)*
+
+**Item 3 is dead. All three of §11.1's items are now retired by measurement,
+and two of the three were retired against the estimate written there.**
+
+#### The sweep
+
+Every S from 1 to 16 at 4096/257 bs1, one `OUT_DIR` per value
+(`v12_splitsweep/s01..s16`), median of 3. Provenance: sixteen distinct
+`decode_splits` values in the env manifests, and the gate verdict collapses to
+**one** line with count 16 — `ran on all 24576 fused layers, realised read
+fraction 0.251`. `peak_GB` is identical (16.13) in all sixteen.
+
+| | TPOT | vs S=1 | spread |
+|---|---|---|---|
+| **S=1** | **0.0559** | — | the control, and the winner |
+| S=2–9 | 0.0599 | **+7.1%** | 1.8% |
+| S=10–16 | 0.0653 | **+16.9%** | 2.1% |
+
+TTFT across the same sixteen runs is **1.8% (1 sd), 5.6% peak-to-peak**. Prefill
+cannot touch this knob, so that is the session noise floor, measured rather than
+assumed — and the within-plateau spread (1.8%, 2.1%) *is* that floor. So this is
+not sixteen values; it is two plateaus with a +7.0% step between S=9 and S=10.
+
+**The shape is the finding.** A per-split cost would ramp with S. It does not:
+S=2 costs +7.7% and S=9 costs +7.9%, flat across a 4.5× range. The penalty is
+for **having** splits — the second launch per layer, the partial buffers, the
+merge — paid in full at S=2, with S=9 adding nothing. The S=9→10 step is
+unexplained; the grid crosses 72→80 blocks there, nowhere near 108.
+
+#### The profile, and why this was never winnable
+
+B=1, split arm, 45.196 ms/step of kernels:
+
+| bucket | ms/step | % |
+|---|---|---|
+| **elementwise** (unattributed) | **21.193** | **46.9%** |
+| model: GEMM | 10.448 | 23.1% |
+| ours: compiled evict | 7.478 | 16.5% |
+| **ours: two-tier decode** | **2.858** | **6.3%** |
+| ours: read gate | 0.308 | 0.7% |
+
+`ours` 10.644 ms ≈ `model` 10.544 ms. **The cache now costs what the model
+costs.** And `shared/other` is 24.008 ms — 53.1% the name-based rollup cannot
+attribute.
+
+**The decode kernel is 6.3% of the step**, and that reading is of the *split*
+arm (`n=64.0` launches over 32 layers = phase 1 + phase 2), so the control is
+lower still. Split-KV bought occupancy on 6% of the step while adding a launch,
+two buffers and a merge to 100% of it.
+
+This caps every decode-kernel item on this page. **§6.2 at its projected 1.5× is
+worth 0.95 ms — 2.1% of the step, not the ~1.40× overall §11.1 claims.** The
+model's GEMMs are at the B=1 weight floor (10.448 vs ~10.3 ms) and are not
+moveable.
+
+#### §11.11's decomposition is refuted
+
+§11.11 fitted `T(B) = fixed + k·B` on whole-step TPOT, concluded *"~11 ms of
+that kernel is paid regardless of batch"*, and built split-KV entirely on that.
+Direct measurement at B=1 puts the kernel at **2.858 ms**. The batch-invariance
+§11.11 measured is real; **the attribution was wrong**. The fixed cost is in the
+elementwise pile and the eviction gather, not in our decode kernel.
+
+Keep the caution that produced this: §11.11 reached its conclusion by
+*inference from a whole-step fit* and it was retired by *one direct
+measurement*. §11.10 had named the discriminator and picked the cheaper
+candidate on an argument; the argument was good and the answer was wrong.
+
+#### One defect found, fixed here
+
+The decode tile ladder's cache key omitted `splits`, while its own comment
+justifies including `B` *"because it moves the grid"* and `Sfp`/`n_sel` because
+*"the serial chain is Sfp and n_sel long"* — `splits` does both. A fixed-S
+process never noticed (one S, no collision), so **the sweep above is unaffected**.
+`auto` is where it bit: `_resolve_splits` runs per layer per step and its `cap`
+tracks live geometry, so one process sees several S values and served a rung
+tuned at one to another. That is the most likely reason the `auto` arm landed at
++11.1% — between the plateaus — instead of on S=13's +16.8%.
+
+#### 11.13.1 The order from here — replaces §11.8
+
+§11.8's list is inverted: it ranks decode-kernel work first, and decode-kernel
+work is 6.3%.
+
+1. **Run E — attribute the 21.193 ms** (`NEXT_RUNS.md` §3c). One kernel
+   signature, `vectorized_elementwise_kernel<4, ...>`, is 19.045 ms/step at 131
+   launches of **0.146 ms each**. At B=1 a model activation is `[1, 1, 4096]`
+   and should be launch-bound at single-digit µs; 146 µs means cache-sized
+   tensors. That is a hypothesis and Run E is how it becomes a finding.
+   `scripts/analyze_decode_trace.py` resolves kernel → aten op → Python call
+   site and crosses kind against owner. **Gains nothing itself. Decides
+   everything.**
+2. **Whichever Run E names.** If the elementwise is ours → fold it into the
+   Inductor region the eviction already compiles. If it is the model's → go at
+   `triton_poi_fused_gather_6`, 6.564 ms in one kernel at 0.517 ms/launch.
+3. **The host gap.** ~10 ms/step at B=1 across ~1,700 launches — close to the
+   whole 1.2× on its own, and no kernel rewrite. Note the tension to resolve
+   first: §5.1 measured the host path at 3 launches/layer, the profile shows 31
+   elementwise launches/layer. One of those is wrong and Run E says which.
+
+**Honest sizing of 1.2× (−9.3 ms off 55.9 ms).** It requires the elementwise
+pile or the host gap; nothing else on this page is large enough. If Run E says
+the elementwise is mostly ours, 1.2× is reachable. If it is mostly the model's,
+the realistic cap is ~1.05× and the claim should move to B=32 throughput and
+memory, per §8.
+
+**And the baseline is wrong for planning.** Every number in §11.13 is B=1 on the
+*split* arm. Re-take the profile at B=32 on `S=1` before committing to any of
+the three.
+

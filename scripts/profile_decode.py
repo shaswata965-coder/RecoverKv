@@ -489,6 +489,12 @@ def main() -> None:
     # ran it compiled -- a different method, and not by a little: compiling moved
     # TPOT 101.6 -> 85 ms (DECODE_HISTORY.md §1). Pass 0 deliberately to A/B it.
     ap.add_argument("--trace", default=None, help="write a chrome trace here")
+    ap.add_argument("--stack", action="store_true",
+                    help="record Python call stacks (with_stack/with_modules) "
+                         "so --trace can be attributed to call sites by "
+                         "scripts/analyze_decode_trace.py. Adds per-op CPU "
+                         "overhead: use it for attribution runs, not timing "
+                         "runs.")
     ap.add_argument("--top", type=int, default=15)
     args = ap.parse_args()
 
@@ -650,8 +656,20 @@ def main() -> None:
             except Exception:  # pragma: no cover - import-path dependent
                 pass
             t0 = time.perf_counter()
+            # `--stack` is what turns the chrome trace from "which kernel"
+            # into "which of OUR functions launched it". Without it the trace
+            # still links kernel -> aten op, which names `aten::mul` and stops;
+            # with it every cpu_op carries a Python call stack, and
+            # `analyze_decode_trace.py` can split the elementwise pile between
+            # this project and the model. It is OFF by default because
+            # with_stack costs real CPU time per op and would distort the host
+            # gap the rollup above reports -- so take the timing run without it
+            # and the attribution run with it, and read each for what it is
+            # valid for.
             with profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                with_stack=bool(args.stack),
+                with_modules=bool(args.stack),
             ) as prof:
                 for _ in range(args.steps):
                     out = _step(nxt, pkv, 1)

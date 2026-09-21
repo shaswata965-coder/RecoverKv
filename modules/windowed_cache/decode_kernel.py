@@ -1333,6 +1333,38 @@ _FIT_LADDER_LEGACY = [
 #: that cost is **unmeasured**. Which is also why `auto` is a starting point
 #: and not an answer -- NEXT_RUNS.md sweeps S explicitly at the headline cell,
 #: because where the real optimum sits depends on exactly that overhead.
+#:
+#: **RETIRED BY MEASUREMENT, 2026-09-21 (Run D + the S sweep, §11.13).** That
+#: sweep has now been run: every S from 1 to 16 at 4096/257 bs1, one OUT_DIR
+#: each, the gate verdict identical across all sixteen. `S=1` wins outright.
+#:
+#:     S=1            0.0559 s   <- control, best
+#:     S=2..9   mean  0.0599 s   +7.1%    (spread 1.8% == the noise floor)
+#:     S=10..16 mean  0.0653 s   +16.9%   (spread 2.1%)
+#:
+#: TTFT across the same sixteen runs -- a quantity this knob cannot touch --
+#: moved 1.8% (1 sd), so the plateaus are real structure and the variation
+#: inside each one is noise.
+#:
+#: The shape is the finding. A per-split cost would ramp with S; this does not.
+#: S=2 costs +7.7% and S=9 costs +7.9%, flat across a 4.5x range. **The penalty
+#: is for HAVING splits, not for how many** -- the second launch per layer, the
+#: partial buffers and the merge pass are paid in full at S=2 and S=9 adds
+#: nothing on top. The step between S=9 and S=10 (+7.0%) is unexplained; the
+#: grid crosses 72 -> 80 blocks there, nowhere near the 108-SM boundary.
+#:
+#: **Why it could not have paid.** The B=1 profile puts `_two_tier_decode_kernel`
+#: at 2.858 ms of a 45.196 ms step -- **6.3%** -- and that measurement is of the
+#: SPLIT arm, so the control is lower still. Split-KV bought occupancy on 6% of
+#: the step while adding a launch, two buffers and a merge to 100% of it. This
+#: also refutes §11.11's decomposition, which inferred "~11 ms of that kernel is
+#: paid regardless of batch" from a whole-step fit and built this feature on it.
+#: The batch-invariance §11.11 measured is real; the attribution was not.
+#:
+#: The code stays: `S=1` is the shipped default and a provable no-op, and the
+#: knob is what makes the arm reproducible. Do not delete the control arm to
+#: tidy up. Do not re-open this without a profile showing the decode kernel is
+#: a materially larger share of the step than 6.3%.
 _DECODE_SPLITS_ENV = "STICKYKV_DECODE_SPLITS"
 _SPLITS_MAX = 16
 _SPLITS_TIE = 5.0
@@ -1916,8 +1948,18 @@ def _decode_triton(
     # are bucketed by bit length so the fp store's one-token-per-step growth
     # between evictions does not re-trigger the search every step; `B` is exact
     # because it moves the grid.
+    #
+    # `splits` joins for BOTH of the reasons above and had been missing: the
+    # grid is `B * H_kv * splits`, and each block's serial chain is `1/splits`
+    # of the unsplit walk. A fixed-S process never noticed -- it has one S, so
+    # the search times its rungs under the real geometry and the key cannot
+    # collide. `auto` is where it bit: `_resolve_splits` runs per layer per
+    # step and its `cap` tracks the live geometry, so one process sees several
+    # S values and, without this term, served a rung tuned at one S to another.
+    # That is the most likely reason the `auto` arm landed between the two
+    # plateaus the fixed-S sweep measured (§11.13) instead of on one of them.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
-           int(B), int(Sfp).bit_length(), int(n_sel).bit_length())
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(splits))
 
     def _launch(rung):
         target_keys, num_stages, num_warps = rung
