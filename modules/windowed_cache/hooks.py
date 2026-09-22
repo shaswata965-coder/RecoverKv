@@ -190,6 +190,26 @@ PREFILL_SCORE_CHUNK = 1024
 SCORE_SOFTMAX_DTYPE = torch.bfloat16
 
 
+def score_accum_dtype(kv_dtype: torch.dtype) -> torch.dtype:
+    """The dtype a layer's window scores are produced -- and so accumulated -- in.
+
+    ``state.window_scores`` is a running sum: over every query row of the
+    prefill, then over every decode step, and its dtype is whatever the first
+    scores handed to it were. In a reduced-precision accumulator an addend under
+    half an ULP of the running total rounds to nothing. ``int2_qwen`` measured
+    it (``446a7eb``): ~76% of per-step contributions vanish in **bfloat16**
+    (8-bit mantissa) against ~52% in float16, and the prefill ranking itself is
+    rounded to 3 significant digits before the first eviction reads it.
+
+    **fp16 keeps fp16**, byte for byte, so the Llama-3.1 and Mistral columns are
+    unchanged. Anything else -- bf16, i.e. Qwen2.5's native dtype -- accumulates
+    in fp32, as the Qwen column always did on ``int2_qwen``. fp32 stays fp32.
+    Widening fp16 too is the right end state, but it moves the existing columns
+    and so needs a LongBench run behind it (CLAUDE.md, standing rules).
+    """
+    return kv_dtype if kv_dtype in (torch.float16, torch.float32) else torch.float32
+
+
 def install_score_hooks(
     model: nn.Module,
     cache: Any,
@@ -567,7 +587,7 @@ def install_score_hooks(
                     lse=lse,
                     chunk=PREFILL_SCORE_CHUNK,
                     softmax_dtype=SCORE_SOFTMAX_DTYPE,
-                    out_dtype=q.dtype,
+                    out_dtype=score_accum_dtype(q.dtype),
                 )                                                    # [B, H_q, S]
 
                 # 4. Reduce to per-window scores and hand off to the cache. At
