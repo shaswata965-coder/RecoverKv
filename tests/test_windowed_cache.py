@@ -960,8 +960,14 @@ def _divergent_scores(B, H_q):
     return s0
 
 
-def _drive_divergent_cache(prefill_scores, B=2, H_kv=2, D=8, layer_major=True):
+def _drive_divergent_cache(prefill_scores, B=2, H_kv=2, D=8, layer_major=True,
+                           with_cache_position=True):
     """Drive a full WindowedCache through prefill + 2 decode steps.
+
+    ``with_cache_position`` omits ``cache_position`` from every ``cache_kwargs``
+    when False, reproducing an attention module (MistralFlashAttention2) that
+    does not pass it. The cache must then derive absolute positions from its own
+    token count; see :class:`TestMissingCachePosition`.
 
     Geometry (window_size=1, num_sink=0, local=1, budget=0.375, prefill=8)
     resolves to top_k=2, local_windows=1. This test targets the per-row eviction
@@ -993,11 +999,14 @@ def _drive_divergent_cache(prefill_scores, B=2, H_kv=2, D=8, layer_major=True):
         del os.environ["STICKYKV_LAYER_MAJOR_DECODE"]
     cache._policies[0].first_eviction_step = 0
     H_q = prefill_scores.shape[1]
+    def _cache_kwargs(start, n, window_scores):
+        kw = {"window_scores": window_scores}
+        if with_cache_position:
+            kw["cache_position"] = torch.arange(start, start + n)
+        return kw
+
     k = _make_pos_keys(B, H_kv, 8, D)
-    cache.update(k, k.clone(), 0, cache_kwargs={
-        "cache_position": torch.arange(8),
-        "window_scores": prefill_scores,
-    })
+    cache.update(k, k.clone(), 0, cache_kwargs=_cache_kwargs(0, 8, prefill_scores))
     for pos in (8, 9):
         # The width a hook would emit: the merged window count of the store as
         # it stands now (window_size=1, num_sink=0, so one window per token).
@@ -1006,11 +1015,58 @@ def _drive_divergent_cache(prefill_scores, B=2, H_kv=2, D=8, layer_major=True):
             store.num_active_windows if store is not None else 0
         )
         k1 = _make_pos_keys(B, H_kv, 1, D, start=pos)
-        cache.update(k1, k1.clone(), 0, cache_kwargs={
-            "cache_position": torch.arange(pos, pos + 1),
-            "window_scores": torch.zeros(B, H_q, W),
-        })
+        cache.update(k1, k1.clone(), 0,
+                     cache_kwargs=_cache_kwargs(pos, 1, torch.zeros(B, H_q, W)))
     return cache._states[0]
+
+
+class TestMissingCachePosition:
+    """Absolute positions must not depend on the caller passing cache_position.
+
+    ``cache_kwargs["cache_position"]`` is a per-model-file convention, not part
+    of the HF Cache contract. ``MistralFlashAttention2`` (transformers 4.47.x)
+    builds ``cache_kwargs = {"sin": sin, "cos": cos}`` and omits it, while
+    Mistral's eager/sdpa paths and every Llama path include it.
+
+    Deriving positions from the current cache length instead is silently wrong
+    after the first eviction — the cache has compacted, so the next token is
+    filed ~``window_size`` positions early. Window identity is
+    ``(position - num_sink) // window_size``, so the new token's window id then
+    collides with a survivor's and eviction ranks a scrambled grouping. The fix
+    (:meth:`WindowedCache._resolve_cache_position`) derives positions from the
+    cache's own monotonic token count, which equals ``cache_position`` whenever
+    HF supplies it, so a Llama run is byte-identical.
+
+    Both decode paths are exercised: the per-layer path
+    (``STICKYKV_LAYER_MAJOR_DECODE=0``, patched in ``_update_per_layer``) and the
+    layer-major joint path (patched in ``_update_joint``).
+    """
+
+    @pytest.mark.parametrize("layer_major", [False, True])
+    def test_positions_match_with_and_without_cache_position(self, layer_major):
+        supplied = _drive_divergent_cache(
+            _divergent_scores(2, 4), B=2, layer_major=layer_major,
+            with_cache_position=True,
+        )
+        omitted = _drive_divergent_cache(
+            _divergent_scores(2, 4), B=2, layer_major=layer_major,
+            with_cache_position=False,
+        )
+        assert torch.equal(supplied.position_ids, omitted.position_ids)
+        assert torch.equal(supplied.key_states, omitted.key_states)
+
+    @pytest.mark.parametrize("layer_major", [False, True])
+    def test_post_eviction_token_keeps_its_absolute_position(self, layer_major):
+        """The decode tokens appended after a compaction are filed at their
+        absolute positions (8, 9), not at the compacted length. This is the
+        assertion that fails pre-fix, where the omitted-cache_position path
+        auto-increments from the shrunken store."""
+        omitted = _drive_divergent_cache(
+            _divergent_scores(2, 4), B=2, layer_major=layer_major,
+            with_cache_position=False,
+        )
+        assert omitted.position_ids[0].tolist() == [1, 3, 8, 9]
+        assert omitted.position_ids[1].tolist() == [4, 6, 8, 9]
 
 
 class TestBatching:

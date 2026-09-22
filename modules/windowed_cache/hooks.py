@@ -92,24 +92,45 @@ try:
 except ImportError:
     Qwen2Attention = None  # type: ignore[assignment,misc]
 
+try:
+    from transformers.models.mistral.modeling_mistral import MistralAttention
+except ImportError:
+    MistralAttention = None  # type: ignore[assignment,misc]
+
 
 def _get_attn_classes() -> Tuple:
-    """Return a tuple of attention module classes to target."""
+    """Return a tuple of attention module classes to target.
+
+    Mistral-7B ships its own ``MistralAttention`` (not a subclass of
+    ``LlamaAttention`` on transformers 4.47.x), so it must be listed explicitly
+    or the score hooks silently attach to nothing and eviction runs with no
+    window scores. The score hook itself is model-agnostic; see the
+    ``rotary_emb`` fallback in :func:`install_score_hooks` for the one shape
+    difference Mistral has (it does not receive ``position_embeddings``).
+    """
     classes = []
     if LlamaAttention is not None:
         classes.append(LlamaAttention)
     if Qwen2Attention is not None:
         classes.append(Qwen2Attention)
+    if MistralAttention is not None:
+        classes.append(MistralAttention)
     return tuple(classes)
 
 
 def _extract_arg(
-    args: Tuple, kwargs: Dict[str, Any], name: str, pos: int
+    args: Tuple, kwargs: Dict[str, Any], name: str, pos: Optional[int] = None
 ) -> Optional[Any]:
-    """Pull a forward argument by keyword name, falling back to position."""
+    """Pull a forward argument by keyword name, falling back to position.
+
+    ``pos=None`` means name-only: no positional fallback. Use it whenever a wrong
+    guess would return a DIFFERENT tensor rather than nothing, because every
+    caller here treats ``None`` as "not available" and degrades loudly, while a
+    wrong tensor is consumed silently.
+    """
     if name in kwargs:
         return kwargs[name]
-    if len(args) > pos:
+    if pos is not None and len(args) > pos:
         return args[pos]
     return None
 
@@ -193,7 +214,8 @@ def install_score_hooks(
 ) -> HookHandles:
     """Install score-extraction hooks on all attention modules.
 
-    For each ``LlamaAttention`` / ``Qwen2Attention`` module, registers a
+    For each ``LlamaAttention`` / ``Qwen2Attention`` / ``MistralAttention``
+    module, registers a
     ``forward_hook`` (with kwargs) that recomputes the post-RoPE query from
     the layer inputs, runs a causally-masked auxiliary SDPA against the
     cached keys, and reduces the result to per-window scores.
@@ -235,7 +257,8 @@ def install_score_hooks(
 
     attn_classes = _get_attn_classes()
     if not attn_classes:
-        msg = "No LlamaAttention or Qwen2Attention found — no hooks installed."
+        msg = ("No LlamaAttention, Qwen2Attention or MistralAttention found "
+               "— no hooks installed.")
         if _committed:
             raise RuntimeError(
                 msg + " The flash backend is committed to the Triton score/decode "
@@ -358,9 +381,31 @@ def install_score_hooks(
         def make_hook(lidx: int):
             def score_hook(module, args, kwargs, output):
                 hidden_states = _extract_arg(args, kwargs, "hidden_states", 0)
+                # Name-only, deliberately. position_embeddings is the LAST
+                # parameter of the attention forward (a late kwarg on Llama and
+                # Qwen2) — NOT index 1, which is attention_mask. A positional
+                # fallback of 1 could only ever fire when it is wrong, handing a
+                # mask to the RoPE path where nothing would raise.
                 position_embeddings = _extract_arg(
-                    args, kwargs, "position_embeddings", 1
+                    args, kwargs, "position_embeddings"
                 )
+                if position_embeddings is None and hasattr(module, "rotary_emb"):
+                    # Mistral's attention (transformers 4.47.x, and the
+                    # <=4.45 layout generally) does not receive
+                    # position_embeddings as a forward argument — the top-level
+                    # model does not compute it centrally the way Llama's
+                    # refactored interface does. Each layer instead holds its own
+                    # self.rotary_emb and derives (cos, sin) from position_ids.
+                    # Recompute the same way; x is used only for its
+                    # dtype/device, so hidden_states stands in for the value
+                    # states rotary_emb expects. This is a no-op on Llama/Qwen2,
+                    # which pass position_embeddings and (post-refactor) carry no
+                    # module-level rotary_emb.
+                    position_ids = _extract_arg(args, kwargs, "position_ids", 2)
+                    if hidden_states is not None and position_ids is not None:
+                        position_embeddings = module.rotary_emb(
+                            hidden_states, position_ids
+                        )
                 if hidden_states is None or position_embeddings is None:
                     msg = ("Flash hook: hidden_states / position_embeddings "
                            "not found in the attention call — scoring "

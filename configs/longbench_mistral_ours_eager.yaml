@@ -1,0 +1,67 @@
+# ============================================================================
+# LongBench — Mistral-7B-Instruct-v0.2, Ours (eager backend, Kaggle-runnable)
+# ============================================================================
+# Windowed KV-cache with eager attention score extraction.
+# Use where flash-attn-2 isn't available (Kaggle T4/P100). There is ONE cache
+# package now: 'eager' selects eager score extraction, not a separate fork, so
+# the geometry below resolves the same two-tier gated cache as the flash config.
+# Cache geometry is identical to configs/longbench_ours_eager.yaml so the
+# Mistral and Llama columns differ only by the model.
+# Produces: outputs/longbench/mistral_ours_eager_compression_0.8/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  # See longbench_mistral_ours_flash_attn.yaml for why v0.2 and not v0.1.
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  revision: main
+  dtype: float16
+  attn_implementation: eager                # MUST match cache.backend_package
+
+cache:
+  # Pinned to utils.config.OPERATING_POINT -- identical to the flash arm so the
+  # two routes measure the same method. scripts/check_operating_point.py fails
+  # if this drifts.
+  backend: windowed
+  backend_package: eager                    # imports modules.windowed_cache (one cache)
+  cache_budget: 0.20                        # DefensiveKV's headline; compression_ratio = 0.8
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
+  quant_ratio: 0.70  # two-tier int2 split q in [0,1]; 0 = pure fp16. q>0 needs window_size divisible by 4.
+  quant_gate_ratio: 0.25            # read-gate selectivity (the gate IS the read path at q>0)
+  quant_budget_mode: bytes
+  first_eviction_step: 0                    # prompt compressed on decode step 0 (default)
+
+telemetry:
+  track_scores: false                       # mandatory; see prompt 04 §1
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                         # published mistral-7B-instruct-v0.2 budget; see the flash config
+  output_dir: outputs/longbench/mistral_ours_eager_compression_0.8
+  seed: 42
+  resume: true                              # essential on Kaggle (9-hour limit)
+  skip_oom: true
+  aggressive_cache_clear: true              # essential on Kaggle T4

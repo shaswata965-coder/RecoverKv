@@ -81,6 +81,7 @@ OPERATING_POINT = {
 OPERATING_POINT_EXEMPT = {
     "base.yaml": "the schema's defaults, not a run",
     "longbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "longbench_mistral_full_cache.yaml": "the Mistral FullKV baseline -- no eviction at all",
     "gsm8k_full_cache.yaml": "the FullKV baseline -- no eviction at all",
     "eval_parity_base.yaml": "parity harness; budget 0.25 is its own control",
     "eval_parity_ours_eager.yaml": "parity harness; matched to the base arm",
