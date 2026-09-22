@@ -102,12 +102,18 @@ def _get_attn_classes() -> Tuple:
 
 
 def _extract_arg(
-    args: Tuple, kwargs: Dict[str, Any], name: str, pos: int
+    args: Tuple, kwargs: Dict[str, Any], name: str, pos: Optional[int] = None
 ) -> Optional[Any]:
-    """Pull a forward argument by keyword name, falling back to position."""
+    """Pull a forward argument by keyword name, falling back to position.
+
+    ``pos=None`` means name-only: no positional fallback. Use it whenever a wrong
+    guess would return a DIFFERENT tensor rather than nothing, because every
+    caller here treats ``None`` as "not available" and degrades loudly, while a
+    wrong tensor is consumed silently.
+    """
     if name in kwargs:
         return kwargs[name]
-    if len(args) > pos:
+    if pos is not None and len(args) > pos:
         return args[pos]
     return None
 
@@ -356,8 +362,16 @@ def install_score_hooks(
         def make_hook(lidx: int):
             def score_hook(module, args, kwargs, output):
                 hidden_states = _extract_arg(args, kwargs, "hidden_states", 0)
+                # Name-only, deliberately. position_embeddings is the LAST
+                # parameter of the attention forward (index 7 on Llama and Qwen2,
+                # absent entirely on Mistral) — NOT index 1, which is
+                # attention_mask. Every decoder layer in 4.47.1 passes it by
+                # keyword, so the lookup always succeeds; a positional fallback of
+                # 1 could only ever fire when it is wrong, handing a mask to the
+                # RoPE path where nothing would raise. None instead falls through
+                # to the loud degrade below.
                 position_embeddings = _extract_arg(
-                    args, kwargs, "position_embeddings", 1
+                    args, kwargs, "position_embeddings"
                 )
                 if hidden_states is None or position_embeddings is None:
                     msg = ("Flash hook: hidden_states / position_embeddings "

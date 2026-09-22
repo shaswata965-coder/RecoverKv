@@ -51,7 +51,10 @@ class TestPacking:
 class TestKeyQuant:
     def test_shapes(self):
         H, W, D = 8, 8, 128
-        k = torch.randn(H, W, D)
+        # fp16 KV — a real key dtype (windows are fp16 or bf16, never fp32). The
+        # grid group scale follows the KV dtype (quantizer.grid_dtype_for): fp16
+        # KV keeps the fp16 grid, byte for byte, so this is the bit-identity path.
+        k = torch.randn(H, W, D, dtype=torch.float16)
         packed, scale, zero = quantize_key_window(k)
         assert packed.shape == (H, D, W // 4)
         assert packed.dtype == torch.uint8
@@ -401,7 +404,9 @@ def test_affine_quantize_inplace_matches_the_out_of_place_form():
     scale guard exists for.
     """
     import torch
-    from modules.quant.quantizer import _affine_quantize, _quantize_grid, _LEVELS
+    from modules.quant.quantizer import (
+        _affine_quantize, _quantize_grid, _LEVELS, grid_dtype_for,
+    )
 
     def _reference(x, group_dim):
         x32 = x.to(torch.float32)
@@ -409,8 +414,12 @@ def test_affine_quantize_inplace_matches_the_out_of_place_form():
         mn = x32.amin(dim=group_dim, keepdim=True)
         scale = (mx - mn) / _LEVELS
         scale = torch.where(mx == mn, torch.ones_like(scale), scale)
-        s_g = _quantize_grid(scale.squeeze(group_dim), signed=False)
-        z_g = _quantize_grid(mn.squeeze(group_dim), signed=True)
+        # The grid group scale follows the KV dtype (grid_dtype_for): fp16 KV
+        # keeps fp16, bf16 KV takes bf16 so it cannot overflow. Mirror that here
+        # so the reference stays bit-identical to the code across all dtypes.
+        gdt = grid_dtype_for(x.dtype)
+        s_g = _quantize_grid(scale.squeeze(group_dim), signed=False, grid_dtype=gdt)
+        z_g = _quantize_grid(mn.squeeze(group_dim), signed=True, grid_dtype=gdt)
         q = torch.round((x32 - z_g.decode().unsqueeze(group_dim))
                         / s_g.decode().unsqueeze(group_dim))
         q = torch.clamp(q, 0.0, _LEVELS)

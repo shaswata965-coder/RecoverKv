@@ -151,12 +151,68 @@ def log_operating_point(config, is_windowed: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: dtype names accepted by ``model.dtype``. Kept here rather than in each runner
+#: because the runners used ``dtypes.get(name, torch.float16)`` — a silent
+#: fallback that turned a typo (``bloat16``) into an fp16 run with nothing in the
+#: log. ``utils.model_loading.resolve_dtype`` reads this and raises on anything else.
+DTYPE_NAMES = ("float16", "bfloat16", "float32")
+
+
 @dataclass
 class ModelConfig:
     name: str = "meta-llama/Meta-Llama-3-8B"
     revision: Optional[str] = None
     dtype: str = "float16"
-    attn_implementation: str = "eager"  # "eager" | "flash_attention_2"
+    attn_implementation: str = "eager"  # "eager" | "flash_attention_2" | "sdpa"
+
+    # --- overrides applied to the checkpoint's own HF config at load time ----
+    #
+    # A checkpoint ships one context/RoPE configuration; a long-context eval may
+    # need another (Qwen2.5's 32K config vs its YaRN-scaled 128K one). Editing a
+    # cached config.json by hand is invisible to the result files and
+    # unshareable, so declare it here instead: utils.model_loading applies these
+    # to the AutoConfig before the weights load and logs every change.
+    #
+    # None means "leave the checkpoint's value alone" for all four. They are
+    # inert on every existing (Llama/Mistral) config, which sets none of them.
+    max_position_embeddings: Optional[int] = None
+    #: e.g. {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}
+    rope_scaling: Optional[Dict[str, Any]] = None
+    sliding_window: Optional[int] = None
+    use_sliding_window: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.dtype not in DTYPE_NAMES:
+            raise ConfigValidationError(
+                f"model.dtype must be one of {list(DTYPE_NAMES)}, got {self.dtype!r}. "
+                f"This used to fall back to float16 silently, which made a typo "
+                f"indistinguishable from an intended fp16 run."
+            )
+        if self.attn_implementation not in ("eager", "flash_attention_2", "sdpa"):
+            raise ConfigValidationError(
+                f"model.attn_implementation must be 'eager', 'flash_attention_2' "
+                f"or 'sdpa', got {self.attn_implementation!r}"
+            )
+        mpe = self.max_position_embeddings
+        if mpe is not None and (
+            isinstance(mpe, bool) or not isinstance(mpe, int) or mpe <= 0
+        ):
+            raise ConfigValidationError(
+                f"model.max_position_embeddings must be a positive int or null, "
+                f"got {mpe!r}"
+            )
+        sw = self.sliding_window
+        if sw is not None and (isinstance(sw, bool) or not isinstance(sw, int) or sw <= 0):
+            raise ConfigValidationError(
+                f"model.sliding_window must be a positive int or null, got {sw!r}"
+            )
+        if self.use_sliding_window is not None and not isinstance(
+            self.use_sliding_window, bool
+        ):
+            raise ConfigValidationError(
+                f"model.use_sliding_window must be a bool or null, got "
+                f"{self.use_sliding_window!r}"
+            )
 
 
 @dataclass

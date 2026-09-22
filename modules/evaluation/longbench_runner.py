@@ -155,42 +155,26 @@ class LongBenchRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer (lazy, called once).
 
-        cfg = self.config
+        Delegates to :func:`utils.model_loading.load_model_and_tokenizer`, the
+        single load path shared by LongBench, RULER and GSM8K, so the three model
+        columns differ only by model: greedy is pinned to bare greedy (a no-op on
+        Llama/Mistral, which ship no sampling knobs), the declared context/RoPE
+        overrides are applied to the AutoConfig, and an unknown dtype raises
+        instead of silently falling back to fp16.
+        """
+        from utils.model_loading import load_model_and_tokenizer
 
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
-
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint=(
+                "LongBench few-shot datasets (trec/triviaqa/samsum/lsht/lcc/"
+                "repobench-p) are prompted raw by design; the rest use the "
+                "chat template."
+            ),
+            is_windowed=self.is_windowed,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name,
-            cfg.model.dtype,
-            cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-
-        return model, tokenizer
 
     def run(self) -> None:
         """Run predictions on all configured datasets."""
@@ -441,6 +425,16 @@ class LongBenchRunner:
             # output_attentions only for eager backend
             if self.cache_backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
+
+            # Qwen2.5 pads its vocab for tensor-core alignment: ids in the gap
+            # decode to '' and crash generate(stop_strings=...) via
+            # StopStringCriteria. Suppress them. None (Llama/Mistral have no gap)
+            # adds no logits processor, so those columns are byte-identical.
+            from utils.generation import unmappable_token_ids
+
+            bad_ids = unmappable_token_ids(model, tokenizer)
+            if bad_ids is not None:
+                gen_kwargs["suppress_tokens"] = bad_ids
 
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache

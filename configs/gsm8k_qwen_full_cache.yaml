@@ -1,0 +1,42 @@
+# ============================================================================
+# GSM8K — Qwen2.5-7B full-cache baseline (no compression)
+# ============================================================================
+# The reference the compressed Qwen runs are measured against. GSM8K prompts
+# (~280 tokens) sit far under Qwen2.5's 32K window, so no YaRN and no truncation
+# is needed; float16 keeps the column comparable with Llama/Mistral.
+#
+# This is also the suite that reaches the vocab-padding crash: GSM8K passes
+# stop_strings, and on Qwen2.5 emitting one of the 399 padded ids raises from
+# inside StopStringCriteria. The runner suppresses those ids
+# (utils.generation.unmappable_token_ids); no effect on Llama/Mistral.
+#
+# Produces: outputs/gsm8k/qwen_full_cache/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic          # DynamicCache — no eviction, no quantization
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/qwen_full_cache
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

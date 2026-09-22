@@ -247,24 +247,63 @@ class QGrid(NamedTuple):
         return QGrid(fn(self.q), fn(self.s))
 
 
-def _quantize_grid(x: Tensor, *, signed: bool) -> QGrid:
-    """Encode one grid field. Codes are fit to the **fp16-stored** group scale.
+def grid_dtype_for(kv_dtype: torch.dtype) -> torch.dtype:
+    """The dtype the one-byte grid's group scale (``QGrid.s``) is stored in.
+
+    **Must stay 2 bytes.** The budget resolver charges the grid at 2 bytes per
+    group scale (:func:`grid_bytes_per_head`), and at int2 the grid is a large
+    part of a Q window, so a wider scale would silently change every compression
+    ratio the method reports.
+
+    - ``float16`` KV → ``float16``. **Byte-identical** to the original pinned
+      grid, so the Llama-3.1 and Mistral-v0.2 fp16 columns produce bit-for-bit
+      the results they always did. Overflow is structurally impossible there: the
+      grid scale is ``amax / levels`` of an fp16-derived value, well inside fp16.
+    - **anything else (bfloat16, float32) → ``bfloat16``.** bf16 has fp32's
+      exponent range in the same 2 bytes, so no value the cache can hold can
+      overflow it. This is the property being bought: a **bf16** KV cache (Qwen2.5
+      native) CAN hold a key past fp16's 65504, and casting the group scale to
+      fp16 there produced ``inf`` and a window of ``nan`` — with nothing raising —
+      for the rest of the run. The overflow is on the grid's *group scale*
+      (``amax / 127`` for the zero field can exceed 65504 once ``|zero| > 8.3e6``,
+      which a bf16 massive-activation channel reaches), not on the int2 codes.
+
+    The trade is 3 mantissa bits (bf16's 8 vs fp16's 11) on the group scale,
+    against int2's 4 levels — the code error dominates by orders of magnitude, and
+    the exactness invariant (fit grid == read grid, bit for bit; design §10) is
+    dtype-agnostic and preserved because the codes are always fit to the *stored*
+    grid.
+    """
+    return torch.float16 if kv_dtype == torch.float16 else torch.bfloat16
+
+
+def _quantize_grid(
+    x: Tensor, *, signed: bool, grid_dtype: torch.dtype = torch.float16
+) -> QGrid:
+    """Encode one grid field. Codes are fit to the **stored** group scale.
 
     ``signed`` picks the field: ``zero`` is an offset and takes int8 symmetric;
     ``scale`` is non-negative and takes the full uint8 range, clamped at 1 so a
     decoded scale is never zero (the fit divides by it).
+
+    ``grid_dtype`` is the storage dtype of the group scale ``QGrid.s`` — see
+    :func:`grid_dtype_for`. It defaults to fp16 (the original, byte-identical
+    behaviour); a bf16 KV cache passes bfloat16 so the scale cannot overflow.
     """
     g = grid_group(x.shape[-1])
     xg = x.reshape(*x.shape[:-1], -1, g)
     levels = 127.0 if signed else 255.0
     amax = (xg.abs() if signed else xg).amax(dim=-1, keepdim=True)
     s = torch.where(amax > 0, amax / levels, torch.ones_like(amax))
-    s16 = s.clamp_min(_FP16_MIN_POS).to(torch.float16)
-    s32 = s16.to(torch.float32).clamp_min(_TINY)
+    # clamp_min BEFORE the cast keeps a decoded scale non-zero (the fit divides by
+    # it); the floor is fp16's smallest subnormal, which is representable in bf16
+    # too, so it never underflows either grid dtype to zero.
+    sg = s.clamp_min(_FP16_MIN_POS).to(grid_dtype)
+    s32 = sg.to(torch.float32).clamp_min(_TINY)
     q = torch.round(xg / s32)
     q = q.clamp_(-levels, levels) if signed else q.clamp_(1.0, levels)
     codes = q.to(torch.int8 if signed else torch.uint8).reshape(x.shape)
-    return QGrid(codes, s16.squeeze(-1))
+    return QGrid(codes, sg.squeeze(-1))
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +327,13 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid
         Shape of ``x`` with ``group_dim`` reduced **away** (squeezed, so the
         grid axis is last and :class:`QGrid`'s sharing applies to it).
     """
+    # The group scale is stored in a dtype that follows the KV dtype, so a
+    # bf16 cache (Qwen2.5) cannot overflow the fp16 grid the way it silently did.
+    # `x` is the KV window in the model dtype, so its dtype IS the KV dtype — no
+    # threading through the store is needed. fp16 keeps the fp16 grid, byte for
+    # byte, so Llama/Mistral are unchanged. See `grid_dtype_for`.
+    grid_dtype = grid_dtype_for(x.dtype)
+
     x32 = x.to(torch.float32)
     mx = x32.amax(dim=group_dim, keepdim=True)
     mn = x32.amin(dim=group_dim, keepdim=True)
@@ -304,8 +350,8 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid
     # `_quantize_grid` takes the grid axis last, which is what squeezing
     # `group_dim` leaves: keys reduce over tokens and share over channels,
     # values reduce over channels and share over tokens.
-    scale_g = _quantize_grid(scale.squeeze(group_dim), signed=False)
-    zero_g = _quantize_grid(zero.squeeze(group_dim), signed=True)
+    scale_g = _quantize_grid(scale.squeeze(group_dim), signed=False, grid_dtype=grid_dtype)
+    zero_g = _quantize_grid(zero.squeeze(group_dim), signed=True, grid_dtype=grid_dtype)
     scale_grid = scale_g.decode().unsqueeze(group_dim)
     zero_grid = zero_g.decode().unsqueeze(group_dim)
 

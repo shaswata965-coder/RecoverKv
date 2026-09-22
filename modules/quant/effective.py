@@ -26,6 +26,7 @@ head count.
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -245,6 +246,68 @@ def dequant_rotate_q_keys(
     )
 
 
+def rope_attention_scaling(rope_module: torch.nn.Module) -> float:
+    """The scalar ``a`` this rotary module folds into its cos/sin.
+
+    ``1.0`` for ``rope_type`` default / linear / dynamic / **llama3** — i.e.
+    Llama-3.1, Mistral and un-scaled Qwen2.5 — so every caller's correction is a
+    no-op branch on those and their numerics are byte-identical to before this
+    existed.
+
+    ``0.1·ln(factor) + 1`` for **YaRN** (1.13862 at factor 4.0) unless the config
+    pins ``attention_factor`` — transformers folds it into cos/sin so the forward
+    map is ``a·R(θ)``, not ``R(θ)``. Read off the module rather than recomputed
+    from the config so it tracks whatever transformers actually built.
+    """
+    a = getattr(rope_module, "attention_scaling", 1.0)
+    try:
+        a = float(a)
+    except (TypeError, ValueError):
+        return 1.0
+    # A non-finite or non-positive scaling is not a rotation we can invert; 1.0
+    # keeps the legacy behaviour and the consistency check below will fire.
+    if not (a > 0.0) or a != a or a in (float("inf"), float("-inf")):
+        return 1.0
+    return a
+
+
+_warned_rope_scaling = [False]
+# cos² + sin² == a² to within fp16 rounding; 2% is far below the 29.6% error a
+# missed YaRN a² would produce and far above fp16 noise.
+_ROPE_SCALING_TOL = 0.02
+
+
+def _check_rope_scaling_consistency(cos: Tensor, sin: Tensor, a: float) -> None:
+    """Warn once if ``cos²+sin²`` disagrees with ``a²`` from the module.
+
+    The RoPE round-trip here inverts ``a·R(θ)`` analytically, so a module that
+    scales cos/sin by something it does not expose as ``attention_scaling`` would
+    corrupt every dequantized int2 key with nothing raising. One scalar
+    comparison per process is a cheap way to make that loud.
+    """
+    if _warned_rope_scaling[0]:
+        return
+    try:
+        measured = float((cos[..., :1] ** 2 + sin[..., :1] ** 2).flatten()[0])
+    except (IndexError, RuntimeError):        # pragma: no cover - degenerate shapes
+        return
+    expected = a * a
+    if expected <= 0 or abs(measured - expected) <= _ROPE_SCALING_TOL * expected:
+        return
+    _warned_rope_scaling[0] = True
+    warnings.warn(
+        f"RoPE module reports attention_scaling={a} (a^2={expected:.4f}) but its "
+        f"cos^2+sin^2 is {measured:.4f}. The two-tier read path inverts RoPE "
+        f"analytically as a*R(theta), so a scaling this module does not expose "
+        f"would inflate every dequantized int2 key by the mismatch. Q-tier "
+        f"numerics are NOT trustworthy for this rope_type — check "
+        f"modules.quant.effective.rope_attention_scaling against the installed "
+        f"transformers before using these results.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
 def _rope_cos_sin(
     rope_module: torch.nn.Module, ref: Tensor, position_range: Tensor
 ) -> Tuple[Tensor, Tensor]:
@@ -252,7 +315,9 @@ def _rope_cos_sin(
     pos = position_range.to(torch.long)
     if pos.dim() == 1:
         pos = pos.unsqueeze(0)  # [1, window]
-    return rope_module(ref, pos)
+    cos, sin = rope_module(ref, pos)
+    _check_rope_scaling_consistency(cos, sin, rope_attention_scaling(rope_module))
+    return cos, sin
 
 
 def unrotate_key_window(
@@ -276,6 +341,16 @@ def unrotate_key_window(
     k = key_post_rope if batched else key_post_rope.unsqueeze(0)
     cos, sin = _rope_cos_sin(rope_module, k, position_range)
     k_un = _apply_rotary_one(k, cos, -sin)
+    # The negated-sin pass is an exact inverse only for a UNIT rotation. When the
+    # module folds a scalar `a` into cos/sin (YaRN: a = 0.1·ln(factor)+1), the
+    # forward map is a·R(θ), so (cos, −sin) lands on a²·k — divide the a² back
+    # out so the stored codes are the true pre-RoPE key. At a == 1 (Llama-3.1's
+    # llama3 rope, Mistral, un-scaled Qwen2.5) this branch is SKIPPED, so those
+    # paths stay byte-identical. Without it every int2 Q-tier key would be 1.296×
+    # too large at YaRN factor 4, silently. See `rope_attention_scaling`.
+    a = rope_attention_scaling(rope_module)
+    if a != 1.0:
+        k_un = k_un / (a * a)
     return k_un if batched else k_un.squeeze(0)
 
 

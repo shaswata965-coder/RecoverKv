@@ -107,42 +107,20 @@ class RulerRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        """Load model and tokenizer (lazy, called once)."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer (lazy, called once).
 
-        cfg = self.config
+        Delegates to :func:`utils.model_loading.load_model_and_tokenizer` — the
+        one load path shared with LongBench and GSM8K, so greedy is bare greedy,
+        the declared context/RoPE overrides are applied, and an unknown dtype
+        raises. A no-op change for the Llama/Mistral columns.
+        """
+        from utils.model_loading import load_model_and_tokenizer
 
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
-
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint="RULER prompts are chat-templated for instruct models.",
+            is_windowed=self.is_windowed,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name,
-            cfg.model.dtype,
-            cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-
-        return model, tokenizer
 
     def run(self) -> None:
         """Run predictions on all configured RULER tasks."""
@@ -357,6 +335,14 @@ class RulerRunner:
 
             if self.cache_backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
+
+            # Suppress the padded vocab ids (Qwen2.5); None on Llama/Mistral adds
+            # no processor, so those columns are byte-identical.
+            from utils.generation import unmappable_token_ids
+
+            bad_ids = unmappable_token_ids(model, tokenizer)
+            if bad_ids is not None:
+                gen_kwargs["suppress_tokens"] = bad_ids
 
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache

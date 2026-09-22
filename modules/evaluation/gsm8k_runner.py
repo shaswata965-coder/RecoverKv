@@ -104,36 +104,21 @@ class GSM8KRunner:
             )
 
     def _load_model_and_tokenizer(self) -> Tuple:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        """Load model and tokenizer via the shared load path.
 
-        cfg = self.config
-        dtypes = {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }
-        model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
+        The one path shared with LongBench and RULER: greedy is pinned to bare
+        greedy — which on Qwen2.5 resets the ``repetition_penalty=1.05`` the
+        checkpoint ships (a logits processor that applies under greedy decoding),
+        matching the other columns — the declared context/RoPE overrides are
+        applied, and an unknown dtype raises. A no-op change for Llama/Mistral.
+        """
+        from utils.model_loading import load_model_and_tokenizer
 
-        log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
-            cfg.model.name, revision=getattr(cfg.model, "revision", None)
+        return load_model_and_tokenizer(
+            self.config,
+            raw_prompt_hint="GSM8K uses an 8-shot CoT prompt.",
+            is_windowed=self.is_windowed,
         )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
-        log.info(
-            "Loading model: %s (dtype=%s, attn=%s)",
-            cfg.model.name, cfg.model.dtype, cfg.model.attn_implementation,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model.name,
-            revision=getattr(cfg.model, "revision", None),
-            torch_dtype=model_dtype,
-            attn_implementation=cfg.model.attn_implementation,
-            device_map="auto",
-        )
-        model.eval()
-        return model, tokenizer
 
     # ------------------------------------------------------------------
     # run
@@ -281,6 +266,18 @@ class GSM8KRunner:
                 gen_kwargs["tokenizer"] = tokenizer
             if self.cache_backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
+
+            # REQUIRED here, not just tidy: GSM8K passes stop_strings, and on
+            # Qwen2.5 emitting one of the 399 padded vocab ids raises IndexError
+            # from inside StopStringCriteria (it sizes embedding_vec by
+            # len(tokenizer)). Suppressing them removes that crash class. None on
+            # Llama/Mistral (no gap) adds no processor — byte-identical.
+            from utils.generation import unmappable_token_ids
+
+            bad_ids = unmappable_token_ids(model, tokenizer)
+            if bad_ids is not None:
+                gen_kwargs["suppress_tokens"] = bad_ids
+
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache
 

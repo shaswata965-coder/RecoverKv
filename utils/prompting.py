@@ -59,6 +59,17 @@ def _first_row(input_ids: Any) -> list:
     return [int(x) for x in seq[:2]]
 
 
+def tokenizer_has_bos(tokenizer: Any) -> bool:
+    """Whether this tokenizer has a BOS token at all.
+
+    Qwen2/Qwen2.5 do not: the prompt opens with ``<|im_start|>``, an ordinary
+    token, and ``bos_token`` is ``None`` (its ``bos_token_id`` 151643 is
+    ``<|endoftext|>``, which this reads off the tokenizer, not the config).
+    Llama-3 and Mistral both do.
+    """
+    return bool(getattr(tokenizer, "bos_token", None))
+
+
 def prompt_carries_bos(tokenizer: Any, prompt: str) -> bool:
     """Whether *prompt* already opens with the tokenizer's BOS token."""
     bos = getattr(tokenizer, "bos_token", None)
@@ -81,7 +92,16 @@ def encode_prompt(tokenizer: Any, prompt: str, **kwargs: Any):
     which is exactly how it lasted this long.
     """
     if "add_special_tokens" not in kwargs:
-        kwargs["add_special_tokens"] = not prompt_carries_bos(tokenizer, prompt)
+        # add_special_tokens = the tokenizer HAS a BOS AND the prompt does not
+        # already start with it. The `has BOS` conjunct is what makes the Qwen
+        # rows False (no BOS to add or duplicate), matching kvpress/DefensiveKV,
+        # which encode with add_special_tokens=False and hand-prepend bos_token
+        # only when there is no chat template — nothing, for a tokenizer with no
+        # BOS. Llama and Mistral have a BOS, so the rule reduces to the previous
+        # one exactly and they are byte-identical.
+        kwargs["add_special_tokens"] = (
+            tokenizer_has_bos(tokenizer) and not prompt_carries_bos(tokenizer, prompt)
+        )
 
     encoded = tokenizer(prompt, **kwargs)
 

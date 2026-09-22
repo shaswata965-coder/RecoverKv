@@ -1,0 +1,63 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B Full Cache Baseline
+# ============================================================================
+# The Qwen2.5 column's baseline. Geometry matches the Llama/Mistral full-cache
+# configs so the columns differ only by model.
+#
+# Qwen2.5-7B-Instruct is a 32K model (max_position_embeddings 32768); its 131072
+# window needs rope_scaling (YaRN) switched on, which THIS config does not do.
+# So max_length is 31500 (the THUDM budget for a 32K model, same as Mistral-v0.2)
+# rather than null — a null here would feed >32K prompts past the model's window.
+# For the full 128K context see longbench_qwen_ours_flash_attn_yarn128k.yaml.
+#
+# dtype note: Qwen2.5 is bf16-native. float16 keeps the three model columns
+# comparable at 32K and fits a T4/P100; if you move to bfloat16, apply it to
+# EVERY model column together or the columns no longer differ only by model.
+#
+# Produces: outputs/longbench/qwen_full_cache/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                      # transformers.DynamicCache, no eviction
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                     # 32K model — truncate to fit (no YaRN here)
+  output_dir: outputs/longbench/qwen_full_cache
+  seed: 42
+  resume: false
+  skip_oom: true                        # baseline: record OOM'd examples as pred=null
+  aggressive_cache_clear: false

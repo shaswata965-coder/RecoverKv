@@ -562,6 +562,17 @@ class CacheState:
             self.key_states, self.key_states, cos_old, -sin_old
         )
 
+        # The negated-sin inverse lands on a²·k when the module folds a scalar a
+        # into cos/sin (YaRN). Divide it out before re-rotating, or the round trip
+        # inflates every rerotated key by a² (1.296× at YaRN factor 4). Skipped
+        # branch at a == 1.0 (Llama/Mistral/un-scaled Qwen), so byte-identical
+        # there. Same correction as modules.quant.effective.unrotate_key_window.
+        from modules.quant.effective import rope_attention_scaling
+
+        a = rope_attention_scaling(rope_module)
+        if a != 1.0:
+            k_unrotated = k_unrotated / (a * a)
+
         # New contiguous positions (same for every row)
         new_pos = (
             torch.arange(T_retained, device=device, dtype=torch.long)

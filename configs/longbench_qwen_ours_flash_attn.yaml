@@ -1,0 +1,60 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B Ours (flash-attn backend), 32K
+# ============================================================================
+# Windowed KV-cache with flash-attention-2 score extraction, at the shipped
+# operating point (utils.config.OPERATING_POINT). Geometry matches the Llama and
+# Mistral "ours" configs so the columns differ only by model.
+#
+# 32K context: Qwen2.5-7B is a 32K model unless YaRN is switched on, so
+# max_length is 31500 (as in longbench_qwen_full_cache.yaml). For the full 128K
+# context, use longbench_qwen_ours_flash_attn_yarn128k.yaml.
+#
+# dtype note: float16 keeps the columns comparable at 32K. Qwen2.5 is bf16-native
+# — if you switch to bfloat16, apply it to every column together.
+#
+# Produces: outputs/longbench/qwen_ours_flash_attn_compression_0.8/
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  # Pinned to utils.config.OPERATING_POINT — the ONE point speed and quality are
+  # both measured at. Same geometry as the Llama/Mistral "ours" configs.
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20                        # DefensiveKV's headline; compression_ratio = 0.8
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
+  quant_ratio: 0.70                         # two-tier int2 split; window_size 8 is divisible by 4
+  quant_gate_ratio: 0.25                    # read-gate selectivity (the rank-1 card gate)
+  quant_budget_mode: bytes
+  first_eviction_step: 0                    # compress the prompt on decode step 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - 2wikimqa
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                         # 32K model — truncate to fit (no YaRN here)
+  output_dir: outputs/longbench/qwen_ours_flash_attn_compression_0.8
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

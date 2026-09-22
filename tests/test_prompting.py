@@ -82,10 +82,16 @@ class TestEncodePrompt:
         assert tok.calls[0]["return_tensors"] == "pt"
         assert tok.calls[0]["truncation"] is False
 
-    def test_tokenizer_without_bos_is_left_alone(self):
+    def test_tokenizer_without_bos_gets_no_special_tokens(self):
+        # A tokenizer with no BOS (Qwen2/2.5) decides add_special_tokens=False on
+        # every prompt: the `has BOS` conjunct in the rule forces it, matching
+        # kvpress/DefensiveKV (which encode with add_special_tokens=False and
+        # hand-prepend bos_token only when there is no chat template — nothing,
+        # for a no-BOS tokenizer). Was True before the Qwen port; there is no BOS
+        # to add or duplicate, so False is correct and matches the reference.
         tok = _NoBosTokenizer()
         encode_prompt(tok, "hi")
-        assert tok.calls[0]["add_special_tokens"] is True
+        assert tok.calls[0]["add_special_tokens"] is False
 
     def test_surviving_duplicate_bos_warns(self, caplog):
         """A template that embeds the BOS in a form the prefix test misses must

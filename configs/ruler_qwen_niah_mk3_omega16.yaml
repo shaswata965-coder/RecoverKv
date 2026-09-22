@@ -1,0 +1,58 @@
+# ============================================================================
+# RULER 4096 — Qwen2.5-7B Ours (flash-attn), task=niah_multikey_3, window_size=16
+# ============================================================================
+# The Qwen column for RULER, at the shipped operating point
+# (utils.config.OPERATING_POINT): quant_ratio 0.70 with the read gate at 0.25.
+# Geometry matched to the Llama/Mistral RULER config so the columns differ only
+# by model. window_size 16 satisfies the % 4 == 0 that int2 crumb packing needs.
+#
+# float16, no YaRN: the 4096 prompts sit far under Qwen2.5's 32K window.
+# Captures a utils/cache_memory.py byte-accounting report per example so
+# retained-bytes / compression-ratio can be read off alongside the accuracy.
+#
+# Produces: outputs/ruler/qwen_4096_niah_mk3_omega16/
+_base_: base.yaml
+
+run:
+  mode: ruler
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20                        # cache 20%
+  window_size: 16                           # omega=16
+  num_sink_tokens: 5
+  local_window_size: 128                    # fixed tokens
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25                    # read-gate selectivity; 1.0 = read everything
+  quant_budget_mode: bytes
+  rerotate_on_evict: false
+  first_eviction_step: 0
+
+window:
+  window_size: 16
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+ruler:
+  # Point this at your RULER 4096 dataset dir (same layout as the Llama config).
+  data_dir: defensivekv_dataset/ruler/4096
+  tasks:
+    - niah_multikey_3
+  num_samples: max
+  capture_memory: true                      # per-example utils/cache_memory.py report
+  output_dir: outputs/ruler/qwen_4096_niah_mk3_omega16
+  seed: 42
+  resume: true
+  skip_oom: false
+  aggressive_cache_clear: false

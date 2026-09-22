@@ -1,5 +1,40 @@
 # Qwen port plan — bring `int2_qwen`'s logic and structure onto `int2_clustered_rep`
 
+## Execution status (as-built on `int2_clustered_qwen`)
+
+Implemented and CPU-validated (torch + transformers 4.47.1) — `test_qwen_port.py`
+(17), `test_qwen_numerics.py` (7), `test_quant.py`, `test_prompting.py`,
+`test_windowed_cache.py` all green except the repo's pre-existing stale tests
+(they import the deleted `windowed_eager_cache`; CLAUDE.md documents that
+backlog). A live Qwen run needs a GPU + the checkpoint and was not possible in
+the web container.
+
+- **Stage 1** ModelConfig overrides + dtype hardening — done.
+- **Stage 2** `utils/model_loading.py` shared load path — done.
+- **Stage 3** `utils/generation.py` + BOS-aware prompting — done.
+- **Stage 4** YaRN `a²` RoPE inverse — done. Only the two PyTorch unrotate sites
+  needed it (`effective.unrotate_key_window`, `state.rerotate_keys`); the fused
+  kernel re-rotates only, so it is correct for free — pinned by the YaRN
+  round-trip test. **There is no eager twin to mirror**: `windowed_eager_cache`
+  was deleted on this branch (`0974687`), so the plan's "×2" sites collapse to one.
+- **Stage 5** grid dtype — **adapted**. This branch stores a *one-byte* grid
+  (`QGrid`, commit `8a8cdc0`), so the fp16→inf overflow is on the grid's fp16
+  *group scale* in `_quantize_grid`, not a flat scale/zero pair. The KV dtype is
+  inferable from `x.dtype` inside `_affine_quantize`, so `grid_dtype_for` threads
+  in with **no** store/slots/sketch changes. fp16 stays byte-identical.
+- **Stage 6-arg** forward-arg-index fix — done. **Stage 6-accum (fp32 window-score
+  accumulation) DEFERRED**: this branch accumulates in the KV/query dtype, so
+  moving to fp32 changes the existing Llama/Mistral scores, which CLAUDE.md
+  forbids without a LongBench run behind it (not runnable here). It is a quality
+  refinement, not a correctness blocker; revisit with a GPU LongBench validation.
+- **Stage 7** runners routed through the shared loader + `suppress_tokens` — done.
+  The samsum-EOS / max_length / eager-OOM-ceiling refinements were **skipped**:
+  they risk moving the existing Llama scores and need LongBench validation.
+- **Stage 8** six Qwen configs (LongBench/GSM8K/RULER, 32K + a YaRN-128K bf16
+  variant) — done. **Stage 9** tests — done.
+
+The sections below are the original design plan, kept as the rationale of record.
+
 ## What this is
 
 `int2_qwen` already made this method run on **Qwen2.5-7B-Instruct** end to end —

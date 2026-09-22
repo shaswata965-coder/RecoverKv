@@ -1,0 +1,54 @@
+# ============================================================================
+# GSM8K — Qwen2.5-7B, 20% cache budget (compression_ratio 0.80)
+# ============================================================================
+# The run that actually measures compression on Qwen: at budget 0.20 the cache
+# binds and eviction fires on essentially every example. Geometry pinned to
+# utils.config.OPERATING_POINT and matched to the Llama/Mistral budget20 configs
+# so the columns differ only by model.
+#
+# float16, no YaRN: GSM8K prompts are short (~280 tokens), well under 32K.
+# suppress_tokens (the vocab-padding crash fix) is applied by the runner and is
+# required here because GSM8K passes stop_strings.
+#
+# Produces: outputs/gsm8k/qwen_budget20/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20        # fraction RETAINED (DefensiveKV compression_ratio = 0.80)
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25    # read-gate selectivity (the rank-1 card gate)
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/qwen_budget20
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false
