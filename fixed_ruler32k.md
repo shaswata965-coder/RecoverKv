@@ -176,7 +176,7 @@ This exact bug was diagnosed and fixed in July on `int2_qwen` (`446a7eb`). It me
 | `tests/test_kernel_compiles.py` (Triton, both `GATED` variants, A100 target) | 19 passed. Type-checks only; not executed. |
 | gate / sketch / window-score / decode test files | Same 12 failures before and after, all in stale tests of deleted control-arm and tile-override code. |
 | CPU `generate()` smoke test: tiny fp16 Llama, q=0.7, ws=8, 40 tokens | Five evictions (step 0 per layer, then all layers together), compiled eviction, fp32 scores throughout. |
-| Full suite, old vs new code | **Still running when this was written.** Failure patterns are identical through the first ~15%. |
+| Full suite (`tests`, `modules/evaluation`, `data`), old vs new code | Old: 1,229 passed, 123 failed, 6 errors. New: 1,271 passed, 123 failed, 6 errors. **The two failure lists are identical**; the extra 42 passes are the new test file. The 123 are pre-existing failures in stale tests (see `CLAUDE.md`, "Two traps in the harness"). |
 
 Not verified: anything on a GPU, the Triton kernel's actual numbers, and any RULER or LongBench score.
 
