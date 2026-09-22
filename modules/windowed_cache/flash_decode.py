@@ -261,6 +261,37 @@ def _flash_utils_module():
         return None
 
 
+def _undo_repeat_kv(t: torch.Tensor, h_kv: int) -> torch.Tensor:
+    """Collapse a GQA ``repeat_kv`` on the head axis (axis 1 of ``[B, H, S, D]``).
+
+    Some attention modules repeat K/V from ``H_kv`` up to ``H_q`` *before* calling
+    ``flash_attn_func`` — ``MistralFlashAttention2`` on transformers 4.47.x does
+    (``repeat_kv`` then ``_flash_attention_forward``), so the tensors this patch
+    intercepts carry ``H_q`` heads while the store, the Q-tier codes and the gate
+    cards are all defined over ``H_kv``. ``LlamaFlashAttention2`` passes the
+    un-repeated ``H_kv`` tensors straight to flash (flash handles GQA natively),
+    so ``h == h_kv`` there and this returns ``t`` unchanged — the Llama path is
+    byte-identical.
+
+    ``repeat_kv`` lays head ``i``'s copies out contiguously at
+    ``[i*rep : (i+1)*rep]`` (see ``transformers...repeat_kv``: expand over a new
+    axis, then reshape ``H_kv*rep``), so every ``rep``-th head is the original.
+    The copies are identical, so this is lossless, not a downsample.
+    """
+    h = t.shape[1]
+    if h == h_kv:
+        return t
+    if h_kv <= 0 or h % h_kv != 0:
+        raise RuntimeError(
+            f"fused decode received {h} K/V heads that do not tile the store's "
+            f"{h_kv} KV heads; a GQA repeat_kv expansion cannot be undone. The "
+            "store, cards and gate are defined over H_kv, so k/v must reduce to "
+            "it exactly."
+        )
+    rep = h // h_kv
+    return t[:, ::rep].contiguous()
+
+
 def _run_fused(ctx: dict, q_flash: torch.Tensor,
                k_flash: torch.Tensor, v_flash: torch.Tensor) -> torch.Tensor:
     """Compute the fused decode output + score for one layer. Returns flash layout.
@@ -316,6 +347,14 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
             "To read every window, set quant_gate_ratio=1.0, which selects all "
             "of them through this same path."
         )
+    # The cards, the Q-tier codes and the gate's selection are all per-KV-head;
+    # normalise the intercepted fp K/V to that same H_kv so a model that
+    # repeat_kv'd them up to H_q before flash (Mistral) lines up with the store.
+    # h_kv is read off the card the gate is about to score, so it is exactly the
+    # head count `sel` will carry — a no-op on Llama, where flash already got H_kv.
+    h_kv = gate["card"][0].shape[2]
+    k_fp = _undo_repeat_kv(k_fp, h_kv)
+    v_fp = _undo_repeat_kv(v_fp, h_kv)
     sel, logmass = fused_gate(
         q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
     # Shapes only — no device sync, no launch. See _STATS.

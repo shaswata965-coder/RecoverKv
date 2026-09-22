@@ -156,6 +156,47 @@ class TestMistralHooksWiring:
 # ---------------------------------------------------------------------------
 
 
+class TestUndoRepeatKV:
+    """The fused decode collapses the GQA repeat_kv MistralFlashAttention2 applies
+    before flash, so the intercepted fp K/V line up with the per-KV-head store."""
+
+    @staticmethod
+    def _repeat_kv(x, n_rep):
+        # transformers.models.*.repeat_kv, replicated so the test does not depend
+        # on transformers being importable.
+        b, h, s, d = x.shape
+        if n_rep == 1:
+            return x
+        return (x[:, :, None, :, :]
+                .expand(b, h, n_rep, s, d)
+                .reshape(b, h * n_rep, s, d)
+                .contiguous())
+
+    def test_round_trips_a_gqa_expansion(self):
+        torch = pytest.importorskip("torch")
+        from modules.windowed_cache.flash_decode import _undo_repeat_kv
+        B, H_kv, S, D = 1, 8, 5, 4          # Mistral-7B / Llama-3.1-8B geometry
+        base = torch.arange(B * H_kv * S * D, dtype=torch.float32).reshape(B, H_kv, S, D)
+        expanded = self._repeat_kv(base, 4)   # 8 -> 32, as Mistral hands flash
+        assert expanded.shape[1] == 32
+        got = _undo_repeat_kv(expanded, H_kv)
+        assert got.shape[1] == H_kv
+        assert torch.equal(got, base)          # lossless: the copies are identical
+
+    def test_is_a_noop_when_already_h_kv(self):
+        torch = pytest.importorskip("torch")
+        from modules.windowed_cache.flash_decode import _undo_repeat_kv
+        t = torch.zeros(1, 8, 3, 4)            # Llama's flash path: already H_kv
+        assert _undo_repeat_kv(t, 8) is t
+
+    def test_raises_when_heads_do_not_tile(self):
+        torch = pytest.importorskip("torch")
+        from modules.windowed_cache.flash_decode import _undo_repeat_kv
+        t = torch.zeros(1, 12, 3, 4)
+        with pytest.raises(RuntimeError):
+            _undo_repeat_kv(t, 8)
+
+
 class TestResolveCachePosition:
     """The unit-level contract of the fix; the integration is covered by
     tests/test_windowed_cache.py::TestMissingCachePosition."""
