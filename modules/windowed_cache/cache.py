@@ -1814,6 +1814,11 @@ class WindowedCache(_HFCacheBase):
                     "num_sink": self.resolved.num_sink_tokens,
                     "window_size": ws,
                     "scaling": self._attn_scaling,
+                    # The store's TRUE KV head count, so _run_fused can un-repeat
+                    # the fp tier when the attention module expanded it to H_q
+                    # before the flash call (Qwen2FlashAttention2 does; Llama does
+                    # not). The store, Q tier and gate cards are all keyed by this.
+                    "n_kv_heads": state.key_states.shape[1],
                     "cache": self,
                 })
                 # The patch writes window_scores; the score forward-hook skips this
@@ -2217,6 +2222,9 @@ class WindowedCache(_HFCacheBase):
                 "num_sink": self.resolved.num_sink_tokens,
                 "window_size": ws,
                 "scaling": self._attn_scaling,
+                # True KV head count (see the per-layer set_pending above) so
+                # _run_fused can un-repeat a GQA-expanded fp tier.
+                "n_kv_heads": k_layer.shape[1],
                 "cache": self,
             })
             self._last_effective_k[layer_idx] = None

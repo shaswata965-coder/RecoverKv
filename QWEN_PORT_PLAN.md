@@ -51,6 +51,20 @@ not. It is justified by Qwen-genuine load needs Mistral did not have — YaRN
 neutralizing the shipped `repetition_penalty=1.05` — but it is a heavier load
 path than the sibling's per-runner loaders. See the closing note in chat.
 
+**GQA un-repeat (found by the first GPU run — the rep=7 risk, now fixed).**
+`Qwen2FlashAttention2` calls `repeat_kv` (4 KV heads → 28) *before* the flash
+call; `LlamaFlashAttention2` does not. So the monkeypatched fused-decode path
+received a 28-head fp tier while the store, int2 Q tier and gate cards are keyed
+by the true `H_kv=4`, and the kernel (`H_kv = k_fp.shape[1] = 28`) rejected the
+`H_kv=4` `sel` — `RuntimeError: fused decode gate expects sel [1, 28, *]; got
+(1, 4, ...)`, failing every LongBench job at decode. Fix: `_run_fused`
+un-repeats `k_fp`/`v_fp` back to `H_kv` (carried in the ctx as `n_kv_heads` from
+the store; `repeat_kv` lays out head `h = kv*rep + r`, so `[:, ::rep]` recovers
+the originals bit-exactly). `rep == 1` (Llama) is a no-op → byte-identical.
+Pinned by `test_gqa_unrepeat_recovers_true_kv_heads` against the real
+`repeat_kv`. This is the one place the fused path assumed Llama's no-repeat FA2
+layout; the rest of the method is head-count-agnostic.
+
 The sections below are the original design plan, kept as the rationale of record.
 
 ## What this is

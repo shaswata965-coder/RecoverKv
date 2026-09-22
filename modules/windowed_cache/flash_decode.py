@@ -281,6 +281,29 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     k_fp = k_flash.transpose(1, 2)                    # [B, H_kv, S_fp, D]
     v_fp = v_flash.transpose(1, 2)
 
+    # GQA un-repeat. Some attention modules expand the KV heads to the query-head
+    # count with repeat_kv BEFORE the flash call — Qwen2FlashAttention2 does
+    # (transformers 4.47.x), LlamaFlashAttention2 does not — so the fp tier can
+    # arrive with H_q heads while the store, the int2 Q tier and the gate cards
+    # are all keyed by the true H_kv (the kernel then reads H_kv = k_fp.shape[1]
+    # and rejects the H_kv-shaped `sel`). repeat_kv lays out head h = kv*rep + r,
+    # so every rep-th head is the original KV head; slice them back. rep == 1
+    # (Llama, and Qwen at H_q == H_kv) makes this a no-op, so those paths are
+    # byte-identical. `sel` is authoritative too, but n_kv_heads is carried in the
+    # ctx from the store so the un-repeat happens before the gate reads anything.
+    n_kv = ctx.get("n_kv_heads")
+    if n_kv is not None and k_fp.shape[1] != n_kv:
+        h_q = k_fp.shape[1]
+        if h_q % n_kv != 0:
+            raise RuntimeError(
+                f"fused decode received a {h_q}-head fp tier that is not a "
+                f"multiple of the store's H_kv={n_kv}; cannot un-repeat the GQA "
+                "expansion. Check the attention module's repeat_kv layout."
+            )
+        rep = h_q // n_kv
+        k_fp = k_fp[:, ::rep].contiguous()            # [B, H_kv, S_fp, D]
+        v_fp = v_fp[:, ::rep].contiguous()
+
     order, q_token_len = ctx["score_meta"]
     num_sink, ws = ctx["num_sink"], ctx["window_size"]
     # The window axis the kernel emits must be the axis `order` permutes, so the

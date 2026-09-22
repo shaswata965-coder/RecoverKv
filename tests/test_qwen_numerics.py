@@ -227,3 +227,32 @@ def test_resolve_cache_position_derives_from_token_count_when_absent():
     with pytest.warns(RuntimeWarning):
         got = cache._resolve_cache_position({"sin": 1, "cos": 1}, n_new=8, device="cpu")
     assert torch.equal(got, torch.arange(32, 40, dtype=torch.long))
+
+
+# ---------------------------------------------------------------------------
+# GQA un-repeat — the Qwen2 fused-decode fix (rep = H_q / H_kv = 7)
+# ---------------------------------------------------------------------------
+
+
+def test_gqa_unrepeat_recovers_true_kv_heads():
+    """repeat_kv then the fp-tier un-repeat (::rep) recovers the KV heads exactly.
+
+    Qwen2FlashAttention2 calls repeat_kv (4 KV heads -> 28) BEFORE the flash call,
+    so _run_fused receives a 28-head fp tier while the gate cards are keyed by the
+    true 4 KV heads. The fix slices k_fp[:, ::rep]. This pins that slice against
+    the REAL transformers repeat_kv, at Qwen2.5-7B's geometry (rep = 7).
+    """
+    from transformers.models.qwen2.modeling_qwen2 import repeat_kv
+
+    B, H_kv, S, D, rep = 1, 4, 6, 8, 7            # Qwen2.5-7B: 28 q / 4 kv
+    kv = torch.randn(B, H_kv, S, D)
+    repeated = repeat_kv(kv, rep)                  # [B, 28, S, D] — what flash gets
+    assert repeated.shape[1] == H_kv * rep == 28
+
+    # The un-repeat _run_fused applies (head h = kv*rep + r, so ::rep picks r=0).
+    recovered = repeated[:, ::rep].contiguous()
+    assert recovered.shape[1] == H_kv
+    assert torch.equal(recovered, kv)              # bit-exact (expand copies)
+
+    # rep == 1 (Llama's fp tier already H_kv) is a no-op: nothing to slice.
+    assert torch.equal(repeat_kv(kv, 1)[:, ::1], kv)
