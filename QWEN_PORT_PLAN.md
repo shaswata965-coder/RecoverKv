@@ -33,6 +33,24 @@ the web container.
 - **Stage 8** six Qwen configs (LongBench/GSM8K/RULER, 32K + a YaRN-128K bf16
   variant) — done. **Stage 9** tests — done.
 
+**Parity with the sibling Mistral port (`int2_mistral_clustered`, same base `5e2b9e8`).**
+The Mistral port added two model-agnostic robustness fixes to the *shared*
+clustered modules; they are now carried here too so the shared modules match the
+reference architecture (both are **inert for Qwen**, which passes both args, so
+they change nothing functionally on the Qwen path — they are pure parity):
+- `cache.py` `_resolve_cache_position` — derive `cache_position` from the cache's
+  own monotonic token count when a caller omits it (Qwen2's three attention
+  variants all pass it, so the derive-branch never fires).
+- `hooks.py` `rotary_emb` fallback — recompute `(cos, sin)` from
+  `module.rotary_emb` when `position_embeddings` is absent (Qwen2 passes it).
+
+**One remaining architectural difference from the Mistral sibling:** this port
+adds `utils/model_loading.py` + reroutes the runners, which the Mistral port did
+not. It is justified by Qwen-genuine load needs Mistral did not have — YaRN
+`rope_scaling`/`max_position_embeddings` overrides applied to the AutoConfig, and
+neutralizing the shipped `repetition_penalty=1.05` — but it is a heavier load
+path than the sibling's per-runner loaders. See the closing note in chat.
+
 The sections below are the original design plan, kept as the rationale of record.
 
 ## What this is

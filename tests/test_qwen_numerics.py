@@ -179,3 +179,51 @@ def test_rope_consistency_check_warns_on_hidden_scaling():
 
     with pytest.warns(RuntimeWarning):
         effective._rope_cos_sin(liar, k, pos)
+
+
+# ---------------------------------------------------------------------------
+# Parity with the clustered architecture — cache_position resolution
+# ---------------------------------------------------------------------------
+
+
+class _FakeModelConfig:
+    num_attention_heads = 32
+    num_key_value_heads = 8
+    hidden_size = 4096
+    head_dim = 128
+    num_hidden_layers = 1
+
+
+def _make_cache():
+    from modules.windowed_cache.config import WindowedCacheConfig
+    from modules.windowed_cache.cache import WindowedCache
+
+    cfg = WindowedCacheConfig(
+        window_size=1, num_sink_tokens=0, local_window_size=1, cache_budget=0.375,
+    )
+    return WindowedCache(
+        config=cfg, prefill_len=8, model_config=_FakeModelConfig(),
+        kv_dtype=torch.float32, rope_module=torch.nn.Identity(),
+        num_layers=1, max_tokens=0,
+    )
+
+
+def test_resolve_cache_position_returns_passed_value():
+    """When the attention module supplies cache_position, it is used verbatim.
+
+    This is Qwen2's path (its three attention variants all pass cache_position),
+    so the derive-branch never fires and positions are byte-identical to before.
+    """
+    cache = _make_cache()
+    want = torch.arange(100, 104, dtype=torch.long)
+    got = cache._resolve_cache_position({"cache_position": want}, n_new=4, device="cpu")
+    assert torch.equal(got, want)
+
+
+def test_resolve_cache_position_derives_from_token_count_when_absent():
+    """When cache_position is absent, positions come from the monotonic count."""
+    cache = _make_cache()
+    cache._tokens_seen = 40          # absolute index after this step's advance
+    with pytest.warns(RuntimeWarning):
+        got = cache._resolve_cache_position({"sin": 1, "cos": 1}, n_new=8, device="cpu")
+    assert torch.equal(got, torch.arange(32, 40, dtype=torch.long))

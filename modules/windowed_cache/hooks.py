@@ -373,6 +373,20 @@ def install_score_hooks(
                 position_embeddings = _extract_arg(
                     args, kwargs, "position_embeddings"
                 )
+                if position_embeddings is None and hasattr(module, "rotary_emb"):
+                    # An attention module that does not receive position_embeddings
+                    # as a forward argument (Mistral's layers, and the <=4.45
+                    # layout generally) instead holds its own self.rotary_emb and
+                    # derives (cos, sin) from position_ids. Recompute the same way;
+                    # x is used only for dtype/device, so hidden_states stands in
+                    # for the value states rotary_emb expects. No-op on Llama and
+                    # Qwen2, which pass position_embeddings and (post-refactor)
+                    # carry no module-level rotary_emb.
+                    position_ids = _extract_arg(args, kwargs, "position_ids", 2)
+                    if hidden_states is not None and position_ids is not None:
+                        position_embeddings = module.rotary_emb(
+                            hidden_states, position_ids
+                        )
                 if hidden_states is None or position_embeddings is None:
                     msg = ("Flash hook: hidden_states / position_embeddings "
                            "not found in the attention call — scoring "

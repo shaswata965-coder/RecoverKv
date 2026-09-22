@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import os
 import traceback
+import warnings
 
 import torch
 from torch import Tensor
@@ -1356,6 +1357,12 @@ class WindowedCache(_HFCacheBase):
         # cache_position contract check below. See _check_position_contract.
         self._tokens_seen: int = 0
         self._pos_contract_checked: bool = False
+        # One-shot flag for the derived-position warning. See
+        # _resolve_cache_position: some attention modules omit cache_position
+        # from cache_kwargs, so it is derived from _tokens_seen rather than left
+        # to state.append's compacted-length fallback. (Inert on Qwen2, whose
+        # three attention variants all pass cache_position.)
+        self._derived_pos_warned: bool = False
 
     # -----------------------------------------------------------------
     # HF Cache interface
@@ -1478,6 +1485,55 @@ class WindowedCache(_HFCacheBase):
                 "loop must do it itself."
             )
 
+    def _resolve_cache_position(
+        self,
+        cache_kwargs: Optional[Dict[str, Any]],
+        n_new: int,
+        device: Any,
+    ) -> Optional[Tensor]:
+        """Absolute positions for the ``n_new`` tokens appended this step.
+
+        The caller's ``cache_position`` when it supplies one; otherwise positions
+        derived from this cache's own monotonic token count.
+
+        Why derive rather than let :meth:`CacheState.append` auto-increment:
+        ``append(pos=None)`` counts up from the store's CURRENT length, which is
+        the *compacted* length after an eviction. Most attention modules pass
+        ``cache_position`` through ``cache_kwargs`` — every Llama path, and
+        **all three Qwen2 attention variants** (their ``cache_kwargs`` is
+        ``{"sin", "cos", "cache_position"}``) — so this derive-branch never runs
+        for them and their positions are byte-identical to before. It exists for
+        modules that omit ``cache_position`` (e.g. ``MistralFlashAttention2`` on
+        transformers 4.47.x), where without it the first post-eviction token
+        would be filed ~``window_size`` positions early, its surviving-key RoPE
+        would go backward, and its window id ``(pos - num_sink) // window_size``
+        would collide with a survivor's, scrambling the eviction's grouping.
+        ``_tokens_seen`` is the absolute index, advanced once per step (at
+        ``layer_idx == 0``, before this runs), so ``_tokens_seen - n_new`` is the
+        correct start for every layer of the step.
+        """
+        if cache_kwargs is not None:
+            pos = cache_kwargs.get("cache_position")
+            if pos is not None:
+                return pos
+        start = self._tokens_seen - n_new
+        if not self._derived_pos_warned:
+            self._derived_pos_warned = True
+            warnings.warn(
+                "cache_position was not supplied through cache_kwargs; deriving "
+                f"absolute positions from the cache's own token count "
+                f"(start={start}, n={n_new}). Expected for an attention module "
+                "that omits cache_position; the derived positions match what "
+                "generate() advances, so surviving keys keep their original RoPE "
+                "after an eviction. On a hand-written decode loop, pass "
+                "cache_position explicitly instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return torch.arange(
+            start, start + n_new, device=device, dtype=torch.long
+        )
+
     def update(
         self,
         key_states: Tensor,
@@ -1551,14 +1607,16 @@ class WindowedCache(_HFCacheBase):
 
         self._resolve_memoization(key_states.shape[0])
 
-        # Extract position_ids from cache_kwargs if provided
-        pos = None
-        if cache_kwargs is not None and "cache_position" in cache_kwargs:
-            pos = cache_kwargs["cache_position"]
+        # Positions for the appended tokens. cache_position when the caller
+        # supplies it (every Llama path; Qwen2's three attention variants all
+        # pass it), otherwise derived from the monotonic token count so a caller
+        # that omits it does not fall through to append()'s compacted-length
+        # auto-increment. Byte-identical whenever cache_position is present.
+        n_new = key_states.shape[2]
+        pos = self._resolve_cache_position(cache_kwargs, n_new, key_states.device)
 
         # 1. Append
         state.append(key_states, value_states, pos)
-        n_new = key_states.shape[2]
         policy.extend_total_after_append(n_new)
 
         # Detect prefill vs generation
@@ -2126,9 +2184,11 @@ class WindowedCache(_HFCacheBase):
             )
 
         if self._layers_opened == 0:
-            pos = (
-                cache_kwargs.get("cache_position")
-                if cache_kwargs is not None else None
+            # Same position resolution as the per-layer path: derive from the
+            # monotonic token count when the caller omits cache_position, so
+            # _begin_step does not auto-increment from the compacted length.
+            pos = self._resolve_cache_position(
+                cache_kwargs, key_states.shape[2], key_states.device
             )
             self._begin_step(key_states.shape[2], pos)
         self._layers_opened += 1
