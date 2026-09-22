@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -350,6 +351,7 @@ class LongBenchScorer:
         self.config = config
 
     def run(self) -> None:
+        longbench_cfg = getattr(self.config, "longbench", None)
 
         # Score individual runs
         base_dir = Path("outputs/longbench")

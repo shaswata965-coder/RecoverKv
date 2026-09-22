@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import os
 import traceback
+import warnings
 
 import torch
 from torch import Tensor
@@ -36,7 +37,7 @@ try:
 except ImportError:
     _HFCacheBase = object  # type: ignore[assignment,misc]
 
-from .config import WindowedCacheConfig
+from .config import ResolvedConfig, WindowedCacheConfig
 from .policy import EvictionPolicy
 from .scorer import accumulate
 from .state import CacheState
@@ -49,22 +50,14 @@ from modules.quant import (
 )
 from modules.quant.effective import rotate_key_window
 from modules.quant.compact import join, stable_partition
+from modules.quant.quantizer import QGrid
 from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
-# torch.compile of the eviction step. Unconditional on every SHIPPED path --
-# no device test, no fallback: `_evict_two_tier` calls the compiled body on
-# every backend and raises if it cannot be lowered.
-#
-# The ONE exception is the explicit control arm (`_EVICT_CONTROL_ARM`), added
-# 2026-09-19 because this is the only perf-affecting change in the repo without
-# one and the measurements said so three separate times (DISTANCE_TO_GOAL
-# §10.0.4, §10.12, §10.14). It is opt-in, it announces itself, it is counted
-# apart from the `eager` tripwire, and it travels in provenance. It is a
-# reference arm, NOT a fallback: a compile failure still raises.
-#
-# `_evict_two_tier_impl` is still the reference the
+# torch.compile of the eviction step. ALWAYS -- there is no knob and no device
+# test: `_evict_two_tier` calls the compiled body on every backend and raises if
+# it cannot be lowered. `_evict_two_tier_impl` is still the reference the
 # compiled body must equal (tests call it directly), and
 # _emulating_precision_casts is what keeps them equal. The compiled callable is
 # process-global and built lazily on first use so a run that never evicts never
@@ -84,47 +77,7 @@ _EVICT_COMPILE_TRIED_STATIC = False
 #: became unconditional nothing increments it, so a nonzero value means an eager
 #: fallback was reintroduced somewhere and the run's numbers are not the
 #: compiled path's.
-_EVICT_STATS = {"eager": 0, "compiled": 0, "control_arm": 0}
-
-# ---------------------------------------------------------------------------
-# The CONTROL ARM for the compiled eviction.
-# ---------------------------------------------------------------------------
-#: The compiled eviction is the one perf-affecting change in this repo that has
-#: never had a control arm, and this repo's own standing rule is that every one
-#: of them gets one. That gap is not academic: between 2026-09-18 and 2026-09-19
-#: the eviction did not compile AT ALL on this build (DISTANCE_TO_GOAL §10.9,
-#: §10.13) while `_EVICT_STATS` reported "compiled" throughout, and nobody could
-#: tell -- because there was nothing to compare against. When it finally did
-#: compile, it was worth **nothing** measurable (§10.14: fully fused, zero
-#: recompiles, TPOT unchanged), which is what a 97.2%-GPU-busy step predicts,
-#: since collapsing launches cannot help a step that is kernel-bound.
-#:
-#: So this is the arm that prices it: the SAME body, run eagerly, against which
-#: the compiled path's claim is stated. It is the eviction's `--gate-ratio 1.0`
-#: -- a provable reference, not a fallback.
-#:
-#: **It is not a fallback and must never become one.** Three properties keep it
-#: honest, and all three are the point:
-#:
-#: 1. **Opt-in only.** Nothing turns this on but an explicit request -- the env
-#:    var below, or :func:`set_evict_control_arm`. A compile failure does NOT
-#:    reach for it; `_run_compiled_evict` still raises. Kernel-or-error is
-#:    unchanged for every run that did not ask for the control arm.
-#: 2. **It announces itself and is counted separately.** `control_arm` is its
-#:    own counter so that `eager` keeps its meaning as a TRIPWIRE (a nonzero
-#:    `eager` still means an accidental eager run got in). A run cannot be the
-#:    control arm quietly.
-#: 3. **It is provenance, not a flag.** :func:`evict_path_mode` is what a runner
-#:    records, so a control-arm number can never be filed as a compiled number
-#:    -- which is the exact failure mode (a measurement mislabelled as the thing
-#:    it was measuring) that made this arm necessary in the first place.
-#:
-#: ``None`` means "not yet resolved"; the env var is read once, on first use, so
-#: a test can set the state directly without the environment interfering.
-_EVICT_CONTROL_ARM = {"on": None, "announced": False}
-
-#: Set to 1/true/yes/on to run the eviction body eagerly as the control arm.
-_EVICT_CONTROL_ARM_ENV = "STICKYKV_EVICT_CONTROL_ARM"
+_EVICT_STATS = {"eager": 0, "compiled": 0}
 
 #: One-shot flag for the reset-and-retry on a Dynamo bail. Not sticky like
 #: :data:`_EVICT_COMPILE_FAILED`: a bail is a run property, so it gets exactly
@@ -152,55 +105,8 @@ _EVICT_COMPILE_TRACEBACK: Optional[str] = None
 
 
 def evict_path_stats() -> dict:
-    """``{"eager": n, "compiled": m, "control_arm": k}`` — evictions per path
-    since the last reset.
-
-    ``eager`` is a TRIPWIRE and should always read 0: nothing increments it, so
-    a nonzero value means an eager fallback was reintroduced somewhere.
-    ``control_arm`` is the DELIBERATE eager path (see
-    :data:`_EVICT_CONTROL_ARM`) and is counted apart from ``eager`` precisely so
-    that asking for the control arm does not disarm the tripwire.
-    """
+    """``{"eager": n, "compiled": m}`` — evictions per path since the last reset."""
     return dict(_EVICT_STATS)
-
-
-def evict_control_arm_enabled() -> bool:
-    """Is the eviction running as the eager CONTROL ARM?
-
-    Resolved from :data:`_EVICT_CONTROL_ARM_ENV` on first use and cached, so the
-    environment is read once per process and :func:`set_evict_control_arm`
-    thereafter wins over it.
-    """
-    if _EVICT_CONTROL_ARM["on"] is None:
-        raw = os.environ.get(_EVICT_CONTROL_ARM_ENV, "")
-        _EVICT_CONTROL_ARM["on"] = raw.strip().lower() in ("1", "true", "yes", "on")
-    return bool(_EVICT_CONTROL_ARM["on"])
-
-
-def set_evict_control_arm(on: bool) -> None:
-    """Turn the control arm on/off explicitly, overriding the environment.
-
-    This is how a runner wires a ``--compile-evict 0`` flag. Call it BEFORE the
-    first eviction: the compiled callable is built lazily on first use, and the
-    point of the arm is that it never gets built at all.
-    """
-    was = _EVICT_CONTROL_ARM["on"]
-    _EVICT_CONTROL_ARM["on"] = bool(on)
-    if was != bool(on):
-        # Re-announce, because which path is live just changed and the banner is
-        # the only thing that says so.
-        _EVICT_CONTROL_ARM["announced"] = False
-        _EVICT_ANNOUNCED["done"] = False
-
-
-def evict_path_mode() -> str:
-    """``"control-arm-eager"`` or ``"compiled"`` — what a runner RECORDS.
-
-    Provenance, not a flag. A control-arm number filed as a compiled number is
-    the same class of error as `_EVICT_STATS` reporting "compiled" for eight
-    commits while the eviction ran eager, so the mode travels with the row.
-    """
-    return "control-arm-eager" if evict_control_arm_enabled() else "compiled"
 
 
 #: Widths the demote / reactivate compacts may take. A count that varies per
@@ -355,7 +261,6 @@ def reset_evict_path_stats() -> None:
     """
     _EVICT_STATS["eager"] = 0
     _EVICT_STATS["compiled"] = 0
-    _EVICT_STATS["control_arm"] = 0
     _EVICT_BAIL_RETRIED["done"] = False
 
 
@@ -817,22 +722,12 @@ _EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never sile
 body under a compiled label -- the point is to MEASURE the compiled path, and a
 quiet eager run would report eager numbers as if compiled. So this raises rather
 than falling back.
-  NOTHING TURNS IT OFF AS A FALLBACK. Compilation is unconditional on every
-shipped path (see the banner at the top of this module): `_evict_two_tier`
-always calls the compiled body, on every backend and every device, and a
-failure raises rather than degrading. `STICKYKV_COMPILE_EVICT` and
+  THERE IS NO WAY TO TURN IT OFF. Compilation is unconditional (see the banner
+at the top of this module): `_evict_two_tier` always calls the compiled body, on
+every backend and every device. `STICKYKV_COMPILE_EVICT`, `--compile-evict` and
 `STICKYKV_COMPILE_EVICT_BACKEND` were deleted in 0974687 ("one production path,
-no fallbacks") and this text used to still advertise them -- so a failure here
-sent you after knobs that no longer exist. Do not read the line below as
-reinstating them.
-  THE ONE THING THAT DOES EXIST is the CONTROL ARM: `STICKYKV_EVICT_CONTROL_ARM=1`
-(or `set_evict_control_arm(True)`, or `--compile-evict 0` where a runner wires
-it) runs this same body EAGERLY so the compiled path has a reference to be
-measured against. It will not rescue the failure you are reading about -- it
-answers a different question ("is the compile worth anything?"), and on the
-evidence so far the answer is no. A run that used it records
-`evict_path_mode() == "control-arm-eager"` and its numbers are eager numbers.
-Apart from that one variable this module reads NO environment
+no fallbacks") and this text used to still advertise all three -- so a failure
+here sent you after knobs that no longer exist. This module reads NO environment
 variable. `perf_runner` still SETS `STICKYKV_COMPILE_EVICT=1`, which nothing
 reads; it records intent, it does not control anything. A lowering failure is
 therefore a total outage until it is fixed, which is why the diagnosis below is
@@ -987,17 +882,6 @@ def _run_compiled_evict(cache, state, store, policy, step: int):
     global _COMPILED_EVICT_FN, _EVICT_COMPILE_FAILED, _EVICT_COMPILE_TRIED_STATIC
     global _EVICT_COMPILE_TRACEBACK
 
-    # THE CONTROL ARM (see `_EVICT_CONTROL_ARM`). Checked first, and deliberately
-    # before the sticky-failure gate: the arm's whole job is to produce the
-    # comparison number, and a build that cannot lower the body is exactly the
-    # build on which someone needs one. Nothing here can be reached without an
-    # explicit opt-in, and the compiled callable is never built, so this run
-    # pays no compile and no autotune -- which is the quantity being measured.
-    if evict_control_arm_enabled():
-        _announce_evict_path_once(compiled=False)
-        _EVICT_STATS["control_arm"] += 1
-        return WindowedCache._evict_two_tier_impl(cache, state, store, policy)
-
     if _EVICT_COMPILE_FAILED is not None:
         # A prior eviction already proved this build cannot lower it; fail fast
         # with the recorded reason rather than re-attempting the compile per cell.
@@ -1113,16 +997,9 @@ def _announce_evict_path_once(compiled: bool) -> None:
             flush=True,
         )
     else:
-        # Named for what it IS. The old text here said "(STICKYKV_COMPILE_EVICT
-        # off)" -- an env var deleted in 0974687 -- which sent anyone who saw
-        # this line after a knob that no longer existed, the same trap
-        # `_EVICT_COMPILE_HELP` had to be corrected for.
         print(
-            "[StickyKV] eviction path: CONTROL ARM -- eager two-tier eviction "
-            f"({_EVICT_CONTROL_ARM_ENV}=1 or set_evict_control_arm(True)). "
-            "This is the REFERENCE, not the shipped path: numbers from this run "
-            "are eager numbers and must be recorded as evict_path_mode()="
-            "'control-arm-eager'.",
+            "[StickyKV] eviction path: eager two-tier eviction "
+            "(STICKYKV_COMPILE_EVICT off)",
             flush=True,
         )
 
@@ -2763,17 +2640,7 @@ class WindowedCache(_HFCacheBase):
         # it is a trace-time constant, so the branch folds away and NOTHING of
         # this reaches the graph; under an eager fallback it is False and the run
         # stops. One bool test per eviction, i.e. one per `ws` steps.
-        # `evict_control_arm_enabled()` is the ONE exemption, and it is not a
-        # weakening of the tripwire: the control arm is an explicit request to
-        # run this body eagerly so the compiled path has something to be
-        # measured against, and it announces itself, counts itself separately
-        # from `eager`, and travels in provenance as `control-arm-eager`. An
-        # eager run that nobody asked for still stops the process here.
-        #
-        # Under Dynamo this whole condition is still a trace-time constant
-        # (`is_compiling()` is True, so the `and` short-circuits before the
-        # Python call), and nothing reaches the graph.
-        if not torch.compiler.is_compiling() and not evict_control_arm_enabled():
+        if not torch.compiler.is_compiling():
             raise EvictionRanEager(
                 "the two-tier eviction ran EAGER. It is compiled-or-error by "
                 "design: the compiled body exists to fuse ~360 pointwise / "

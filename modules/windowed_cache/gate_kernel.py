@@ -53,7 +53,8 @@ Backend contract (mirrors ``score_kernel`` / ``decode_kernel``)
 
 from __future__ import annotations
 
-from typing import Tuple
+import math
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor

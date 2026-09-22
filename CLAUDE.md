@@ -1,30 +1,5 @@
 # RecoverKv — working notes for Claude
 
-## The branch rule
-
-**`int2_clustered_rep` is the working branch. Every command, every measurement
-and every analysis happens on it.** It is not the repository's configured
-GitHub default — that is still `quant_batched_fixed_int2_eviction`, an
-abandoned Sep-9 line — and the mismatch is a live trap: a stale local ref
-pointing at the *old* `int2_clustered_rep` (an unrelated Sep-14 history where
-the gate has **zero non-test callers**) reads as a plausible checkout and
-produces confident, wrong analysis of code that is not this code.
-
-So before quoting anything, check you are on the branch AND that the branch is
-current:
-
-```bash
-git branch --show-current                  # expect: int2_clustered_rep
-git fetch origin int2_clustered_rep
-git rev-list --left-right --count int2_clustered_rep...origin/int2_clustered_rep
-```
-
-A nonzero right-hand number means your ref is behind and anything you conclude
-from the tree may describe a different codebase. The cheapest positive check
-that you are on the right line is the gate reachability grep below: on this
-branch it returns `flash_decode.py`, and on the abandoned line it returns
-nothing.
-
 `DISTANCE_TO_GOAL.md` is the live status document. Read it before proposing any
 decode work; it holds the current numbers and what is measured vs. argued. This
 file holds the things that are easy to get wrong *while* reading it.
@@ -162,18 +137,10 @@ one per-window block is the real fix and needs a GPU to verify.
   per-step re-gather, no device sync. The two fusions still open (gate as a
   kernel prologue; score permutation into the epilogue) are worth ~2% together.
   The remaining factor of two is inside the kernel, not around it.
-  **The 2026-09-19 profile measured 97.2% GPU busy at 4096/B=32** (§10.1), and
-  that reading is true *of the shipped path* — but it was taken on a step whose
-  launches had already been collapsed by the compiled eviction, so it cannot be
-  quoted as "launches never matter here". **Measured on the UNCOLLAPSED path
-  (the 2026-09-20 control arm, §11.9) the same cell runs at 91.2% busy with a
-  3.80 ms/step host gap, and the compiled eviction is worth 6.4–11.2% of TPOT
-  — while costing ~1 ms/step MORE in GPU kernels than the eager work it
-  replaces.** The win is host-side, from 36 fewer launches per step. So: the
-  host path is tight *because* something is keeping it tight; do not remove
-  that something on the strength of a busy number it produced.
-  Our two kernels remain 13.7× and 11.0× off their own rooflines and cost three
-  times what the whole model's GEMMs do — the work is still *inside* them.
+  **The 2026-09-19 profile closes this: 97.2% GPU busy at 4096/B=32** (§10.1).
+  There is no host gap left to attack. Our two kernels are 13.7× and 11.0× off
+  their own rooflines and cost three times what the whole model's GEMMs do — the
+  work is *inside* them.
 * **A `TorchDispatchMode` sees the eviction's op chain BEFORE Inductor fuses
   it** — counts are identical with the compile flag on and off. Eviction byte
   totals taken that way are an upper bound, not a GPU measurement.

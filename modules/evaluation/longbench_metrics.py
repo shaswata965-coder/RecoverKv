@@ -16,6 +16,7 @@ import string
 
 from fuzzywuzzy import fuzz
 
+from typing import List
 from collections import Counter
 from rouge import Rouge
 

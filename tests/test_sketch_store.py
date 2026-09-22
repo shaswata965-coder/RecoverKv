@@ -15,7 +15,7 @@ import math
 import pytest
 import torch
 
-from modules.quant.slots import SKETCH_FIELDS
+from modules.quant.slots import SKETCH_FIELDS, QuantSlotTable
 from modules.quant.sketch import Sketch, gate_and_score
 from modules.quant.store import QuantizedStore
 

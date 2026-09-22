@@ -423,22 +423,6 @@ def _reset_evict_path_stats() -> None:
             pass
 
 
-def _evict_path_mode() -> str:
-    """``"compiled"`` or ``"control-arm-eager"`` — which arm produced this row.
-
-    Recorded on EVERY row, not only control-arm rows, for the same reason
-    `_gate_stats` is: a run that took the reference arm is indistinguishable in
-    a latency table from one that took the shipped path, and the whole value of
-    a control arm is lost the moment its numbers can be filed as the thing it
-    was controlling for.
-    """
-    fn = _kernel_fn("evict_path_mode")
-    try:
-        return fn() if fn is not None else "compiled"
-    except Exception:  # pragma: no cover - environment dependent
-        return "compiled"
-
-
 def _evict_compile_failed() -> Optional[str]:
     """The eviction's sticky torch.compile failure reason, or None."""
     fn = _kernel_fn("evict_compile_failed")
@@ -1113,7 +1097,7 @@ class PerfRunner:
         Never raises: an autopsy that fails must not mask the OOM.
         """
         lines = [
-            "# CUDA OOM autopsy",
+            f"# CUDA OOM autopsy",
             f"# config={name} prefill={prefill_len} batch={batch_size}",
             f"# exception: {type(exc).__name__}: {exc}",
             "",
@@ -1935,29 +1919,9 @@ class PerfRunner:
             ev = _evict_path_stats()
             dyn = _dynamo_counters()
             compile_failed = _evict_compile_failed()
-            path_mode = _evict_path_mode()
-            # The decode tile ladder's order travels with the row for the same
-            # reason path_mode does: it is a control arm, and a row measured on
-            # one arm must never be readable as the other.
-            try:
-                from modules.windowed_cache.decode_kernel import fit_ladder_order
-                ladder_order = fit_ladder_order()
-            except Exception:  # pragma: no cover - import-path dependent
-                ladder_order = "unknown"
             diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn,
-                                "compile_failed": compile_failed,
-                                "path_mode": path_mode,
-                                "fit_ladder_order": ladder_order}
-            log.info("eviction path: %s | mode: %s | tile ladder: %s | dynamo: %s",
-                     ev or "n/a", path_mode, ladder_order, dyn or "n/a")
-            if path_mode == "control-arm-eager":
-                log.warning(
-                    "config %s: CONTROL ARM -- the eviction ran EAGER by request "
-                    "(%d run(s)). This row is the reference, not the shipped "
-                    "path. Compare it against a run without "
-                    "STICKYKV_EVICT_CONTROL_ARM and state the compiled path's "
-                    "claim against it.",
-                    c.get("name"), ev.get("control_arm", 0))
+                                "compile_failed": compile_failed}
+            log.info("eviction path: %s | dynamo: %s", ev or "n/a", dyn or "n/a")
             compile_on = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
                 "1", "true", "yes", "on")
             if compile_failed:
@@ -1968,10 +1932,8 @@ class PerfRunner:
                 log.warning(
                     "config %s: torch.compile could NOT lower the eviction on this "
                     "build (%s). Kernel-or-error: the cell ERRORED rather than "
-                    "running eager under a compiled label. Fix the lowering, or "
-                    "run the CONTROL ARM (STICKYKV_EVICT_CONTROL_ARM=1) for eager "
-                    "reference numbers -- recorded as path_mode="
-                    "'control-arm-eager', never as compiled.",
+                    "running eager under a compiled label. Fix the lowering or run "
+                    "with STICKYKV_COMPILE_EVICT=0 for eager numbers.",
                     c.get("name"), compile_failed)
             elif compile_on and ev.get("eager"):
                 log.warning(

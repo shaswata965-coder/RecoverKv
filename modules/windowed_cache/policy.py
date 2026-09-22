@@ -142,6 +142,10 @@ class EvictionPolicy:
         ps = self.post_sink_tokens
         return (ps + self.window_size - 1) // self.window_size if ps > 0 else 0
 
+    @property
+    def num_evictable_windows(self) -> int:
+        return max(self.num_total_windows - self.local_windows, 0)
+
     # -----------------------------------------------------------------
     # Retain indices — window granularity
     # -----------------------------------------------------------------

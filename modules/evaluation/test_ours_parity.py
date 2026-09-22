@@ -8,10 +8,11 @@ import numpy as np
 import pytest
 import torch
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 from utils.config import (
     ExperimentConfig, ParityValidationError, RunConfig,
     ModelConfig, CacheConfig, ParityConfig, WindowConfig,
-    TelemetryConfig,
+    TelemetryConfig, DataConfig,
 )
 from utils.cache_factory import ConfigValidationError
 

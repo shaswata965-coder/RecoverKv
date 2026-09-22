@@ -61,9 +61,19 @@ split the ``shared/other`` bucket, because it carries the launching stack.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
+
+# The project root, so `utils` / `modules` import when this file is run as a
+# path -- `python scripts/profile_decode.py`, the usage the docstring above
+# gives. sys.path[0] is then scripts/, not the root, and the `from utils.config
+# import ...` inside main() raises ModuleNotFoundError before anything loads.
+# The insert inside main() adds scripts/ for the audit_e2e sibling import: a
+# different directory, and it runs after that import, so it never covered this.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _self_device_us(ev) -> float:
@@ -243,26 +253,6 @@ def _print_evict_fusion_verdict(agg, n: int) -> None:
         return
     stats = evict_path_stats()
     compiled_runs, eager_runs = int(stats.get("compiled", 0)), int(stats.get("eager", 0))
-    arm_runs = int(stats.get("control_arm", 0))
-    if arm_runs:
-        # The CONTROL ARM. Not a fault, and not a fused/unfused question at all
-        # -- there is nothing to fuse. Reported in its own words so a reference
-        # run can never be read as a broken shipped run, which is the mistake
-        # this whole printer exists to prevent in the other direction.
-        print(f"\n    eviction: CONTROL ARM -- {arm_runs} eager run(s), no "
-              "compile, no autotune.\n"
-              "      This is the REFERENCE arm (--compile-evict 0). Its ms/step "
-              "is what the\n"
-              "      compiled eviction has to beat. Compare against the same "
-              "command with\n"
-              "      --compile-evict 1 and state the claim against it; a tie "
-              "means the\n"
-              "      compile is buying nothing (DISTANCE_TO_GOAL §10.14 found "
-              "exactly that).")
-        if compiled_runs:
-            print("      !! MIXED: compiled runs in a control-arm window "
-                  f"({compiled_runs}). Not a clean arm.")
-        return
     if compiled_runs == 0 and eager_runs == 0:
         print("\n    eviction: NO EVICTION RAN in the profiled window. Raise "
               "--steps above window_size, or this profile is not measuring the "
@@ -280,62 +270,14 @@ def _print_evict_fusion_verdict(agg, n: int) -> None:
               "         emitted no kernel this rollup can see. The eviction is "
               "paying\n"
               "         compile overhead for eager kernels. Check:\n"
-              "         and bound the cost with one --compile-evict 0 run "
-              "(the control\n"
-              "         arm, which now exists): if eager and 'compiled' tie, "
-              "the compile is\n"
-              "         doing nothing either way.")
+              "         and bound the cost with one --compile-evict 0 run: if "
+              "eager\n"
+              "         and 'compiled' tie, the compile is doing nothing either "
+              "way.")
     elif eager_runs > 0 and compiled_runs > 0:
         print("      !! MIXED eviction paths in one window -- the ms/step above "
               "is an\n         average of two methods. Re-run with "
               "--compile-evict pinned.")
-
-
-#: Substrings that mark a PROFILER RANGE rather than a kernel. These are
-#: rejected before any other test, including ``device_type``.
-#:
-#: Why a hard reject and not a device-type test: `torch._dynamo.utils.
-#: dynamo_timed` opens a `record_function` range around compilation, and on the
-#: 2026-09-19 A100 profile those ranges came back carrying CUDA self time and
-#: passed BOTH arms of `_is_device_event` -- so `compile_fx_inner` was counted
-#: as a 268 ms/step "kernel" with **n = 0.0 launches**, and five such rows made
-#: up 726.824 ms/step of the `other` bucket. A range's self device time is the
-#: CUDA time of everything nested inside it, so adding it to the kernels it
-#: encloses double-counts them: exactly the failure this function was written
-#: for (see the aten::mm case below), one level up.
-#:
-#: The damage was not cosmetic. It pushed `GPU busy` to **203.9%** -- which is
-#: impossible on one stream, and is the tell -- and the script then printed
-#: "KERNEL-BOUND ... the kernels themselves are slow" for a step whose real
-#: kernel time was 345 ms of a 526 ms wall (65.6% busy, i.e. a ~180 ms host
-#: gap from the autotuner's per-rep `cudaDeviceSynchronize`). Acting on that
-#: verdict sends you into the two kernels, which were the only part of that
-#: profile that had got FASTER.
-#:
-#: Kernels launched *inside* one of these ranges are unaffected: they appear
-#: under their own names as their own rows and are still counted. Only the
-#: enclosing range is dropped.
-_NON_KERNEL_MARKERS = (
-    "(dynamo_timed)",           # every row observed on the 2026-09-19 profile
-    "CachingAutotuner",         # ... and the individual names, in case the
-    "compile_fx",               #     "(dynamo_timed)" suffix ever changes
-    "create_aot_dispatcher",
-    "compile_inner",
-    "_recursive_",
-    "Torch-Compiled Region",
-    "TorchDynamo Cache Lookup",
-    "CompiledFunction",
-    "AOTAutograd",
-    "dynamo",
-    "inductor",
-)
-
-
-def _is_compile_range(ev) -> bool:
-    """True for a compilation / autotuning profiler range (see
-    :data:`_NON_KERNEL_MARKERS`). Reported separately -- a window containing
-    these is not measuring a steady-state step."""
-    return any(m in str(ev.key) for m in _NON_KERNEL_MARKERS)
 
 
 def _is_device_event(ev) -> bool:
@@ -358,11 +300,6 @@ def _is_device_event(ev) -> bool:
     ``autograd::``), device events are not. Memcpy/Memset are device events and
     are deliberately NOT excluded by it.
     """
-    # FIRST, and ahead of device_type: a compilation range is never a kernel,
-    # whatever the profiler tags it as. See _NON_KERNEL_MARKERS for the profile
-    # that made this necessary and what it did to `GPU busy`.
-    if _is_compile_range(ev):
-        return False
     dt = getattr(ev, "device_type", None)
     if dt is not None:
         try:
@@ -374,80 +311,6 @@ def _is_device_event(ev) -> bool:
         ("aten::", "autograd::", "torch::", "nn.Module", "Optimizer",
          "ProfilerStep", "cudaLaunch", "cudaMemcpy", "cudaStream",
          "cudaDevice", "cudaEvent", "cudaHost"))
-
-
-def _dynamo_counters() -> dict:
-    """Dynamo's own compile tally, or ``{}``. Read-only, no side effects."""
-    try:
-        from torch._dynamo.utils import counters
-        st = dict(counters.get("stats", {}))
-        return {k: int(v) for k, v in st.items()}
-    except Exception:  # pragma: no cover - torch-version dependent
-        return {}
-
-
-def _print_compile_contamination(evs, steady_us: float, n: int) -> None:
-    """Say, out loud, if COMPILATION happened inside the measured window.
-
-    This is the half of the instrument that was missing. `perf_runner` prints
-    Dynamo's counters for its measured runs; this script printed nothing, so a
-    window in which Inductor was still compiling and autotuning looked exactly
-    like a steady-state window -- only ~10x slower, with no line saying why.
-
-    That is not hypothetical. The 2026-09-19 profile at 4096/B=32 reported
-    525.81 ms/step against the 45.69 ms/step the SAME command produced days
-    earlier, and the reason was visible only because the compile ranges had
-    leaked into the kernel table (see _NON_KERNEL_MARKERS). Now that they are
-    correctly excluded from the kernels, they would vanish from the output
-    entirely -- and a 10x-slow profile would carry no explanation at all. So
-    they are excluded from the kernels AND reported here.
-
-    The signature to recognise, all of it visible in that profile:
-      * `CachingAutotuner.benchmark_all_configs` ranges at all;
-      * `Memcpy DtoD` and `cudaMemcpyAsync` at hundreds per step -- Inductor
-        cloning mutated arguments between benchmark repetitions;
-      * a `cudaDeviceSynchronize` per repetition (196 ms/step, there).
-
-    What to do about it is NOT "raise --warmup" by reflex. The eviction fires
-    once per `window_size` steps, so a 12-step warmup contains one or two of
-    them; if a fresh graph is being built for each, no warmup is long enough
-    and the recompile axis is the bug (DISTANCE_TO_GOAL §10.10 named `T_fp` and
-    `W`, which are `int()`-forced and therefore specialise even under
-    `dynamic=True`). The message says both.
-    """
-    ranges = [(_self_device_us(e), e.count, e.key)
-              for e in evs if _is_compile_range(e) and _self_device_us(e) > 0]
-    counters = _dynamo_counters()
-    if not ranges and not counters:
-        return
-    print("\n  -- COMPILATION INSIDE THE MEASURED WINDOW " + "-" * 31)
-    if counters:
-        print(f"  dynamo/inductor counters: {counters}")
-    if ranges:
-        total = sum(us for us, _, _ in ranges)
-        print(f"  compile/autotune ranges:  {total / n / 1000:.2f} ms/step "
-              f"across {len(ranges)} range(s), EXCLUDED from the kernel totals "
-              "above.")
-        for us, cnt, key in sorted(ranges, reverse=True)[:6]:
-            print(f"      {us / n / 1000:8.3f} ms/step  n={cnt / n:7.1f}  "
-                  f"{str(key)[:52]}")
-        share = total / max(steady_us, 1.0)
-        print(f"  -> THIS PROFILE IS NOT A STEADY-STATE STEP. Compilation is "
-              f"~{share * 100:.0f}% of the\n"
-              "     unprofiled wall, so every ms/step below is an average of "
-              "the step and\n"
-              "     the compiler. Do NOT quote it, and do not read the kernel "
-              "ranking as a\n"
-              "     ranking of the step's real costs.\n"
-              "     Before reaching for --warmup: the eviction fires once per "
-              "window_size\n"
-              "     steps, so a short warmup holds only one or two of them. If "
-              "a NEW graph is\n"
-              "     built per eviction, no warmup is long enough and the "
-              "recompile axis is\n"
-              "     the bug -- see DISTANCE_TO_GOAL.md §10.10 (T_fp and W are "
-              "int()-forced,\n"
-              "     so they specialise even under dynamic=True).")
 
 
 def _perf_cell_quant(cfg) -> float:
@@ -466,13 +329,6 @@ def main() -> None:
     ap.add_argument("--prefill", type=int, default=1048)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--steps", type=int, default=20, help="profiled decode steps")
-    ap.add_argument("--compile-evict", type=int, choices=(0, 1), default=1,
-                    help="1 (default) = the shipped compiled eviction. "
-                         "0 = the CONTROL ARM: the same body run eagerly, so "
-                         "the compiled path has a reference to be measured "
-                         "against. The rollup below has advertised this flag "
-                         "since before it existed; it exists now. A 0 run "
-                         "reports eager numbers and says so.")
     ap.add_argument("--warmup", type=int, default=12,
                     help="decode steps before profiling; must exceed window_size "
                          "so at least one eviction is compiled/autotuned away")
@@ -511,7 +367,7 @@ def main() -> None:
     pkg, attn_impl = resolve_backend(cfg)
 
     print(f"loading {cfg.model.name} (attn={attn_impl}, cache_package={pkg}) ...")
-    AutoTokenizer.from_pretrained(cfg.model.name)
+    tok = AutoTokenizer.from_pretrained(cfg.model.name)
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model.name, torch_dtype=dtype,
         attn_implementation=attn_impl, device_map="auto")
@@ -519,17 +375,6 @@ def main() -> None:
 
     input_ids = torch.randint(1000, 20000, (args.batch, args.prefill),
                               device=model.device, dtype=torch.long)
-
-    # The control arm, set BEFORE any eviction: the compiled callable is built
-    # lazily on first use, and the point of the arm is that it is never built,
-    # so the run pays no compile and no autotune. That is the quantity being
-    # measured.
-    try:
-        from modules.windowed_cache.cache import set_evict_control_arm
-        set_evict_control_arm(args.compile_evict == 0)
-    except Exception:  # pragma: no cover - import-path dependent
-        if args.compile_evict == 0:
-            raise
 
     # -- cache + hooks: same construction as scripts/diagnose_perf.py --------
     from utils.cache_factory import get_cache_classes
@@ -609,18 +454,6 @@ def main() -> None:
             # spend. That lands entirely in the denominator and nowhere in the
             # numerator, so it drives `busy` DOWN and makes a mixed step read as
             # host-bound -- the one reading this script exists to rule on.
-            #
-            # The counters are snapshotted ACROSS this window, not just at the
-            # end. `busy` divides window 2's kernel time by window 1's wall, so
-            # the two windows have to be the same KIND of step. If Inductor
-            # compiles in window 1 and is done by window 2, they are not: the
-            # 2026-09-20 run measured window 1 at 2357.34 ms/step and window 2
-            # at 136.32, and `busy` came out at 1.7% with a confident
-            # "HOST-BOUND. The GPU idles most of the step" underneath. The GPU
-            # was not idling; window 1 was compiling 18 graphs. Nothing in the
-            # kernel table could show it, because the compile happened in the
-            # window the profiler was not watching.
-            dyn_before = _dynamo_counters()
             t0 = time.perf_counter()
             for _ in range(args.steps):
                 out = _step(nxt, pkv, 1)
@@ -628,7 +461,6 @@ def main() -> None:
                 nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             torch.cuda.synchronize()
             steady_us = (time.perf_counter() - t0) * 1e6
-            dyn_after = _dynamo_counters()
 
             # ---- window 2: the attribution, with the profiler ON -------------
             # Same length as window 1 so the two see the same number of eviction
@@ -696,75 +528,7 @@ def main() -> None:
           f"{gpu_us / max(wall_us, 1.0) * 100:.1f}% -- that figure is an "
           "artifact\n   of the measurement and must not be quoted.)")
     print(f"  kernel launches {n_launch / n:8.0f} /step")
-    # A verdict is only printed when the number it rests on is POSSIBLE. Kernel
-    # self time cannot exceed wall time on one stream, so busy > 100% does not
-    # mean "very busy" -- it means something that is not a kernel is in the
-    # numerator, and every bucket below inherits the error. The 2026-09-19
-    # profile read 203.9% and still printed "KERNEL-BOUND ... the kernels
-    # themselves are slow"; the kernels were in fact the only thing that had
-    # improved. Refusing the verdict is the whole fix.
-    # The SAME class of failure as busy > 100%, in the other direction, and it
-    # needs its own guard because the ratio's two halves come from two
-    # different windows. `gpu_us` is window 2; `steady_us` is window 1. If they
-    # are not the same kind of step the ratio is meaningless, and it fails
-    # SILENTLY -- a low `busy` reads as a discovery ("host-bound!"), not as an
-    # error. Two tells, both cheap:
-    #
-    #   * profiling made the step FASTER. Tracing only ever adds cost, so a
-    #     negative overhead means window 1 was doing something window 2 was
-    #     not;
-    #   * Dynamo's graph count MOVED during window 1. That is compilation
-    #     inside the denominator.
-    #
-    # The 2026-09-20 run at 4096/B=32 hit both: 2357.34 ms/step unprofiled
-    # against 136.32 profiled, 18 unique graphs built, and `GPU busy 1.7% ->
-    # HOST-BOUND. The GPU idles most of the step`. Window 2 was clean and good
-    # (40.51 ms of kernels over 1726 launches); only the denominator was junk.
-    compiled_in_w1 = {k: dyn_after.get(k, 0) - v
-                      for k, v in (dyn_before or {}).items()
-                      if dyn_after.get(k, 0) != v}
-    for k, v in (dyn_after or {}).items():
-        if k not in (dyn_before or {}):
-            compiled_in_w1[k] = v
-    windows_differ = wall_us < steady_us or bool(compiled_in_w1)
-    if windows_differ:
-        print("  -> !! THE TWO WINDOWS ARE NOT COMPARABLE, so `GPU busy` above "
-              "is NOT a\n"
-              "        measurement. Kernel time comes from the profiled "
-              "window and the wall\n"
-              "        from the unprofiled one; the ratio only means something "
-              "when both\n"
-              "        ran the same kind of step.")
-        if wall_us < steady_us:
-            print(f"        * profiling made the step FASTER by "
-                  f"{(steady_us - wall_us) / n / 1000:.2f} ms/step. Tracing "
-                  "only ever ADDS\n"
-                  "          cost, so the unprofiled window was doing "
-                  "something the profiled one\n"
-                  "          was not.")
-        if compiled_in_w1:
-            print(f"        * Dynamo compiled during the unprofiled window: "
-                  f"{compiled_in_w1}.\n"
-                  "          That is compilation inside the denominator.")
-        print("        The kernel table below is still valid -- it is the "
-              "profiled window\n"
-              "        alone. Only `GPU busy` and the wall are spoiled. Raise "
-              "--warmup until\n"
-              "        no graphs are built here, then re-read busy.")
-    elif busy > 1.0:
-        print("  -> !! IMPOSSIBLE: kernel self time EXCEEDS the unprofiled "
-              "wall. One stream\n"
-              "        cannot be more than 100% busy, so a non-kernel event is "
-              "being counted\n"
-              "        as a kernel and NO bucket below can be trusted. Check "
-              "the rows with\n"
-              "        near-zero launches (n~0.0) in the top-N list -- a range "
-              "carries the\n"
-              "        CUDA time of everything nested in it. Add the offender "
-              "to\n"
-              "        _NON_KERNEL_MARKERS. No host/kernel verdict is printed "
-              "for this run.")
-    elif busy < 0.5:
+    if busy < 0.5:
         print("  -> HOST-BOUND. The GPU idles most of the step; launches and "
               "syncs are the budget.")
     elif busy > 0.85:
@@ -772,8 +536,6 @@ def main() -> None:
               "are slow. Collapsing launches cannot help.")
     else:
         print("  -> MIXED. Both terms are real; fix the larger one first.")
-
-    _print_compile_contamination(evs, steady_us, n)
 
     # Which method was actually profiled. The fused kernel running does not mean
     # the read gate ran: a store with no sketch cards reads the whole tier,

@@ -246,7 +246,7 @@ def main() -> None:
           f"({overhead/win_s*100:+.1f}% of wall clock)")
     print()
     share = max(overhead, 0) / win_s
-    print("  Amdahl ceiling: making ALL StickyKV code infinitely fast would")
+    print(f"  Amdahl ceiling: making ALL StickyKV code infinitely fast would")
     print(f"  cut a 34-minute run to {34*(1-share):.1f} minutes.")
     if share < 0.15:
         print("\n  StickyKV is a minority of the runtime. Optimizing it further")

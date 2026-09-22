@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -67,7 +68,7 @@ class TestSeedContext:
         with SeedContext(99):
             inside = torch.rand(3)
 
-        _ = torch.rand(3)
+        after = torch.rand(3)
         # After context exit, state should continue from where it was
         # (we consumed 3 values before entering context)
         # The inside values should differ from before/after

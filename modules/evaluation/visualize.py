@@ -7,7 +7,7 @@ degrades: falls back to pure matplotlib if seaborn unavailable.
 from __future__ import annotations
 import json, warnings
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
 import numpy as np
 
 from utils.config import ExperimentConfig
@@ -237,6 +237,7 @@ def make_perf_summary(npz_paths: List[Path], out_dir: Path,
         ttft = d["arrays"].get("ttft_ms")
         tpot_arr = d["arrays"].get("tpot_ms")
         mem = d["arrays"].get("peak_memory_mb")
+        pf = d["metadata"].get("prefill_len", "?")
         for ci in range(len(names)):
             if skip is not None and skip[ci]: continue
             nm = str(names[ci])

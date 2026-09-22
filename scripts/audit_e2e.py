@@ -260,8 +260,11 @@ def _build_cache(cfg, model, prefill_len: int, gen_len: int, q: float,
     deltas would then not add up to the table they are meant to explain.
     """
     from utils.cache_factory import get_cache_classes
+    from utils.config import FIRST_EVICTION_STEP_DEFAULT
 
     WC, WCC, install_hooks = get_cache_classes(pkg)
+    c = _perf_cell(cfg)
+    w = cfg.window
 
     # Two-pass RoPE discovery, as perf_runner does: some models expose the
     # module only as a submodule attribute, and a None rope breaks the cache.

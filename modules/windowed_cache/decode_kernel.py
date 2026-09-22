@@ -48,6 +48,8 @@ Backend contract (mirrors :mod:`score_kernel`)
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -375,6 +377,7 @@ def two_tier_window_reference(
     # `exp2=True` mirrors the kernel's base-2 softmax: log2(e) folds into the
     # scale, so every logit becomes a base-2 exponent and m / wmax / lse are all
     # in base-2 units. p, l, acc and out are unchanged quantities either way.
+    _e = math.exp2 if exp2 else math.exp
     scale_eff = scaling * _LOG2E if exp2 else scaling
     logits = torch.matmul(q5, k.transpose(-2, -1)) * scale_eff    # [B,H_kv,rep,1,S]
     logits = logits.reshape(B, H_q, S)
@@ -1096,48 +1099,10 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
 #: host gap). A smaller tile trades iteration count for occupancy, and which way
 #: that trade falls is a measurement, not a derivation.
 #:
-#: **Ordering still carries meaning, and the claim that it did not was wrong.**
-#: It is irrelevant to a TUNED geometry -- every rung is timed and the fastest
-#: wins, whatever order they were tried in. But a geometry that has not yet been
-#: seen :data:`_TUNE_AFTER` times runs :func:`_first_fit`, which returns the
-#: first rung that *fits*; a fit is shape-independent, so that fallback is a
-#: CONSTANT across every untuned geometry in the run. Under the tile-major order
-#: that constant was ``(64, 2, 4)`` -- measured 5th-to-9th of 11 on three
-#: separate profiles and 1.20-1.45x off the winner. §10.14 measured 6.1% of tile
-#: win available at 2048/B=32 and only 1.4% observed; untuned geometries taking
-#: a known-mediocre rung is the leak.
-#:
-#: So the ladder is now ordered by MEASURED time, best first, from the
-#: 2026-09-20 control-arm profile (the first fully valid one -- positive
-#: profiler overhead, no compilation in either window). The three profiles taken
-#: at ``ws=8, D=128, B=32, n_sel~2^6`` rank the rungs identically:
-#:
-#:     (32,2,4) 0.486  (32,1,4) 0.538  (64,2,8) 0.561  (64,1,8) 0.575
-#:     (64,2,4) 0.582  (64,1,4) 0.583  (16,2,4) 0.614  (16,1,4) 0.629
-#:     (32,1,8) 0.647  (32,2,8) 0.654  (16,1,8) 0.807  (16,2,8) 0.823
-#:
-#: **What this is NOT.** `_LAST_WINNER` (§10.15) exported one geometry's tuned
-#: winner across all geometries at runtime and cost 12%, because the trade a
-#: rung selects does move with the geometry. This is a different thing: a static,
-#: deterministic reordering of the fallback walk, which still walks, and which
-#: replaces an ordering that was *asserted* with one that was *measured*. Both
-#: are guesses at an untuned geometry. Only one of them is informed.
-#:
-#: **It is a guess, so it has a control arm.** `STICKYKV_FIT_LADDER=legacy`
-#: restores the tile-major order exactly, which makes the A/B one environment
-#: variable and the claim statable against it -- the thing `_LAST_WINNER` shipped
-#: without. The risk this prices: at a fill-phase geometry (`n_sel` small) the
-#: Q-tier loop is short, the fp body dominates, and a larger tile may win there
-#: even though it loses at the shipped shape. Nobody has measured that, and this
-#: comment is not a substitute for doing so.
-_FIT_LADDER_MEASURED = [
-    (32, 2, 4), (32, 1, 4), (64, 2, 8), (64, 1, 8),
-    (64, 2, 4), (64, 1, 4), (16, 2, 4), (16, 1, 4),
-    (32, 1, 8), (32, 2, 8), (16, 1, 8), (16, 2, 8),
-]
-
-#: The pre-2026-09-20 tile-major order. The control arm, and nothing else.
-_FIT_LADDER_LEGACY = [
+#: Ordering therefore no longer carries meaning -- every entry is timed and the
+#: fastest wins. It is kept tile-major only so the announcement reads in the
+#: order the shared-memory argument above discusses.
+_FIT_LADDER = [
     (64, 2, 4), (64, 2, 8),
     (64, 1, 4), (64, 1, 8),
     (32, 2, 4), (32, 2, 8),
@@ -1145,30 +1110,6 @@ _FIT_LADDER_LEGACY = [
     (16, 2, 4), (16, 2, 8),
     (16, 1, 4), (16, 1, 8),
 ]
-
-
-def _resolve_fit_ladder():
-    """Latched at import: this must not be read on the hot path."""
-    import os
-    want = os.environ.get("STICKYKV_FIT_LADDER", "").strip().lower()
-    if want in ("legacy", "tile-major", "tile_major"):
-        print("[StickyKV] decode tile ladder: LEGACY tile-major order "
-              "(STICKYKV_FIT_LADDER=legacy) -- this is the CONTROL ARM for the "
-              "measured ordering, not the shipped default.", flush=True)
-        return list(_FIT_LADDER_LEGACY)
-    if want not in ("", "measured"):
-        raise RuntimeError(
-            f"STICKYKV_FIT_LADDER={want!r} is not a ladder. Use 'measured' "
-            "(default) or 'legacy'. A misspelled knob that silently falls back "
-            "is how two arms come to measure the same thing.")
-    return list(_FIT_LADDER_MEASURED)
-
-
-_FIT_LADDER = _resolve_fit_ladder()
-
-#: Which ordering this process is using, for a run's provenance.
-def fit_ladder_order() -> str:
-    return "legacy" if _FIT_LADDER == list(_FIT_LADDER_LEGACY) else "measured"
 
 
 #: Winning rung per geometry signature, so the search runs once per process.
@@ -1352,18 +1293,13 @@ def _search_rungs(choice: dict, timed: dict, announced: set, seen: dict, sig,
         return _first_fit(ladder, launch, label, sig, key)
 
     timings = []
-    # NOT `seen` -- that is the sighting-count dict this function was handed,
-    # and rebinding it here shadowed the parameter for the rest of the body.
-    # Harmless today only because the one write to the dict happens above this
-    # line; any future read of `seen` below it would have silently queried a
-    # set of rungs instead of the recurrence counter.
-    deduped = set()
+    seen = set()
     last: Optional[BaseException] = None
     for rung in ladder:
         k = rung if key is None else key(rung)
-        if k in deduped:
+        if k in seen:
             continue
-        deduped.add(k)
+        seen.add(k)
         try:
             ms = _time_launch(lambda r=rung: launch(r))
         except BaseException as exc:                     # noqa: BLE001

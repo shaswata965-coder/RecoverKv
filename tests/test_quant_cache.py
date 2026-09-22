@@ -12,7 +12,7 @@ import torch
 
 from modules.windowed_cache.cache import WindowedCache
 from modules.windowed_cache.config import WindowedCacheConfig
-from modules.quant.effective import rotate_key_window
+from modules.quant.effective import rotate_key_window, unrotate_key_window
 
 
 class _FakeModelConfig:
@@ -134,7 +134,7 @@ def test_first_eviction_demotes_and_materializes():
 def test_redemotion_after_promotion_reactivates():
     """Demote w1, promote it (dormant), then re-demote — codes unchanged (§10)."""
     cache = _make_cache(quant_ratio=0.5, ws=4, num_sink=0)
-    ws = 4
+    H, D, ws = 2, 4, 4
     k_pre, v, k_post, pos = _seed_prefill_state(cache, n_win=4, ws=ws)
     st = cache._states[0]
     st.window_scores = torch.zeros(1, 2, 4)
@@ -697,7 +697,7 @@ def test_b_gt_1_ragged_demote_counts_allocate_correctly():
     tensor rather than by count, and this asserts the ragged case is real and
     that no row's allocation clobbers another's.
     """
-    B, H, ws = 3, 2, 4
+    B, H, D, ws = 3, 2, 4, 4
     cache = _batched_cache(B, ws=ws, prefill=16)
     st = _seed_rows(cache, B)
     store = cache._stores[0]
@@ -736,7 +736,7 @@ def test_b_gt_1_dormant_survives_promote_then_redemote():
     would pick up fp16 rounding from the promote-side dequant and could flip
     boundary codes). Asserted on the codes tensor itself, per row.
     """
-    B, H, ws = 3, 2, 4
+    B, H, D, ws = 3, 2, 4, 4
     cache = _batched_cache(B, ws=ws, prefill=16)
     st = _seed_rows(cache, B, seed=29)
     store = cache._stores[0]
@@ -808,6 +808,77 @@ def test_b_gt_1_end_to_end_invariants(B):
         assert torch.all(p[1:] > p[:-1]), f"row {r} positions not strictly increasing"
     store.validate()
     assert store.num_active_windows <= cache._policies[0].N_q
+
+
+# ---------------------------------------------------------------------------
+# The memoized fused hand-off
+# ---------------------------------------------------------------------------
+
+
+def test_memoized_fused_ctx_equals_a_fresh_rebuild_every_step():
+    """Every memoized hand-off is tensor-for-tensor what a rebuild would produce.
+
+    This is the whole safety argument for hoisting the gather / RoPE / argsort out
+    of the per-layer-per-step path: design §10 freezes Q entries between evictions,
+    so the memo can only return the same values — never merely equivalent ones.
+    """
+    cache = _seeded_fused_cache(ws=4)
+    compared = 0
+    for step, pos in enumerate(range(16, 21)):
+        ctx = _drive_decode_step(cache, pos)
+        if ctx is None:                       # Q tier emptied — nothing to compare
+            continue
+        compared += 1
+        want_q, want_meta = _fresh_fused_ctx(cache)
+        for field, got in ctx["qtier"].items():
+            if field == "window_size":
+                continue
+            assert torch.equal(got, want_q[field]), f"step {step}: {field} diverged"
+        assert torch.equal(ctx["score_meta"][0], want_meta[0]), f"step {step}: order"
+        assert ctx["score_meta"][1] == want_meta[1], f"step {step}: q_token_len"
+    # Guard against the loop quietly going vacuous if the fixture drifts.
+    assert compared >= 4, f"only {compared} fused steps exercised"
+
+
+def test_fused_ctx_is_reused_between_evictions_and_dropped_by_one():
+    """The memo actually hits (same object) and an eviction actually drops it.
+
+    Without the first half the fix does nothing; without the second it would serve
+    a stale Q tier after the active set moves.
+
+    The first observed step is 17, not 16, because step 16 is the cache's first
+    eviction and step 17 is where the layer-major decode store is built
+    (DECODE_SPEED_PLAN.md §4.1). That join copies the Q tier into new tensors, so
+    it necessarily drops the memo once — a rebuild, not a stale hit. Both
+    observations therefore have to sit on the same side of it.
+    """
+    cache = _seeded_fused_cache(ws=4)
+    assert _drive_decode_step(cache, 16) is not None      # first eviction
+    first = _drive_decode_step(cache, 17)                 # the join rebuilds
+    assert first is not None
+    second = _drive_decode_step(cache, 18)
+    # Same epoch -> the identical dict, not a rebuilt copy.
+    assert second["qtier"] is first["qtier"]
+
+    # Post-join the eviction is layer-major: layer_idx=None is every layer's rows.
+    cache._evict_two_tier(None, step=4)
+    after = _drive_decode_step(cache, 19)
+    if after is not None:
+        assert after["qtier"] is not first["qtier"]
+        want_q, _ = _fresh_fused_ctx(cache)
+        assert torch.equal(after["qtier"]["k_codes"], want_q["k_codes"])
+
+
+def test_store_version_bump_invalidates_the_memo():
+    """Any Q-store mutation invalidates, not just the eviction entry point."""
+    cache = _seeded_fused_cache(ws=4)
+    first = _drive_decode_step(cache, 16)
+    assert first is not None
+    cache._stores[0]._invalidate()            # what every store mutator calls
+    again = _drive_decode_step(cache, 17)
+    assert again["qtier"] is not first["qtier"]
+    want_q, _ = _fresh_fused_ctx(cache)
+    assert torch.equal(again["qtier"]["k_codes"], want_q["k_codes"])
 
 
 # ---------------------------------------------------------------------------

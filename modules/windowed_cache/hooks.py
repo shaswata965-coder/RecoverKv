@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+import os
 
 from . import flash_lse, flash_decode
 from .decode_kernel import (
@@ -46,6 +47,7 @@ from .score_kernel import (
     describe_prefill_backend,
 )
 from .scorer import (
+    compute_window_scores,
     reduce_token_scores_to_windows,
     reduce_two_tier_scores,
 )

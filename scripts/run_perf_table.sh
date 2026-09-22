@@ -71,27 +71,9 @@
 #                     reproducing a table printed before this change. It is
 #                     prefill-inclusive AND omits the prefill->decode gap, so it
 #                     is neither claim; do not quote it.
-#   EVICT_CONTROL_ARM  true | false                           (default: false)
-#                   false = the shipped compiled eviction. true = the CONTROL
-#                   ARM: the same eviction body run EAGERLY, so the compiled
-#                   path has a reference to be measured against. It is the
-#                   eviction's equivalent of --gate-ratio 1.0.
-#                   USE A SEPARATE OUT_DIR PER ARM. The npz is named
-#                   perf_prefill{P}_gen{G}_bs{B}.npz -- shape and batch, nothing
-#                   about the config -- so two arms in one OUT_DIR overwrite
-#                   each other and the table prints the survivor.
-#                   A control-arm run records path_mode=control-arm-eager and
-#                   its rows are EAGER rows; they are the reference, not the
-#                   shipped path.
-#   FIT_LADDER      measured | legacy                       (default: measured)
-#                   Order of the decode tile ladder. Irrelevant to a TUNED
-#                   geometry -- every rung is timed. It decides the fallback
-#                   for an UNTUNED one, which is a constant across the run:
-#                   `measured` starts at (32,2,4); `legacy` at (64,2,4), which
-#                   three profiles rank 5th-to-9th of 11. `legacy` is the
-#                   CONTROL ARM for that change. Separate OUT_DIR per arm.
-#   (No LSE_STRICT. It is unconditional now -- an L-reuse miss raises -- so the
-#   flag was parsed and then never read, which is worse than not having it.)
+#   (No COMPILE_EVICT / LSE_STRICT. Both are unconditional now -- the eviction
+#   is compiled-or-raise and an L-reuse miss raises -- so the flags were parsed
+#   and then never read, which is worse than not having them.)
 #
 # ------------------------------------------------------------------- examples
 #   # the shipped table (q=0.70, the two default batch sizes)
@@ -167,8 +149,6 @@ STAT="${STAT:-median}"
 COOLDOWN="${COOLDOWN:-0}"
 CLOCK_LOCK="${CLOCK_LOCK:-false}"
 THROUGHPUT="${THROUGHPUT:-both}"
-EVICT_CONTROL_ARM="${EVICT_CONTROL_ARM:-false}"
-FIT_LADDER="${FIT_LADDER:-measured}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -193,13 +173,9 @@ while [[ $# -gt 0 ]]; do
     --cooldown)             COOLDOWN="$2"; shift 2;;
     --clock-lock)           CLOCK_LOCK="$2"; shift 2;;
     --throughput)           THROUGHPUT="$2"; shift 2;;
-    --evict-control-arm|--compile-evict-off) EVICT_CONTROL_ARM="$2"; shift 2;;
-    --fit-ladder)           FIT_LADDER="$2"; shift 2;;
-    # The whole banner, found rather than hard-coded: a fixed end line silently
-    # truncated the help every time the header grew, and then did it again when
-    # EVICT_CONTROL_ARM was added past line 96. `2,/^# ===/p` stops at the
-    # banner's own closing rule, so it cannot go stale.
-    -h|--help)              sed -n '2,/^# =\{20,\}$/p' "$0"; exit 0;;
+    # 2..96 is the whole banner; a hard-coded end line silently truncated the
+    # help every time the header grew.
+    -h|--help)              sed -n '2,96p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
 done
@@ -218,8 +194,7 @@ fi
 # compiled would be worse than an error. The torch<=2.6 Inductor failures
 # (`((I)//ws)` guard, `aten.amin` StarDep) are fixed at the source in cache.py,
 # so a supported build compiles. If yours still cannot, the error names the op
-# and the fix; rerun with --evict-control-arm true for eager reference numbers
-# (recorded as path_mode=control-arm-eager, never as compiled).
+# and the fix; rerun with --compile-evict 0 for eager (launch-bound) numbers.
 
 # L-reuse (a PREFILL optimization) hands the softmax normaliser L from the flash
 # forward to the score kernel instead of recomputing it. DEFAULT IS STRICT: a
@@ -238,17 +213,6 @@ case "$BACKEND" in
   flash_attn) ATTN_IMPL="flash_attention_2";;
   eager)      ATTN_IMPL="eager";;
   *) echo "error: --backend must be flash_attn or eager, got '$BACKEND'." >&2; exit 2;;
-esac
-
-case "$FIT_LADDER" in
-  measured|legacy) export STICKYKV_FIT_LADDER="$FIT_LADDER";;
-  *) echo "error: --fit-ladder must be measured or legacy, got '$FIT_LADDER'." >&2; exit 2;;
-esac
-
-case "$EVICT_CONTROL_ARM" in
-  true|1|yes|on)   export STICKYKV_EVICT_CONTROL_ARM=1; ARM_LABEL="CONTROL ARM (eager eviction)";;
-  false|0|no|off)  export STICKYKV_EVICT_CONTROL_ARM=0; ARM_LABEL="compiled eviction (shipped)";;
-  *) echo "error: --evict-control-arm must be true or false, got '$EVICT_CONTROL_ARM'." >&2; exit 2;;
 esac
 
 mkdir -p "$OUT_DIR"
@@ -345,17 +309,9 @@ YAML
   echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE  stat: $STAT"
   echo "cooldown_s: $COOLDOWN  clock_locking: $CLOCK_LOCK"
   echo "throughput_columns: $THROUGHPUT"
-  echo "evict_control_arm: $EVICT_CONTROL_ARM  (STICKYKV_EVICT_CONTROL_ARM=$STICKYKV_EVICT_CONTROL_ARM)"
-  echo "fit_ladder: $FIT_LADDER  (STICKYKV_FIT_LADDER=$STICKYKV_FIT_LADDER)"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
-echo "=== eviction: $ARM_LABEL ==="
-if [[ "$STICKYKV_EVICT_CONTROL_ARM" == "1" ]]; then
-  echo "    These rows are the REFERENCE arm, not the shipped path. Compare"
-  echo "    against a run with --evict-control-arm false in a DIFFERENT OUT_DIR;"
-  echo "    the npz name carries only shape and batch, so one directory per arm."
-fi
 
 # Say it out loud when a flag moves this run off the pinned operating point.
 # `--gate-ratio 1.0` is the case that matters: it is a legitimate ablation, and

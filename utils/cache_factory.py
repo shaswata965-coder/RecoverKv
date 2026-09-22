@@ -12,7 +12,7 @@ Prompt 02.  Two functions:
 
 from __future__ import annotations
 
-from typing import Callable, Optional, Tuple, Type
+from typing import Any, Callable, Optional, Tuple, Type
 
 from utils.config import ConfigValidationError
 

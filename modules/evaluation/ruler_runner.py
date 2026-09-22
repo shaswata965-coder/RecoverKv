@@ -298,6 +298,7 @@ class RulerRunner:
 
         Returns ``(pred, memory_report_dict_or_None)``.
         """
+        cfg = self.config
         model = self.model
         tokenizer = self.tokenizer
 

@@ -1,4 +1,4 @@
-"""Unified logging.
+"""Unified logging with optional Weights & Biases integration.
 
 Usage:
     from utils.logger import get_logger
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Console handler setup
@@ -37,6 +38,58 @@ def _configure_root_logger() -> None:
     root.addHandler(console)
 
     _root_configured = True
+
+
+# ---------------------------------------------------------------------------
+# Weights & Biases wrapper (graceful fallback)
+# ---------------------------------------------------------------------------
+
+_wandb_available: Optional[bool] = None
+
+
+def _check_wandb() -> bool:
+    """Return True if wandb can be imported, caching the result."""
+    global _wandb_available
+    if _wandb_available is None:
+        try:
+            import wandb  # noqa: F401
+
+            _wandb_available = True
+        except ImportError:
+            _wandb_available = False
+    return _wandb_available
+
+
+def init_wandb(project: str, config: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+    """Initialize a wandb run if available; returns the run object or None.
+
+    Parameters
+    ----------
+    project : str
+        W&B project name.
+    config : dict, optional
+        Run configuration to log.
+    **kwargs
+        Forwarded to ``wandb.init``.
+    """
+    if not _check_wandb():
+        log = get_logger("utils.logger")
+        log.warning("wandb not installed — skipping W&B initialization")
+        return None
+
+    import wandb
+
+    return wandb.init(project=project, config=config, **kwargs)
+
+
+def log_wandb(data: dict[str, Any], step: Optional[int] = None) -> None:
+    """Log metrics to wandb if a run is active; no-op otherwise."""
+    if not _check_wandb():
+        return
+    import wandb
+
+    if wandb.run is not None:
+        wandb.log(data, step=step)
 
 
 # ---------------------------------------------------------------------------

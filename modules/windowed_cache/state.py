@@ -35,7 +35,7 @@ or :meth:`replace`, which own the buffers.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor

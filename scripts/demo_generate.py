@@ -103,7 +103,7 @@ def main() -> None:
     if prefill_len < MIN_PREFILL_TOKENS:
         print(f"\n✗ Prompt too short: {prefill_len} tokens, need ≥ {MIN_PREFILL_TOKENS}")
         print(f"  Budget constraint: floor({CACHE_BUDGET} × prefill) ≥ {NUM_SINK} + {LOCAL_WINDOW}")
-        print("  Extend the prompt or reduce local_window / num_sink / increase budget.")
+        print(f"  Extend the prompt or reduce local_window / num_sink / increase budget.")
         sys.exit(1)
     # ── 3. Build cache + hooks ────────────────────────────────────────
     print("[4/5] Building windowed cache …")
@@ -188,7 +188,7 @@ def main() -> None:
     # Cache stats
     cache_seq_len = cache.get_seq_length(0)
     full_seq_len  = prefill_len + total_tokens
-    print("\nStats:")
+    print(f"\nStats:")
     print(f"  Generated tokens  : {total_tokens}")
     print(f"  Time              : {elapsed:.2f}s  ({total_tokens / elapsed:.1f} tok/s)")
     print(f"  Full seq length   : {full_seq_len}")

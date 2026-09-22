@@ -57,6 +57,7 @@ exists to serve, and a silent degrade to it is worse than a hard failure. Decode
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch

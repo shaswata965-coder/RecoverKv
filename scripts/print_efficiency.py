@@ -108,6 +108,7 @@ def build_report(files: list[Path]) -> str:
         alloc = _col(data, "peak_memory_mb", n_cfg, n_run)
         reserved = _col(data, "peak_reserved_mb", n_cfg, n_run)
         steady = _col(data, "peak_decode_steady_mb", n_cfg, n_run)
+        p_step0 = _col(data, "peak_decode_step0_mb", n_cfg, n_run)
 
         # Where each row compacts. Only a decode_step0 method adds step 0 to its
         # prefill column; a press-style row already paid it inside TTFT, and a
