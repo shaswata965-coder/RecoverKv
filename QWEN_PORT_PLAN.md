@@ -1,5 +1,82 @@
 # Qwen port plan — bring `int2_qwen`'s logic and structure onto `int2_clustered_rep`
 
+## The LongBench-20% gap against `int2_qwen` (QEvict) — diagnosed and fixed
+
+The first full Qwen2.5 LongBench run at 20% (gated, q=0.70) fell short of the
+`int2_qwen` / QEvict column, worst on **triviaqa (82.40 vs 89.63)**, then trec
+(64.5 vs 67.0) and musique (22.14 vs 24.37). triviaqa is the tell: on Llama it
+barely noticed the cache halving (91.21 -> 91.09, ACCURACY_RECOVERY_PLAN §1),
+because its answers are memorised facts. A task that does not need the context
+losing 7 points means the int2 tier was *corrupting* attention, not merely
+missing context.
+
+**Cause — the one-byte grid (`8a8cdc0`) cannot hold Qwen2's biased keys.**
+Qwen2's `k_proj` has a bias, which puts a large, near-CONSTANT value on some key
+channels: pre-RoPE, such a channel's per-window range is ~0 and its zero-point
+(the window min) is the bias, hundreds. `int2_qwen` stored the zero per entry in
+the KV dtype, which holds a KV-dtype number exactly. The one-byte grid stores it
+as int8 x a scale shared by 32 channels, i.e. only to within `max|zero|/254`.
+That error is the SAME in every window (same bias, same code), so it is not
+noise: times the query's own massive value in that channel it shifts every int2
+logit against every fp logit by several nats, scaling the whole tier's attention
+mass (~88% of the retained windows at q=0.7) up or down by orders of magnitude.
+Measured on synthetic Qwen-like keys (`tests/test_key_anchor.py`): 6 bias
+channels of |40..240| per head in the low-frequency RoPE band, taken through
+the real demotion round trip (Qwen2 rotary, rope_theta 1e6, rotate + unrotate
+in the cache dtype), mean tier-wide logit shift over 5 seeds, in nats:
+
+| grid | bf16, q +20 | bf16, q +150 | fp16, q +20 | fp16, q +150 |
+|---|---|---|---|---|
+| one-byte (as shipped) | 0.95 | 7.1 | 1.18 | 8.8 |
+| per-entry (`int2_qwen`) | 0.035 | 0.24 | 0.017 | 0.12 |
+| **anchored (fix)** | **0.010** | **0.061** | **0.012** | **0.078** |
+
+("q +20" = the query's added magnitude in the bias channels.) Per-key noise is
+the same in every row; the one-byte grid adds a BIAS, not noise, which is why no
+aggregate error metric saw it. Llama-like keys (no bias): 0.02 either way —
+which is why the one-byte grid passed its own validation, and why nothing on
+the Llama column ever showed it.
+
+**Fix — the key zero-point is stored relative to a frozen anchor**
+(`quant_key_anchor`). `QuantizedStore` freezes a per-(row, head, channel)
+pre-RoPE key mean at the first demotion (the same idiom the gate card already
+uses for `mu`), the quantizer encodes `zero - anchor`, and every reader adds it
+back: `promote_many`, `effective_q_tier`, `gated_q_tier`, and the fused Triton
+kernel (`KEY_ANCHOR` constexpr, one [H_kv, D] load per program). A bias
+channel's residual is then exactly 0 and round-trips bit-exact; tier shift
+0.01 nat. **Zero bytes per window** — the budget, N_q and every compression
+ratio are unchanged. **Auto-on only where `k_proj` has a bias**
+(`key_projection_has_bias`: Qwen2 yes; Llama-3.1 `attention_bias=False`, Mistral
+no), so the Llama/Mistral columns are byte-identical; the un-anchored kernel
+compiles exactly as before. The sidecar records it
+(`resolved_geometry_first_example.quant_key_anchor`).
+
+**Two smaller bf16 defects, fixed alongside** (both no-ops on fp16):
+- The slot table stored every grid group scale as fp16 regardless of the grid
+  dtype, and `write` casts to the buffer: a bf16 cache's grid was fit to a bf16
+  scale and read back from an fp16 copy, so the Stage-5 "grid follows the KV
+  dtype" fix held inside the quantizer and was undone at storage. The table now
+  allocates `grid_dtype_for(kv_dtype)`.
+- Window scores accumulated in the KV dtype: in bf16 ~76% of per-step
+  contributions vanish (`int2_qwen` `446a7eb`, which QEvict had). Scores are now
+  produced — hence accumulated — in fp32 on a bf16 cache
+  (`hooks.score_accum_dtype`); fp16 keeps fp16, byte for byte (widening it is
+  still the Stage-6 item and moves Llama/Mistral).
+
+**Not changed, flagged:** `longbench_qwen_ours_flash_attn_yarn128k.yaml` sets
+`max_position_embeddings: 131072`. On the pinned transformers 4.47.1,
+`_compute_yarn_parameters` takes the YaRN correction range from
+`max_position_embeddings`, so this is NOT Qwen's YaRN (which uses the original
+32768, what Qwen's own config.json keeps): 23 of 64 RoPE frequency pairs differ
+by >1%, up to 2.2x at pair 40. `int2_qwen`'s config carries the identical
+override, so it does not explain the gap above and changing it would move the
+column off the protocol QEvict was measured at; fix it for both together.
+
+Status: **CPU-validated** (mechanism, fix, store/cache/kernel plumbing, and all
+32 decode-kernel specializations compile for sm80 via `test_kernel_compiles.py`);
+the Qwen2.5 LongBench number needs a GPU run. Quality rows for Qwen2.5 do not
+compare across this commit.
+
 ## Execution status (as-built on `int2_clustered_qwen`)
 
 Implemented and CPU-validated (torch + transformers 4.47.1) — `test_qwen_port.py`

@@ -118,6 +118,7 @@ class QuantSlotTable:
         num_kv_heads: int,
         device: torch.device,
         sketch: bool = False,
+        grid_dtype: torch.dtype = torch.float16,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -127,19 +128,28 @@ class QuantSlotTable:
         self.num_kv_heads = H
 
         self.key_codes = torch.zeros((B, N, H, D, S // 4), dtype=torch.uint8, device=device)
-        # The grid is one byte per entry against an fp16 scale shared by
+        # The grid is one byte per entry against a 2-byte scale shared by
         # `grid_group` of them (QGrid). uint8 for `scale` (non-negative, and a
         # zero would divide by zero at fit time), int8 for `zero` (an offset).
+        #
+        # The shared scale is STORED in `grid_dtype`, which must be the dtype the
+        # quantizer fit the codes against -- `grid_dtype_for(kv_dtype)`: fp16 for
+        # an fp16 cache (this table, byte for byte, as it always was), bf16 for a
+        # bf16 one (Qwen2.5). These were hard-coded fp16, and `write` casts to the
+        # buffer's dtype, so a bf16 cache's grid was fit to a bf16 scale and read
+        # back from an fp16 copy of it -- the "fit grid == read grid" invariant
+        # and the overflow guard `grid_dtype_for` exists for, both undone at
+        # storage.
         gk, gv = D // grid_group(D), S // grid_group(S)
         self.key_scale_q = torch.zeros((B, N, H, D), dtype=torch.uint8, device=device)
-        self.key_scale_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
+        self.key_scale_s = torch.zeros((B, N, H, gk), dtype=grid_dtype, device=device)
         self.key_zero_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
-        self.key_zero_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
+        self.key_zero_s = torch.zeros((B, N, H, gk), dtype=grid_dtype, device=device)
         self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
         self.val_scale_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
-        self.val_scale_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
+        self.val_scale_s = torch.zeros((B, N, H, gv), dtype=grid_dtype, device=device)
         self.val_zero_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
-        self.val_zero_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
+        self.val_zero_s = torch.zeros((B, N, H, gv), dtype=grid_dtype, device=device)
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)

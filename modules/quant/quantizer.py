@@ -45,7 +45,7 @@ v1) — shapes carry no batch axis. Keys/values come in token-major
 
 from __future__ import annotations
 
-from typing import NamedTuple, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -311,12 +311,50 @@ def _quantize_grid(
 # ---------------------------------------------------------------------------
 
 
+def _zero_grid(zero: "QGrid", offset: Optional[Tensor]) -> Tensor:
+    """The fp32 zero-point a reader sees: the decoded grid, plus its anchor.
+
+    ``offset`` is ``None`` for an un-anchored grid, which returns exactly
+    ``zero.decode()`` -- no addition, so that path is bit-identical to before
+    anchors existed. Otherwise it is the fp32 per-(head, channel) anchor the
+    zero was stored RELATIVE to (see :func:`_affine_quantize`), broadcast
+    against the grid, and the fit and every later read add it the same way.
+    """
+    z = zero.decode()
+    if offset is None:
+        return z
+    return z + offset.to(torch.float32)
+
+
 @_compile_disable
-def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid"]:
+def _affine_quantize(
+    x: Tensor, group_dim: int, zero_offset: Optional[Tensor] = None
+) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Affine asymmetric int2 quantize ``x`` grouped along ``group_dim``.
 
     The quant group is the slice along ``group_dim``: mx/mn are reduced over
     that axis so every group shares one ``(scale, zero)``.
+
+    ``zero_offset`` stores the zero-point **relative to an anchor** instead of
+    absolutely: the grid encodes ``zero - zero_offset`` and every reader adds
+    ``zero_offset`` back (:func:`_zero_grid`). It must broadcast against the
+    grid shape (``x`` with ``group_dim`` squeezed). ``None`` is the historic
+    absolute encoding, bit for bit.
+
+    Why an anchor exists at all. The one-byte grid stores a zero as an int8
+    code times a scale shared by ``GRID_GROUP`` channels, i.e. to within
+    ``max|zero| / 254`` of the group. That is harmless while every channel's
+    zero is of the same order as its own int2 step -- Llama and Mistral keys.
+    Qwen2.5 has a ``k_proj`` **bias**, which gives some key channels a large,
+    near-CONSTANT value: a zero of hundreds on a channel whose window range is
+    ~0. The per-entry grid reproduced such a channel exactly (the window min is
+    already a KV-dtype number); the shared-scale grid cannot, and the error it
+    leaves is the SAME in every window (the same bias, the same code), so it is
+    not noise but a tier-wide offset -- multiplied by the query's own massive
+    value in that channel, it shifts every int2 logit against every fp logit by
+    several nats (``tests/test_key_anchor.py`` measures it). Anchoring moves
+    the common mode out of the grid: a bias channel's residual is exactly 0,
+    and the shared scale is set by genuine per-window deviation instead.
 
     Returns
     -------
@@ -325,7 +363,8 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid
         element).
     scale, zero : :class:`QGrid`
         Shape of ``x`` with ``group_dim`` reduced **away** (squeezed, so the
-        grid axis is last and :class:`QGrid`'s sharing applies to it).
+        grid axis is last and :class:`QGrid`'s sharing applies to it). With a
+        ``zero_offset``, ``zero`` holds the residual.
     """
     # The group scale is stored in a dtype that follows the KV dtype, so a
     # bf16 cache (Qwen2.5) cannot overflow the fp16 grid the way it silently did.
@@ -351,9 +390,12 @@ def _affine_quantize(x: Tensor, group_dim: int) -> Tuple[Tensor, "QGrid", "QGrid
     # `group_dim` leaves: keys reduce over tokens and share over channels,
     # values reduce over channels and share over tokens.
     scale_g = _quantize_grid(scale.squeeze(group_dim), signed=False, grid_dtype=grid_dtype)
-    zero_g = _quantize_grid(zero.squeeze(group_dim), signed=True, grid_dtype=grid_dtype)
+    zero_sq = zero.squeeze(group_dim)
+    if zero_offset is not None:
+        zero_sq = zero_sq - zero_offset.to(torch.float32)
+    zero_g = _quantize_grid(zero_sq, signed=True, grid_dtype=grid_dtype)
     scale_grid = scale_g.decode().unsqueeze(group_dim)
-    zero_grid = zero_g.decode().unsqueeze(group_dim)
+    zero_grid = _zero_grid(zero_g, zero_offset).unsqueeze(group_dim)
 
     # In place, deliberately. The out-of-place form
     #     q = torch.round((x32 - zero_grid) / scale_grid)
@@ -440,7 +482,9 @@ def unpack_crumbs_last(packed: Tensor, n: int) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
+def quantize_key_window(
+    k_win: Tensor, anchor: Optional[Tensor] = None
+) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Quantize one window's keys.
 
     Parameters
@@ -448,6 +492,11 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     k_win : Tensor
         Shape ``[H_kv, window, D]`` (token-major, pre-RoPE keys for one window).
         ``window`` must be a multiple of 4.
+    anchor : Tensor, optional
+        ``[H_kv, D]`` fp32 per-(head, channel) key anchor. The zero grid then
+        stores ``zero - anchor`` (see :func:`_affine_quantize`), and the same
+        anchor must be handed to :func:`dequantize_key_window`. ``None`` is the
+        absolute encoding, unchanged.
 
     Returns
     -------
@@ -466,7 +515,7 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
         )
 
     # Quant group = token axis (dim 1) ⇒ scale/zero per (head, channel).
-    codes, scale, zero = _affine_quantize(k_win, group_dim=1)
+    codes, scale, zero = _affine_quantize(k_win, group_dim=1, zero_offset=anchor)
 
     # Channel-major, then pack along the token axis (now last).
     codes_cm = codes.transpose(1, 2).contiguous()  # [H_kv, D, window]
@@ -474,8 +523,13 @@ def quantize_key_window(k_win: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
     return packed, scale, zero
 
 
-def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
+def quantize_key_windows(
+    k_wins: Tensor, anchor: Optional[Tensor] = None
+) -> Tuple[Tensor, "QGrid", "QGrid"]:
     """Batched :func:`quantize_key_window` over a leading window axis.
+
+    ``anchor`` is ``[N, H_kv, D]`` (one per window, typically its row's frozen
+    anchor repeated) or ``[H_kv, D]``; ``None`` keeps the absolute zero.
 
     Bit-identical to calling the singular form per window: the quant group is
     still the token axis, and every op below is either elementwise or a
@@ -505,7 +559,7 @@ def quantize_key_windows(k_wins: Tensor) -> Tuple[Tensor, "QGrid", "QGrid"]:
         )
 
     # Quant group = token axis (dim 2 with the batch axis) ⇒ grid per (N, head, channel).
-    codes, scale, zero = _affine_quantize(k_wins, group_dim=2)
+    codes, scale, zero = _affine_quantize(k_wins, group_dim=2, zero_offset=anchor)
 
     codes_cm = codes.transpose(2, 3).contiguous()  # [N, H_kv, D, window]
     packed = pack_crumbs_last(codes_cm)            # [N, H_kv, D, window // 4]
@@ -551,16 +605,19 @@ def dequantize_key_window(
     zero: "QGrid",
     window: int,
     out_dtype: torch.dtype = torch.float16,
+    anchor: Optional[Tensor] = None,
 ) -> Tensor:
     """Inverse of :func:`quantize_key_window`.
 
     Returns token-major ``[H_kv, window, D]`` in ``out_dtype`` — the same
     layout the fp store uses, ready for RoPE at the window's positions.
+    ``anchor`` must be the one the window was quantized against (or ``None``).
     """
     codes_cm = unpack_crumbs_last(packed, window)           # [H_kv, D, window]
     codes = codes_cm.transpose(1, 2).contiguous()           # [H_kv, window, D]
     return _affine_dequantize(
-        codes, scale.decode().unsqueeze(1), zero.decode().unsqueeze(1), out_dtype
+        codes, scale.decode().unsqueeze(1),
+        _zero_grid(zero, anchor).unsqueeze(1), out_dtype,
     )
 
 
@@ -570,6 +627,7 @@ def dequantize_key_windows(
     zero: "QGrid",
     window: int,
     out_dtype: torch.dtype = torch.float16,
+    anchor: Optional[Tensor] = None,
 ) -> Tensor:
     """Batched :func:`dequantize_key_window` over a leading window axis.
 
@@ -583,6 +641,8 @@ def dequantize_key_windows(
     packed : uint8 ``[N, H_kv, D, window // 4]`` — channel-major, 4 tokens/byte.
     scale, zero : :class:`QGrid` — one grid entry per ``(window, head, channel)``.
     window : int — original (unpacked) token count.
+    anchor : ``[N, H_kv, D]`` or ``[H_kv, D]`` fp32, the anchor the windows were
+        quantized against; ``None`` for the absolute encoding.
 
     Returns
     -------
@@ -591,7 +651,8 @@ def dequantize_key_windows(
     codes_cm = unpack_crumbs_last(packed, window)           # [N, H_kv, D, window]
     codes = codes_cm.transpose(2, 3).contiguous()           # [N, H_kv, window, D]
     return _affine_dequantize(
-        codes, scale.decode().unsqueeze(2), zero.decode().unsqueeze(2), out_dtype
+        codes, scale.decode().unsqueeze(2),
+        _zero_grid(zero, anchor).unsqueeze(2), out_dtype,
     )
 
 

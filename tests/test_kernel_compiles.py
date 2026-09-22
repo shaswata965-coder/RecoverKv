@@ -56,7 +56,7 @@ _DECODE_PTRS = {
     **{n: "*i8" for n in ("KZ", "VZ", "VM")},
     "SEL": "*i32",
     "WSUM": "*fp32", "WMAX": "*fp32", "LOGM": "*fp32", "scale": "fp32",
-    "VANC": "*fp32",
+    "VANC": "*fp32", "KANC": "*fp32",
 }
 
 _GATE_PTRS = {
@@ -87,22 +87,26 @@ def test_the_harness_reports_a_compile_error_rather_than_swallowing_it():
         _compile(_broken, {"X": "*fp32"}, {"N": 16})
 
 
+@pytest.mark.parametrize("key_anchor", [False, True])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("ws", WINDOW_SIZES)
-def test_the_fused_decode_kernel_compiles(gated, ws):
-    """Both GATED specializations, at every window size ``window_tiling`` allows.
+def test_the_fused_decode_kernel_compiles(gated, ws, key_anchor):
+    """Every GATED x KEY_ANCHOR specialization, at every window size
+    ``window_tiling`` allows.
 
-    ``GATED`` is a constexpr, so these are genuinely two different kernels: the
-    gated one carries the ``SEL`` dereference and the skipped-column prologue, the
-    ungated one folds both away. Compiling only one would leave the other's
-    front end unchecked.
+    Both are constexprs, so these are genuinely different kernels: the gated one
+    carries the ``SEL`` dereference and the skipped-column prologue, the ungated
+    one folds both away; the anchored one (Qwen2's biased keys) loads the key
+    anchor and adds it to the decoded zero, the un-anchored one (Llama, Mistral)
+    compiles exactly the kernel it always did. Compiling only some would leave
+    the others' front end unchecked.
     """
     block_nw, block_t = window_tiling(ws)
     _compile(dk._two_tier_decode_kernel, _DECODE_PTRS, dict(
         HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=4, BLOCK_NW=block_nw,
         BLOCK_T=block_t, BLOCK_W=16, PACK_K=max(ws // 4, 1), PACK_V=32,
         GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
-        GATED=gated))
+        GATED=gated, KEY_ANCHOR=key_anchor))
 
 
 @pytest.mark.parametrize("ws", WINDOW_SIZES)
@@ -144,3 +148,25 @@ def test_padding_lanes_cannot_reach_the_gate_kernels_reductions(ws):
     if block_ws != ws:
         assert not torch.allclose(zeroed.logsumexp(-1), x[:, :ws].logsumexp(-1)), (
             "this test cannot distinguish the two treatments; fixture is wrong")
+
+
+def test_the_qwen25_production_specialization_compiles():
+    """The kernel Qwen2.5 actually launches, which no case above is.
+
+    bf16 everywhere a Qwen2.5 cache is bf16 -- q/k/v, the RoPE tables, the output
+    and, since the slot table stores group scales in ``grid_dtype_for(kv)``, the
+    grid scales too (they were fp16 whatever the cache). ``BLOCK_R`` is what the
+    dispatcher picks for rep = 28 / 4 = 7, gated as shipped, and ``KEY_ANCHOR``
+    on, because Qwen2's ``k_proj`` has a bias. ``*bf16`` grid pointers are the
+    part the fp16 harness above never type-checks.
+    """
+    ptrs = dict(_DECODE_PTRS)
+    ptrs.update({n: "*bf16" for n in ("Q", "KFP", "VFP", "COS", "SIN", "OUT",
+                                      "KSS", "KZS", "VSS", "VZS")})
+    ws = 8
+    block_nw, block_t = window_tiling(ws)
+    _compile(dk._two_tier_decode_kernel, ptrs, dict(
+        HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=dk._pow2_at_least(7),
+        BLOCK_NW=block_nw, BLOCK_T=block_t, BLOCK_W=16, PACK_K=ws // 4,
+        PACK_V=32, GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
+        GATED=True, KEY_ANCHOR=True))

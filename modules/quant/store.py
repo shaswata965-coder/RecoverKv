@@ -62,6 +62,13 @@ class QuantizedStore:
     memoize_read : bool
         Cache :meth:`effective_q_tier`'s dequantized + RoPE'd result between
         evictions. See that method for the memory/bandwidth trade.
+    key_anchor : bool
+        Store every key window's zero-point RELATIVE to a frozen per-(row,
+        head, channel) pre-RoPE anchor (:attr:`_k_anchor`) instead of
+        absolutely. Required wherever the key projection has a bias (Qwen2):
+        see :func:`modules.quant.quantizer._affine_quantize` for why the
+        one-byte grid cannot hold a bias channel's zero otherwise. Off, every
+        path below is bit-identical to the un-anchored store.
     """
 
     def __init__(
@@ -72,12 +79,22 @@ class QuantizedStore:
         n_slots: int,
         memoize_read: bool = True,
         sketch_enabled: bool = False,
+        key_anchor: bool = False,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
         self.memoize_read = memoize_read
+
+        # [B, H_kv, D] fp32 pre-RoPE key common mode that the key zero grid is
+        # stored relative to. FROZEN at the first demotion batch, like the card
+        # anchor and for a stronger reason: the codes themselves are fit to
+        # `anchor + residual`, so changing it would silently shift every key
+        # window already in the tier. Not budgeted per window: it is one
+        # [H_kv, D] vector per (layer, row), like `_anchor`.
+        self.key_anchor = key_anchor
+        self._k_anchor: Optional[Tensor] = None
 
         # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
         # off nothing is allocated and every path below is the pre-gate one.
@@ -112,8 +129,20 @@ class QuantizedStore:
 
     # -- lifecycle -----------------------------------------------------------
 
-    def ensure(self, batch_size: int, device: torch.device) -> QuantSlotTable:
-        """Allocate the slot table on first use; return it."""
+    def ensure(
+        self,
+        batch_size: int,
+        device: torch.device,
+        grid_dtype: torch.dtype = torch.float16,
+    ) -> QuantSlotTable:
+        """Allocate the slot table on first use; return it.
+
+        ``grid_dtype`` is the dtype the grid's shared group scales are STORED
+        in, and must be :func:`~modules.quant.quantizer.grid_dtype_for` of the
+        KV dtype -- the dtype the quantizer fit the codes against. fp16 (the
+        default, and what an fp16 cache passes) is the historic table, byte for
+        byte.
+        """
         if self.table is None:
             self.table = QuantSlotTable(
                 batch_size=batch_size,
@@ -123,6 +152,7 @@ class QuantizedStore:
                 num_kv_heads=self.num_kv_heads,
                 device=device,
                 sketch=self.sketch_enabled,
+                grid_dtype=grid_dtype,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -176,12 +206,27 @@ class QuantizedStore:
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
+            key_anchor=ref.key_anchor,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
         if ref.sketch_enabled and all(s._anchor is not None for s in stores):
             joint._anchor = torch.cat([s._anchor for s in stores], dim=0)
             joint._v_anchor = torch.cat([s._v_anchor for s in stores], dim=0)
+        # The key anchor is all-or-nothing. A layer whose codes were fit against
+        # an anchor cannot be joined to one without: the joint store would then
+        # either drop the anchor (decoding those codes wrong) or invent one at
+        # the next demotion (decoding the old ones wrong). Every layer demotes on
+        # the same step, so a mix means the layers were not in lockstep.
+        has_k = [s._k_anchor is not None for s in stores]
+        if any(has_k) and not all(has_k):
+            raise RuntimeError(
+                "join_layers: some layers carry a key anchor and some do not; "
+                "the first demotion runs on every layer at once, so this means "
+                "the per-layer evictions diverged"
+            )
+        if all(has_k):
+            joint._k_anchor = torch.cat([s._k_anchor for s in stores], dim=0)
         if ref.table is not None:
             joint.table = QuantSlotTable.join_layers([s.table for s in stores])
         joint._n_active = ref._n_active
@@ -239,6 +284,50 @@ class QuantizedStore:
         self._invalidate()
         self.table.set_active(slot_idx, valid, True)
 
+    # -- key anchor ----------------------------------------------------------
+
+    def key_anchor_rows(self) -> Optional[Tensor]:
+        """``[B, H_kv, D]`` fp32 key anchor, or ``None`` for an un-anchored store.
+
+        Raises on an anchored store that has not demoted yet: there is nothing
+        to decode in that state, so a caller asking is reading a tier that does
+        not exist, and handing it a zero anchor would decode wrong silently.
+        """
+        if not self.key_anchor:
+            return None
+        if self._k_anchor is None:
+            raise RuntimeError(
+                "this Q store anchors its key zero-points but has not demoted a "
+                "window yet, so it has no anchor to decode against"
+            )
+        return self._k_anchor
+
+    def _lane_key_anchor(self, n: int) -> Optional[Tensor]:
+        """The key anchor per gathered window, ``[B*n, H_kv, D]`` (row-major,
+        matching :meth:`QuantSlotTable.gather`'s flattening), or ``None``."""
+        a = self.key_anchor_rows()
+        return None if a is None else a.repeat_interleave(n, dim=0)
+
+    @staticmethod
+    def _freeze_key_anchor(keys_pre_rope: Tensor, valid: Tensor) -> Tensor:
+        """Per-(row, head, channel) mean of the VALID, finite keys -> ``[B, H, D]``.
+
+        Over ``(window, token)``. Invalid lanes ride the demote batch with
+        whatever the gather put there and must not steer an encoding every later
+        window inherits, and one non-finite key must not turn the whole row's
+        anchor into NaN. A row with nothing valid gets 0 -- which is exactly the
+        absolute encoding, so it degrades to the historic grid, not to garbage.
+        A constant channel's mean is its constant exactly (``n*b`` is exact in
+        fp32 for fp16/bf16 inputs at these counts), which is what makes its
+        residual zero exactly 0.
+        """
+        x = keys_pre_rope.to(torch.float32)                      # [B, n, H, S, D]
+        keep = torch.isfinite(x) & valid[:, :, None, None, None]
+        x = torch.where(keep, x, torch.zeros_like(x))
+        num = x.sum(dim=(1, 3))
+        den = keep.sum(dim=(1, 3)).clamp_min(1).to(torch.float32)
+        return num / den
+
     # -- demotion ------------------------------------------------------------
 
     def demote_many(
@@ -288,7 +377,15 @@ class QuantizedStore:
         # singular op applied slice-wise — bit-identical, one launch per tier.
         k_flat = keys_pre_rope.reshape(B * n, H, S, D)
         v_flat = values.reshape(B * n, H, S, D)
-        k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
+        k_anc = None
+        if self.key_anchor:
+            if self._k_anchor is None:
+                # Frozen here, from the first batch of demoted windows, before a
+                # single code is fit against it. See `_k_anchor`.
+                self._k_anchor = self._freeze_key_anchor(
+                    keys_pre_rope.reshape(B, n, H, S, D), valid)
+            k_anc = self._k_anchor.repeat_interleave(n, dim=0)     # [B*n, H, D]
+        k_codes, k_scale, k_zero = quantize_key_windows(k_flat, anchor=k_anc)
         v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
 
         sketch = None
@@ -352,7 +449,8 @@ class QuantizedStore:
 
         k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(slot_idx)
         keys = dequantize_key_windows(
-            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
+            k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype,
+            anchor=self._lane_key_anchor(n),
         )
         values = dequantize_value_windows(
             v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
@@ -511,10 +609,16 @@ class QuantizedStore:
         # only a reshape. cos/sin then come from this row's own positions.
         BH = B * H
         pos_flat = pos.reshape(BH, n_sel * S)
+        k_anc = self.key_anchor_rows()                                  # [B,H,D]
+        if k_anc is not None:
+            # Same fold as the codes: (row, head, selected window) -> one axis.
+            k_anc = k_anc[:, :, None, :].expand(B, H, n_sel, D).reshape(
+                BH * n_sel, 1, D)
         keys = dequant_rotate_q_keys(
             k_codes.reshape(BH * n_sel, 1, D, S // 4),
             k_scale.reshape(BH * n_sel, 1, D), k_zero.reshape(BH * n_sel, 1, D),
             S, pos_flat, rope_module, out_dtype, BH, n_sel, 1, D,
+            anchor=k_anc,
         ).reshape(B, H, n_sel * S, D)
 
         values = dequantize_value_windows(
@@ -582,6 +686,7 @@ class QuantizedStore:
         keys = dequant_rotate_q_keys(
             k_codes, k_scale, k_zero, self.window_size, pos_flat,
             rope_module, out_dtype, B, n, H, D,
+            anchor=self._lane_key_anchor(n),
         )
 
         # Values carry no RoPE (asymmetric store) — just dequant, then

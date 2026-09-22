@@ -577,6 +577,7 @@ if _HAS_TRITON:
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
         VM, VMS, VANC,             # value centroids: int4-packed u8 [B,n,H_kv,D//2], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
+        KANC,                      # key anchor the zero grid is relative to: fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -589,6 +590,7 @@ if _HAS_TRITON:
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
         GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
+        KEY_ANCHOR: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -767,6 +769,17 @@ if _HAS_TRITON:
         vshift = (4 * (offs_d % 2)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
+        # KEY_ANCHOR: the key zero grid is stored RELATIVE to a frozen
+        # per-(row, KV head, channel) anchor (Qwen2's k_proj bias puts large
+        # near-constant values on some channels, which the one-byte grid cannot
+        # hold absolutely -- modules.quant.quantizer._affine_quantize). It is
+        # added back to the decoded zero exactly where the host adds it
+        # (`_zero_grid`: decode, then + anchor, then codes * scale + zero). Same
+        # [B, H_kv, D] layout as VANC, so the same derived strides. A constexpr:
+        # an un-anchored store (Llama, Mistral) compiles this away entirely.
+        if KEY_ANCHOR:
+            ka_lo = tl.load(KANC + b * vab + kv * vah + offs_hl).to(tl.float32)
+            ka_hi = tl.load(KANC + b * vab + kv * vah + HALF + offs_hl).to(tl.float32)
         # A statement, not a ternary: `if` on a constexpr is the form Triton's
         # frontend is guaranteed to fold, and only the taken branch is traced.
         if GATED:
@@ -814,6 +827,9 @@ if _HAS_TRITON:
                              mask=qmask[None, :], other=0).to(tl.float32)
                      * tl.load(zptr + kg_hi,
                                mask=qmask[None, :], other=0.0).to(tl.float32))
+            if KEY_ANCHOR:
+                kz_lo = kz_lo + ka_lo[:, None]
+                kz_hi = kz_hi + ka_hi[:, None]
             kb_lo = tl.load(KC + b * kcb + widx[None, :] * kcn + kv * kch
                             + offs_hl[:, None] * PACK_K + byte_t[None, :],
                             mask=qmask[None, :], other=0)
@@ -1526,6 +1542,24 @@ def _decode_triton(
                 f"§5.2). Got shape {tuple(t.shape)} strides {tuple(t.stride())}."
             )
 
+    # The key anchor the zero grid is relative to (see the kernel's KEY_ANCHOR
+    # block). Checked rather than trusted: a wrong-shape anchor would add the
+    # wrong channel's offset to every int2 key, which no downstream check sees.
+    k_anchor = qtier.get("k_anchor") if qtier is not None else None
+    key_anchored = k_anchor is not None
+    if key_anchored:
+        if tuple(k_anchor.shape) != (B, H_kv, D) or k_anchor.dtype != torch.float32:
+            raise RuntimeError(
+                f"the key anchor must be fp32 [B, H_kv, D] = [{B}, {H_kv}, {D}]; "
+                f"got {tuple(k_anchor.shape)} {k_anchor.dtype}.")
+        if not k_anchor.is_contiguous():
+            raise RuntimeError(
+                "fused decode requires a contiguous key anchor; its strides are "
+                "derived from its shape inside the kernel.")
+        KANC = k_anchor
+    else:
+        KANC = torch.zeros((1,), dtype=torch.float32, device=dev)
+
     n_sel = check_gate_selection(sel, B, H_kv, n_active)
     gated = n_sel > 0
     if gated:
@@ -1630,9 +1664,11 @@ def _decode_triton(
     # `B * H_kv` and the serial chain is `Sfp` and `n_sel` long. `Sfp` and `n_sel`
     # are bucketed by bit length so the fp store's one-token-per-step growth
     # between evictions does not re-trigger the search every step; `B` is exact
-    # because it moves the grid.
+    # because it moves the grid. `key_anchored` joins for the same reason as
+    # `gated`: KEY_ANCHOR is a constexpr, hence a separate compile.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
-           int(B), int(Sfp).bit_length(), int(n_sel).bit_length())
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(),
+           bool(key_anchored))
 
     def _launch(rung):
         target_keys, num_stages, num_warps = rung
@@ -1642,6 +1678,7 @@ def _decode_triton(
             q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
             COS, SIN, SEL, LOGM,
             VM, VMS, VANC,
+            KANC,
             out, wsum, wmax,
             scaling,
             H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -1655,6 +1692,7 @@ def _decode_triton(
             PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
             GROUP_K=gk, GROUP_V=gv,
             GATED=gated, LOG2E=_LOG2E,
+            KEY_ANCHOR=key_anchored,
             num_stages=num_stages, num_warps=num_warps,
         )
 

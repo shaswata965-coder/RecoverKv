@@ -194,6 +194,7 @@ def _dequant_rotate_flat(
     H: int,
     D: int,
     apply_rotary,
+    anchor: Optional[Tensor] = None,
 ) -> Tensor:
     """Dequantize ``B*n`` key windows and RoPE them, as one elementwise chain.
 
@@ -203,9 +204,13 @@ def _dequant_rotate_flat(
     so it is bit-identical whether run eager or under ``torch.compile``. ``cos``/
     ``sin`` are passed in (position-only, value-independent) so the compiled
     region is pure tensor math with no module call to trace through.
+
+    ``anchor`` (``[B*n, H, D]`` fp32, or ``None``) is the key anchor the windows'
+    zero-points are stored relative to; see
+    :func:`modules.quant.quantizer._affine_quantize`.
     """
     keys_pre = dequantize_key_windows(
-        k_codes, k_scale, k_zero, window, out_dtype=out_dtype
+        k_codes, k_scale, k_zero, window, out_dtype=out_dtype, anchor=anchor,
     )                                                        # [B*n, H, window, D]
     k_flat = (
         keys_pre.reshape(B, n, H, window, D)
@@ -228,6 +233,7 @@ def dequant_rotate_q_keys(
     n: int,
     H: int,
     D: int,
+    anchor: Optional[Tensor] = None,
 ) -> Tensor:
     """Read-path Q-tier keys: dequantize + RoPE, fused.
 
@@ -235,14 +241,15 @@ def dequant_rotate_q_keys(
     the store. ``cos``/``sin`` depend only on the positions
     and the ``out_dtype``/device (not the key values), so we build them from a
     tiny reference tensor — bit-identical to computing them from the dequantized
-    keys as the eager path did.
+    keys as the eager path did. ``anchor`` is the store's per-window key anchor
+    (``[B*n, H, D]``) or ``None`` for an un-anchored store.
     """
     ref = torch.empty(1, 1, 1, dtype=out_dtype, device=pos_flat.device)
     cos, sin = _rope_cos_sin(rope_module, ref, pos_flat)
     apply_rotary = _apply_rotary()
     return _dequant_rotate_flat(
         k_codes, k_scale, k_zero, window, cos, sin,
-        out_dtype, B, n, H, D, apply_rotary,
+        out_dtype, B, n, H, D, apply_rotary, anchor=anchor,
     )
 
 

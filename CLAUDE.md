@@ -221,5 +221,12 @@ one per-window block is the real fix and needs a GPU to verify.
   in the quality YAMLs does not mean the kernel is unreached.
 * **Quality rows do not compare across `ac128e8` or `8a8cdc0`.** Both moved the
   stored format and the price of a window.
+* **A model whose `k_proj` has a bias (Qwen2) needs `quant_key_anchor`.** The
+  one-byte grid stores a key zero only to `max|zero|/254` of its 32-channel
+  group, and a bias makes some channels large and constant: the error is the
+  same in every window, so it shifts the whole int2 tier's logits by nats. It is
+  auto-on from the model config (`key_projection_has_bias`) and off on
+  Llama/Mistral; `QWEN_PORT_PLAN.md` has the measurement. Qwen2.5 quality rows do
+  not compare across the commit that added it.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

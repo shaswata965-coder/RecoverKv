@@ -21,6 +21,28 @@ from .policy import FIRST_EVICTION_STEP
 #: 'bytes' this is enforced rather than reported.
 MIN_BUDGET_UTILISATION = 0.99
 
+#: Model families whose attention projections carry a bias but whose config has
+#: no ``attention_bias`` flag to say so: Qwen2 and its descendants hard-code
+#: ``bias=True`` on ``q_proj``/``k_proj``/``v_proj``. A config that DOES declare
+#: ``attention_bias`` (Llama, Qwen3, ...) is believed instead of this list.
+_KEY_BIAS_MODEL_TYPES = frozenset({"qwen2", "qwen2_moe", "qwen2_vl", "qwen2_5_vl"})
+
+
+def key_projection_has_bias(model_config: Any) -> bool:
+    """Whether this model's ``k_proj`` adds a bias -- the Q-tier key-anchor test.
+
+    A key bias puts a large, token-independent value on some key channels, and
+    that is exactly what the one-byte int2 grid cannot store (see
+    ``modules.quant.quantizer._affine_quantize``). An explicit boolean
+    ``attention_bias`` on the config decides; otherwise the model type does.
+    False for Llama-3.1 (``attention_bias=False``) and Mistral (no flag, no
+    bias), True for Qwen2.5.
+    """
+    explicit = getattr(model_config, "attention_bias", None)
+    if isinstance(explicit, bool):
+        return explicit
+    return getattr(model_config, "model_type", None) in _KEY_BIAS_MODEL_TYPES
+
 
 # ---------------------------------------------------------------------------
 # ResolvedConfig (frozen, output of resolve())
@@ -81,6 +103,11 @@ class ResolvedConfig:
     quant_gate_ratio: float = 0.25
     quant_gate_margin: float = float("inf")
     quant_gate_max_windows: Optional[int] = None
+    # Store int2 key zero-points relative to a frozen per-(row, head, channel)
+    # anchor. RESOLVED: `resolve()` has already turned the tri-state knob into a
+    # bool (auto = the model's k_proj has a bias, and there is a Q tier). Costs
+    # no bytes per window, so it does not enter the budget arithmetic.
+    quant_key_anchor: bool = False
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -298,6 +325,19 @@ class WindowedCacheConfig:
     # and leaves short answers measured at full cache (see FIRST_EVICTION_STEP
     # and EvictionPolicy.should_evict).
     first_eviction_step: int = FIRST_EVICTION_STEP
+    # -- int2 key zero-point anchor (modules/quant/quantizer._affine_quantize) --
+    # None (default) = auto: ON iff the model's key projection carries a bias
+    # (`key_projection_has_bias` -- Qwen2.5 yes, Llama-3.1/Mistral no), so the
+    # Llama and Mistral columns stay byte-identical. An explicit bool overrides.
+    #
+    # Why it exists: the one-byte grid stores a key channel's zero to within
+    # max|zero|/254 of its 32-channel group. A k_proj bias makes some channels
+    # large and near-constant, which that cannot represent; the error is the
+    # same in every window, and times the query's massive value in the same
+    # channel it shifts the whole int2 tier's logits against the fp tier by
+    # several nats. Anchored, a bias channel's stored residual is exactly 0.
+    # Zero bytes per window: one [H_kv, D] fp32 vector per (layer, row).
+    quant_key_anchor: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -428,6 +468,15 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_memoize_read must be None (auto) or bool, got "
                 f"{type(self.quant_memoize_read).__name__}"
+            )
+
+        # -- quant_key_anchor (tri-state) --
+        if self.quant_key_anchor is not None and not isinstance(
+            self.quant_key_anchor, bool
+        ):
+            raise ValueError(
+                f"quant_key_anchor must be None (auto) or bool, got "
+                f"{type(self.quant_key_anchor).__name__}"
             )
 
         # -- first_eviction_step (non-negative int; bool rejected before int) --
@@ -666,6 +715,11 @@ class WindowedCacheConfig:
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,
             first_eviction_step=self.first_eviction_step,
+            # Only meaningful with a Q tier; auto follows the model's key bias.
+            quant_key_anchor=q > 0.0 and (
+                key_projection_has_bias(model_config)
+                if self.quant_key_anchor is None else self.quant_key_anchor
+            ),
         )
 
         # --- ENFORCE the budget, do not merely compute it --------------------

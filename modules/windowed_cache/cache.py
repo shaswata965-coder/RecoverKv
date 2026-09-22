@@ -45,6 +45,7 @@ from .telemetry import NullTelemetry, Telemetry
 
 from modules.quant import (
     QuantizedStore,
+    grid_dtype_for,
     materialize_effective_kv,
     unrotate_key_window,
 )
@@ -1222,6 +1223,11 @@ class WindowedCache(_HFCacheBase):
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
+                    # Key zero-points stored relative to a frozen anchor. On
+                    # wherever the key projection carries a bias (Qwen2) and
+                    # off elsewhere, so Llama/Mistral are byte-identical; see
+                    # WindowedCacheConfig.quant_key_anchor.
+                    key_anchor=self.resolved.quant_key_anchor,
                 )
                 for _ in range(num_layers)
             ]
@@ -2274,6 +2280,9 @@ class WindowedCache(_HFCacheBase):
         # `gather_sketch` keeps the [R, n] leading pair, and R is layer-major, so
         # layer i's rows are the same [r0, r0+B) slice everything else here uses.
         joint_gate = self._gate_ctx(store, idx, n)
+        # [L*B, H_kv, D] fp32, row-major like everything else here; None for an
+        # un-anchored store. Frozen, so it rides the same memo as the codes.
+        k_anchor = store.key_anchor_rows()
 
         key = (store.version, n, B)
         for i in range(L):
@@ -2289,6 +2298,8 @@ class WindowedCache(_HFCacheBase):
                     "v_zero": vz.map(lambda t: t[i]),
                     "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
                     "window_size": ws,
+                    "k_anchor": (None if k_anchor is None
+                                 else k_anchor[r0:r0 + B]),
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
@@ -2430,6 +2441,8 @@ class WindowedCache(_HFCacheBase):
             "k_codes": kc, "k_scale": ks, "k_zero": kz,
             "v_codes": vc, "v_scale": vs, "v_zero": vz,
             "cos": cos_h, "sin": sin_h, "window_size": ws,
+            # [B, H_kv, D] fp32 key anchor the zero grid is relative to, or None.
+            "k_anchor": store.key_anchor_rows(),
         }
         # A new Q tier invalidates the scatter map built against the old one.
         self._fused_ctx[layer_idx] = {
@@ -2923,7 +2936,9 @@ class WindowedCache(_HFCacheBase):
         is_q_new = new_tier == 1
 
         # --- Resolve window ids → slots ONCE, then decide with masks --------
-        store.ensure(B, device)
+        # The grid's group scales are stored in the dtype the quantizer fits
+        # them in (fp16 for an fp16 cache, byte for byte; bf16 for bf16).
+        store.ensure(B, device, grid_dtype=grid_dtype_for(dtype))
         has_entry, is_q_cur, slot_of, keep_slots = store.lookup(wids)
 
         demote = is_q_new & ~is_q_cur      # currently fp, wants Q

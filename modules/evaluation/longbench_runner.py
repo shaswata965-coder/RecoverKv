@@ -567,6 +567,10 @@ class LongBenchRunner:
                 # the run is holding LESS than cache_budget of the full cache
                 # while still being reported at cache_budget.
                 "budget_utilisation": round(r.budget_utilisation, 4),
+                # Whether int2 key zero-points were stored relative to the key
+                # anchor (auto: on iff the model's k_proj has a bias). A Qwen2.5
+                # row without it is the one-byte-grid regression, not the method.
+                "quant_key_anchor": bool(getattr(r, "quant_key_anchor", False)),
             }
 
         hooks = self.install_score_hooks(model, cache, cache_config)
