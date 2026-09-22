@@ -185,6 +185,21 @@ PREFILL_SCORE_CHUNK = 1024
 #: logits).
 SCORE_SOFTMAX_DTYPE = torch.bfloat16
 
+#: Dtype of the window scores this hook hands the cache -- and therefore of
+#: ``state.window_scores``, the running sum the eviction ranks on, which takes its
+#: dtype from the first scores it is given. It was ``q.dtype``, i.e. fp16.
+#:
+#: That sum starts at the prefill total -- up to ~32k query rows each adding to a
+#: window at RULER 32k -- and then receives one decode step's softmax mass per
+#: step, typically well under 1e-2 per window. An fp16 addend below half an ULP
+#: of the running total rounds to no change: at a total of 64 that is anything
+#: under 0.03, so almost every decode step's evidence was discarded and each
+#: re-eviction ranked on the prompt alone. ``446a7eb`` measured the same loss on
+#: the July int2 branches (52% of per-step contributions gone in fp16, the kept
+#: set diverging ~9% over 512 steps) and fixed it on the Qwen branch only; it
+#: never reached this line. The cost is ``[B, H_q, W]`` fp32 per layer.
+SCORE_ACCUM_DTYPE = torch.float32
+
 
 def install_score_hooks(
     model: nn.Module,
@@ -534,6 +549,10 @@ def install_score_hooks(
                             "bit-identical."
                         )
 
+                # SCORE_ACCUM_DTYPE, not q.dtype. These scores seed
+                # `state.window_scores`, the running sum every later decode step
+                # is added into, and its dtype is decided HERE -- see the
+                # constant for what fp16 threw away.
                 token_scores = compute_token_scores(
                     q,
                     k_current,
@@ -541,7 +560,7 @@ def install_score_hooks(
                     lse=lse,
                     chunk=PREFILL_SCORE_CHUNK,
                     softmax_dtype=SCORE_SOFTMAX_DTYPE,
-                    out_dtype=q.dtype,
+                    out_dtype=SCORE_ACCUM_DTYPE,
                 )                                                    # [B, H_q, S]
 
                 # 4. Reduce to per-window scores and hand off to the cache. At

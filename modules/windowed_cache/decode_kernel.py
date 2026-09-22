@@ -525,23 +525,35 @@ def two_tier_window_reference(
     out = acc / l.unsqueeze(-1)
     lse = m + (torch.log2 if exp2 else torch.log)(l)
     live = wmax > NEG
+    raw = wsum                                             # tile-relative, pre-rescale
     wsum = torch.where(live, wsum * (torch.exp2 if exp2 else torch.exp)(wmax - lse.unsqueeze(-1)),
                        torch.zeros_like(wsum))
 
-    # Skipped windows get their card's estimate, scaled onto the same footing as
-    # the real scores — mirroring the kernel's GATED epilogue. `live` over the Q
-    # columns IS the read set (a skipped column was never written, so its wmax is
-    # still the -inf sentinel), which is why neither this nor the kernel consults
-    # `sel` again. The offset in `fill_skipped_window_scores` cancels in the
-    # ratio, so a max and a sum suffice and no logarithm is taken.
+    # Skipped windows get their card's estimate, corrected by the card's TYPICAL
+    # error on the windows that were read -- mirroring the kernel's GATED
+    # epilogue. `live` over the Q columns IS the read set (a skipped column was
+    # never written, so its wmax is still the -inf sentinel), which is why
+    # neither this nor the kernel consults `sel` again.
+    #
+    # The correction is the mean LOG ratio, exact over estimate, and not the
+    # ratio of the sums: see `scorer.fill_skipped_window_scores` for why the sum
+    # form transfers a retrieval head's peak onto every window it did not read.
+    # The log of each read window's normalised mass is taken as
+    # log(raw) + (wmax - lse), never as log(exp(...)), so a read window far below
+    # the step's peak still has a finite log instead of underflowing to -inf.
     if sel is not None and logmass is not None:
         read = live[..., n_body_win:]                          # [B,H_q,n_active]
-        num = (wsum[..., n_body_win:] * read).sum(-1, keepdim=True)
-        gmx = torch.where(read, logmass, torch.full_like(logmass, NEG)).amax(
-            -1, keepdim=True)
-        rel = (logmass - gmx).exp()
-        gsm = (rel * read).sum(-1, keepdim=True).clamp_min(1e-30)
-        fill = num * rel / gsm                                 # calibrated mass
+        raw_q = raw[..., n_body_win:]
+        ok = read & (raw_q > 0)
+        log_scaled = (torch.log(torch.where(ok, raw_q, torch.ones_like(raw_q)))
+                      + (wmax[..., n_body_win:] - lse.unsqueeze(-1))
+                      * (math.log(2.0) if exp2 else 1.0))
+        cnt = ok.sum(-1, keepdim=True)
+        dsum = torch.where(ok, log_scaled - logmass,
+                           torch.zeros_like(logmass)).sum(-1, keepdim=True)
+        dmean = torch.where(cnt > 0, dsum / cnt.clamp_min(1),
+                            torch.full_like(dsum, NEG))
+        fill = (logmass + dmean).exp()                         # calibrated mass
         wsum = torch.cat([
             wsum[..., :n_body_win],
             torch.where(read, wsum[..., n_body_win:], fill),
@@ -891,9 +903,10 @@ if _HAS_TRITON:
         # column to -inf and only the visited ones were written, so no SEL lookup
         # is needed here.
         offs_w = tl.arange(0, BLOCK_W)
-        num = tl.zeros([BLOCK_R], tl.float32)          # mass the read windows hold
-        gmx = tl.full([BLOCK_R], -float("inf"), tl.float32)   # running max of logmass
-        gsm = tl.zeros([BLOCK_R], tl.float32)          # sum exp(logmass - gmx)
+        # The card's typical error over the read windows, as a mean LOG ratio
+        # (exact over estimate) -- see §5 for why not a ratio of sums.
+        dsum = tl.zeros([BLOCK_R], tl.float32)         # sum ln(exact/estimate)
+        dcnt = tl.zeros([BLOCK_R], tl.float32)         # read windows measured
         for w0 in range(0, W_phys, BLOCK_W):
             cols = w0 + offs_w
             cmask = cols < W_phys
@@ -906,37 +919,44 @@ if _HAS_TRITON:
                               ssum * tl.exp2(smax - lse[:, None]), 0.0)
             tl.store(ptr, scaled, mask=sm)
             if GATED:
-                live = sm & (smax > -float("inf")) & (cols[None, :] >= n_body_win)
-                num += tl.sum(tl.where(live, scaled, 0.0), axis=1)
+                live = (sm & (smax > -float("inf")) & (ssum > 0.0)
+                        & (cols[None, :] >= n_body_win))
                 qc = tl.maximum(cols - n_body_win, 0)
                 lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
-                             mask=live, other=-float("inf"))
-                gmx_new = tl.maximum(gmx, tl.max(tl.where(live, lg, -float("inf")),
-                                                 axis=1))
-                # `gmx` is -inf until the first selected column is seen, and a
-                # tile of body columns alone sees none; exp(-inf - -inf) is NaN,
-                # so the first-tile case is selected away rather than computed.
-                corr = tl.where(gmx == -float("inf"), 0.0, tl.exp2(
-                    (gmx - gmx_new) * LOG2E))
-                gsm = gsm * corr + tl.sum(
-                    tl.where(live, tl.exp2((lg - gmx_new[:, None]) * LOG2E), 0.0),
-                    axis=1)
-                gmx = gmx_new
+                             mask=live, other=0.0)
+                # ln(scaled) taken as log2(ssum) + smax - lse, never as the log of
+                # `scaled` itself: a read window far below the step's peak would
+                # underflow to 0 there and drag the mean to -inf. Masked lanes are
+                # given a harmless ssum of 1 before the log and then selected away.
+                lsc = (tl.log2(tl.where(live, ssum, 1.0)) + smax
+                       - lse[:, None]) / LOG2E
+                dsum += tl.sum(tl.where(live, lsc - lg, 0.0), axis=1)
+                dcnt += tl.sum(tl.where(live, 1.0, 0.0), axis=1)
 
         # ---- 5. GATED only: score the windows this step did not read ----------
         # A skipped window credited with zero would rank last and be evicted, so
         # the gate would destroy the tier it exists to read less often. It gets
-        # its card's estimate instead, put on the same footing as the real scores
-        # by the ratio the read windows give for free:
+        # its card's estimate instead, corrected by the card's TYPICAL error on
+        # the windows that were read:
         #
-        #     score_i = (mass the read windows hold) * softmax(logmass)_i
+        #     score_i = exp(logmass_i + mean_read(ln exact_j - logmass_j))
         #
-        # over the read set. The arbitrary offset in `fill_skipped_window_scores`
-        # cancels in that ratio, which is why only a max and a sum are needed and
-        # no logarithm is taken. `LOG2E` keeps the base-e logmass exact while
-        # every exponential in this kernel stays base 2.
+        # The softmax normaliser cancels out of that expression, so `lse` is not
+        # needed; `LOG2E` keeps the base-e logmass exact while every exponential
+        # in this kernel stays base 2.
+        #
+        # It used to be the ratio of the SUMS, (sum exact) / (sum estimate). That
+        # is right only when the card is off by the same factor everywhere, and
+        # it is most wrong on the step that matters most: a retrieval head whose
+        # target token sits in a read int2 window puts nearly all its mass on
+        # that one token, which a rank-1 card does not model, so the sum ratio
+        # becomes that token's error and every skipped window was credited with a
+        # share of the needle's mass -- about 3x it at ratio 0.25. The output
+        # below then diluted the needle by that much and blended in centroids.
+        # The mean log ratio moves by 1/n_sel of such an outlier, not by all of it.
         if GATED:
-            gsm = tl.maximum(gsm, 1e-30)
+            dmean = tl.where(dcnt > 0.0, dsum / tl.maximum(dcnt, 1.0),
+                             -float("inf"))
             # The skipped windows also ATTEND, through their value centroids.
             #
             # Reading 25% of the tier and returning that softmax unchanged is not
@@ -966,8 +986,10 @@ if _HAS_TRITON:
                 qc = tl.maximum(cols - n_body_win, 0)
                 lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
                              mask=skipped, other=-float("inf"))
-                fill = (num[:, None]
-                        * tl.exp2((lg - gmx[:, None]) * LOG2E) / gsm[:, None])
+                # dmean is -inf when no read window could be measured, and lg is
+                # -inf off the skipped set; either way this is exp2(-inf) = 0,
+                # never NaN, because dmean is never +inf.
+                fill = tl.exp2((lg + dmean[:, None]) * LOG2E)
                 tl.store(ptr, fill, mask=skipped)
 
                 f = tl.where(skipped, fill, 0.0)           # [BLOCK_R, BLOCK_W]

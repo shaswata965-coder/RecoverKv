@@ -187,6 +187,11 @@ one per-window block is the real fix and needs a GPU to verify.
   rejected at load and inert in every runner once (`6b8a188`); `quant_ratio: 0.0`
   in the quality YAMLs does not mean the kernel is unreached.
 * **Quality rows do not compare across `ac128e8` or `8a8cdc0`.** Both moved the
-  stored format and the price of a window.
+  stored format and the price of a window. **Nor across the 2026-09-22 fill
+  fix** (`DISTANCE_TO_GOAL.md` §11): the skipped-window credit is now a mean
+  *log* ratio, and window scores accumulate in fp32 — both move decode outputs
+  and eviction decisions. The old ratio-of-sums fill handed a retrieval head's
+  needle mass to every window the gate skipped; do not reintroduce a
+  `Σ exact / Σ estimate` calibration.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

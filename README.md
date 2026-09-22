@@ -76,11 +76,19 @@ its window, worse than useless.
    reaches the kernel as an indirection (`widx = tl.load(SEL + …)`), not a
    re-gather, and the int2 unpack + dequant + RoPE all happen in registers.
 4. **Credit the rest.** The windows that were not read still contribute. The read
-   windows have both a real mass and a card estimate, so their ratio is the
-   step's *deviation* — how wrong the cards were against this query. Every
-   skipped window is credited with `deviation × its estimate`, which goes to both
+   windows have both a real mass and a card estimate, so they measure the
+   step's *deviation* — how wrong the cards were against this query — as the
+   **mean log ratio** `mean(ln exact − logmass)` over the read set. Every
+   skipped window is credited with `exp(logmass + deviation)`, which goes to both
    its eviction score **and** the attention output via its value centroid. `out`
    and every score are then renormalized by `1 + Σ(restored mass)`.
+
+   The deviation is a mean of logs, not `Σ exact / Σ estimate`, and that is the
+   RULER fix. On a retrieval step the read set's exact mass *is* the one token
+   being copied, which a rank-1 card does not model; the ratio of sums turned
+   that token's error into a factor on every skipped window, crediting them with
+   about three times the needle's mass at ratio 0.25 and diluting the needle's
+   value by that much in the output. See `tests/test_gate_fill_calibration.py`.
 
 Step 4 rides in an epilogue pass that already ran: the only added traffic is the
 centroid tile, and the only added arithmetic is one `tl.dot` of a tile the loop

@@ -1,6 +1,6 @@
 # Distance to the goal
 
-Updated 2026-09-18.
+Updated 2026-09-22 (§11: the RULER regression). Sections 1–10 as of 2026-09-18/19.
 
 **The goal:** beat Flash FullKV, int2 KIVI and QEvict across all six shape/batch
 cells. Today we beat Flash in **one of six**. At our best numbers ever we beat it
@@ -1569,3 +1569,83 @@ things worse before §10.8's fixes.** They are a silent-fallback
 repair and two searches replacing two assumptions; the searches cannot be wrong
 about which rung is faster, but whether a faster rung *exists* is exactly what no
 one has ever asked the hardware.
+
+---
+
+## 11. The RULER 32k regression — two decode defects, 2026-09-22
+
+RULER 32k at `ws=32` (budget 0.20, q 0.70 bytes, gate 0.25) against the
+QEvict reference: `niah_single_3` 99.0 → 71.4, `cwe` 43.98 → 18.56,
+`niah_multivalue` 95.9 → 87.1, `niah_multikey_2` 97.0 → 91.0, `qa_1` 84.6 →
+78.0, while `niah_single_2` held (100 → 99.2). At `ws=8` it was worse:
+`niah_single_3` 2.40, with the model copying the first ~8 characters of each
+UUID and inventing the rest. That pattern — the first tokens of a copy right,
+the rest wrong, and the task with the longest verbatim copy hurt most — pointed
+at the decode step, not the prompt compression.
+
+### Defect 1: the skipped windows were credited with the needle's mass
+
+The gate reads 25% of the int2 tier. Every skipped window is credited with
+`c · exp(logmass)` — for its eviction score **and** as the weight its value
+centroid attends with — and `c` was `Σ exact / Σ estimate` over the read
+windows. That ratio of sums is right only when the card is off by one common
+factor. On a retrieval step it is not: a head copying a token out of a READ
+int2 window puts nearly all its mass on that one token, which a rank-1 card
+does not model, so `Σ exact` *is* that token and `c` becomes that token's
+estimation error. Every skipped window was then credited with a share of the
+needle — about 3× the needle's own mass at ratio 0.25 — and the output was
+renormalised by `1 + Σ fill`: the needle's value diluted by that factor and
+replaced by a blend of centroids. The sharper the head, the more mass it handed
+to windows it did not read. That is backwards, and it is exactly the step RULER
+is made of.
+
+`c` is now the **mean log ratio**, `exp(mean(ln exact − logmass))` over the
+read windows: it still recovers a common factor exactly, and one outlier moves it
+by `1/n_sel` of its log instead of by all of it. Kernel (`GATED` epilogue), CPU
+oracle (`two_tier_window_reference`) and spec (`fill_skipped_window_scores`)
+changed together. `ratio = 1.0` never had the defect — nothing is skipped — so
+the control arm could not have shown it.
+
+**CPU-only, on the kernel's own oracle with real cards** (synthetic keys with a
+massive-activation common mode; the hot token is a random token of a random
+window, not the farthest point the card is built on). Relative output error vs
+full attention, 840 windows × `ws=32`, ratio 0.25, 4 seeds:
+
+| head | shipped fill | mean-log fill | no fill |
+|---|---|---|---|
+| diffuse | 0.257 | 0.257 | 1.505 |
+| one hot token in a read int2 window, sharpness 8 / 12 / 20 | 0.253 / 0.530 / 0.301 | 0.021 / 0.002 / 0.000 | 0.925 / 0.042 / 0.000 |
+| hot token in the fp tier, sharpness 8 / 12 | 0.019 / 0.002 | 0.020 / 0.003 | — |
+
+Same shape at 1600 × `ws=8` and at ratio 0.10. The credited mass now tracks
+what the skipped windows truly hold in every regime (e.g. 2.34 vs 2.34 diffuse,
+0.42 vs 0.43 at sharpness 8, ~0 vs ~0 when sharp);
+`tests/test_gate_fill_calibration.py` pins that, and fails on the old fill.
+
+### Defect 2: the running window score was fp16
+
+`hooks.py` handed the cache prefill scores in `q.dtype`, and
+`state.window_scores` takes its dtype from them. At 32k a window's prefill total
+is a sum over up to 32k query rows; a decode step adds well under 1e-2 per
+window, which is below half an fp16 ULP of any total above ~32 and rounds to
+nothing. So every re-eviction ranked on the prompt alone. `446a7eb` measured
+this on the July int2 branches (52% of per-step contributions lost in fp16, the
+kept set ~9% off over 512 steps) and fixed it on the Qwen branch only.
+`SCORE_ACCUM_DTYPE = float32` now. Arithmetic, not measured on a GPU.
+
+### What this does not change, and what is left
+
+* **Scores move — this is a quality change.** Quality rows do not compare
+  across it, and it has no LongBench or RULER run behind it yet. The Triton
+  epilogue compiles for sm80 (`tests/test_kernel_compiles.py`); it has not run.
+* **The card's bytes are in the budget** (`ac128e8`), so at 32k/`ws=32` the
+  cache holds 59 fp + 840 int2 windows and **drops 97** (~10% of the prompt);
+  at `ws=8` it drops 1,653 (41%). That is honest accounting, not a defect, and it
+  is most of why `ws=8` is so much worse than `ws=32`.
+* **Gate recall is untested on real attention.** A rank-1 card models the
+  window's farthest token; a copy step's target is usually some other token. If
+  the fixed build still trails QEvict on NIAH, `quant_gate_ratio=1.0` on the same
+  build separates gate recall from everything else.
+
+Next GPU run, in this order: RULER 32k `ws=32` at gate 0.25 on this build; the
+same at gate 1.0; LongBench at the operating point for the quality-change record.

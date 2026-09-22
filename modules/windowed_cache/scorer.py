@@ -181,15 +181,32 @@ def fill_skipped_window_scores(
     ``quant_ratio = 0.7`` that is 70% of the evictable cache.
 
     So every skipped window is credited with the estimate its own card produced,
-    rescaled onto the same footing as the real scores:
+    corrected by the card's **typical** error on the selected windows:
 
-        c = sum(exact over selected) / sum(estimated over selected)
+        log c = mean over selected of (log exact - logmass)
 
-    ``c`` costs one extra reduction and needs nothing the step did not already
-    compute — the selected windows have *both* a real and an estimated score, so
-    the correction factor is free and self-calibrating. Without it the two
-    populations sit on different scales and the ranking between them is
-    arbitrary.
+    ``c`` needs nothing the step did not already compute — the selected windows
+    have *both* a real and an estimated score, so the correction is free and
+    self-calibrating. Without it the two populations sit on different scales and
+    the ranking between them is arbitrary.
+
+    **Why a mean of logs and not a ratio of sums.** ``c`` used to be
+    ``sum(exact) / sum(estimated)`` over the selected windows. That is right only
+    when the card is off by one common factor, and it fails on exactly the step a
+    retrieval benchmark is made of: a head copying a token out of a selected
+    int2 window puts nearly all of its mass on that one token, which a rank-1
+    card does not model, so ``sum(exact)`` is that token's mass and the ratio
+    becomes that token's estimation error. Every skipped window was then
+    credited with a share of the needle's mass — about three times the needle at
+    ratio 0.25 — and, since the same weight is what the skipped windows attend
+    with, the needle's value was diluted by that factor and replaced by a blend
+    of centroids. The more peaked the head, the more mass it handed to the
+    windows it did NOT read, which is backwards. A mean over logs moves by
+    ``1/n_selected`` of one outlier, not by all of it, and still recovers a
+    common factor exactly (``tests/test_gate_fill_calibration.py``).
+
+    A selected window with ``exact == 0`` has no finite log and is left out of the
+    mean; if none is left, the skipped windows are credited with nothing.
 
     Parameters
     ----------
@@ -203,16 +220,18 @@ def fill_skipped_window_scores(
 
     Returns
     -------
-    ``[B, H_q, W]`` — ``exact`` where selected, ``c * estimate`` where not.
+    ``[B, H_q, W]`` — ``exact`` where selected, ``c * exp(logmass)`` where not.
     """
-    # Exponentiate relative to each head's own maximum. The offset cancels in the
-    # ratio below, so this is a pure overflow guard, not an approximation.
-    est = (logmass - logmass.amax(dim=-1, keepdim=True)).exp()
-    sel = keep.to(est.dtype)
-    num = (exact * sel).sum(dim=-1, keepdim=True)
-    den = (est * sel).sum(dim=-1, keepdim=True)
-    c = num / den.clamp_min(torch.finfo(est.dtype).tiny)
-    return torch.where(keep, exact, c * est)
+    logmass = logmass.to(torch.float32)
+    ok = keep & (exact > 0)
+    log_exact = torch.log(torch.where(ok, exact.to(torch.float32),
+                                      torch.ones_like(logmass)))
+    cnt = ok.sum(dim=-1, keepdim=True)
+    dsum = torch.where(ok, log_exact - logmass,
+                       torch.zeros_like(logmass)).sum(dim=-1, keepdim=True)
+    log_c = torch.where(cnt > 0, dsum / cnt.clamp_min(1),
+                        torch.full_like(dsum, float("-inf")))
+    return torch.where(keep, exact.to(torch.float32), (logmass + log_c).exp())
 
 
 def expand_keep_to_query_heads(keep: Tensor, num_query_heads: int) -> Tensor:
