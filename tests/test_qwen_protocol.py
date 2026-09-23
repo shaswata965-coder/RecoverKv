@@ -1,15 +1,20 @@
-"""The Qwen2.5 column is run on the QEvict column's protocol and split.
+"""The Qwen2.5 column is run on the QEvict column's protocol and operating point.
 
-For three rounds the Qwen2.5 comparison against QEvict (``int2_qwen``) was not
-like for like, and nothing said so: this branch's
-``configs/longbench_qwen_ours_flash_attn.yaml`` -- the SAME filename QEvict's
-branch uses -- ran fp16 at native 32K truncated to 31500 at quant_ratio 0.70,
-while QEvict's ran bf16 + YaRN 128K, untruncated, at 0.5. At 0.70 the
-full-precision tier holds ~40% fewer tokens, which is where the retrieval-heavy
-tasks lost 4-8 points (QWEN_PORT_PLAN.md "Round 3").
+The QEvict column (``int2_qwen``'s code) and this branch's Qwen2.5 column were
+both run at the shared operating point (quant_ratio 0.70, budget 0.20) on bf16 +
+YaRN 128K, untruncated -- the ``_yarn128k`` config here. So the gap between
+them is the machinery, and the configs must not drift away from that pairing
+without saying so:
 
-These pin the protocol, so a config edit that re-opens the gap fails here with
-the reason rather than showing up weeks later as a score.
+* every Qwen config is bf16 + YaRN 128K (fp16 is the overflow trap
+  ``utils/model_loading.py`` warns about, and a row on a different RoPE is a
+  different model). The default-named config was fp16 at 32K under the same
+  name ``int2_qwen`` uses for bf16 + YaRN; it is now the run that was measured,
+  and ``_yarn128k`` inherits it;
+* the method configs sit at ``OPERATING_POINT`` -- the split QEvict ran too.
+  (A diagnosis that assumed QEvict ran at int2_qwen's YAML default of 0.5 moved
+  them to 0.5 for one commit; it was wrong, see QWEN_PORT_PLAN.md.)
+* the gate's control arm is a one-field diff.
 """
 
 from __future__ import annotations
@@ -32,7 +37,6 @@ QEVICT_MODEL = {
     "rope_scaling": {"rope_type": "yarn", "factor": 4.0,
                      "original_max_position_embeddings": 32768},
 }
-QEVICT_SPLIT = 0.5
 
 QWEN_METHOD_CONFIGS = [
     "longbench_qwen_ours_flash_attn.yaml",
@@ -43,7 +47,6 @@ QWEN_METHOD_CONFIGS = [
 QWEN_ALL_CONFIGS = QWEN_METHOD_CONFIGS + [
     "longbench_qwen_full_cache.yaml",
     "gsm8k_qwen_full_cache.yaml",
-    "longbench_qwen_ours_q070.yaml",
     "longbench_qwen_ours_gate100.yaml",
 ]
 
@@ -64,14 +67,13 @@ def test_every_qwen_config_runs_qevicts_model_setup(name):
 
 
 @pytest.mark.parametrize("name", QWEN_METHOD_CONFIGS)
-def test_the_qwen_column_is_at_qevicts_split(name):
+def test_the_qwen_column_is_at_the_operating_point_qevict_ran_at(name):
+    """The QEvict column was run at quant_ratio 0.70 as well, so the Qwen column
+    stays on OPERATING_POINT's split; comparing it at any other split confounds
+    the machinery with the operating point."""
     cache = _load(name).cache
-    assert cache.quant_ratio == QEVICT_SPLIT, (
-        f"{name}: quant_ratio {cache.quant_ratio}. The Qwen column is compared "
-        "against QEvict at 0.5; the shared 0.70 is the q070 ablation arm.")
-    assert OPERATING_POINT["quant_ratio"] != QEVICT_SPLIT, (
-        "the shared operating point moved to QEvict's split; the Qwen "
-        "exemptions in OPERATING_POINT_EXEMPT are no longer needed")
+    assert cache.quant_ratio == OPERATING_POINT["quant_ratio"] == 0.70, (
+        f"{name}: quant_ratio {cache.quant_ratio}")
 
 
 @pytest.mark.parametrize("name", ["longbench_qwen_ours_flash_attn.yaml",
@@ -98,7 +100,6 @@ def test_the_yarn128k_alias_is_the_same_run():
 
 
 @pytest.mark.parametrize("arm,field,value", [
-    ("longbench_qwen_ours_q070.yaml", "quant_ratio", OPERATING_POINT["quant_ratio"]),
     ("longbench_qwen_ours_gate100.yaml", "quant_gate_ratio", 1.0),
 ])
 def test_each_ablation_arm_changes_exactly_one_cache_field(arm, field, value):
@@ -114,11 +115,11 @@ def test_each_ablation_arm_changes_exactly_one_cache_field(arm, field, value):
     assert getattr(got.cache, field) == value
 
 
-def test_the_ablation_script_runs_the_three_arms_into_separate_dirs():
+def test_the_ablation_script_runs_its_arms_into_separate_dirs():
     src = (ROOT / "scripts/run_longbench_qwen_ablation.sh").read_text()
     for cfg in ("longbench_qwen_ours_flash_attn.yaml",
-                "longbench_qwen_ours_q070.yaml",
-                "longbench_qwen_ours_gate100.yaml"):
+                "longbench_qwen_ours_gate100.yaml",
+                "longbench_qwen_full_cache.yaml"):
         assert f"configs/{cfg}" in src
     assert 'longbench.output_dir=$out' in src
     r = subprocess.run(["bash", "-n", str(ROOT / "scripts/run_longbench_qwen_ablation.sh")],

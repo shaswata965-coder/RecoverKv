@@ -248,19 +248,14 @@ one per-window block is the real fix and needs a GPU to verify.
   byte-identical, though the rep-4 row says Llama has it too — measure there
   before flipping the default. `QWEN_PORT_PLAN.md` has the numbers. A real
   defect; the LongBench run with it on moved nothing beyond noise.
-* **Compare a column against its reference at the reference's operating point
-  and protocol — check the configs before any mechanism.** The Qwen2.5 column
-  was compared with QEvict (`int2_qwen`) for three rounds while QEvict's configs
-  ran bf16 + YaRN 128K + untruncated at `quant_ratio 0.5` and this branch's ran
-  `0.70` (and, under the same filenames, fp16 at 32K truncated to 31500). At
-  0.70 the fp tier holds ~40% fewer tokens (~5.5% of the prompt vs ~9.3%): the
-  retrieval-heavy tasks fell 4-8 while broad-context ones rose — the leading
-  explanation, not yet a measurement. So **the Qwen2.5 column runs QEvict's
-  protocol and split** (exempt from the shared 0.70 in
-  `OPERATING_POINT_EXEMPT`, pinned by `tests/test_qwen_protocol.py`); the 0.70
-  arm is `longbench_qwen_ours_q070.yaml` and
-  `scripts/run_longbench_qwen_ablation.sh` prices it. **n = 200 per LongBench
-  task means ±2.5-3 points is noise** — do not read a single run's move
-  smaller than that as a result.
+* **Ask how the reference was actually invoked before reading its config.**
+  One round of the Qwen investigation (`1db0488`, reverted) moved the Qwen
+  configs to `quant_ratio 0.5` because `int2_qwen`'s YAML says 0.5 — but the
+  QEvict column was run at 0.70 with an override. Both Qwen columns are at the
+  shared operating point on bf16 + YaRN 128K (`tests/test_qwen_protocol.py`
+  pins it), so the gap is the machinery; the gate's control arm is
+  `longbench_qwen_ours_gate100.yaml`. **n = 200 per LongBench task means
+  ±2.5-3 points is noise** — do not read a single run's move smaller than that
+  as a result.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

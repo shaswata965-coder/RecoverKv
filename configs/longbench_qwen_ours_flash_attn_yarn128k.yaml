@@ -1,10 +1,10 @@
 # ============================================================================
 # LongBench — Qwen2.5-7B-Instruct (YaRN 128K), Ours — ALIAS
 # ============================================================================
-# Kept so existing commands keep working. It used to differ from
-# longbench_qwen_ours_flash_attn.yaml in dtype, RoPE and truncation; that file
-# is now itself bf16 + YaRN 128K + no truncation (the QEvict column's protocol),
-# so this one inherits it whole and changes only where the outputs go.
+# Kept so existing commands keep working: this is the config the Qwen2.5
+# LongBench runs were made with (bf16 + YaRN 128K, untruncated, quant_ratio
+# 0.70, gate 0.25). longbench_qwen_ours_flash_attn.yaml is now that same run, so
+# this one inherits it whole and changes only where the outputs go.
 _base_: longbench_qwen_ours_flash_attn.yaml
 
 longbench:

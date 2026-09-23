@@ -4,8 +4,10 @@
 # One-field ablation of longbench_qwen_ours_flash_attn.yaml:
 # quant_gate_ratio 1.0, which selects every int2 window through the same gate
 # code -- the provable no-op, i.e. QEvict's read path (every window read
-# exactly, no centroid fill). The difference between this row and the default
-# is what reading 25% of the tier costs on Qwen.
+# exactly, no centroid fill, no card-estimated scores) at the same q=0.70. The
+# difference between this row and the default is what reading 25% of the tier
+# costs on Qwen; the difference between this row and QEvict is what the rest
+# of the machinery (one-byte grid, kernels) costs.
 _base_: longbench_qwen_ours_flash_attn.yaml
 
 cache:
