@@ -289,10 +289,14 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     # usually partial and still owns a column).
     n_body_win = -(-max(k_fp.shape[2] - num_sink, 0) // ws)
 
-    # 1. Gate: score every window from its card, keep the top `n_sel`. One extra
-    #    launch reading 400 B/head/window, against the 6432 B/window it decides
-    #    not to read. `sel` is an INDIRECTION into the tier the cache already
-    #    gathered, not a re-gather — see `_two_tier_decode_kernel`'s GATED block.
+    # 1. Gate: score every window from its card, keep the top `n_sel` by the
+    #    largest share of its own int2 mass any query head of the GQA group puts
+    #    on it (NOT by raw logit: a raw max lets the head with the largest
+    #    baseline choose for the whole group -- sketch.group_share). Two launches:
+    #    the card scan, reading 272 B/head/window against the window it decides
+    #    not to read, and the share union over its output. `sel` is an
+    #    INDIRECTION into the tier the cache already gathered, not a re-gather —
+    #    see `_two_tier_decode_kernel`'s GATED block.
     #    Indexed, not `.get`: a missing key would run ungated and correct, i.e. a
     #    decode silently timed against a method it is not running — the same
     #    failure FusedDecodeNotReached exists to refuse. `None` is the explicit

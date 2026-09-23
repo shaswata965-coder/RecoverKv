@@ -1,6 +1,6 @@
 # Distance to the goal
 
-Updated 2026-09-22 (§11: the RULER regression). Sections 1–10 as of 2026-09-18/19.
+Updated 2026-09-23 (§12: what the RULER regression actually was). §11 as of 2026-09-22. Sections 1–10 as of 2026-09-18/19.
 
 **The goal:** beat Flash FullKV, int2 KIVI and QEvict across all six shape/batch
 cells. Today we beat Flash in **one of six**. At our best numbers ever we beat it
@@ -177,6 +177,10 @@ Being strict about this is the point of the document.
 | The compiled eviction is worth anything | **measured to be worth nothing** — v9 ≈ v8 at every cell. And it still has no control arm |
 | Extrapolating a tuned rung across geometries | **measured to cost 12%.** Reverted (§10.15) |
 | This session's net effect on TPOT | **measured: a wash** (4 cells +0.9% … +3.3%, 1 unchanged, 1 at −1.4%) |
+| The gate's GQA union starved every query head but the loudest of its group | **measured on CPU fixtures**, the kernels' own oracles: worst head 0.05% of its mass read at 0.25 on the recall fixture; retrieval needle read on ~50% of steps at ws=32 (§12) |
+| The per-head share union fixes that | **measured on the same CPU fixtures**: worst head 99.95%; needle read on every seed (§12) |
+| It recovers RULER | **not measured.** No GPU run on this commit yet (§12) |
+| The share kernel costs ~1 launch + `2·rep·NW` fp32 per program per layer | **arithmetic.** Compiles for sm80 (Triton 3.3.1); never executed |
 
 ### The confound in the 24% number
 
@@ -1649,3 +1653,182 @@ kept set ~9% off over 512 steps) and fixed it on the Qwen branch only.
 
 Next GPU run, in this order: RULER 32k `ws=32` at gate 0.25 on this build; the
 same at gate 1.0; LongBench at the operating point for the quality-change record.
+
+---
+
+## 12. The RULER 32k regression was the gate's GQA union — 2026-09-23
+
+### §11 did not move the numbers, and the way it did not is the clue
+
+RULER 32k at `ws=32` on `0b21c9f` (the §11 build), against the build before it:
+
+| task | QEvict | before §11 | after §11 |
+|---|---|---|---|
+| cwe | 43.98 | 18.56 | **18.56** |
+| niah_single_3 | 99.00 | 71.40 | **71.40** |
+| niah_multikey_2 | 97.00 | 91.00 | **91.00** |
+| niah_single_2 | 100.00 | 99.20 | **99.20** |
+| niah_multivalue | 95.90 | 87.10 | 87.55 |
+| niah_multiquery | 97.00 | 95.70 | 95.40 |
+| qa_1 | 84.60 | 78.00 | 78.20 |
+
+cwe, niah_single_3 and niah_multikey_2 (three of the four largest drops) and
+niah_single_2 did not change to the second decimal, out of 500 examples each.
+The other three moved by under half a point. §11 changed the weight the skipped
+windows attend with, so on these tasks what the skipped windows carried was not
+what decided the answer. Which windows got read was.
+
+### The defect
+
+The gate reads `n_sel = ceil(0.25 · n_active)` windows per **KV head**, for the
+four query heads that share it. It chose them by the group max of each query
+head's raw card estimate, `est_h(w) = max_i scale · q_h·k̂_i`. That is a raw
+logit, and it carries two things the head's own softmax ignores:
+
+* the head's **baseline**, `scale · q_h·anchor`, the same for every window of
+  that head, and different between the heads of a group by several logit units;
+* the head's **scale**, `|q_h|`, which sets the spread of its logits.
+
+So the max over the group was decided by whichever head had the largest
+baseline or the widest spread. The other three were read only where that head
+happened to agree with them. A retrieval head that shares its KV head with a
+louder one loses its needle window whenever the louder head does not also rank
+it in its top quarter.
+
+That fits the RULER pattern. Retrieval is a *copy*, one step per answer token,
+and each step needs the needle window read for the heads doing the copy:
+
+* niah_single_3 copies a ~25-token UUID and lost 28 points;
+* niah_single_2 copies a ~3-token number and lost 0.8;
+* cwe lost 25. An aggregation head gets a quarter of the list read, and under
+  the old union that quarter was chosen for whichever head of its group was
+  loudest. This one is a consistent explanation, not a demonstrated one.
+
+### Why nothing caught it
+
+The recall test that justified ratio 0.25 (`test_recall_at_the_shipped_25_percent_ratio`)
+measured recall of the group's *summed raw* mass, `Σ_h exp(logit_h)`. That sum
+is dominated by the same loudest head the union served, so metric and selection
+shared one blind spot. It read **1.000**. Per query head, on the same fixture:
+
+| ratio | worst query head, old union | worst query head, share union |
+|---|---|---|
+| 0.10 | 0.0000 | 0.977 |
+| 0.15 | 0.0001 | 0.995 |
+| 0.25 (shipped) | **0.0005** | **0.9995** |
+| 0.50 | 0.0020 | 1.0000 |
+
+Over 8 seeds × 32 heads at 0.25, the old union left **6.6%** of query heads with
+less than half their mass read, and 17.6% under 99%. The share union left none
+under 99%.
+
+The §11 fixtures could not see it either: every query head of a group there
+points at the same target, so they agree.
+
+### The fix
+
+Rank each window by the largest **share of its own int2 mass** any head of the
+group puts on it:
+
+```
+share_h(w) = logmass_h(w) − logsumexp_w' logmass_h(w')      per query head
+score(w)   = max_h share_h(w)                                the GQA union
+```
+
+This is what each head's own softmax computes, so it ignores baselines and
+scales exactly as the softmax does, and it is shift-invariant per head
+(`test_selection_ignores_a_per_head_baseline`). A head's shares sum to 1, so
+every window the cards estimate to hold more than about `rep / n_sel` of ANY
+member's int2 mass is read. That is about 2% at the 32k operating point. It ranks on `logmass`
+(the whole window) rather than `est` (one token's rank-1 estimate). At `ws=32`
+the token a query wants is rarely the card's farthest point, and on the
+oracle `logmass` read the needle on every seed where `est − logsumexp` read it
+60–90%.
+
+Changed together, as the kernel-or-error contract requires:
+
+* spec — `sketch.head_log_share`, `sketch.group_share`;
+* CPU reference — `gate_kernel.gate_reference`, `QuantizedStore.gate_and_select`;
+* Triton — `_gate_kernel` now emits only `logm`, and a new `_gate_share_kernel`
+  (one program per `(row, KV head)`, two passes over `logm`) writes the union.
+  The union needs each head's logsumexp over every window, and the card kernel
+  splits windows across programs, so this is a second launch. It moves
+  `2 · rep · NW` fp32 per program, about 3% of the card kernel's traffic.
+  `gate_share_tiled_reference` mirrors its tiling and masking on CPU.
+
+Nothing else moves. The card, `ratio`, the budget, the eviction ranking and the
+fill are all unchanged, and `quant_gate_ratio = 1.0` still selects every window.
+
+### Evidence, CPU only
+
+These use the kernels' own oracles and real cards from `build_sketch`.
+`tests/test_gate_union_is_per_head.py` (48 tests) pins them. 10 of them fail on
+the parent's selection, and the file's guards run the old rule on each fixture
+and require it to fail.
+
+**RULER-shaped** (840 int2 windows at `ws=32`; per group, three ordinary heads
+with random directions and a per-head baseline spread of 0, 4 or 8 logit units,
+plus one retrieval head pointing at a random token of a random int2 window;
+6 seeds; the ranges span the three spreads):
+
+| needle share of the retrieval head's int2 mass | needle window read, old | needle window read, share |
+|---|---|---|
+| 0.02 | 0.35–0.44 | 0.98 |
+| 0.36 | 0.42–0.52 | 1.00 |
+| 0.95 | 0.50–0.62 | 1.00 |
+
+**Decode output**, `two_tier_window_reference`, relative error against reading
+the whole tier (240 windows at `ws=32`, per-head scales 0.5–2× and baselines,
+5 seeds):
+
+| head | old union | share union |
+|---|---|---|
+| retrieval, needle in one window | 0.501 | **0.005** |
+| retrieval, needle across two windows (a UUID over a boundary) | 0.534 | **0.077** |
+| diffuse heads (mean over all heads) | 0.654 | 0.524 |
+| sink-heavy heads (~99% of mass on a sink) | ≤ 0.006 | ≤ 0.003 |
+
+An oracle that also knew each head's true int2-tier fraction of its total mass
+(the gate cannot, without reading the fp tier) improved diffuse heads by
+≤ 0.05 and changed nothing else. The plain share takes nearly all of the gain.
+
+**What the union fix cannot reach: a rank-1 card at `ws=32`.** The fixtures
+above give the needle's window a shared key component, which is what
+neighbouring tokens that share context would produce. With it removed, the needle token is
+the only thing in its window aligned with the query. The card's mean then
+carries it at `1/ws` weight, and its direction points elsewhere. Needle window
+read, 8 seeds × 4 groups, needle logit margin 8–24:
+
+| keys | `ws` | share union | old union |
+|---|---|---|---|
+| shared window component | 8 or 32 | **1.00** | 0.38–0.97 |
+| no window component | 8 | **0.97–1.00** | 0.44–0.69 |
+| no window component | 32 | **0.56–0.66** | 0.22–0.28 |
+
+So at `ws=32` a residual miss rate is possible that no union rule can remove.
+It is bounded by how much window structure real needle keys have, which only
+a GPU run can say. Step 2 below measures it.
+
+### What is verified and what is not
+
+| check | result |
+|---|---|
+| `tests/test_gate_union_is_per_head.py` (new) | 48 passed; 10 fail on the parent's selection |
+| the gate, sketch, store, fill-calibration and read-path suites, the new file included | 138 passed. `test_gate_fill_calibration.py` now runs the shipped selection, not a restatement of it |
+| `tests/test_kernel_compiles.py` (Triton 3.3.1, sm80) | 24 passed, including `_gate_share_kernel` at `rep` 1/2/3/4/8. The decode-kernel cases were repaired: they passed `BLOCK_R=4`, which `tl.dot` rejects and the dispatcher never launches |
+| GPU execution, the Triton numbers, any RULER or LongBench score | **not done** |
+
+### Next GPU run
+
+1. **RULER 32k, `ws=32`, gate 0.25, this commit**, with the same command as
+   `scripts/run_ruler32k_windows_8gpu.sh`. Check `read_gate == gated` in every
+   sidecar.
+2. If a task still trails QEvict, run **the same at `quant_gate_ratio=1.0`**.
+   What remains at 1.0 is not the gate. It is the int2 tier and the eviction
+   (97 windows dropped at `ws=32`, §11). The gap between 0.25 and 1.0 is the
+   card's `ws=32` capacity limit above. If it is large, the next lever is the
+   selection's evidence, not its union. One candidate is keeping a window read
+   while the previous step measured it holding a head's mass, which fits how a
+   copy walks one window token by token.
+3. **LongBench at the operating point.** The gate reads different windows now,
+   so quality rows do not compare across this commit.

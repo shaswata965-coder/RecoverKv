@@ -65,13 +65,22 @@ its window, worse than useless.
 ### One decode step
 
 1. **Score every window from its card** — two `D`-length dots per (window, head)
-   against the rank-1 model, no int2 codes touched. Yields `logmass` (what a
-   window is worth) and `est` (what to rank on). One Triton launch.
+   against the rank-1 model, no int2 codes touched. Yields `logmass`, the card's
+   estimate of what the window is worth to each query head. One Triton launch.
 2. **Select** the top 25% per KV head — per *KV head*, not per row: a program
    owns a KV head and every query head sharing it, so that is the unit of work.
-   Measured at `ratio=0.25` on a 271-window tier: per (row, KV head) reads
-   68/271 at 100% mass recall; a per-row union reads 240/271 and the gate buys
-   nothing.
+   A window is ranked by the largest **share of its own int2 mass** that any
+   query head of the group puts on it: `logmass − logsumexp(logmass)` per head,
+   then the max over the group. A second, small launch.
+
+   **It must be the share, not the raw logit.** Until 2026-09-23 the rank was
+   the group max of the raw estimate. A raw logit carries its head's baseline
+   (`q·anchor`) and scale (`|q|`), both of which that head's softmax ignores,
+   so the loudest head of each group chose for all four. Per query head, the
+   worst head had 0.05% of its mass read on the fixture that "measured 100%
+   recall". At RULER geometry a retrieval head's needle window was read on
+   about half the steps. See `tests/test_gate_union_is_per_head.py` and
+   `DISTANCE_TO_GOAL.md` §12.
 3. **Attend** over `[sink | fp body | the selected int2 windows]`. The selection
    reaches the kernel as an indirection (`widx = tl.load(SEL + …)`), not a
    re-gather, and the int2 unpack + dequant + RoPE all happen in registers.

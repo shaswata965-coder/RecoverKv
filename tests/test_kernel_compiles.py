@@ -62,8 +62,12 @@ _DECODE_PTRS = {
 _GATE_PTRS = {
     **{n: "*fp16" for n in ("Q", "MUS", "VS", "TS", "ANCH")},
     **{n: "*i8" for n in ("MU", "V", "T")},
-    "EST": "*fp32", "LOGM": "*fp32", "SCALE": "fp32",
+    "LOGM": "*fp32", "SCALE": "fp32",
 }
+
+#: The GQA union over per-head shares: reads the card kernel's ``LOGM``, writes
+#: the ``[B, H_kv, NW]`` score the top-k ranks on.
+_GATE_SHARE_PTRS = {"LOGM": "*fp32", "EST": "*fp32"}
 
 #: One ``ws`` per structural case in :func:`window_tiling`, not a sweep — each
 #: entry is a real compile, and they are slow. ``1`` is the degenerate
@@ -98,11 +102,15 @@ def test_the_fused_decode_kernel_compiles(gated, ws):
     front end unchecked.
     """
     block_nw, block_t = window_tiling(ws)
+    # BLOCK_R as the dispatcher launches it: `_pow2_at_least(rep)` floors at 16,
+    # which is also the smallest M `tl.dot` accepts. A literal 4 here made every
+    # case below fail to compile on Triton 3.3 for a reason no launch can hit.
     _compile(dk._two_tier_decode_kernel, _DECODE_PTRS, dict(
-        HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=4, BLOCK_NW=block_nw,
-        BLOCK_T=block_t, BLOCK_W=16, PACK_K=max(ws // 4, 1), PACK_V=32,
+        HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=dk._pow2_at_least(4),
+        BLOCK_NW=block_nw, BLOCK_T=block_t, BLOCK_W=16,
+        PACK_K=max(ws // 4, 1), PACK_V=32,
         GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
-        GATED=gated))
+        GATED=gated, LOG2E=dk._LOG2E))
 
 
 @pytest.mark.parametrize("ws", WINDOW_SIZES)
@@ -117,6 +125,18 @@ def test_the_gate_kernel_compiles(ws):
     _compile(gk._gate_kernel, _GATE_PTRS, dict(
         HEAD_DIM=128, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
         BLOCK_D=128, BLOCK_W=64))
+
+
+@pytest.mark.parametrize("rep", [1, 2, 3, 4, 8])
+def test_the_gate_share_kernel_compiles(rep):
+    """The GQA union, at every group width it can be launched with.
+
+    ``BLOCK_R`` is ``rep`` rounded up to a power of two, so ``rep = 3`` is the
+    case with a padding query-head lane: it must compile with the lane masked out
+    of both passes. ``BLOCK_W`` is the shipped tile.
+    """
+    _compile(gk._gate_share_kernel, _GATE_SHARE_PTRS, dict(
+        BLOCK_R=triton.next_power_of_2(rep), BLOCK_W=gk.GATE_SHARE_BLOCK_W))
 
 
 @pytest.mark.parametrize("ws", [3, 5, 7, 12, 24, 48])

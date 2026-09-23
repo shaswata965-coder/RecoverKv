@@ -256,12 +256,13 @@ def test_ratio_of_one_is_a_no_op():
 
 
 def test_ratio_keeps_the_window_holding_the_true_best_key():
-    """What a capped gate must not do: drop the window the query actually wants.
+    """What a capped gate must not do: drop the window a query head actually wants.
 
-    Selection ranks by BOUND, not by true logit -- a window whose bound carries
-    more slack can outrank one with a higher true logit, and that is the gate
-    being conservative rather than wrong. The property that has to hold is the
-    safety one: the window containing the globally hottest key survives.
+    Checked for EVERY query head of every group: the window holding that head's
+    own hottest key survives. It used to be checked once per group, on the
+    group's hottest key by RAW logit -- which is the loudest head's key, the one
+    the old raw-max union already served, so the check could not see a quieter
+    head losing its window (``tests/test_gate_union_is_per_head.py``).
     """
     st = _store()
     k_post = _demote(st)
@@ -272,8 +273,8 @@ def test_ratio_keeps_the_window_holding_the_true_best_key():
         kk = k_post[torch.arange(B)[:, None], order]
         qg = q.reshape(B, H, 2, D)
         true = torch.einsum("bnhwd,bhrd->bhrnw", kk, qg).amax(-1)      # [B,H,r,n]
-        best = true.amax(2).argmax(-1)                                 # [B,H]
-        assert keep.gather(-1, best.unsqueeze(-1)).all(), f"dropped it at {ratio}"
+        best = true.argmax(-1)                                         # [B,H,r]
+        assert keep.gather(-1, best).all(), f"dropped a head's best at {ratio}"
 
 
 def test_default_config_turns_the_gate_on_where_there_is_a_tier():

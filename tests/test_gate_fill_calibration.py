@@ -28,10 +28,9 @@ import math
 import pytest
 import torch
 
-from modules.quant.sketch import (
-    Sketch, build_sketch, gate_and_score, group_max, value_centroid,
-)
+from modules.quant.sketch import Sketch, build_sketch, value_centroid
 from modules.windowed_cache.decode_kernel import two_tier_window_reference
+from modules.windowed_cache.gate_kernel import gate_reference
 from modules.windowed_cache.scorer import fill_skipped_window_scores
 
 D, H_KV, REP, SINK = 64, 2, 4, 5
@@ -91,9 +90,10 @@ def _step(d, ratio=0.25):
     """
     q, ws, n_q = d["q"], d["ws"], d["n_q"]
     scaling = D ** -0.5
-    logmass, est = gate_and_score(q, d["card"], d["anc"], scaling)
     n_sel = max(1, math.ceil(ratio * n_q))
-    sel = group_max(est, H_KV).topk(n_sel, dim=-1).indices.sort(-1).values
+    # The shipped selection, not a restatement of it: this file tests the fill
+    # the kernel applies to whatever the gate actually skips.
+    sel, logmass = gate_reference(q, *d["card"], d["anc"], scaling, n_sel)
     cent = (value_centroid(d["card"], d["v_anc"]).permute(0, 2, 1, 3)
             .repeat_interleave(REP, dim=1))
     sfp = SINK + d["n_body"] * ws

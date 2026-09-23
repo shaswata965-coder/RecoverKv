@@ -28,6 +28,7 @@ from modules.quant.sketch import (
     decode_sketch,
     gate_and_score,
     group_max,
+    group_share,
     select_windows,
     sketch_bytes_per_head,
     value_centroid,
@@ -109,10 +110,11 @@ def test_int4_mu_and_vbar_are_accuracy_neutral(ratio):
     def picks(enc, k, a, v, va, q, n_sel):
         sketch_mod._q_sym4, sketch_mod._dq_sym4 = enc
         try:
-            _, est = gate_and_score(q, _card(k, a, v, va), a, 1.0 / math.sqrt(D))
+            logmass, _ = gate_and_score(q, _card(k, a, v, va), a, 1.0 / math.sqrt(D))
         finally:
             sketch_mod._q_sym4, sketch_mod._dq_sym4 = int4
-        return group_max(est, HKV).topk(n_sel, dim=-1).indices
+        # The shipped selection: the group union of per-head shares.
+        return group_share(logmass, HKV).topk(n_sel, dim=-1).indices
 
     overlaps = []
     for seed in range(6):
@@ -333,8 +335,16 @@ def test_recall_at_the_shipped_25_percent_ratio():
 
     Built at the real shape-C geometry -- 271 active Q windows, Llama-3.1-8B GQA
     (32 query heads over 8 KV heads, rep=4) -- and measured as **attention mass
-    recall per KV head**, which is the quantity a quality loss would come out of.
-    Deliberately the worst head, not the mean: a mean hides the head that breaks.
+    recall per QUERY head**: each head's share of its OWN softmax that the gate
+    reads, which is the quantity a quality loss comes out of. Deliberately the
+    worst head, not the mean: a mean hides the head that breaks.
+
+    This used to measure recall of the group's SUMMED raw mass, ``exp(logit)``
+    added across the group's query heads. That sum is dominated by the head with
+    the largest baseline logit, which is the same head the old raw-max union let
+    choose for the group, so metric and selection shared one blind spot. It read
+    1.000 while the worst query head had 0.0005 of its mass read
+    (``tests/test_gate_union_is_per_head.py``).
     """
     hkv, hq, nw = 8, 32, 271
     g = torch.Generator().manual_seed(31)
@@ -349,13 +359,14 @@ def test_recall_at_the_shipped_25_percent_ratio():
 
     s = build_sketch(k, a, v, v.mean(dim=(0, 2)))
     card = type(s)(*[f.unsqueeze(0) for f in s])
-    _, est = gate_and_score(q, card, a, scaling)
+    logmass, _ = gate_and_score(q, card, a, scaling)
     true = scaling * torch.einsum(
         "nhwd,bhrd->bhrnw", k, q.reshape(1, hkv, hq // hkv, D)).reshape(1, hq, nw, WS)
-    mass_kv = true.logsumexp(-1).reshape(1, hkv, hq // hkv, nw).logsumexp(2).exp()
+    tw = true.logsumexp(-1)
+    p = (tw - tw.logsumexp(-1, keepdim=True)).exp()          # each head's own softmax
 
-    for ratio, floor in ((0.10, 0.98), (0.15, 0.99), (0.25, 0.995), (0.50, 0.999)):
-        keep = select_windows(group_max(est, hkv), math.ceil(ratio * nw))
+    for ratio, floor in ((0.10, 0.95), (0.15, 0.985), (0.25, 0.995), (0.50, 0.999)):
+        keep = select_windows(group_share(logmass, hkv), math.ceil(ratio * nw))
         assert keep.sum(-1).max() <= math.ceil(ratio * nw)
-        recall = (mass_kv * keep).sum(-1) / mass_kv.sum(-1)
+        recall = (p * keep.repeat_interleave(hq // hkv, dim=1)).sum(-1)
         assert recall.min() >= floor, f"ratio {ratio}: worst head {recall.min():.4f}"

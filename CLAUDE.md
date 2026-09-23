@@ -69,6 +69,23 @@ already expresses "read everything" through the same code, which makes it a
 *provable* no-op and therefore the control arm. Shipped operating point: **0.25**
 (`utils.config.OPERATING_POINT`).
 
+### The GQA union is over each head's share, never over raw logits
+
+The gate reads `n_sel` windows per **KV head**, chosen for the four query heads
+that share it. A window is ranked by the largest share of its own int2 mass any
+of them puts on it, `max_h [logmass_h(w) − logsumexp_w' logmass_h(w')]`
+(`sketch.group_share`, `gate_kernel._gate_share_kernel`).
+
+Until 2026-09-23 it was the group max of the **raw** estimate. A raw logit
+carries its head's baseline (`q·anchor`) and scale (`|q|`), both invisible to
+that head's softmax, so the loudest head chose for the group. That defect was
+behind the RULER 32k gap the fill fix (`0b21c9f`) did not move
+(`DISTANCE_TO_GOAL.md` §12). **Anything that compares or adds attention
+quantities across query heads must normalise per head first.** That covers
+selection and recall metrics alike. The old recall test summed raw `exp(logit)`
+across a group, which shares the same blind spot, so it read 1.000 while one
+head got 0.05% of its mass read.
+
 ## The finding that governs decode work
 
 **A card must be read for every window on every step, while a window is only
@@ -192,6 +209,7 @@ one per-window block is the real fix and needs a GPU to verify.
   *log* ratio, and window scores accumulate in fp32 — both move decode outputs
   and eviction decisions. The old ratio-of-sums fill handed a retrieval head's
   needle mass to every window the gate skipped; do not reintroduce a
-  `Σ exact / Σ estimate` calibration.
+  `Σ exact / Σ estimate` calibration. **Nor across the 2026-09-23 union fix**
+  (§12): the gate now reads different windows at the same ratio.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

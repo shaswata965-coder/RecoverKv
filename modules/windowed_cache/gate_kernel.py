@@ -11,30 +11,42 @@ the log-mass estimate that every **skipped** window contributes to
 
 Shape of the work
 -----------------
-One program owns one ``(batch, KV head)``, matching ``decode_kernel``'s grid, so
-the GQA group's union is free: the program reduces over its own ``rep`` query
-heads before selecting, which is what makes the cap bind on the KV head -- the
-real unit of work, since one program loads a window once for the whole group.
-Capping per query head and unioning afterwards would let a 0.25 ratio read up to
-``0.25 * rep`` of the tier (100% at Llama-3.1-8B's rep=4).
-
-Two dot products per window give both outputs::
+Two launches. ``_gate_kernel`` scores the cards: one program per
+``(batch, KV head, window tile)``, reading a window's card once for all ``rep``
+query heads that share it. Two dot products per window give::
 
     m = q.anchor + q.mu        g = q.v
-    x_i   = scale * (m + t_i * g)                  per-token estimate
-    bound = max_i (x_i + scale * ||q|| * eps_i)    upper bound, cannot miss
-    est   = max_i x_i                              slack-free, what the cap ranks on
-    logmass = logsumexp_i x_i                      what a skipped window scores
+    x_i     = scale * (m + t_i * g)                per-token estimate
+    logmass = logsumexp_i x_i                      what a window is worth to a head
 
-``bound`` and ``est`` are different quantities with different jobs; see
-:func:`modules.quant.sketch.select_windows` for why the cap ranks on the second.
+``_gate_share_kernel`` then turns ``logmass`` into the selection score, one
+program per ``(batch, KV head)``::
+
+    share_h(w) = logmass_h(w) - logsumexp_w' logmass_h(w')   per query head
+    score(w)   = max over the group's heads of share_h(w)    the GQA union
+
+The union has to bind on the KV head, because that is the unit of work: one
+decode program loads a window once for the whole group. Capping per query head
+and unioning afterwards would let a 0.25 ratio read up to ``0.25 * rep`` of the
+tier (100% at Llama-3.1-8B's rep=4).
+
+**Why the union is over shares and not over raw logits.** It used to be the max
+of the raw ``max_i x_i`` over the group, computed inside ``_gate_kernel``. A raw
+logit carries its head's baseline (``q.anchor``) and scale (``|q|``), and a
+softmax is invariant to both, so that max was decided by whichever head had the
+largest baseline, and the other heads were read only where it agreed. The share
+is what a head's own softmax computes, so it compares heads on one footing. The
+normaliser is a reduction over every window, which the card kernel cannot do
+because it splits windows across programs. That is the only reason for the
+second launch. :func:`modules.quant.sketch.group_share` has the measurement.
 
 A separate kernel, for now
 --------------------------
 This could be a prologue inside ``_two_tier_decode_kernel`` -- one program
 already owns the right ``(batch, KV head)`` -- and that is where it belongs
-eventually, because the decode path is launch-bound and this costs one extra
-launch per layer per step. It is separate first because a prologue competes for
+eventually, because the decode path is launch-bound and the card scan costs
+one extra launch per layer per step (the share union is a second, small one).
+It is separate first because a prologue competes for
 the main kernel's register budget: its Q-tier loop already stages ten
 ``[D/2, BLOCK_T]`` fp32 tiles and the autotuner falls back silently when that
 budget is exceeded, so a rung dropped by the prologue would cost more than the
@@ -45,9 +57,10 @@ Backend contract (mirrors ``score_kernel`` / ``decode_kernel``)
 --------------------------------------------------------------
 * :func:`gate_reference` -- pure-PyTorch oracle. Defines correctness, runs on
   CPU, and is the Triton kernel's test oracle.
-* ``_gate_kernel`` + :func:`_gate_triton` -- the GPU kernel. **GPU-only, ships
-  unvalidated by construction** (this repo's dev box is CPU-only), like every
-  other Triton kernel here.
+* ``_gate_kernel`` + ``_gate_share_kernel`` + :func:`_gate_triton` -- the GPU
+  kernels. **GPU-only, ship unvalidated by construction** (this repo's dev box
+  is CPU-only), like every other Triton kernel here.
+  :func:`gate_share_tiled_reference` mirrors the second one's tiling on CPU.
 * :func:`fused_gate` -- dispatcher: Triton on CUDA, reference otherwise.
 """
 
@@ -96,13 +109,19 @@ def gate_reference(
         :func:`_sorted_pick` for why the order is free to the result and not
         free to the memory system.
     logmass : ``[B, H_q, Nw]`` the estimate for every window.
+
+    The pick is the top ``n_sel`` by :func:`~modules.quant.sketch.group_share`:
+    the largest share of its own int2 mass that any query head of the group puts
+    on a window. It used to be the top ``n_sel`` by the group max of the RAW
+    estimate, which let the head with the largest baseline logit choose for the
+    whole group; see ``group_share`` for the measurement.
     """
-    from modules.quant.sketch import Sketch, gate_and_score, group_max
+    from modules.quant.sketch import Sketch, gate_and_score, group_share
 
     card = Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
-    logmass, est = gate_and_score(q, card, anchor, scaling)
+    logmass, _ = gate_and_score(q, card, anchor, scaling)
     hkv = mu_q.shape[2]
-    top = group_max(est, hkv).topk(n_sel, dim=-1).indices          # [B,Hkv,n_sel]
+    top = group_share(logmass, hkv).topk(n_sel, dim=-1).indices    # [B,Hkv,n_sel]
     return _sorted_pick(top), logmass
 
 
@@ -150,11 +169,11 @@ def _sorted_pick(top: Tensor) -> Tensor:
 #:
 #: **What a rung can and cannot move.** ``BLOCK_W`` is provably bit-identical:
 #: each program owns a disjoint span of output columns and every reduction here
-#: -- the ``logsumexp`` over ``WS`` and the ``max`` over ``REP`` -- lives entirely
-#: inside one window, so which program owns which window changes nothing about
-#: the arithmetic. ``num_warps`` is NOT: it changes the lane layout of the
-#: ``tl.sum`` over ``HEAD_DIM``, so ``est`` and ``logmass`` move in their last
-#: bits, and ``est`` feeds a top-k. A last-bit move can therefore swap the k-th
+#: -- the ``logsumexp`` over ``WS`` -- lives entirely inside one window, so which
+#: program owns which window changes nothing about the arithmetic. ``num_warps``
+#: is NOT: it changes the lane layout of the ``tl.sum`` over ``HEAD_DIM``, so
+#: ``logmass`` moves in its last bits, and ``logmass`` feeds the share the top-k
+#: ranks on. A last-bit move can therefore swap the k-th
 #: and (k+1)-th window when the two are already tied to ~1e-7 -- windows whose
 #: estimated mass is equal to seven digits. That is the same class of
 #: perturbation the tile ladder next door already ships, and the same one
@@ -202,14 +221,20 @@ def gate_window_tiles(rows: int, n_windows: int, sm_count: int) -> int:
     return 16
 
 
+#: Windows per tile in ``_gate_share_kernel``'s two passes. Any power of two is
+#: correct -- the union is exact whatever the tiling -- and the tensor it walks is
+#: ``[REP, NW]`` fp32 per program, so this only trades loop trips for registers.
+GATE_SHARE_BLOCK_W = 128
+
+
 if _HAS_TRITON:  # pragma: no cover - GPU-only
 
     @triton.jit
     def _gate_kernel(
         Q, MU, MUS, V, VS, T, TS, ANCH,
-        EST, LOGM,
+        LOGM,
         qb, qh, pmb, pmn, pmh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah,
-        lb, lh, eb, eh,
+        lb, lh,
         NW, REP, SCALE,
         HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr,
@@ -227,11 +252,12 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         **The window axis is split across programs**, not walked serially inside
         one. See :func:`gate_window_tiles`.
 
-        **``est`` leaves as the GQA group's max**, already reduced over ``r``, so
-        the output is ``[B, H_kv, NW]`` rather than ``[B, H_q, NW]`` — a quarter
-        of the write traffic, and it saves the host a reshape and an ``amax``
-        before the top-k. ``logmass`` stays per query head because every query
-        head's skipped windows need their own estimate.
+        **Only ``logmass`` leaves, per query head.** This kernel used to also
+        store the group max of the raw estimate, and the top-k ranked on it. That
+        max compared raw logits across query heads, which is the defect
+        :func:`modules.quant.sketch.group_share` describes. The union needs each
+        head's logsumexp over EVERY window, and this kernel splits windows across
+        programs, so the union moved to :func:`_gate_share_kernel`.
 
         ``BLOCK_WS`` is ``WS`` rounded up to a power of two, because ``tl.arange``
         admits nothing else. The surplus lanes are masked out of the ``t`` load
@@ -243,8 +269,7 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         No ``bound`` is computed. The margin rule that needed it has no caller on
         this path (``WindowedCache._gate_ctx`` refuses a finite margin), so the
         bound cost a ``[B, H_q, NW]`` fp32 store and the whole ``eps`` field of
-        every card, to be discarded by :func:`_gate_triton`. The cap ranks on the
-        estimate; see :func:`modules.quant.sketch.select_windows`.
+        every card, to be discarded by :func:`_gate_triton`.
         """
         b = tl.program_id(0)
         kv = tl.program_id(1)
@@ -279,7 +304,6 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         # The anchor is indexed by KV head alone, so it is constant in r too.
         anc = tl.load(ANCH + b * ab + kv * ah + d, mask=dm, other=0.0).to(tl.float32)
 
-        est_g = tl.full([BLOCK_W], -float("inf"), tl.float32)
         for r in range(0, REP):
             hq = kv * REP + r
             q_v = tl.load(Q + b * qb + hq * qh + d, mask=dm, other=0.0).to(tl.float32)
@@ -297,10 +321,96 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
             lm = xm + tl.log(tl.sum(tl.exp(x - xm[:, None]), axis=1))
             tl.store(LOGM + b * lb + hq * lh + cols,
                      tl.where(cm, lm, -float("inf")), mask=cm)
-            est_g = tl.maximum(est_g, xm)
 
-        tl.store(EST + b * eb + kv * eh + cols,
-                 tl.where(cm, est_g, -float("inf")), mask=cm)
+    @triton.jit
+    def _gate_share_kernel(
+        LOGM, EST,
+        lb, lh, eb, eh,
+        NW, REP,
+        BLOCK_R: tl.constexpr, BLOCK_W: tl.constexpr,
+    ):
+        """The GQA union, on shares. One program per ``(row, KV head)``.
+
+        Pass 1 is an online logsumexp over EVERY window of each of the group's
+        ``REP`` query heads, which is each head's int2-tier normaliser. Pass 2
+        stores, per window, the max over those heads of
+        ``logmass - normaliser``: the largest share of its own int2 mass any head
+        of the group puts on the window. The top-k then ranks on that.
+
+        Both passes read only ``LOGM``, which ``_gate_kernel`` wrote in the
+        previous launch, so ordering is the stream's, not this program's. The
+        traffic is ``2 * REP * NW`` fp32 per program against the card kernel's
+        ``NW`` cards, about 3% of it at ``D = 128``.
+
+        Masking, both kinds, and why neither can produce a NaN:
+
+        * a padding query-head lane (``r >= REP``, when ``REP`` is not a power of
+          two) loads ``-inf`` everywhere, so its running max stays ``-inf``. Its
+          normaliser is forced to ``0`` and its shares to ``-inf``, so it never
+          wins the max and never evaluates ``-inf - -inf``.
+        * a padding window lane (``cols >= NW``) loads ``-inf``, which adds
+          ``exp(-inf) = 0`` to the sum. The running max is shifted through
+          ``m_safe`` so ``exp(m - m_new)`` is never ``exp(-inf - -inf)``.
+
+        :func:`gate_share_tiled_reference` mirrors this tile for tile on CPU.
+        """
+        b = tl.program_id(0)
+        kv = tl.program_id(1)
+        r = tl.arange(0, BLOCK_R)
+        rm = r < REP
+        hq = kv * REP + r
+        offs_w = tl.arange(0, BLOCK_W)
+
+        m = tl.full([BLOCK_R], -float("inf"), tl.float32)
+        s = tl.zeros([BLOCK_R], tl.float32)
+        for w0 in range(0, NW, BLOCK_W):
+            cols = w0 + offs_w
+            msk = rm[:, None] & (cols < NW)[None, :]
+            x = tl.load(LOGM + b * lb + hq[:, None] * lh + cols[None, :],
+                        mask=msk, other=-float("inf"))
+            m_new = tl.maximum(m, tl.max(x, axis=1))
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            s = s * tl.exp(m - m_safe) + tl.sum(tl.exp(x - m_safe[:, None]), axis=1)
+            m = m_new
+        lse = tl.where(rm & (m > -float("inf")), m + tl.log(s), 0.0)
+
+        for w0 in range(0, NW, BLOCK_W):
+            cols = w0 + offs_w
+            cm = cols < NW
+            msk = rm[:, None] & cm[None, :]
+            x = tl.load(LOGM + b * lb + hq[:, None] * lh + cols[None, :],
+                        mask=msk, other=-float("inf"))
+            share = tl.where(msk, x - lse[:, None], -float("inf"))
+            tl.store(EST + b * eb + kv * eh + cols, tl.max(share, axis=0), mask=cm)
+
+
+def gate_share_tiled_reference(logmass: Tensor, num_kv_heads: int,
+                               block_w: int = GATE_SHARE_BLOCK_W) -> Tensor:
+    """CPU mirror of ``_gate_share_kernel``, tile for tile. ``[B,Hq,NW] -> [B,Hkv,NW]``.
+
+    Not a shortcut to :func:`modules.quant.sketch.group_share`. It walks the
+    window axis in ``block_w`` tiles with the kernel's online logsumexp,
+    including the ``m_safe`` shift and the ``-inf`` padding lanes, so the
+    tiling and masking are what the tests check against the spec. That is the
+    part a CPU box can verify. The Triton lowering is not.
+    """
+    B, Hq, NW = logmass.shape
+    rep = Hq // num_kv_heads
+    x = logmass.to(torch.float32).reshape(B, num_kv_heads, rep, NW)
+    ninf = float("-inf")
+    m = torch.full((B, num_kv_heads, rep), ninf)
+    s = torch.zeros((B, num_kv_heads, rep))
+    for w0 in range(0, NW, block_w):
+        cols = torch.arange(w0, w0 + block_w)
+        valid = cols < NW
+        tile = torch.full((B, num_kv_heads, rep, block_w), ninf)
+        tile[..., valid] = x[..., cols[valid]]
+        m_new = torch.maximum(m, tile.amax(-1))
+        m_safe = torch.where(m_new == ninf, torch.zeros_like(m_new), m_new)
+        s = s * torch.exp(m - m_safe) + torch.exp(tile - m_safe[..., None]).sum(-1)
+        m = m_new
+    lse = torch.where(m > ninf, m + torch.log(s), torch.zeros_like(m))
+    return (x - lse[..., None]).amax(2)
 
 
 def _sm_count(device) -> int:  # pragma: no cover - GPU-only
@@ -323,9 +433,10 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     ws = t_q.shape[-1]
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
-    # Both are dead by the end of `_run_fused`: `est` is consumed by the topk
-    # below, `logm` by the decode kernel's §5 fill in the same call. Reused
-    # across layers within a step -- see `decode_kernel._scratch` (W4/D5).
+    # Both are dead by the end of `_run_fused`: `est` (the union score) is
+    # consumed by the topk below, `logm` by the decode kernel's §5 fill in the
+    # same call. Reused across layers within a step -- see
+    # `decode_kernel._scratch` (W4/D5).
     from .decode_kernel import _scratch
     logm = _scratch("logm", (B, HQ, NW), torch.float32, q.device)
     est = _scratch("est", (B, HKV, NW), torch.float32, q.device)
@@ -351,7 +462,7 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
         block_w, num_warps = rung
         _gate_kernel[(B, HKV, -(-NW // block_w))](
             q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
-            est, logm,
+            logm,
             q.stride(0), q.stride(1),
             mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
             v_q.stride(0), v_q.stride(1), v_q.stride(2),
@@ -359,7 +470,6 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
             t_q.stride(0), t_q.stride(1), t_q.stride(2),
             anchor.stride(0), anchor.stride(1),
             logm.stride(0), logm.stride(1),
-            est.stride(0), est.stride(1),
             NW, HQ // HKV, scaling,
             HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
             BLOCK_D=triton.next_power_of_2(D),
@@ -375,7 +485,19 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV))
     _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, _GATE_SEEN,
                   sig, ladder, _launch, "read gate tiling")
-    # `est` already carries the group max, so this is a bare top-k. Sorted
+    # The GQA union, on each head's share of its own int2 mass. It needs every
+    # window's `logm`, so it is its own launch after the tile search's final
+    # launch has written them; see `_gate_share_kernel`. Not tuned: it moves
+    # 2 * REP * NW floats per program, ~3% of the card kernel's traffic.
+    rep = HQ // HKV
+    _gate_share_kernel[(B, HKV)](
+        logm, est,
+        logm.stride(0), logm.stride(1), est.stride(0), est.stride(1),
+        NW, rep,
+        BLOCK_R=triton.next_power_of_2(rep), BLOCK_W=GATE_SHARE_BLOCK_W,
+        num_warps=4,
+    )
+    # `est` now carries the union score, so this is a bare top-k. Sorted
     # ascending -- free to the result, not free to the memory system; the whole
     # argument is in `_sorted_pick`.
     return _sorted_pick(est.topk(n_sel, dim=-1).indices), logm
@@ -395,7 +517,7 @@ def fused_gate(
     is not a *degraded* path -- same arithmetic, same selectivity, just without
     the fused launch. That argument is wrong about cost, and the cost is the
     entire point of the gate. Measured at the benchmarked shape, the reference is
-    **62 torch ops per layer per step** against the kernel's one launch, and it
+    **62 torch ops per layer per step** against the kernels' two launches, and it
     materialises a ``[B, Nw, H_kv, rep, ws]`` intermediate the kernel never
     builds. A silent fallback therefore turns a read-traffic optimisation into a
     large decode regression, while every number downstream still looks like the
@@ -411,7 +533,7 @@ def fused_gate(
         raise RuntimeError(
             "the read gate requires the Triton kernel on CUDA and triton is not "
             "installed. There is no CUDA fallback: the PyTorch reference costs "
-            "~62 ops per layer per step against the kernel's one launch, so "
+            "~62 ops per layer per step against the kernels' two launches, so "
             "falling back would silently replace the optimisation with a "
             "regression. Install triton, or set STICKYKV_FUSED_DECODE=0 to run "
             "the materialize path (which does not gate at all)."

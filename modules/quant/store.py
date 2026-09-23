@@ -402,17 +402,20 @@ class QuantizedStore:
                 "gate_and_select needs sketch cards; construct the store with "
                 "sketch_enabled=True and demote at least once."
             )
-        from .sketch import Sketch, gate_and_score, group_max, select_windows
+        from .sketch import Sketch, gate_and_score, group_share, select_windows
 
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
-        logmass, est = gate_and_score(query, card, self._anchor, scaling)
+        logmass, _ = gate_and_score(query, card, self._anchor, scaling)
         # Union the GQA group FIRST, then select. The KV head is the unit of
         # work -- one program loads a window once for every query head sharing
         # it -- so the cap has to bind there. Capping per query head and unioning
         # afterwards would let ratio r read up to r*rep windows (see group_max).
+        # The union is over each head's SHARE of its own mass, not over raw
+        # logits: a raw max lets the head with the largest baseline pick for the
+        # whole group (see group_share).
         keep = select_windows(
-            group_max(est, self.num_kv_heads), self.cap_for_ratio(ratio))
+            group_share(logmass, self.num_kv_heads), self.cap_for_ratio(ratio))
         return keep, logmass, slots
 
     def cap_for_ratio(self, ratio: float) -> int:
@@ -456,6 +459,12 @@ class QuantizedStore:
         top-k pays 2.5% of the worst head's mass for the same traffic. So each KV
         head picks its own windows, and the cost is that positions become
         per-head: ``[B, H_kv, n_sel*ws]`` rather than the shared ``[B, n*ws]``.
+
+        Those recall figures are of the GQA group's summed raw mass, which the
+        loudest query head dominates. They say which unit the cap should bind on;
+        they do not say every query head is served. Measured per query head, the
+        raw-max union that produced them left one head 0.05% of its mass, which is
+        why the union now runs over per-head shares (``sketch.group_share``).
 
         Counts are equal across rows and heads (the cap is a fixed
         ``ceil(ratio * n_active)``), so the result is still dense and needs no

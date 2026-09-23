@@ -2,6 +2,27 @@
 
 Date: 2026-09-22 · Fix commit: `0b21c9f` on `Clustered_int2_paused_fast`
 
+> **Update 2026-09-23: the fix below did not move RULER.** On the `0b21c9f`
+> build, cwe (18.56), niah_single_3 (71.40), niah_multikey_2 (91.00) and
+> niah_single_2 (99.20) scored exactly what they scored before it. The fill it
+> corrects is real, but it was not what decided those tasks.
+>
+> **The cause was which windows the gate reads, not how it weights the rest.**
+> The gate picks windows per KV head for four query heads at once, and it
+> merged them by the max of each head's *raw* logit estimate. A raw logit
+> carries the head's baseline and scale, which its softmax ignores, so the
+> loudest head of each group chose for all four. A retrieval head sharing a KV
+> head with a louder one had its needle window read on about half the steps.
+> The recall test could not see this because it summed raw mass across the
+> group, which the same loudest head dominates. It read 1.000 while the worst
+> query head had 0.05% of its mass read.
+>
+> Fixed by ranking each window on the largest share of its own int2 mass that
+> any head of the group puts on it (`sketch.group_share`, and a second small
+> Triton launch, `_gate_share_kernel`). Full write-up: `DISTANCE_TO_GOAL.md` §12.
+> Tests: `tests/test_gate_union_is_per_head.py`. CPU-verified; not yet run on a
+> GPU.
+
 ## The report
 
 RULER 32k at `window_size=32`, compared with the QEvict reference.

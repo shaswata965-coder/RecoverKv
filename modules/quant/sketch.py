@@ -104,6 +104,8 @@ __all__ = [
     "gate_and_score",
     "select_windows",
     "group_max",
+    "head_log_share",
+    "group_share",
 ]
 
 
@@ -348,22 +350,25 @@ def gate_and_score(
     -------
     logmass : ``[B, Hq, Nw]`` ``logsumexp_i(scaling * q.k_i_hat)`` -- what a
         skipped window contributes, both to ``window_scores`` and (weighted by
-        the step's measured deviation) to the attention output.
-    est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``. The
-        selection ranks on this.
+        the step's measured deviation) to the attention output. The selection
+        ranks on this too, normalised per query head -- see :func:`group_share`.
+    est : ``[B, Hq, Nw]`` point estimate ``max_i scaling * q.k_i_hat``.
+        Diagnostic only: it is a raw logit, and raw logits are not comparable
+        across query heads, which is why the selection no longer ranks on it.
 
-    Both live in the log domain, so they are comparable across windows and cannot
-    overflow. Two ``D``-length dots (``q.mu``, ``q.v``) yield both; ``t`` is 10
-    bytes and rides in the cache line the vectors already pulled in.
+    Both live in the log domain, so they cannot overflow. Two ``D``-length dots
+    (``q.mu``, ``q.v``) yield both; ``t`` is 10 bytes and rides in the cache line
+    the vectors already pulled in.
+
+    **Neither is comparable across query heads.** Each carries its head's own
+    baseline (``q.anchor``) and scale (``|q|``), and a head's softmax is
+    invariant to both. Comparing them across the heads of a GQA group is the
+    defect :func:`group_share` exists to fix.
 
     **There is no bound any more.** The card used to return a Cauchy-Schwarz
     upper bound alongside the estimate, for a ``quant_gate_margin`` rule that the
-    fused gate never implemented. Ranking on the estimate is not a weakening of
-    that: the estimate was already the better ranking quantity (the bound's slack
-    term lets a loosely-bounded window outrank a tighter one carrying a higher
-    true logit, measured at 100.0% worst-head mass recall against the bound's
-    99.7%). What is gone is a guarantee nothing consumed, and the ``eps`` field
-    that paid for it.
+    fused gate never implemented. What is gone is a guarantee nothing consumed,
+    and the ``eps`` field that paid for it.
     """
     B, Hq, D = q.shape
     Nw, Hkv = s.mu_q.shape[1], s.mu_q.shape[2]
@@ -400,22 +405,85 @@ def group_max(est: Tensor, num_kv_heads: int) -> Tensor:
 
     One kernel program owns a KV head and every query head sharing it, so a
     window is loaded once for the whole group and the group's cost is one window
-    either way. Taking the **max** bound over the group before selecting is what
-    makes that true: whatever any member of the group needs, the group keeps.
+    either way. Taking the **max** over the group before selecting is what makes
+    that true: whatever any member of the group needs, the group keeps.
 
     This reduction MUST come before any cap. Capping per query head and unioning
     afterwards lets a ratio of ``r`` turn into as much as ``r * rep`` windows
     actually read -- at ``rep = 4`` (Llama-3.1-8B) a 25% cap becomes 100% loaded
     and the gate buys nothing. ``tests/test_sketch_store.py`` pins this.
+
+    **The input must already be on one footing across query heads.** A max over
+    raw logits is not a union: see :func:`group_share`, which is what the
+    selection passes in.
     """
     B, Hq, Nw = est.shape
     return est.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).amax(2)
 
 
-def select_windows(est: Tensor, max_windows: int) -> Tensor:
-    """Keep-mask over the window axis: the top ``max_windows`` by estimate.
+def head_log_share(logmass: Tensor) -> Tensor:
+    """``[B, Hq, Nw]`` -> each query head's log share of ITS OWN int2-tier mass.
 
-    Call it on **KV-head** estimates (i.e. after :func:`group_max`), not on
+    ``logmass - logsumexp_w(logmass)``: the card's estimate of what fraction of
+    this head's attention over the int2 tier each window holds, in the log
+    domain. It is invariant to anything a softmax is invariant to -- a per-head
+    constant on every logit (the head's ``q.anchor`` baseline) cancels exactly --
+    and it puts every head of a GQA group on the same footing: ``0`` means "this
+    window is all of my int2 mass", ``-log(Nw)`` means "I am spread evenly".
+
+    The logsumexp is written out for the same two reasons as in
+    :func:`gate_and_score`, and the max is guarded so a head whose every entry is
+    ``-inf`` yields ``-inf`` shares rather than NaN.
+    """
+    m = logmass.amax(dim=-1, keepdim=True)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    lse = m + (logmass - m).exp().sum(dim=-1, keepdim=True).log()
+    return logmass - lse
+
+
+def group_share(logmass: Tensor, num_kv_heads: int) -> Tensor:
+    """``[B, Hq, Nw]`` -> ``[B, Hkv, Nw]``: what the gate ranks windows on.
+
+    For each window, the largest share of its own int2-tier mass that ANY query
+    head of the GQA group puts on it::
+
+        score(w) = max_h [ logmass_h(w) - logsumexp_w' logmass_h(w') ]
+
+    **Why not the max of the raw estimates, which is what shipped.** A head's
+    attention is a softmax over its own logits, so what a window is worth to a
+    head is its share of THAT head's mass. The raw estimate also carries the
+    head's baseline (``q.anchor``, which differs by several logit units between
+    the heads of a group) and its scale (``|q|``). The max over raw estimates was
+    therefore decided by whichever head had the largest baseline or scale, and
+    every other head in the group was read only where that head happened to
+    agree. On the repo's own recall fixture the group-summed metric said 1.000
+    while the worst query head had **0.0005** of its mass read. At RULER geometry
+    (840 windows x ws=32) a retrieval head's needle window was read on about
+    **half** of the steps even when it held 95% of that head's int2 mass. A copy
+    step can only reproduce a token its head actually reads, and a UUID is about
+    25 copy steps long. ``tests/test_gate_union_is_per_head.py`` pins both.
+
+    **What the share guarantees.** A head's shares sum to one, so at most
+    ``rep / tau`` windows of a group can hold more than ``tau`` of any member's
+    int2 mass. With ``n_sel`` windows read per KV head, every window that holds
+    more than about ``rep / n_sel`` of ANY member's int2 mass is read. At the
+    32k operating point that is about 2%. The raw max gave no such guarantee to
+    any head but the dominant one.
+
+    **Why ``logmass`` and not ``est``.** ``est`` is one token's rank-1 estimate.
+    At ``ws = 32`` the token a query wants is rarely the card's farthest point,
+    so that estimate is mostly noise from ``t_far * q.v``. ``logmass`` sums the
+    whole window, which is the quantity a softmax consumes. Measured on the
+    kernel's oracle at ``ws=32``, it reads the needle window on every seed
+    (``est``-based: 60-90%), and gives lower output error on diffuse heads too.
+    """
+    return group_max(head_log_share(logmass), num_kv_heads)
+
+
+def select_windows(est: Tensor, max_windows: int) -> Tensor:
+    """Keep-mask over the window axis: the top ``max_windows`` by score.
+
+    Call it on **KV-head** scores (i.e. after :func:`group_share`), not on
     query-head ones: one kernel program owns a KV head and every query head
     sharing it, so a window is loaded once for the whole group and the KV head is
     the unit the cap has to bind on. Capping per query head and unioning
@@ -423,10 +491,8 @@ def select_windows(est: Tensor, max_windows: int) -> Tensor:
     a 25% cap becomes 100% loaded and the gate buys nothing.
 
     The margin rule is gone with ``eps``. It thresholded on a Cauchy-Schwarz
-    bound the fused gate never implemented, and the estimate was already the
-    better ranking quantity — 100.0% worst-head mass recall at a 0.15 ratio
-    against the bound's 99.7%. What is left is a deterministic top-k: one
-    criterion, no calibration, no host sync, no data-dependent shape.
+    bound the fused gate never implemented. What is left is a deterministic
+    top-k: one criterion, no calibration, no host sync, no data-dependent shape.
     """
     rank = torch.argsort(torch.argsort(est, dim=-1, descending=True), dim=-1)
     return rank < max_windows
