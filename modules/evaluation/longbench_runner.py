@@ -512,6 +512,8 @@ class LongBenchRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Gate-card field widths (sketch.CardBits); None means the shipped card.
+            quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
             # The gate itself. LongBench must be able to take the same arm the
             # throughput table takes, or the two describe different methods --
             # which is the exact defect 8ef579a fixed for quant_ratio.
@@ -566,6 +568,8 @@ class LongBenchRunner:
                 "top_k_windows": int(r.top_k_windows),
                 "top_k_fp": int(r.top_k_fp),
                 "N_q": int(r.N_q),
+                "quant_card_bits": dict(r.quant_card_bits._asdict()),
+                "bytes_per_gate_card": int(r.bytes_per_gate_card),
                 "retained_windows": int(r.retained_windows),
                 "retained_tokens": int(r.retained_tokens),
                 "retained_bytes": int(r.retained_bytes),
@@ -754,8 +758,10 @@ class LongBenchRunner:
         else:
             lws_resolved = None
 
+        from utils.cache_factory import quant_card_bits_record
         meta = {
             "read_gate": read_gate,
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
             "dataset": dataset_name,
             "num_examples": num_examples,
             "model_name": cfg.model.name,

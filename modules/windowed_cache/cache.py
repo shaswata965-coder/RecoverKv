@@ -1098,6 +1098,7 @@ class WindowedCache(_HFCacheBase):
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
+                    card_bits=self.resolved.quant_card_bits,
                 )
                 for _ in range(num_layers)
             ]
@@ -2278,10 +2279,14 @@ class WindowedCache(_HFCacheBase):
         # skips cost no second pass over the tier to attend through. `vm_q` /
         # `vm_s` are SKETCH_FIELDS[-2:]; the kernel wants them contiguous and
         # separate from the scan fields, which the gather already gives.
+        # `bits` travels with the card because the card cannot say how it was
+        # encoded: a packed field's shape does not determine its width once `D`
+        # is not known, and both kernels take the widths as constexprs.
         return {
             "card": card,
             "anchor": store._anchor,
             "centroid": (card[-2], card[-1], store._v_anchor),
+            "bits": store.card_bits,
             "n_sel": max(1, math.ceil(ratio * n)),
         }
 

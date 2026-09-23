@@ -56,6 +56,7 @@ import torch
 from torch import Tensor
 
 from modules.quant.quantizer import grid_group
+from modules.quant.sketch import card_field_layout
 
 try:  # pragma: no cover - import guard, exercised only where triton is present
     import triton
@@ -580,6 +581,10 @@ def two_tier_window_reference(
 
 if _HAS_TRITON:
 
+    # The card-field unpack the gate kernel reads mu/v/t with, reused for the
+    # value centroid so every card field has one lane map at every width.
+    from .gate_kernel import _card_codes
+
     @triton.jit
     def _two_tier_decode_kernel(
         Q, KFP, VFP,
@@ -591,7 +596,7 @@ if _HAS_TRITON:
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
-        VM, VMS, VANC,             # value centroids: int4-packed u8 [B,n,H_kv,D//2], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
+        VM, VMS, VANC,             # value centroids: [B,n,H_kv,D*VM_BITS//8] (int4-packed u8 by default), fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -604,6 +609,7 @@ if _HAS_TRITON:
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
         GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
+        VM_BITS: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -701,10 +707,12 @@ if _HAS_TRITON:
         vsgn = H_kv * GV
         vsgh = GV
         cob = n_active * WS * HALF
-        # VM is int4, packed two per byte along D, so its row is HALF wide.
-        vmb = n_active * H_kv * HALF
-        vmn = H_kv * HALF
-        vmh = HALF
+        # VM is packed along D at VM_BITS (the `quant_card_bits` knob), so its
+        # row is D * VM_BITS / 8 bytes wide: HALF at the shipped int4, D at int8.
+        VMW: tl.constexpr = HEAD_DIM * VM_BITS // 8
+        vmb = n_active * H_kv * VMW
+        vmn = H_kv * VMW
+        vmh = VMW
         vmsb = n_active * H_kv
         vmsn = H_kv
         vab = H_kv * HEAD_DIM
@@ -777,9 +785,6 @@ if _HAS_TRITON:
 
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
-        # int4 lane map for the value centroids (§5): two per byte along D.
-        vbyte = (offs_d // 2)
-        vshift = (4 * (offs_d % 2)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
         # A statement, not a ternary: `if` on a constexpr is the form Triton's
@@ -998,12 +1003,11 @@ if _HAS_TRITON:
                 # exactly as the Q loop dequantizes codes -- no fp16 centroid
                 # tensor is ever built.
                 qmask = cmask & (cols >= n_body_win)
-                # int4 nibbles, +8 biased: element d is byte d//2, shift 4*(d%2)
-                # -- the same unpack as the Q loop's int2 crumbs, one width up.
-                vb_ = tl.load(VM + b * vmb + qc[:, None] * vmn + kv * vmh
-                              + vbyte[None, :],
-                              mask=qmask[:, None], other=0)
-                vq = (((vb_ >> vshift[None, :]) & 0xF).to(tl.float32) - 8.0)
+                # At VM_BITS (`_card_codes`). At the shipped int4 these are
+                # nibbles, +8 biased: element d is byte d//2, shift 4*(d%2) --
+                # the same unpack as the Q loop's int2 crumbs, one width up.
+                vq = _card_codes(VM + b * vmb + qc[:, None] * vmn + kv * vmh,
+                                 offs_d[None, :], qmask[:, None], VM_BITS)
                 vsc = tl.load(VMS + b * vmsb + qc * vmsn + kv,
                               mask=qmask, other=0.0).to(tl.float32)
                 vbar = vq * vsc[:, None] + vanc[None, :]
@@ -1386,6 +1390,7 @@ def _decode_triton(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -1508,17 +1513,20 @@ def _decode_triton(
                 "skips attend through them, and without them 75% of the tier "
                 "would be silently absent from the attention output.")
         VM, VMS, VANC = centroids
-        # int4, packed two per byte along D (modules/quant/sketch._q_sym4), so
-        # the stored row is D//2 wide. Checked rather than inferred: a full-width
-        # int8 centroid would read the right number of BYTES and the wrong
-        # VALUES, which is the failure mode a shape check exists to catch.
-        if VM.shape != (B, n_active, H_kv, D // 2):
+        # At `vm_bits` (modules/quant/sketch._q_symb): int4 by default, packed
+        # two per byte along D, so the stored row is D//2 wide. Checked rather
+        # than inferred: a centroid at the wrong width would read the right
+        # number of BYTES and the wrong VALUES, which is the failure mode a
+        # shape check exists to catch.
+        vm_width, vm_dtype = card_field_layout(D, vm_bits)
+        if VM.shape != (B, n_active, H_kv, vm_width):
             raise RuntimeError(
-                f"centroid codes must be int4-packed [B, n_active, H_kv, D//2] = "
-                f"[{B}, {n_active}, {H_kv}, {D // 2}]; got {tuple(VM.shape)}.")
-        if VM.dtype != torch.uint8:
+                f"centroid codes at {vm_bits} bits must be [B, n_active, H_kv, "
+                f"{vm_width}] = [{B}, {n_active}, {H_kv}, {vm_width}]; got "
+                f"{tuple(VM.shape)}.")
+        if VM.dtype != vm_dtype:
             raise RuntimeError(
-                f"centroid codes must be uint8 (packed int4 nibbles); got "
+                f"centroid codes at {vm_bits} bits must be {vm_dtype}; got "
                 f"{VM.dtype}.")
         if VMS.shape != (B, n_active, H_kv):
             raise RuntimeError(
@@ -1590,7 +1598,7 @@ def _decode_triton(
     # between evictions does not re-trigger the search every step; `B` is exact
     # because it moves the grid.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
-           int(B), int(Sfp).bit_length(), int(n_sel).bit_length())
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(vm_bits))
 
     def _launch(rung):
         target_keys, num_stages, num_warps = rung
@@ -1612,7 +1620,7 @@ def _decode_triton(
             BLOCK_W=BLOCK_W,
             PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
             GROUP_K=gk, GROUP_V=gv,
-            GATED=gated, LOG2E=_LOG2E,
+            GATED=gated, LOG2E=_LOG2E, VM_BITS=vm_bits,
             num_stages=num_stages, num_warps=num_warps,
         )
 
@@ -1642,6 +1650,7 @@ def fused_two_tier_decode(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -1654,6 +1663,8 @@ def fused_two_tier_decode(
         it, so the kernel's window axis matches the caller's score axis exactly.
     sel : the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns, or None
         to read the whole tier.
+    vm_bits : the width the value centroids were built at (``CardBits.vm``,
+        the ``quant_card_bits`` knob); 4 is the shipped card.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
     physical order (body windows, then Q windows). ``W_phys`` counts the **whole**
@@ -1670,4 +1681,4 @@ def fused_two_tier_decode(
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
     return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
-                          sel, logmass, centroids)
+                          sel, logmass, centroids, vm_bits)

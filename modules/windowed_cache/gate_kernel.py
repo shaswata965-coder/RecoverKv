@@ -4,10 +4,11 @@ What it replaces
 ----------------
 Without the gate the decode step dequantizes every active int2 window to find
 out which ones mattered (design §8). This kernel reads each window's card --
-``mu``/``v`` int8 plus two tiny scalars, 400 B per head against a 6432 B window
--- and emits the compacted slot list the Q-tier loop should actually visit, plus
-the log-mass estimate that every **skipped** window contributes to
-``window_scores``.
+at the default widths ``mu`` int4 and ``v``/``t`` int8 with fp16 scales, 272 B
+per head with the value centroid, against a 6432 B window; ``quant_card_bits``
+sets each field to 8, 4 or 2 bits -- and emits the compacted slot list the
+Q-tier loop should actually visit, plus the log-mass estimate that every
+**skipped** window contributes to ``window_scores``.
 
 Shape of the work
 -----------------
@@ -72,6 +73,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from modules.quant.sketch import _as_bits, card_field_layout, parse_card_bits
+
 try:  # pragma: no cover - import guard, exercised only where triton is present
     import triton
     import triton.language as tl
@@ -90,6 +93,7 @@ def gate_reference(
     anchor: Tensor,
     scaling: float,
     n_sel: int,
+    bits=None,
 ) -> Tuple[Tensor, Tensor]:
     """``(sel, logmass)`` — the oracle.
 
@@ -102,6 +106,8 @@ def gate_reference(
         object.
     anchor : ``[B, H_kv, D]`` or ``[H_kv, D]``.
     n_sel : windows to keep per ``(row, KV head)``.
+    bits : the card's :class:`~modules.quant.sketch.CardBits`; ``None`` is the
+        shipped card.
 
     Returns
     -------
@@ -119,7 +125,7 @@ def gate_reference(
     from modules.quant.sketch import Sketch, gate_and_score, group_share
 
     card = Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
-    logmass, _ = gate_and_score(q, card, anchor, scaling)
+    logmass, _ = gate_and_score(q, card, anchor, scaling, parse_card_bits(bits))
     hkv = mu_q.shape[2]
     top = group_share(logmass, hkv).topk(n_sel, dim=-1).indices    # [B,Hkv,n_sel]
     return _sorted_pick(top), logmass
@@ -230,6 +236,30 @@ GATE_SHARE_BLOCK_W = 128
 if _HAS_TRITON:  # pragma: no cover - GPU-only
 
     @triton.jit
+    def _card_codes(ROW, lane, mask, BITS: tl.constexpr):
+        """One card field's signed codes, as fp32, at its stored width.
+
+        ``ROW`` points at each window's field (``[BLOCK_W, 1]`` pointers),
+        ``lane`` is the element index (``[1, n]``). ``BITS`` is a constexpr, so
+        only one branch is traced and a field at its shipped width compiles to
+        the load it always was: int8 is a plain load; a packed width reads byte
+        ``lane // (8 // BITS)`` and shifts ``BITS * (lane % (8 // BITS))``, then
+        removes the ``2**(BITS-1)`` bias -- ``modules.quant.sketch._q_symb``'s
+        lane map, and at 4 bits exactly the nibble unpack this kernel had
+        inline. Masked lanes decode to a finite value that every caller already
+        multiplies by a masked-to-zero operand or forces to ``-inf``.
+        """
+        if BITS == 8:
+            codes = tl.load(ROW + lane, mask=mask, other=0).to(tl.float32)
+        else:
+            PER: tl.constexpr = 8 // BITS
+            raw = tl.load(ROW + lane // PER, mask=mask, other=0)
+            shift = (BITS * (lane % PER)).to(tl.uint8)
+            codes = (((raw >> shift) & ((1 << BITS) - 1)).to(tl.float32)
+                     - (1 << (BITS - 1)))
+        return codes
+
+    @triton.jit
     def _gate_kernel(
         Q, MU, MUS, V, VS, T, TS, ANCH,
         LOGM,
@@ -238,6 +268,7 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         NW, REP, SCALE,
         HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
         BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr,
+        MU_BITS: tl.constexpr, V_BITS: tl.constexpr, T_BITS: tl.constexpr,
     ):
         """One program per ``(row, KV head, window tile)``.
 
@@ -280,24 +311,23 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
 
         cols = tl.program_id(2) * BLOCK_W + tl.arange(0, BLOCK_W)
         cm = cols < NW
-        # mu is int4 packed two per byte along D: element `d` is the nibble at
-        # byte `d // 2`, shift `4 * (d % 2)`, biased by +8 so it is unsigned.
-        # Same idiom as the decode kernel's int2 crumbs, one width up.
-        dbyte = d // 2
-        dshift = (4 * (d % 2)).to(tl.uint8)
 
         # ---- the cards for this tile: read ONCE for the whole query group ----
-        mu_b = tl.load(MU + b * pmb + cols[:, None] * pmn + kv * pmh + dbyte[None, :],
-                       mask=cm[:, None] & dm[None, :], other=0)
-        mu = (((mu_b >> dshift[None, :]) & 0xF).to(tl.float32) - 8.0)
+        # Each field at its `quant_card_bits` width (`_card_codes`). At the
+        # shipped card mu is int4 packed two per byte along D -- element `d` is
+        # the nibble at byte `d // 2`, shift `4 * (d % 2)`, biased by +8 so it
+        # is unsigned, the decode kernel's int2 crumb idiom one width up -- and
+        # v and t are int8.
+        mu = _card_codes(MU + b * pmb + cols[:, None] * pmn + kv * pmh, d[None, :],
+                         cm[:, None] & dm[None, :], MU_BITS)
         mus = tl.load(MUS + b * sb + cols * sn + kv * sh,
                       mask=cm, other=0.0).to(tl.float32)
-        vv = tl.load(V + b * mub + cols[:, None] * mun + kv * muh + d[None, :],
-                     mask=cm[:, None] & dm[None, :], other=0).to(tl.float32)
+        vv = _card_codes(V + b * mub + cols[:, None] * mun + kv * muh, d[None, :],
+                         cm[:, None] & dm[None, :], V_BITS)
         vs = tl.load(VS + b * sb + cols * sn + kv * sh,
                      mask=cm, other=0.0).to(tl.float32)
-        tt = tl.load(T + b * tb + cols[:, None] * tn + kv * th + w[None, :],
-                     mask=cm[:, None] & wm[None, :], other=0).to(tl.float32)
+        tt = _card_codes(T + b * tb + cols[:, None] * tn + kv * th, w[None, :],
+                         cm[:, None] & wm[None, :], T_BITS)
         ts = tl.load(TS + b * sb + cols * sn + kv * sh,
                      mask=cm, other=0.0).to(tl.float32)
 
@@ -420,17 +450,37 @@ def _sm_count(device) -> int:  # pragma: no cover - GPU-only
         return 64
 
 
-def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-only
+def _check_card_layout(card, bits, D: int, ws: int) -> None:
+    """Validate every card field against its width.
+
+    A packed field's shape cannot say its own width once ``D`` is not known, and
+    the kernel derives nothing from the shapes it is handed but these extents.
+    So they are checked rather than inferred: a field at the wrong width reads
+    the right number of BYTES and the wrong VALUES, which is the failure a shape
+    check exists to catch. Run once per launch signature, not per step: every
+    card in a run comes from one slot table, built at one width.
+    """
+    mu_q, _, v_q, _, t_q, _, vm_q, _ = card
+    for name, t, n, w in (("mu", mu_q, D, bits.mu), ("v", v_q, D, bits.v),
+                          ("t", t_q, ws, bits.t), ("vm", vm_q, D, bits.vm)):
+        width, dtype = card_field_layout(n, w)
+        if t.shape[-1] != width or t.dtype != dtype:
+            raise RuntimeError(
+                f"card field {name} at {w} bits must be {dtype} with a last axis "
+                f"of {width} (n={n}); got {t.dtype} {tuple(t.shape)}. The card "
+                "and the `bits` it was passed with disagree.")
+
+
+def _gate_triton(q, card, anchor, scaling, n_sel, bits):  # pragma: no cover - GPU-only
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
     mu_q, mu_s, v_q, v_s, t_q, t_s, _vm_q, _vm_s = card
-    # mu_q's last axis is D//2 (int4, packed); the head dim comes from `v_q`,
-    # which is still full-width int8. Reading it off mu_q would halve every
-    # downstream extent.
+    # The head dim comes from the query: every card field may be packed, and
+    # reading it off one would shrink every downstream extent by its pack.
     B, NW, HKV = mu_q.shape[0], mu_q.shape[1], mu_q.shape[2]
-    D = v_q.shape[-1]
+    D = q.shape[-1]
     HQ = q.shape[1]
-    ws = t_q.shape[-1]
+    ws = t_q.shape[-1] * 8 // bits.t           # t may be packed along ws
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
     # Both are dead by the end of `_run_fused`: `est` (the union score) is
@@ -474,6 +524,7 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
             HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
             BLOCK_D=triton.next_power_of_2(D),
             BLOCK_W=block_w,
+            MU_BITS=bits.mu, V_BITS=bits.v, T_BITS=bits.t,
             num_warps=num_warps,
         )
 
@@ -482,7 +533,11 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     # moves the active set only there), so it takes one value per budget regime
     # and an exact key costs no extra searches while a bucketed one could serve a
     # tile chosen for a tier 40% larger.
-    sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV))
+    # The widths join it because they are constexprs: each is its own compile,
+    # and a tile timed on one is not evidence about another.
+    sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV), bits)
+    if sig not in _GATE_CHOICE:
+        _check_card_layout(card, bits, D, ws)
     _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, _GATE_SEEN,
                   sig, ladder, _launch, "read gate tiling")
     # The GQA union, on each head's share of its own int2 mass. It needs every
@@ -510,8 +565,13 @@ def fused_gate(
     scaling: float,
     n_sel: int,
     force_reference: bool = False,
+    bits=None,
 ) -> Tuple[Tensor, Tensor]:
     """Dispatch: Triton on CUDA (**required**), the reference on CPU.
+
+    ``bits`` is the card's :class:`~modules.quant.sketch.CardBits` (``None`` =
+    the shipped card). It must be the widths the card was BUILT with; the
+    Triton path checks every field against it.
 
     This used to fall back silently on CUDA, on the argument that the reference
     is not a *degraded* path -- same arithmetic, same selectivity, just without
@@ -527,8 +587,10 @@ def fused_gate(
     So on CUDA it raises, like ``fused_two_tier_decode``. ``force_reference``
     remains for tests that want the oracle on purpose.
     """
+    bits = _as_bits(bits)                      # one isinstance on the hot path
     if force_reference or not q.is_cuda:
-        return gate_reference(*( (q,) + tuple(card) + (anchor, scaling, n_sel) ))
+        return gate_reference(*((q,) + tuple(card) + (anchor, scaling, n_sel)),
+                              bits=bits)
     if not _HAS_TRITON:
         raise RuntimeError(
             "the read gate requires the Triton kernel on CUDA and triton is not "
@@ -538,4 +600,4 @@ def fused_gate(
             "regression. Install triton, or set STICKYKV_FUSED_DECODE=0 to run "
             "the materialize path (which does not gate at all)."
         )
-    return _gate_triton(q, card, anchor, scaling, n_sel)
+    return _gate_triton(q, card, anchor, scaling, n_sel, bits)

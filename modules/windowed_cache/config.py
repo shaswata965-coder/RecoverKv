@@ -14,6 +14,8 @@ from typing import Any, Optional, Union
 
 import torch
 
+from modules.quant.sketch import CARD_BITS_DEFAULT, CardBits, parse_card_bits
+
 from .policy import FIRST_EVICTION_STEP
 
 #: Floor on `ResolvedConfig.budget_utilisation`. A budget that is granted and
@@ -81,6 +83,9 @@ class ResolvedConfig:
     quant_gate_ratio: float = 0.25
     quant_gate_margin: float = float("inf")
     quant_gate_max_windows: Optional[int] = None
+    # Each gate-card field's width, already parsed (WindowedCacheConfig's
+    # `quant_card_bits`). `bytes_per_gate_card` above is priced from it.
+    quant_card_bits: CardBits = CARD_BITS_DEFAULT
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -291,6 +296,18 @@ class WindowedCacheConfig:
     quant_gate_margin: float = float("inf")
     # Absolute cap, overriding the ratio when set. Diagnostics; prefer the ratio.
     quant_gate_max_windows: Optional[int] = None
+    # Bits per element of each gate-card field, (mu, v, t, vm), each 8, 4 or 2
+    # (modules/quant/sketch.CardBits). None is the shipped card, mu4/v8/t8/vm4,
+    # and is byte- and kernel-identical to the build before this knob existed.
+    # One width sets every field (`4`, `"int2"`); a mapping or a
+    # "mu=4,v=4,t=2,vm=2" string sets some. Parsed to a CardBits here.
+    #
+    # It moves the card's PRICE, and the budget follows it: under
+    # quant_budget_mode="bytes" a narrower card buys more int2 windows, so which
+    # windows the cache keeps moves with it -- a quality change, not only a
+    # read-traffic one. Under "tokens" the window count is unchanged and only
+    # the bytes move.
+    quant_card_bits: Any = None
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -389,6 +406,7 @@ class WindowedCacheConfig:
         if (self.quant_gate_max_windows is not None
                 and self.quant_gate_max_windows < 1):
             raise ValueError("quant_gate_max_windows must be >= 1 or None")
+        self.quant_card_bits = parse_card_bits(self.quant_card_bits)
 
         # -- quant_budget_mode (what quant_ratio divides) --
         if self.quant_budget_mode not in ("tokens", "bytes"):
@@ -589,7 +607,8 @@ class WindowedCacheConfig:
         from modules.quant.sketch import sketch_bytes_per_head
 
         gate_live = q > 0.0
-        b_card = (num_kv_heads * sketch_bytes_per_head(head_dim, self.window_size)
+        b_card = (num_kv_heads * sketch_bytes_per_head(
+                      head_dim, self.window_size, self.quant_card_bits)
                   if gate_live else 0)
         b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size) + b_card
         m_evict = remaining * bytes_per_token                           # evictable bytes
@@ -665,6 +684,7 @@ class WindowedCacheConfig:
             quant_gate_ratio=self.quant_gate_ratio,
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,
+            quant_card_bits=self.quant_card_bits,
             first_eviction_step=self.first_eviction_step,
         )
 

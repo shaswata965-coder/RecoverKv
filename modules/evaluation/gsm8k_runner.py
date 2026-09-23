@@ -363,6 +363,8 @@ class GSM8KRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Gate-card field widths (sketch.CardBits); None means the shipped card.
+            quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -506,8 +508,10 @@ class GSM8KRunner:
         cfg = self.config
         budget = cfg.cache.cache_budget
 
+        from utils.cache_factory import quant_card_bits_record
         meta = {
             "read_gate": self._read_gate_report("gsm8k"),
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
             "task": "gsm8k",
             "run_name": output_dir.name,
             "num_examples": n_examples,

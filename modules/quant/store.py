@@ -72,6 +72,7 @@ class QuantizedStore:
         n_slots: int,
         memoize_read: bool = True,
         sketch_enabled: bool = False,
+        card_bits=None,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
@@ -82,6 +83,11 @@ class QuantizedStore:
         # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
         # off nothing is allocated and every path below is the pre-gate one.
         self.sketch_enabled = sketch_enabled
+        # Each card field's width (the `quant_card_bits` knob, sketch.CardBits).
+        # Parsed once here so every later call hands the encoder, the gate and
+        # the slot table the same validated object.
+        from .sketch import parse_card_bits
+        self.card_bits = parse_card_bits(card_bits)
         # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
         # be frozen, not running: a card is written once and never revisited
         # (§10), so a later anchor change would silently reinterpret every card
@@ -123,6 +129,7 @@ class QuantizedStore:
                 num_kv_heads=self.num_kv_heads,
                 device=device,
                 sketch=self.sketch_enabled,
+                card_bits=self.card_bits,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -156,8 +163,9 @@ class QuantizedStore:
                     f"join_layers: layer {i} has {s._n_active} active Q windows, "
                     f"layer 0 has {ref._n_active} — layers must stay in lockstep"
                 )
-            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots) != (
-                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots):
+            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots,
+                    s.card_bits) != (ref.window_size, ref.head_dim,
+                                     ref.num_kv_heads, ref.n_slots, ref.card_bits):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s store geometry differs from layer 0's"
                 )
@@ -176,6 +184,7 @@ class QuantizedStore:
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
+            card_bits=ref.card_bits,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
@@ -311,7 +320,7 @@ class QuantizedStore:
                 self._v_anchor = vp.reshape(B, n, H, S, D).mean(dim=(1, 3))
             anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
             vanc = self._v_anchor.repeat_interleave(n, dim=0)
-            sketch = tuple(build_sketch(kp, anc, vp, vanc))
+            sketch = tuple(build_sketch(kp, anc, vp, vanc, self.card_bits))
 
         self.table.write(
             slot_idx, valid, wid,
@@ -406,7 +415,8 @@ class QuantizedStore:
 
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
-        logmass, _ = gate_and_score(query, card, self._anchor, scaling)
+        logmass, _ = gate_and_score(query, card, self._anchor, scaling,
+                                    self.card_bits)
         # Union the GQA group FIRST, then select. The KV head is the unit of
         # work -- one program loads a window once for every query head sharing
         # it -- so the cap has to bind there. Capping per query head and unioning
@@ -432,7 +442,7 @@ class QuantizedStore:
         from .sketch import Sketch, value_centroid
 
         card = Sketch(*self.table.gather_sketch(slots))
-        return value_centroid(card, self._v_anchor)
+        return value_centroid(card, self._v_anchor, self.card_bits)
 
     def gated_q_tier(
         self,

@@ -321,7 +321,8 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
             "of them through this same path."
         )
     sel, logmass = fused_gate(
-        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"],
+        bits=gate["bits"])
     # Shapes only — no device sync, no launch. See _STATS.
     _STATS["gated"] += 1
     _STATS["windows_read"] += int(sel.shape[-1])
@@ -336,6 +337,7 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     out, wsum = fused_two_tier_decode(
         q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
         sel=sel, logmass=logmass, centroids=gate["centroid"],
+        vm_bits=gate["bits"].vm,
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is

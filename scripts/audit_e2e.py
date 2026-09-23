@@ -213,6 +213,11 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         "quant_gate_ratio": c.get(
             "quant_gate_ratio",
             getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+        # Same reason: the card's widths are compile-time constants of both
+        # kernels, so profiling must run the card the config asked for.
+        "quant_card_bits": c.get(
+            "quant_card_bits",
+            getattr(cfg.cache, "quant_card_bits", None)),
         "first_eviction_step": c.get(
             "first_eviction_step",
             getattr(cfg.cache, "first_eviction_step",

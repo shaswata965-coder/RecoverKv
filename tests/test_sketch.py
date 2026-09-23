@@ -52,9 +52,9 @@ def _fixture(n=64, h=HKV, ws=WS, d=D, hot=6.0, spread=1.0, seed=0):
     return k, a, v, v.mean(dim=(0, 2))
 
 
-def _card(k, a, v, va, b=1):
+def _card(k, a, v, va, b=1, bits=None):
     """A built card with a leading batch axis, as the read path sees it."""
-    s = build_sketch(k, a, v, va)
+    s = build_sketch(k, a, v, va, bits)
     return type(s)(*[f.unsqueeze(0).expand(b, *f.shape).contiguous() for f in s])
 
 
@@ -102,17 +102,16 @@ def test_int4_mu_and_vbar_are_accuracy_neutral(ratio):
     ``mu`` and ``vbar`` are 64% of the card and both are means stored as a
     residual from a frozen anchor. Coarsening them must not move what the gate
     SELECTS, which is the only thing that changes which keys attention sees.
-    Compared against the previous int8 encoding on the same fixture.
+    Compared against the previous int8 encoding on the same fixture -- now
+    selected through the ``quant_card_bits`` knob rather than by swapping the
+    module's encoder, which the knob replaced.
     """
-    int4 = (sketch_mod._q_sym4, sketch_mod._dq_sym4)
-    int8 = (sketch_mod._q_sym, sketch_mod._dq_sym)
+    int4 = sketch_mod.CARD_BITS_DEFAULT
+    int8 = sketch_mod.CardBits(mu=8, v=8, t=8, vm=8)
 
-    def picks(enc, k, a, v, va, q, n_sel):
-        sketch_mod._q_sym4, sketch_mod._dq_sym4 = enc
-        try:
-            logmass, _ = gate_and_score(q, _card(k, a, v, va), a, 1.0 / math.sqrt(D))
-        finally:
-            sketch_mod._q_sym4, sketch_mod._dq_sym4 = int4
+    def picks(bits, k, a, v, va, q, n_sel):
+        logmass, _ = gate_and_score(q, _card(k, a, v, va, bits=bits), a,
+                                    1.0 / math.sqrt(D), bits)
         # The shipped selection: the group union of per-head shares.
         return group_share(logmass, HKV).topk(n_sel, dim=-1).indices
 

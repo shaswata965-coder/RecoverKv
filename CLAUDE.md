@@ -116,6 +116,23 @@ to five decimals (0.00004 median relative output error, both encodings, 8
 seeds); at 0.10 it is 0.00166 vs 0.00151. **Not yet measured on a GPU** — the
 speed claim is bytes-only.
 
+**The widths are a knob: `quant_card_bits`** (`sketch.CardBits(mu, v, t, vm)`,
+each 8, 4 or 2; `null` = the shipped mu4/v8/t8/vm4). It exists to re-measure the
+table above, not to overrule it. Know three things before using it:
+* **The default is a no-op**: same bytes, same budget, and both kernels take the
+  widths as constexprs, so a default launch compiles to the unpack it always
+  had. Checked bitwise against the pre-knob kernels under the Triton interpreter.
+* **int2 here is ternary** (`{-1, 0, +1}·scale`), the same symmetric rule as
+  int4 one width down. All-int4 is 204 B/head, all-int2 106 B/head.
+* **Under `quant_budget_mode: bytes` it is a quality change**: a cheaper card
+  buys more int2 windows, so which windows the cache keeps moves. Sidecars
+  record it as `quant_card_bits`, next to `read_gate`.
+
+`tests/interp_card_kernels.py` runs the gate and decode kernels under
+`TRITON_INTERPRET=1` on CPU. That checks their arithmetic and lane maps, **not**
+their GPU lowering. "Triton cannot run on this dev box" still holds for
+performance and compilation.
+
 Consequences that still hold, from `DISTANCE_TO_GOAL.md` §2:
 
 * break-even is a **read ratio**, not something small — 0.66 now, not 0.50;

@@ -150,9 +150,12 @@ def test_the_budget_buys_21_percent_more_int2_windows():
     now = n_q(bytes_per_q_window(H, D, WS) + b_card)
     before = n_q(H * ((D * WS) // 2 + 4 * D + 4 * WS) + b_card)
     assert now > before
-    assert now / before == pytest.approx(1.21, abs=0.02)
-    # And an int2 window is still much cheaper than an fp16 one, card included.
-    assert b_fp / (bytes_per_q_window(H, D, WS) + b_card) == pytest.approx(3.4, abs=0.1)
+    # 1.23 with the int4 card (2176 B); it read 1.21 when the card was int8
+    # (3200 B), and the assertion outlived that change.
+    assert now / before == pytest.approx(1.234, abs=0.01)
+    # And an int2 window is still much cheaper than an fp16 one, card included:
+    # 32768 / 8608, the fp/q price ratio DISTANCE_TO_GOAL.md quotes.
+    assert b_fp / (bytes_per_q_window(H, D, WS) + b_card) == pytest.approx(3.81, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

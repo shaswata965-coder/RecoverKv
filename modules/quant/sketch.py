@@ -80,6 +80,29 @@ pins the conclusions):
   bound eviction path, one fewer transform in the kernel prologue, and no
   resident transform matrix.
 
+The width knob: ``quant_card_bits``
+-----------------------------------
+Every field's width is a setting, :class:`CardBits` ``(mu, v, t, vm)``, each one
+of **8, 4 or 2** bits. The default is the measured split above,
+``CardBits(mu=4, v=8, t=8, vm=4)``, and at the default every path -- the
+encoder, the slot table, the budget, both Triton kernels -- is the code it was
+before the knob existed: the width reaches the kernels as a ``constexpr``, so a
+default launch compiles to the same unpack it always did. The findings above
+are why the default is what it is; the knob exists to re-measure them, not to
+overrule them.
+
+Every width uses one rule, :func:`_q_symb`: symmetric, per-(window, head) fp16
+scale fit to ``amax / qmax`` with ``qmax = 2**(bits-1) - 1``. 8 bits is stored
+as plain ``int8``, unpacked (unchanged). 4 and 2 bits are stored as ``code +
+2**(bits-1)`` so every lane is unsigned, packed ``8 // bits`` per byte along the
+last axis, element ``j`` at byte ``j // per``, shift ``bits * (j % per)`` --
+low lanes first, the int2 crumb packer's convention. **int2 is therefore
+ternary**, ``{-1, 0, +1} * scale``: symmetric with an exact zero, the same rule
+as int4 one width down. A window's card bytes follow from the widths through
+:func:`sketch_bytes_per_head`, which is what the budget prices, so a narrower
+card buys int2 windows under ``quant_budget_mode='bytes'`` exactly as the
+int8 -> int4 change did.
+
 Shapes
 ------
 The leading axis is opaque, matching :class:`~modules.quant.slots.QuantSlotTable`
@@ -90,12 +113,17 @@ quantisers). Everything here takes ``[N, H, ws, D]`` keys and returns
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import Any, Mapping, NamedTuple, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 __all__ = [
+    "CardBits",
+    "CARD_BITS_DEFAULT",
+    "CARD_BITS_ALLOWED",
+    "parse_card_bits",
+    "card_field_layout",
     "Sketch",
     "sketch_bytes_per_head",
     "build_sketch",
@@ -109,11 +137,130 @@ __all__ = [
 ]
 
 
-def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
+class CardBits(NamedTuple):
+    """Bits per element of each card field: ``(mu, v, t, vm)``.
+
+    The default is the measured split (module docstring): ``mu`` and ``vm`` are
+    means stored as residuals from a frozen anchor and take int4; ``v`` is the
+    deviation direction and ``t`` the per-token projection, and both stay int8.
+    Each field accepts 8, 4 or 2 -- see the module docstring for the encoding.
+    """
+
+    mu: int = 4
+    v: int = 8
+    t: int = 8
+    vm: int = 4
+
+
+#: The shipped widths. Every default in this module, the slot table, the store
+#: and both config classes is this object, so "no knob set" is one definition.
+CARD_BITS_DEFAULT = CardBits()
+#: Widths a card field can take. 8 is unpacked int8; 4 and 2 are packed.
+CARD_BITS_ALLOWED = (8, 4, 2)
+
+
+def _one_width(name: str, val: Any) -> int:
+    """One field's width from an int or an ``"int4"``-style string."""
+    if isinstance(val, bool):
+        raise ValueError(f"quant_card_bits.{name} must be 8, 4 or 2, got bool")
+    if isinstance(val, str):
+        txt = val.strip().lower()
+        txt = txt[3:] if txt.startswith("int") else txt
+        try:
+            val = int(txt)
+        except ValueError:
+            raise ValueError(
+                f"quant_card_bits.{name} must be 8, 4 or 2, got {val!r}") from None
+    if not isinstance(val, int) or val not in CARD_BITS_ALLOWED:
+        raise ValueError(
+            f"quant_card_bits.{name} must be one of {CARD_BITS_ALLOWED}, got "
+            f"{val!r}")
+    return val
+
+
+def parse_card_bits(spec: Any) -> CardBits:
+    """Normalise the ``quant_card_bits`` knob to a validated :class:`CardBits`.
+
+    Accepted forms, so a YAML value and a CLI string both work:
+
+    * ``None`` -- the default, :data:`CARD_BITS_DEFAULT`.
+    * one width (``4``, ``"int2"``) -- **every** field at that width.
+    * a mapping over any subset of ``mu, v, t, vm`` (``{"v": 4}``) -- those
+      fields overridden, the rest at their default.
+    * ``"mu=4,v=4,t=2,vm=2"`` -- the same, as a string.
+    * a 4-sequence in ``(mu, v, t, vm)`` order, including a :class:`CardBits`.
+
+    Anything else raises: a typo'd field name silently falling back to the
+    default would run the default card under a config that says otherwise.
+    """
+    if spec is None:
+        return CARD_BITS_DEFAULT
+    if isinstance(spec, str) and "=" in spec:
+        pairs = {}
+        for part in spec.split(","):
+            if not part.strip():
+                continue
+            if "=" not in part:
+                raise ValueError(
+                    f"quant_card_bits string must be 'field=bits,...', got {spec!r}")
+            k, v = part.split("=", 1)
+            pairs[k.strip()] = v
+        spec = pairs
+    if isinstance(spec, Mapping):
+        unknown = set(spec) - set(CardBits._fields)
+        if unknown:
+            raise ValueError(
+                f"quant_card_bits has no field(s) {sorted(unknown)}; the card's "
+                f"fields are {list(CardBits._fields)}")
+        return CARD_BITS_DEFAULT._replace(
+            **{k: _one_width(k, v) for k, v in spec.items()})
+    if isinstance(spec, (int, str)):
+        w = _one_width("*", spec)
+        return CardBits(w, w, w, w)
+    if isinstance(spec, (tuple, list)):
+        if len(spec) != len(CardBits._fields):
+            raise ValueError(
+                f"quant_card_bits as a sequence must be (mu, v, t, vm), got "
+                f"{len(spec)} entries: {spec!r}")
+        return CardBits(*(_one_width(n, v) for n, v in zip(CardBits._fields, spec)))
+    raise ValueError(
+        f"quant_card_bits must be None, a width, a mapping, a 'field=bits' "
+        f"string or a 4-sequence; got {type(spec).__name__} {spec!r}")
+
+
+def _as_bits(bits: Any) -> CardBits:
+    """``bits`` if it is already a :class:`CardBits`, else parsed. The store and
+    the cache always hold a parsed one, so on their paths this is one isinstance
+    check -- which matters inside the compiled eviction."""
+    return bits if isinstance(bits, CardBits) else parse_card_bits(bits)
+
+
+def card_field_layout(n: int, bits: int) -> Tuple[int, torch.dtype]:
+    """``(stored last-axis width, dtype)`` of an ``n``-element field at ``bits``.
+
+    8 bits is ``(n, int8)``; 4 and 2 are ``(n * bits // 8, uint8)``. ``n`` must
+    fill whole bytes -- a ragged tail would need a masked lane map in both
+    kernels' inner loops.
+    """
+    if bits == 8:
+        return n, torch.int8
+    per = 8 // bits
+    if n % per:
+        raise ValueError(
+            f"a {n}-element card field cannot be packed {per} per byte at "
+            f"{bits} bits; it must be a multiple of {per}.")
+    return n // per, torch.uint8
+
+
+def sketch_bytes_per_head(head_dim: int, window_size: int,
+                          bits: Any = CARD_BITS_DEFAULT) -> int:
     """Bytes one head's card costs — for the budget arithmetic.
 
-    ``mu`` **int4**(D, packed 2/byte) + fp16 scale, ``v`` int8(D) + fp16 scale,
-    ``t`` int8(ws) + fp16 scale, ``vbar`` **int4**(D, packed) + fp16 scale.
+    Each field is its packed codes plus one fp16 scale: ``mu``, ``v`` and
+    ``vbar`` over ``head_dim`` elements, ``t`` over ``window_size``, each at its
+    :class:`CardBits` width. At the default that is ``mu`` **int4**(D, packed
+    2/byte) + fp16 scale, ``v`` int8(D) + fp16 scale, ``t`` int8(ws) + fp16
+    scale, ``vbar`` **int4**(D, packed) + fp16 scale.
 
     ``mu`` and ``vbar`` are int4 and ``v`` is not, and that split is measured,
     not stylistic. ``v`` is the deviation DIRECTION -- the thing that lets the
@@ -128,15 +275,21 @@ def sketch_bytes_per_head(head_dim: int, window_size: int) -> int:
     This number is LOAD-BEARING, not documentation: ``config.resolve`` adds it to
     ``bytes_per_q_window``, so a card field that is not counted here is a window
     the cache holds and the budget does not know about. At ``D=128, ws=8, H=8``
-    the card is 2176 B against the codes-plus-grid's 6432 — down from 3200 B
-    when ``mu`` and ``vbar`` were int8. Unbudgeted, that would be a 34% overrun
-    on the tier the memory claim is made about.
+    the default card is 2176 B against the codes-plus-grid's 6432 — down from
+    3200 B when ``mu`` and ``vbar`` were int8. Unbudgeted, that would be a 34%
+    overrun on the tier the memory claim is made about.
     """
-    return 2 * (head_dim // 2 + 2) + (head_dim + 2) + (window_size + 2)
+    b = _as_bits(bits)
+    return sum(card_field_layout(n, w)[0] + 2 for n, w in (
+        (head_dim, b.mu), (head_dim, b.v), (window_size, b.t), (head_dim, b.vm)))
 
 
 class Sketch(NamedTuple):
-    """One window's card, per head. Leading axis opaque (``N``)."""
+    """One window's card, per head. Leading axis opaque (``N``).
+
+    Shapes are at the default :class:`CardBits`; each ``*_q`` field's last axis
+    and dtype follow :func:`card_field_layout` for its width.
+    """
 
     mu_q: Tensor      # [N, H, D//2] uint8  — mu - anchor, int4 packed 2/byte
     mu_s: Tensor      # [N, H]       fp16
@@ -172,42 +325,72 @@ def _dq_sym(codes: Tensor, scale: Tensor) -> Tensor:
 #: makes every nibble unsigned in ``[1, 15]``, so unpacking is a shift-and-mask
 #: with no sign extension — the same shape as the int2 crumb unpack the decode
 #: kernel already does, which is why the Triton side is three extra lines.
+#: :func:`_q_symb` is the same rule at any packed width: bias ``2**(bits-1)``,
+#: codes in ``[-(2**(bits-1) - 1), 2**(bits-1) - 1]``.
 _NIB_BIAS = 8
 _NIB_MAX = 7
+
+
+def _q_symb(x: Tensor, bits: int) -> Tuple[Tensor, Tensor]:
+    """Symmetric ``bits``-wide codes along the last axis, + a per-row fp16 scale.
+
+    ``bits == 8`` is :func:`_q_sym` -- plain int8, unpacked. ``bits`` of 4 or 2
+    returns ``(packed uint8 [..., n * bits // 8], scale fp16 [...])``.
+
+    The packing order matches the int2 crumb packer in
+    :mod:`modules.quant.quantizer`: element ``j`` lives in byte ``j // per`` at
+    shift ``bits * (j % per)``, low lanes first. Keeping one convention across
+    every width means the kernels' unpack is the same idiom at every width.
+
+    This is a REAL narrow encoder, not a coarsened int8 one: the scale is re-fit
+    to ``amax / qmax`` rather than inherited from the wider grid, so the codes
+    use the whole range. At 2 bits ``qmax`` is 1, so the codes are ternary.
+    """
+    if bits == 8:
+        return _q_sym(x)
+    per = 8 // bits
+    qmax = (1 << (bits - 1)) - 1
+    if x.shape[-1] % per:
+        raise ValueError(
+            f"cannot pack a last axis of {x.shape[-1]} {per} per byte")
+    amax = x.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / qmax, torch.ones_like(amax))
+    s16 = scale.to(torch.float16)
+    s32 = s16.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    codes = torch.round(x / s32).clamp_(-qmax, qmax)
+    lanes = (codes + (1 << (bits - 1))).to(torch.uint8)       # [..., n] unsigned
+    packed = lanes[..., 0::per]
+    for j in range(1, per):
+        packed = packed | (lanes[..., j::per] << (bits * j))
+    return packed, s16.squeeze(-1)
+
+
+def _dq_symb(packed: Tensor, scale: Tensor, bits: int) -> Tensor:
+    """Unpack + dequantize :func:`_q_symb`. ``[..., n * bits // 8]`` -> ``[..., n]``."""
+    if bits == 8:
+        return _dq_sym(packed, scale)
+    per = 8 // bits
+    mask = (1 << bits) - 1
+    bias = 1 << (bits - 1)
+    lanes = [((packed if j == 0 else packed >> (bits * j)) & mask).to(torch.int16)
+             - bias for j in range(per)]
+    codes = torch.stack(lanes, dim=-1).flatten(-2)             # interleave back
+    return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
 
 
 def _q_sym4(x: Tensor) -> Tuple[Tensor, Tensor]:
     """Symmetric int4, **packed two per byte** along the last axis.
 
-    Returns ``(packed uint8 [..., D//2], scale fp16 [...])``.
-
-    The packing order matches the int2 crumb packer in
-    :mod:`modules.quant.quantizer`: element ``j`` lives in byte ``j // 2`` at
-    shift ``4 * (j % 2)``, low nibble first. Keeping one convention across both
-    widths means the kernel's unpack is the same idiom twice, not two idioms.
-
-    This is a REAL int4 encoder, not a coarsened int8 one: the scale is re-fit to
-    ``amax / 7`` rather than inherited from the wider grid, so the codes use the
-    whole 4-bit range. The ablation that cleared this change simulated int4 by
-    rounding int8 codes against the int8 scale, which is strictly worse — so the
-    measured accuracy is a floor, not an estimate.
+    Returns ``(packed uint8 [..., D//2], scale fp16 [...])``. :func:`_q_symb` at
+    4 bits: element ``j`` in byte ``j // 2`` at shift ``4 * (j % 2)``, low nibble
+    first, scale re-fit to ``amax / 7``.
     """
-    amax = x.abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(amax > 0, amax / _NIB_MAX, torch.ones_like(amax))
-    s16 = scale.to(torch.float16)
-    s32 = s16.to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
-    codes = torch.round(x / s32).clamp_(-_NIB_MAX, _NIB_MAX)
-    nib = (codes + _NIB_BIAS).to(torch.uint8)                   # [..., D] in [1,15]
-    lo, hi = nib[..., 0::2], nib[..., 1::2]
-    return (lo | (hi << 4)), s16.squeeze(-1)
+    return _q_symb(x, 4)
 
 
 def _dq_sym4(packed: Tensor, scale: Tensor) -> Tensor:
     """Unpack + dequantize :func:`_q_sym4`. ``[..., D//2]`` -> ``[..., D]``."""
-    lo = (packed & 0x0F).to(torch.int16) - _NIB_BIAS
-    hi = ((packed >> 4) & 0x0F).to(torch.int16) - _NIB_BIAS
-    codes = torch.stack([lo, hi], dim=-1).flatten(-2)           # interleave back
-    return codes.to(torch.float32) * scale.to(torch.float32).unsqueeze(-1)
+    return _dq_symb(packed, scale, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +403,7 @@ def build_sketch(
     anchor: Tensor,
     values: Tensor,
     v_anchor: Tensor,
+    bits: Any = CARD_BITS_DEFAULT,
 ) -> Sketch:
     """One pass over a window's **post-RoPE** keys and values -> its card.
 
@@ -236,6 +420,8 @@ def build_sketch(
     v_anchor : ``[H, D]`` float — the value-side common mode, same role as
         ``anchor``: values carry a strong per-head common mode that would
         otherwise eat the int8 range without separating one window from another.
+    bits : :class:`CardBits` (or anything :func:`parse_card_bits` takes) -- each
+        field's width. The default is the shipped card.
 
     Why the value side is a plain mean while the key side is rank-1
     ---------------------------------------------------------------
@@ -276,12 +462,13 @@ def build_sketch(
     v = fdev.squeeze(-2) / fnrm                                # sweep 2, unit
     t = (dev * v.unsqueeze(-2)).sum(-1)                        # sweep 3
 
-    mu_q, mu_s = _q_sym4(mu - anc)
-    v_q, v_s = _q_sym(v)
-    t_q, t_s = _q_sym(t)
+    b = _as_bits(bits)
+    mu_q, mu_s = _q_symb(mu - anc, b.mu)
+    v_q, v_s = _q_symb(v, b.v)
+    t_q, t_s = _q_symb(t, b.t)
 
     vbar = values.to(torch.float32).mean(dim=-2)               # [N, H, D]
-    vm_q, vm_s = _q_sym4(vbar - _align_anchor(v_anchor, vbar))
+    vm_q, vm_s = _q_symb(vbar - _align_anchor(v_anchor, vbar), b.vm)
 
     return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
 
@@ -302,7 +489,8 @@ def _align_anchor(anchor: Tensor, like: Tensor) -> Tensor:
     return anchor
 
 
-def value_centroid(s: Sketch, v_anchor: Tensor) -> Tensor:
+def value_centroid(s: Sketch, v_anchor: Tensor,
+                   bits: Any = CARD_BITS_DEFAULT) -> Tensor:
     """``[..., H, D]`` — the window's representative value vector.
 
     What a window contributes to the attention output when the gate did not read
@@ -310,19 +498,21 @@ def value_centroid(s: Sketch, v_anchor: Tensor) -> Tensor:
     windows measured this step, so the term is calibrated against real attention
     on every step rather than trusted open-loop.
     """
-    vm = _dq_sym4(s.vm_q, s.vm_s)
+    vm = _dq_symb(s.vm_q, s.vm_s, _as_bits(bits).vm)
     return vm + _align_anchor(v_anchor, vm)
 
 
-def decode_sketch(s: Sketch, anchor: Tensor):
+def decode_sketch(s: Sketch, anchor: Tensor, bits: Any = CARD_BITS_DEFAULT):
     """``(mu_hat, v_hat, t_hat)`` — the decoded card."""
-    # Align against the DECODED mu, not the stored codes: mu_q's last axis is
-    # D//2 now, so aligning on it would broadcast the anchor onto half a head.
-    mu = _dq_sym4(s.mu_q, s.mu_s)
+    # Align against the DECODED mu, not the stored codes: a packed mu_q's last
+    # axis is narrower than D, so aligning on it would broadcast the anchor onto
+    # part of a head.
+    b = _as_bits(bits)
+    mu = _dq_symb(s.mu_q, s.mu_s, b.mu)
     return (
         _align_anchor(anchor, mu) + mu,
-        _dq_sym(s.v_q, s.v_s),
-        _dq_sym(s.t_q, s.t_s),
+        _dq_symb(s.v_q, s.v_s, b.v),
+        _dq_symb(s.t_q, s.t_s, b.t),
     )
 
 
@@ -336,6 +526,7 @@ def gate_and_score(
     s: Sketch,
     anchor: Tensor,
     scaling: float,
+    bits: Any = CARD_BITS_DEFAULT,
 ) -> Tuple[Tensor, Tensor]:
     """Per-window ``(logmass, est)`` from two dot products.
 
@@ -345,6 +536,7 @@ def gate_and_score(
     s : card fields with leading axes ``[B, Nw, Hkv, ...]``.
     anchor : ``[Hkv, D]`` or ``[B, Hkv, D]``.
     scaling : the attention ``1 / sqrt(head_dim)``.
+    bits : the card's :class:`CardBits` -- how ``s`` was encoded.
 
     Returns
     -------
@@ -375,9 +567,10 @@ def gate_and_score(
     rep = Hq // Hkv
     qf = q.to(torch.float32)
 
-    mu_r = _dq_sym4(s.mu_q, s.mu_s)                                  # [B,Nw,Hkv,D]
-    v_h = _dq_sym(s.v_q, s.v_s)
-    t_h = _dq_sym(s.t_q, s.t_s)                                      # [B,Nw,Hkv,ws]
+    b = _as_bits(bits)
+    mu_r = _dq_symb(s.mu_q, s.mu_s, b.mu)                            # [B,Nw,Hkv,D]
+    v_h = _dq_symb(s.v_q, s.v_s, b.v)
+    t_h = _dq_symb(s.t_q, s.t_s, b.t)                                # [B,Nw,Hkv,ws]
 
     qg = qf.reshape(B, Hkv, rep, D)
     a_base = (torch.einsum("bhrd,hd->bhr", qg, anchor) if anchor.dim() == 2

@@ -522,6 +522,10 @@ def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
         "top_k_fp": int(resolved.top_k_fp),
         "N_q": int(resolved.N_q),
         "quant_ratio": float(resolved.quant_ratio),
+        # The gate card's widths and what they cost -- a narrower card is a
+        # cheaper window, so N_q above already reflects them under "bytes".
+        "quant_card_bits": dict(resolved.quant_card_bits._asdict()),
+        "bytes_per_gate_card": int(resolved.bytes_per_gate_card),
         "fp_tokens": fp_tokens,
         "q_tokens": q_tokens,
         # The number of keys one decode step attends over — the quantity that
@@ -1378,7 +1382,12 @@ class PerfRunner:
                       # through the factory: the eager package has no gate.
                       **quant_gate_ratio_kwargs(
                           WCC, c.get("quant_gate_ratio",
-                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))))
+                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))),
+                      # Gate-card field widths, per-config override like the
+                      # ratio above; None means the shipped card.
+                      quant_card_bits=c.get(
+                          "quant_card_bits",
+                          getattr(cfg.cache, "quant_card_bits", None)))
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():

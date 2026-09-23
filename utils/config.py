@@ -190,6 +190,12 @@ class CacheConfig:
     # tier. 1.0 selects every window, which makes the gate a provable no-op and
     # is the control arm for pricing it.
     quant_gate_ratio: float = 0.25
+    # Bits per element of each read-gate card field, (mu, v, t, vm), each 8, 4
+    # or 2 (modules/quant/sketch.CardBits). null = the shipped card, mu4/v8/t8/vm4.
+    # `4` / `2` set every field; {"v": 4} or "mu=4,v=4,t=2,vm=2" set some.
+    # Under quant_budget_mode "bytes" a narrower card buys more int2 windows,
+    # so this moves what the cache keeps, not only what it reads.
+    quant_card_bits: Any = None
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -265,6 +271,14 @@ class CacheConfig:
                 f"quant_budget_mode must be 'tokens' or 'bytes', got "
                 f"{self.quant_budget_mode!r}"
             )
+        # Rejected at load, not at the first eviction. Imported only when set,
+        # so the default config stays torch-free to load.
+        if self.quant_card_bits is not None:
+            from modules.quant.sketch import parse_card_bits
+            try:
+                parse_card_bits(self.quant_card_bits)
+            except ValueError as exc:
+                raise ConfigValidationError(str(exc)) from None
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.

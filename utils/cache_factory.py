@@ -215,6 +215,19 @@ def validate_backend_attn_pairing(
         )
 
 
+def quant_card_bits_record(cache_cfg: Any) -> dict:
+    """``{"mu": 4, "v": 8, "t": 8, "vm": 4}`` -- the gate-card widths a run used.
+
+    For metadata sidecars, next to ``read_gate``: the widths move the card's
+    price, and under ``quant_budget_mode: bytes`` which windows the cache
+    keeps, so a quality number without them does not say which card it ran.
+    Parsed from the config exactly as ``WindowedCacheConfig`` parses it, so a
+    ``null`` records the shipped default rather than ``None``.
+    """
+    from modules.quant.sketch import parse_card_bits
+    return parse_card_bits(getattr(cache_cfg, "quant_card_bits", None))._asdict()
+
+
 def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
     """``{"quant_gate_ratio": requested}``, or ``{}`` if the backend lacks it.
 

@@ -118,6 +118,7 @@ class QuantSlotTable:
         num_kv_heads: int,
         device: torch.device,
         sketch: bool = False,
+        card_bits=None,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -154,23 +155,36 @@ class QuantSlotTable:
         # works on it unchanged. A head-major layout would coalesce no better --
         # the inner dim is what matters -- and would need a `slots.py` refactor.
         self.sketch = sketch
+        # Each card field's width, from the `quant_card_bits` knob
+        # (modules/quant/sketch.CardBits). It decides the stored shape and dtype
+        # of every `sk_*_q` column below, so it is part of the table's geometry.
+        from .sketch import card_field_layout, parse_card_bits
+        self.card_bits = parse_card_bits(card_bits)
         if sketch:
-            # int4, packed two per byte along D (modules/quant/sketch._q_sym4).
-            # mu and vbar are 64% of the card and neither needs int8's range, so
-            # halving them is what takes the card from 400 B/head to 272 and
-            # moves the gate's break-even read ratio from 0.50 to 0.66.
-            self.sk_mu_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
+            # At the default, mu and vbar are int4 packed two per byte along D
+            # (modules/quant/sketch._q_symb) and v and t are int8. mu and vbar
+            # are 64% of the card and neither needs int8's range, so halving
+            # them is what takes the card from 400 B/head to 272 and moves the
+            # gate's break-even read ratio from 0.50 to 0.66. `card_field_layout`
+            # gives each field's width and dtype at whatever the knob says.
+            cb = self.card_bits
+
+            def field(n: int, bits: int) -> Tensor:
+                width, dtype = card_field_layout(n, bits)
+                return torch.zeros((B, N, H, width), dtype=dtype, device=device)
+
+            self.sk_mu_q = field(D, cb.mu)
             self.sk_mu_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_v_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_v_q = field(D, cb.v)
             self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_t_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+            self.sk_t_q = field(S, cb.t)
             self.sk_t_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             # Value-side centroid. This is what makes a SKIPPED window contribute
             # to the attention output instead of vanishing from it; its weight is
             # the card's mass estimate, recalibrated every step against the
             # windows that were actually read. It replaces the `eps` residual
             # field, which served a bound the fused gate never implemented.
-            self.sk_vm_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
+            self.sk_vm_q = field(D, cb.vm)
             self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
@@ -202,8 +216,9 @@ class QuantSlotTable:
         ref = tables[0]
         for i, t in enumerate(tables):
             if (t.n_slots, t.window_size, t.head_dim, t.num_kv_heads,
-                    t.batch_size) != (ref.n_slots, ref.window_size, ref.head_dim,
-                                      ref.num_kv_heads, ref.batch_size):
+                    t.batch_size, t.card_bits) != (
+                        ref.n_slots, ref.window_size, ref.head_dim,
+                        ref.num_kv_heads, ref.batch_size, ref.card_bits):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s slot table geometry differs from "
                     "layer 0's; every layer resolves the same config, so this "
@@ -216,6 +231,7 @@ class QuantSlotTable:
         joint.head_dim = ref.head_dim
         joint.num_kv_heads = ref.num_kv_heads
         joint.sketch = ref.sketch
+        joint.card_bits = ref.card_bits
         fields = ["key_codes", *GRID_FIELDS, "val_codes",
                   "slot_wid", "slot_active", "slot_pos"]
         if ref.sketch:
