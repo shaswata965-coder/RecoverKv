@@ -248,6 +248,15 @@ one per-window block is the real fix and needs a GPU to verify.
   byte-identical, though the rep-4 row says Llama has it too — measure there
   before flipping the default. `QWEN_PORT_PLAN.md` has the numbers. A real
   defect; the LongBench run with it on moved nothing beyond noise.
+* **The gate's card accuracy on Qwen2.5 is unmeasured, and it is the leading
+  suspect for the Qwen gap.** With the operating point and protocol equal, the
+  columns differ only in how a decode step READS the kept cache, and the gate
+  reads 75% of the int2 tier through cards. A card is one mean plus one
+  direction; a q_proj bias makes some query channels large, and then key
+  content the card does not capture dominates the logit (synthetic: 0.28 ->
+  1.4-3.5 nats, TV 0.09 -> 0.56-0.89, int8 or int4). Measure it on the model with
+  `scripts/diagnose_gate_error.py` before touching the card; the control arm is
+  `longbench_qwen_ours_gate100.yaml`.
 * **Ask how the reference was actually invoked before reading its config.**
   One round of the Qwen investigation (`1db0488`, reverted) moved the Qwen
   configs to `quant_ratio 0.5` because `int2_qwen`'s YAML says 0.5 — but the

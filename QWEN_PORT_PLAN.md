@@ -21,6 +21,62 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 4 — where the gap can still be: the decode READ
+
+Established with the operating point and protocol equal (both columns
+q=0.70, bf16, YaRN 128K, untruncated):
+- **The first generated token is the same** on both branches: it comes from the
+  prefill forward, before any eviction.
+- **The kept set is the same** from the first eviction on: it is ranked by the
+  prefill scores (same H2O semantics; the Triton score kernel was EXECUTED under
+  Triton's interpreter against its reference at Qwen's shapes, rep 7: 1e-6 in
+  fp32), and 32-64 decode steps barely move a cumulative score summed over
+  thousands of prompt queries.
+- So tokens 2+ differ only in **how each decode step reads** the kept cache:
+  - this branch reads 25% of the int2 tier exactly and the other 75% through
+    each window's card (estimated weight) and value centroid; QEvict reads every
+    window exactly;
+  - kernel numerics are not worse: the fused kernel dots in fp32 (TF32 on A100
+    -- exact for bf16 inputs, finer than the bf16 cast the materialize path
+    applies to dequantized keys); the int2 storage is equal or better (above).
+- Rounds 1 and 2 changed the precision of the windows READ and WHICH windows are
+  read. Neither touched the 75% approximated through their cards.
+
+**Why the card may be the Qwen-specific part (synthetic, CPU, magnitudes
+guessed):** a card models a window as one mean plus one deviation direction.
+A q_proj bias makes some query channels large, and then a key's content in
+those channels dominates the logit -- content a rank-1 card does not capture.
+On keys + queries with a Qwen-style bias through the real Qwen2 RoPE, the
+card's per-window log-mass error and its misallocated share of each head's
+attention (TV):
+
+| bias (low-frequency RoPE band) | median error | TV |
+|---|---|---|
+| none | 0.28 nats | 0.09 |
+| k 20 / q 5 | 0.63 | 0.21 |
+| k 60 / q 10 | 1.42 | 0.56 |
+| k 150 / q 20 | 3.49 | 0.89 |
+
+int8 `mu` gives the same numbers in this band (in a mid-frequency band int4 is
+worse, e.g. median 3.34 vs 1.43 at k 60). The per-head union (Round 2) cannot
+help an estimate that is wrong. **Whether Qwen2.5's real biases are in this
+range is exactly what is not known here.**
+
+**Two ways to settle it on the GPU:**
+- minutes: `python scripts/diagnose_gate_error.py --config
+  configs/longbench_qwen_ours_flash_attn.yaml --dataset triviaqa` (and the same
+  with the Llama config). Per layer: the gated step's output error against the
+  full read of the same step, the card's TV against the true window weights,
+  the selection's recall, and the int2 tier's share of attention
+  (`modules/windowed_cache/gate_diagnosis.py`). A large `card_tv` on Qwen and a
+  small one on Llama is this mechanism.
+- one quality run: `ARMS=gate100 scripts/run_longbench_qwen_ablation.sh trec
+  triviaqa musique` -- every window read exactly, same code otherwise.
+  Predicted: trec/triviaqa/musique back within noise of QEvict. If so,
+  `quant_gate_ratio: 1.0` is the immediate fix for Qwen (CLAUDE.md: 1.0 ties 0.25
+  in TPOT today) and a card that models the large-query channels is the real
+  one. If not, the gate is ruled out and the one-byte grid is next.
+
 ### Round 3 — the operating point (RETRACTED: the premise was wrong)
 
 Round 3 read `int2_qwen`'s YAML (`quant_ratio: 0.5`) as the split the QEvict
