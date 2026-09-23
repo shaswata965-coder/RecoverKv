@@ -2,8 +2,9 @@
 # GSM8K — Qwen2.5-7B full-cache baseline (no compression)
 # ============================================================================
 # The reference the compressed Qwen runs are measured against. GSM8K prompts
-# (~280 tokens) sit far under Qwen2.5's 32K window, so no YaRN and no truncation
-# is needed; float16 keeps the column comparable with Llama/Mistral.
+# (~280 tokens) sit far under Qwen2.5's 32K window; YaRN and bf16 are here
+# anyway because the QEvict column (int2_qwen) ran every Qwen suite that way, so
+# the rows and their baseline are the same model.
 #
 # This is also the suite that reaches the vocab-padding crash: GSM8K passes
 # stop_strings, and on Qwen2.5 emitting one of the 399 padded ids raises from
@@ -20,8 +21,18 @@ run:
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16
+  dtype: bfloat16
   attn_implementation: flash_attention_2
+  # QEvict's Qwen protocol: bf16 (Qwen2.5's released dtype; fp16 overflows at
+  # long context) and YaRN 32K -> 128K, as every int2_qwen Qwen config runs.
+  # See configs/longbench_qwen_ours_flash_attn.yaml for why each key matters.
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
   backend: dynamic          # DynamicCache — no eviction, no quantization

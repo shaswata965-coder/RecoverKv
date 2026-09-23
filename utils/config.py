@@ -99,6 +99,26 @@ OPERATING_POINT_EXEMPT = {
     # gate, scored under the same branch's name as LongBench at 0.70. It is now
     # at the operating point on every axis but the one it exists to vary.
     "ruler_niah_mk3_omega16.yaml": "the omega=16 arm; window_size is the ablation",
+    # The Qwen2.5 column runs at the QEvict column's split, not the shared 0.70.
+    # QEvict (int2_qwen) ran every Qwen suite at quant_ratio 0.5 on bf16 + YaRN
+    # 128K, and these configs are what it is compared against. At 0.70 the
+    # full-precision tier holds ~40% fewer tokens (~5.5% of the prompt against
+    # ~9.3% at a 20% budget); the retrieval-heavy tasks fell 4-8 points there
+    # while broad-context ones did not (QWEN_PORT_PLAN.md "Round 3"). The 0.70
+    # arm stays runnable as longbench_qwen_ours_q070.yaml, which IS at the
+    # operating point and so needs no entry here.
+    "longbench_qwen_ours_flash_attn.yaml":
+        "Qwen2.5 column at QEvict's split (q=0.5) -- QWEN_PORT_PLAN.md Round 3",
+    "longbench_qwen_ours_flash_attn_yarn128k.yaml":
+        "alias of longbench_qwen_ours_flash_attn.yaml (inherits it whole)",
+    "longbench_qwen_ours_gate100.yaml":
+        "the Qwen gate's control arm (quant_gate_ratio 1.0) at QEvict's split",
+    "gsm8k_qwen_budget20.yaml":
+        "Qwen2.5 column at QEvict's split (q=0.5) -- QWEN_PORT_PLAN.md Round 3",
+    "ruler_qwen_niah_mk3_omega16.yaml":
+        "the omega=16 arm, at the Qwen2.5 column's split (q=0.5)",
+    "longbench_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "gsm8k_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",
 }
 
 

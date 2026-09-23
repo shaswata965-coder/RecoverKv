@@ -1,16 +1,26 @@
 # ============================================================================
-# LongBench — Qwen2.5-7B Ours (flash-attn backend), 32K
+# LongBench — Qwen2.5-7B-Instruct (YaRN 128K), Ours — flash-attn-2
 # ============================================================================
-# Windowed KV-cache with flash-attention-2 score extraction, at the shipped
-# operating point (utils.config.OPERATING_POINT). Geometry matches the Llama and
-# Mistral "ours" configs so the columns differ only by model.
+# The Qwen2.5 column, run on the SAME protocol and at the SAME two-tier split as
+# the QEvict column it is compared against (`int2_qwen`'s
+# configs/longbench_qwen_ours_flash_attn.yaml): bf16, YaRN 4x (32K -> 128K), no
+# prompt truncation, cache_budget 0.20, quant_ratio 0.5. Everything else is this
+# branch's method: the read gate at 0.25 (per-query-head union), the one-byte
+# grid with the key anchor, the fused Triton kernels.
 #
-# 32K context: Qwen2.5-7B is a 32K model unless YaRN is switched on, so
-# max_length is 31500 (as in longbench_qwen_full_cache.yaml). For the full 128K
-# context, use longbench_qwen_ours_flash_attn_yarn128k.yaml.
+# Why this file used to be different, and why that mattered (QWEN_PORT_PLAN.md,
+# "Round 3"): the port shipped it as fp16 / native 32K / max_length 31500 /
+# quant_ratio 0.70 under the SAME filename QEvict's branch uses for bf16 / YaRN /
+# no truncation / 0.5, so "run the same config on both branches" compared two
+# model setups and two operating points. At q=0.70 the full-precision tier holds
+# ~5.5% of the prompt against ~9.3% at 0.5 -- 40% fewer exact tokens -- which is
+# where retrieval-heavy tasks (trec, triviaqa, musique) lost 4-8 points while
+# broad-context ones (qasper, multifieldqa_en) sat slightly ABOVE QEvict.
 #
-# dtype note: float16 keeps the columns comparable at 32K. Qwen2.5 is bf16-native
-# — if you switch to bfloat16, apply it to every column together.
+# The shared OPERATING_POINT (q=0.70) arm for Qwen is
+# longbench_qwen_ours_q070.yaml; the gate's control arm is
+# longbench_qwen_ours_gate100.yaml. scripts/run_longbench_qwen_ablation.sh runs
+# the three on the same datasets and prints one table.
 #
 # Produces: outputs/longbench/qwen_ours_flash_attn_compression_0.8/
 _base_: base.yaml
@@ -22,21 +32,40 @@ run:
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16
-  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+  # Qwen2.5's released dtype. fp16 is the trap utils/model_loading.py warns
+  # about: a bf16-native model with large activations overflows at long context,
+  # and the damage shows up as empty/repeated generations -- a numerics failure
+  # that reads like a method result.
+  dtype: bfloat16
+  attn_implementation: flash_attention_2   # MUST match cache.backend_package
+  # YaRN 32K -> 128K, exactly as the QEvict column and its baselines ran. On the
+  # pinned transformers 4.47.1 the correction range comes from
+  # max_position_embeddings (original_max_position_embeddings is not read), so
+  # 131072 is load-bearing; the fused kernel and the int2 read path divide
+  # YaRN's attention_scaling back out (modules/quant/effective.py).
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  # Declared by the checkpoint and disabled by it; stays off, which the windowed
+  # cache needs (a band measured in cache slots is not token distance).
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
-  # Pinned to utils.config.OPERATING_POINT — the ONE point speed and quality are
-  # both measured at. Same geometry as the Llama/Mistral "ours" configs.
   backend: windowed
   backend_package: flash_attn
-  cache_budget: 0.20                        # DefensiveKV's headline; compression_ratio = 0.8
+  cache_budget: 0.20                        # fraction RETAINED; compression_ratio = 0.8
   window_size: 8
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
-  quant_ratio: 0.70                         # two-tier int2 split; window_size 8 is divisible by 4
+  # QEvict's split. NOT utils.config.OPERATING_POINT's 0.70 -- exempt in
+  # OPERATING_POINT_EXEMPT with the reason; the 0.70 arm is
+  # longbench_qwen_ours_q070.yaml.
+  quant_ratio: 0.5
   quant_gate_ratio: 0.25                    # read-gate selectivity (the rank-1 card gate)
-  quant_gate_head_norm: null               # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
+  quant_gate_head_norm: null                # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
   quant_budget_mode: bytes
   first_eviction_step: 0                    # compress the prompt on decode step 0
 
@@ -53,7 +82,9 @@ longbench:
     - 2wikimqa
   include_chinese: false
   use_e_variants: false
-  max_length: 31500                         # 32K model — truncate to fit (no YaRN here)
+  # No truncation: YaRN's 131072 window fits every LongBench prompt, which is
+  # the QEvict column's protocol (its max_length: null auto-fit never cuts).
+  max_length: null
   output_dir: outputs/longbench/qwen_ours_flash_attn_compression_0.8
   seed: 42
   resume: false

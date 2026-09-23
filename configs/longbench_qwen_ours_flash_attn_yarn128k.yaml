@@ -1,82 +1,11 @@
 # ============================================================================
-# LongBench — Qwen2.5-7B Ours (flash-attn), YaRN-scaled 128K context
+# LongBench — Qwen2.5-7B-Instruct (YaRN 128K), Ours — ALIAS
 # ============================================================================
-# The full-context Qwen column. Switches YaRN on so the 32K checkpoint reaches
-# 131072 positions, and runs bfloat16 because fp16 OVERFLOWS at long context on
-# this bf16-native model (empty/repeated generations that read like a bad method
-# result). This is the config that exercises the two Qwen-specific numerics
-# fixes end to end:
-#
-#   * bfloat16 KV → the int2 (scale, zero) grid group-scale is stored bf16, not
-#     fp16 (modules.quant.quantizer.grid_dtype_for), so a massive-activation key
-#     past fp16's 65504 no longer casts the grid to inf and a window to nan.
-#   * YaRN folds a scalar a = 0.1·ln(4)+1 ≈ 1.13862 into cos/sin, so the two-tier
-#     read path divides a² back out at demotion
-#     (modules.quant.effective.unrotate_key_window); without it every int2 Q-tier
-#     key would be 1.296× too large.
-#
-# dtype note: bfloat16 here is REQUIRED, not a preference. If you want the Qwen
-# column to sit in the same table as the Llama/Mistral fp16 columns, either move
-# ALL columns to bfloat16 or run Qwen at 32K in fp16 (see
-# longbench_qwen_ours_flash_attn.yaml) — a mixed-dtype table is not comparable.
-#
-# skip_oom / resume are false on purpose: at 128K an OOM must FAIL the run, not
-# be recorded as pred=null and scored as 0 (a uniformly depressed table with
-# skipped=N as the only tell), and a crash-truncated jsonl must not be resumed
-# as if finished.
-#
-# Produces: outputs/longbench/qwen_ours_flash_attn_yarn128k/
-_base_: base.yaml
-
-run:
-  mode: longbench
-  seed: 42
-
-model:
-  name: Qwen/Qwen2.5-7B-Instruct
-  revision: main
-  dtype: bfloat16                            # REQUIRED: fp16 overflows at 128K
-  attn_implementation: flash_attention_2
-  # YaRN: 32K checkpoint → 131072 positions. max_position_embeddings MUST be set
-  # alongside rope_scaling — transformers 4.47.1 derives the YaRN correction range
-  # from it and ignores original_max_position_embeddings, so the scaled window is
-  # what shapes the frequencies. original_max_position_embeddings is still
-  # declared: it is what every other YaRN consumer reads and it documents intent.
-  max_position_embeddings: 131072
-  rope_scaling:
-    rope_type: yarn
-    factor: 4.0
-    original_max_position_embeddings: 32768
-
-cache:
-  backend: windowed
-  backend_package: flash_attn
-  cache_budget: 0.20
-  window_size: 8
-  num_sink_tokens: 5
-  local_window_size: 128
-  quant_ratio: 0.70
-  quant_gate_ratio: 0.25
-  quant_gate_head_norm: null               # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
-  quant_budget_mode: bytes
-  first_eviction_step: 0
-
-window:
-  window_size: 8
-  num_sink_tokens: 5
-  local_window_size: 128
-
-telemetry:
-  track_scores: false
+# Kept so existing commands keep working. It used to differ from
+# longbench_qwen_ours_flash_attn.yaml in dtype, RoPE and truncation; that file
+# is now itself bf16 + YaRN 128K + no truncation (the QEvict column's protocol),
+# so this one inherits it whole and changes only where the outputs go.
+_base_: longbench_qwen_ours_flash_attn.yaml
 
 longbench:
-  datasets:
-    - 2wikimqa
-  include_chinese: false
-  use_e_variants: false
-  max_length: null                           # full context — YaRN 131072 fits every LongBench prompt
   output_dir: outputs/longbench/qwen_ours_flash_attn_yarn128k
-  seed: 42
-  resume: false
-  skip_oom: false
-  aggressive_cache_clear: false

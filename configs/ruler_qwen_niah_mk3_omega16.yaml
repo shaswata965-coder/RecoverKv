@@ -1,12 +1,11 @@
 # ============================================================================
 # RULER 4096 — Qwen2.5-7B Ours (flash-attn), task=niah_multikey_3, window_size=16
 # ============================================================================
-# The Qwen column for RULER, at the shipped operating point
-# (utils.config.OPERATING_POINT): quant_ratio 0.70 with the read gate at 0.25.
-# Geometry matched to the Llama/Mistral RULER config so the columns differ only
-# by model. window_size 16 satisfies the % 4 == 0 that int2 crumb packing needs.
-#
-# float16, no YaRN: the 4096 prompts sit far under Qwen2.5's 32K window.
+# The Qwen column for RULER, at the QEvict column's protocol and split
+# (int2_qwen): bf16 + YaRN 128K, quant_ratio 0.5, with the read gate at 0.25.
+# Not OPERATING_POINT's 0.70 -- QWEN_PORT_PLAN.md "Round 3"; exempt in
+# OPERATING_POINT_EXEMPT alongside the omega=16 reason the Llama RULER config
+# already carries. window_size 16 satisfies the % 4 == 0 int2 crumb packing needs.
 # Captures a utils/cache_memory.py byte-accounting report per example so
 # retained-bytes / compression-ratio can be read off alongside the accuracy.
 #
@@ -20,8 +19,18 @@ run:
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16
+  dtype: bfloat16
   attn_implementation: flash_attention_2     # MUST match cache.backend_package
+  # QEvict's Qwen protocol: bf16 (Qwen2.5's released dtype; fp16 overflows at
+  # long context) and YaRN 32K -> 128K, as every int2_qwen Qwen config runs.
+  # See configs/longbench_qwen_ours_flash_attn.yaml for why each key matters.
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
   backend: windowed
@@ -30,7 +39,7 @@ cache:
   window_size: 16                           # omega=16
   num_sink_tokens: 5
   local_window_size: 128                    # fixed tokens
-  quant_ratio: 0.70
+  quant_ratio: 0.5                          # QEvict's split, not OPERATING_POINT's 0.70 (exempt, with the reason)
   quant_gate_ratio: 0.25                    # read-gate selectivity; 1.0 = read everything
   quant_gate_head_norm: null               # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
   quant_budget_mode: bytes

@@ -232,8 +232,8 @@ one per-window block is the real fix and needs a GPU to verify.
   same in every window, so it shifts the whole int2 tier's logits by nats. It is
   auto-on from the model config (`key_projection_has_bias`) and off on
   Llama/Mistral; `QWEN_PORT_PLAN.md` has the measurement. Qwen2.5 quality rows do
-  not compare across the commit that added it. **It was not the Qwen gap** — the
-  next bullet was.
+  not compare across the commit that added it. **It was not the Qwen gap**, and
+  neither was the next bullet — see the one after it.
 * **The gate's GQA union must compare query heads in their own units
   (`quant_gate_head_norm`).** It keeps `n_sel` windows per KV head by a max
   over the `rep` query heads sharing it, and a max over raw logits is decided by
@@ -246,6 +246,21 @@ one per-window block is the real fix and needs a GPU to verify.
   recall per query head, never pooled.** Auto-on where the projections carry a
   bias (Qwen2: rep 7, bias offsets); off on Llama/Mistral to keep their columns
   byte-identical, though the rep-4 row says Llama has it too — measure there
-  before flipping the default. `QWEN_PORT_PLAN.md` has the numbers.
+  before flipping the default. `QWEN_PORT_PLAN.md` has the numbers. A real
+  defect; the LongBench run with it on moved nothing beyond noise.
+* **Compare a column against its reference at the reference's operating point
+  and protocol — check the configs before any mechanism.** The Qwen2.5 column
+  was compared with QEvict (`int2_qwen`) for three rounds while QEvict's configs
+  ran bf16 + YaRN 128K + untruncated at `quant_ratio 0.5` and this branch's ran
+  `0.70` (and, under the same filenames, fp16 at 32K truncated to 31500). At
+  0.70 the fp tier holds ~40% fewer tokens (~5.5% of the prompt vs ~9.3%): the
+  retrieval-heavy tasks fell 4-8 while broad-context ones rose — the leading
+  explanation, not yet a measurement. So **the Qwen2.5 column runs QEvict's
+  protocol and split** (exempt from the shared 0.70 in
+  `OPERATING_POINT_EXEMPT`, pinned by `tests/test_qwen_protocol.py`); the 0.70
+  arm is `longbench_qwen_ours_q070.yaml` and
+  `scripts/run_longbench_qwen_ablation.sh` prices it. **n = 200 per LongBench
+  task means ±2.5-3 points is noise** — do not read a single run's move
+  smaller than that as a result.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

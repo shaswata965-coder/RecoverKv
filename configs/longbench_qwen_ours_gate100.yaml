@@ -1,0 +1,15 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours with the read gate's CONTROL ARM
+# ============================================================================
+# One-field ablation of longbench_qwen_ours_flash_attn.yaml:
+# quant_gate_ratio 1.0, which selects every int2 window through the same gate
+# code -- the provable no-op, i.e. QEvict's read path (every window read
+# exactly, no centroid fill). The difference between this row and the default
+# is what reading 25% of the tier costs on Qwen.
+_base_: longbench_qwen_ours_flash_attn.yaml
+
+cache:
+  quant_gate_ratio: 1.0
+
+longbench:
+  output_dir: outputs/longbench/qwen_ours_gate100_compression_0.8

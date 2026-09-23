@@ -1,0 +1,17 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours at the SHARED operating point (q=0.70)
+# ============================================================================
+# One-field ablation of longbench_qwen_ours_flash_attn.yaml: quant_ratio 0.70,
+# utils.config.OPERATING_POINT's split (the Llama/Mistral columns and the speed
+# table). At a 20% budget it keeps ~5.5% of the prompt in full precision against
+# ~9.3% at 0.5, and ~50% in int2 against ~36%. Run beside the default to price
+# that trade on Qwen: QWEN_PORT_PLAN.md "Round 3" predicts retrieval-heavy tasks
+# (trec, triviaqa, musique) fall and broad-context ones (qasper,
+# multifieldqa_en) hold or rise.
+_base_: longbench_qwen_ours_flash_attn.yaml
+
+cache:
+  quant_ratio: 0.70
+
+longbench:
+  output_dir: outputs/longbench/qwen_ours_q070_compression_0.8

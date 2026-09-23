@@ -1,18 +1,10 @@
 # ============================================================================
-# LongBench — Qwen2.5-7B Full Cache Baseline
+# LongBench — Qwen2.5-7B-Instruct (YaRN 128K) Full Cache Baseline
 # ============================================================================
-# The Qwen2.5 column's baseline. Geometry matches the Llama/Mistral full-cache
-# configs so the columns differ only by model.
-#
-# Qwen2.5-7B-Instruct is a 32K model (max_position_embeddings 32768); its 131072
-# window needs rope_scaling (YaRN) switched on, which THIS config does not do.
-# So max_length is 31500 (the THUDM budget for a 32K model, same as Mistral-v0.2)
-# rather than null — a null here would feed >32K prompts past the model's window.
-# For the full 128K context see longbench_qwen_ours_flash_attn_yarn128k.yaml.
-#
-# dtype note: Qwen2.5 is bf16-native. float16 keeps the three model columns
-# comparable at 32K and fits a T4/P100; if you move to bfloat16, apply it to
-# EVERY model column together or the columns no longer differ only by model.
+# The Qwen2.5 column's baseline, on the same protocol as the "ours" rows and as
+# the QEvict column (int2_qwen): bf16, YaRN 32K -> 128K, no truncation. It used
+# to be fp16 at native 32K truncated to 31500, i.e. a different model setup from
+# the rows it is the baseline for -- see QWEN_PORT_PLAN.md "Round 3".
 #
 # Produces: outputs/longbench/qwen_full_cache/
 _base_: base.yaml
@@ -24,8 +16,18 @@ run:
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   revision: main
-  dtype: float16
+  dtype: bfloat16
   attn_implementation: flash_attention_2
+  # QEvict's Qwen protocol: bf16 (Qwen2.5's released dtype; fp16 overflows at
+  # long context) and YaRN 32K -> 128K, as every int2_qwen Qwen config runs.
+  # See configs/longbench_qwen_ours_flash_attn.yaml for why each key matters.
+  max_position_embeddings: 131072
+  rope_scaling:
+    rope_type: yarn
+    factor: 4.0
+    original_max_position_embeddings: 32768
+  sliding_window: 131072
+  use_sliding_window: false
 
 cache:
   backend: dynamic                      # transformers.DynamicCache, no eviction
@@ -55,7 +57,7 @@ longbench:
     - repobench-p
   include_chinese: false
   use_e_variants: false
-  max_length: 31500                     # 32K model — truncate to fit (no YaRN here)
+  max_length: null                      # YaRN's 131072 window fits every prompt: no truncation
   output_dir: outputs/longbench/qwen_full_cache
   seed: 42
   resume: false

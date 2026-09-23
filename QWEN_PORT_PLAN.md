@@ -2,23 +2,108 @@
 
 ## The LongBench-20% gap against `int2_qwen` (QEvict)
 
-| task | QEvict | first run | after the key anchor (`efba5db`) |
-|---|---|---|---|
-| trec | 67.00 | 64.50 | 62.00 |
-| triviaqa | 89.63 | 82.40 | 79.97 |
-| qasper | 35.74 | 35.44 | 36.96 |
-| multifieldqa_en | 44.28 | 43.86 | 44.40 |
-| hotpotqa | 49.15 | 48.53 | 47.92 |
-| 2wikimqa | 37.43 | 39.31 | 36.55 |
-| musique | 24.37 | 22.14 | 21.58 |
-| samsum | 44.17 | 45.00 | 44.18 |
+| task | QEvict | run 1 | run 2: key anchor (`efba5db`) | run 3: head-unit gate (`0db8eb6`) |
+|---|---|---|---|---|
+| trec | 67.00 | 64.50 | 62.00 | 62.50 |
+| triviaqa | 89.63 | 82.40 | 79.97 | 81.40 |
+| qasper | 35.74 | 35.44 | 36.96 | 36.83 |
+| multifieldqa_en | 44.28 | 43.86 | 44.40 | 44.95 |
+| hotpotqa | 49.15 | 48.53 | 47.92 | 48.76 |
+| 2wikimqa | 37.43 | 39.31 | 36.55 | 36.83 |
+| musique | 24.37 | 22.14 | 21.58 | 20.71 |
+| samsum | 44.17 | 45.00 | 44.18 | 44.13 |
 
-The key-anchor fix below (round 1) is real but was **not the cause**: the gap
-survived it and trec/triviaqa/musique moved further down. What it fixed was how
-the int2 windows the gate READS are scored; what was broken was WHICH windows it
-reads.
+**Read the runs against their noise first.** n = 200 per task, so a task moves
+~2.5-3 points between runs for no reason at all. Rounds 1 and 2 each fixed a
+real defect and each moved nothing beyond that: across three runs the gap is
+stable, confined to trec (-4.5), triviaqa (-8.2) and musique (-3.7), while
+qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
+qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
+predicted anything going up.
 
-### Round 2 — the cause: the read gate's GQA union was taken over raw logits
+### Round 3 — the two columns were never at the same operating point
+
+Found by diffing the runs' inputs instead of guessing at mechanisms. Every Qwen
+config on `int2_qwen` -- the branch that produced the QEvict column -- runs
+**bf16, YaRN 32K->128K, untruncated, `quant_ratio 0.5`**. Every Qwen config
+this branch shipped with (the port, `78b5eb8`) ran **`quant_ratio 0.70`**, and
+the default-named ones -- the SAME filenames QEvict's branch uses -- were also
+**fp16 at native 32K, LongBench truncated to 31500**. Only `_yarn128k` matched
+QEvict's model setup, and it too was at 0.70.
+
+What 0.70 does to the cache, from each branch's own resolver at Qwen2.5-7B's
+shapes (bf16, budget 0.20, arithmetic):
+
+| prompt | QEvict q=0.5: fp tier / int2 tier | this branch q=0.70: fp tier / int2 tier |
+|---|---|---|
+| 6,000 | 8.9% / 34.8% of the prompt | **5.3%** / 48.8% |
+| 11,000 | 9.4% / 36.5% | **5.6%** / 51.1% |
+| 15,000 | 9.5% / 37.1% | **5.7%** / 52.0% |
+
+**40% fewer tokens kept exactly, 40% more kept at 2 bits.** At EQUAL q the two
+branches resolve the same geometry (identical fp window count, int2 within
+1.5%: the gate's card is priced in), so the machinery does not change what is
+kept -- the split does.
+
+Why that predicts this table, including the tasks that went up:
+- An int2 window carries breadth, not exact content. Values are quantized per
+  token over all 128 channels at 2 bits -- identically on both branches
+  (`group_dim=3` in both quantizers) -- so a token copied out of an int2 window
+  comes back approximately. Tasks that copy precise content from the context
+  (trec's labels, triviaqa's answers, musique's hops) need the attended tokens in
+  the fp tier, and at 0.70 that tier is 40% smaller: they fall.
+- Tasks that need broad context gain from 40% more int2 coverage: qasper and
+  multifieldqa_en sit above QEvict.
+- The Llama history agrees on what the int2 tier is for: shrinking ONLY the int2
+  tier (`quant_budget_mode` tokens, `ACCURACY_RECOVERY_PLAN.md` §1 on
+  `digest-gate`) cost Llama qasper -9.5 and triviaqa -0.1. That triviaqa then
+  falls 8 points on Qwen suggests Qwen2.5-7B answers it from the passages where
+  Llama-3.1 answers from memory -- an inference from the two tables, not a
+  measurement.
+
+Ruled out along the way (CPU, by reading both branches side by side): the
+eviction policy and the scorer are semantically identical (the diff is compile
+refactoring plus the gate's skipped-window fill); the LongBench runner treats
+the few-shot datasets identically (template skipped for
+trec/triviaqa/samsum/lsht/lcc/repobench-p, no BOS on Qwen, first-line
+extraction); values are quantized the same way.
+
+**Not measured: the LongBench effect of the split on Qwen.** It is the leading
+explanation because it is the one difference large enough, targeted at the
+right tasks, and untouched by rounds 1-2 -- not because a run has shown it.
+
+**What changed.** The Qwen2.5 column now runs on QEvict's protocol and split:
+every Qwen config is bf16 + YaRN 128K (LongBench untruncated) and the method
+configs are at `quant_ratio 0.5`, with everything else this branch's method
+(gate 0.25 with the per-head union, one-byte grid + key anchor, fused kernels).
+`_yarn128k` is an alias that inherits the default. The shared 0.70 stays
+runnable as `longbench_qwen_ours_q070.yaml`, and the gate's control arm is
+`longbench_qwen_ours_gate100.yaml`; each is a one-field diff (asserted). The
+Qwen method configs are listed in `OPERATING_POINT_EXEMPT` with this reason;
+`tests/test_qwen_protocol.py` pins all of it.
+
+**The run that settles it:** `scripts/run_longbench_qwen_ablation.sh` -- three
+arms on trec, triviaqa, musique plus qasper and multifieldqa_en as canaries, each
+into its own directory, one table at the end:
+
+| arm | what it isolates | predicted |
+|---|---|---|
+| `ours` (q=0.5, gate 0.25) | this branch's machinery at QEvict's point | trec/triviaqa/musique back within noise of QEvict |
+| `q070` | the 0.70 split | about the old "Current" column |
+| `gate100` (q=0.5, every window read) | reading 25% of the int2 tier | about `ours` |
+
+If `ours` stays below QEvict and `gate100` closes it, the gate is the remaining
+cost; if both stay below, the storage format (one-byte grid vs QEvict's
+per-entry grid) is next. Check every arm's sidecar before quoting it:
+`read_gate.verdict == "gated"` and `read_gate.union == "per-head"`.
+
+Qwen2.5 quality rows do not compare across this change.
+
+### Round 2 — the read gate's GQA union over raw logits (fixed: a real defect, not the gap)
+
+Run 3 is this fix: triviaqa +1.4, trec +0.5, musique -0.9 against run 2 --
+inside the noise. The defect is real and stays fixed; the account below of
+why it would explain the Qwen gap was wrong.
 
 QEvict has no read gate: it dequantizes the whole int2 tier on every step, so
 every query head attends to its own hot tokens exactly. Here the gate reads
@@ -175,7 +260,7 @@ compiles exactly as before. The sidecar records it
   (`hooks.score_accum_dtype`); fp16 keeps fp16, byte for byte (widening it is
   still the Stage-6 item and moves Llama/Mistral).
 
-**Not changed, flagged:** `longbench_qwen_ours_flash_attn_yarn128k.yaml` sets
+**Not changed, flagged:** the Qwen configs (all of them since Round 3) set
 `max_position_embeddings: 131072`. On the pinned transformers 4.47.1,
 `_compute_yarn_parameters` takes the YaRN correction range from
 `max_position_embeddings`, so this is NOT Qwen's YaRN (which uses the original
@@ -612,6 +697,9 @@ searchable.
 - **bf16 or fp16 for the headline Qwen table?** fp16 keeps columns comparable at
   32K; bf16 is required for the YaRN-128K matrix. This decides whether Stage 5's
   bf16 grid is exercised on the main table or only the long-context one.
+  **Settled in Round 3:** bf16 + YaRN 128K on every Qwen config, because that is
+  the protocol the QEvict column was measured on; the fp16/32K choice made the
+  two columns different model setups under the same filenames.
 - **Do we want a Qwen parity/perf column?** If yes, fold the parity/perf runners
   into `utils/model_loading` too (out of scope above; `int2_qwen` left them).
 - **Does this branch already accumulate window scores in fp32?** If its numerics
