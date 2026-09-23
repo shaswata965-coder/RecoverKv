@@ -2309,6 +2309,10 @@ class WindowedCache(_HFCacheBase):
                     "centroid": tuple(t[r0:r0 + B]
                                       for t in joint_gate["centroid"]),
                     "n_sel": joint_gate["n_sel"],
+                    # The production (layer-major) path rebuilds this dict per
+                    # layer, so every key `_gate_ctx` sets must be carried here
+                    # too -- `_run_fused` indexes it and a dropped key raises.
+                    "head_norm": joint_gate["head_norm"],
                 },
             }
 
@@ -2487,6 +2491,10 @@ class WindowedCache(_HFCacheBase):
             "anchor": store._anchor,
             "centroid": (card[-2], card[-1], store._v_anchor),
             "n_sel": max(1, math.ceil(ratio * n)),
+            # Units of the GQA union (WindowedCacheConfig.quant_gate_head_norm).
+            # Read with [], not .get, in `_run_fused`: a context without it
+            # would gate in raw units and look exactly like the configured run.
+            "head_norm": bool(self.resolved.quant_gate_head_norm),
         }
 
     def _fused_meta(self, layer_idx: int, state, ws: int):

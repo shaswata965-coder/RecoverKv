@@ -213,6 +213,11 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         "quant_gate_ratio": c.get(
             "quant_gate_ratio",
             getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+        # The units the gate's GQA union is taken in (None = auto from the
+        # model config), carried for the same reason: perf_runner passes it.
+        "quant_gate_head_norm": c.get(
+            "quant_gate_head_norm",
+            getattr(cfg.cache, "quant_gate_head_norm", None)),
         "first_eviction_step": c.get(
             "first_eviction_step",
             getattr(cfg.cache, "first_eviction_step",

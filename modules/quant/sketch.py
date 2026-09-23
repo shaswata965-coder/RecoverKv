@@ -104,6 +104,8 @@ __all__ = [
     "gate_and_score",
     "select_windows",
     "group_max",
+    "head_log_partition",
+    "in_head_units",
 ]
 
 
@@ -400,16 +402,82 @@ def group_max(est: Tensor, num_kv_heads: int) -> Tensor:
 
     One kernel program owns a KV head and every query head sharing it, so a
     window is loaded once for the whole group and the group's cost is one window
-    either way. Taking the **max** bound over the group before selecting is what
-    makes that true: whatever any member of the group needs, the group keeps.
+    either way. Taking the **max** over the group before selecting is what makes
+    that true: whatever any member of the group needs, the group keeps.
 
     This reduction MUST come before any cap. Capping per query head and unioning
     afterwards lets a ratio of ``r`` turn into as much as ``r * rep`` windows
     actually read -- at ``rep = 4`` (Llama-3.1-8B) a 25% cap becomes 100% loaded
     and the gate buys nothing. ``tests/test_sketch_store.py`` pins this.
+
+    **A max across heads is only a union if the heads are in the same units.**
+    Raw logits are not: each query head has its own softmax, and a constant
+    added to every one of its logits leaves that head's attention unchanged
+    while moving it up or down against its siblings here. Feed this
+    :func:`in_head_units` when the heads' offsets differ, or the head with the
+    largest offset picks for the whole group (see that function).
     """
     B, Hq, Nw = est.shape
     return est.reshape(B, num_kv_heads, Hq // num_kv_heads, Nw).amax(2)
+
+
+def head_log_partition(logmass: Tensor) -> Tensor:
+    """``[B, Hq, Nw]`` -> ``[B, Hq, 1]``: each query head's log-partition over
+    the Q tier, ``log sum_w exp(logmass_w)``, from the cards.
+
+    Written out rather than calling ``torch.logsumexp``: ``scripts/audit_e2e.py``
+    keys its attribution on that call being unique across ``modules/``, and the
+    kernel merges per-tile (max, sum) partials in exactly this shape.
+    """
+    m = logmass.amax(dim=-1, keepdim=True)
+    return m + (logmass - m).exp().sum(dim=-1, keepdim=True).log()
+
+
+def in_head_units(est: Tensor, logmass: Tensor) -> Tensor:
+    """``est - head_log_partition(logmass)``: the hot token's estimated share of
+    its own head's Q-tier attention, in log units. What :func:`group_max` should
+    compare across a GQA group.
+
+    Why the raw estimate is the wrong thing to take a max over
+    ------------------------------------------------------------
+    ``est`` is a logit. A query head's softmax discards any constant added to all
+    of its logits, and the model never had a reason to keep that constant
+    similar across heads, so it is not: every head carries ``q_h . k_common``,
+    its query's projection onto the keys' common mode, and that is a different
+    number for each head. A cross-head max over raw logits is therefore decided
+    by those offsets, not by what any head attends to. Once one head's offset
+    beats its siblings' by more than their windows' spread, that head picks the
+    whole group's ``n_sel`` and every other head's hot windows are skipped --
+    read only through a value centroid, which for a head attending to one token
+    is the wrong vector.
+
+    A q/k bias (Qwen2) makes the offsets larger by construction: the bias is a
+    token-independent key component, and each head's query projects onto it
+    differently. Through the mid-frequency RoPE pairs the same bias also puts a
+    smooth positional swing on some heads' logits -- real attention, but on a
+    larger logit scale than a sibling's content match, so it outvotes that head
+    too. Subtracting the anchor term ``q . anchor`` removes the first and not the
+    second (in a synthetic check with +-20-nat positional heads it did no better
+    than the raw union for the retrieval heads beside them); dividing each head
+    by its own partition function removes both, because it compares heads in
+    probability, which is the only unit they share.
+
+    Measured on ``tests/test_sketch.py``'s own recall fixture (keys with a
+    massive-activation common mode), per QUERY head at ratio 0.25: the raw union
+    leaves the worst head 0.0000 of its Q-tier mass at both rep=4 (Llama-3.1
+    GQA) and rep=7 (Qwen2.5-7B), mean 0.947 / 0.857; in head units the worst head
+    keeps 0.998, mean 0.9999 / 0.9997. The pooled per-KV-head recall that test
+    asserts on sums raw ``exp(logit)`` across the group first, so it is
+    dominated by the same head the raw union serves and could not see this.
+
+    Within one head this is a constant shift, so a head's own ranking and every
+    ``rep == 1`` selection are unchanged; only the cross-head comparison moves.
+    ``est`` rather than ``logmass`` stays the ranked quantity for the reason the
+    module docstring gives: the centroid a skipped window attends through is
+    exact for a window whose weight is spread evenly and wrong for one with a
+    single hot token, and the hot token is what ``est`` measures.
+    """
+    return est - head_log_partition(logmass)
 
 
 def select_windows(est: Tensor, max_windows: int) -> Tensor:
@@ -427,6 +495,10 @@ def select_windows(est: Tensor, max_windows: int) -> Tensor:
     better ranking quantity — 100.0% worst-head mass recall at a 0.15 ratio
     against the bound's 99.7%. What is left is a deterministic top-k: one
     criterion, no calibration, no host sync, no data-dependent shape.
+
+    Those recall figures pool raw ``exp(logit)`` over each KV head's query heads,
+    which is blind to a query head the union never serves -- see
+    :func:`in_head_units` for that failure and its per-query-head numbers.
     """
     rank = torch.argsort(torch.argsort(est, dim=-1, descending=True), dim=-1)
     return rank < max_windows

@@ -59,11 +59,18 @@ _DECODE_PTRS = {
     "VANC": "*fp32", "KANC": "*fp32",
 }
 
+#: ``MU`` is ``*u8``: the card packs ``mu`` as int4 nibbles in a uint8
+#: (``sketch._q_sym4``), and the kernel shifts it -- an ``*i8`` here type-checked
+#: an arithmetic shift nobody runs. ``PMX``/``PSM`` are the HEAD_NORM partials.
 _GATE_PTRS = {
     **{n: "*fp16" for n in ("Q", "MUS", "VS", "TS", "ANCH")},
-    **{n: "*i8" for n in ("MU", "V", "T")},
-    "EST": "*fp32", "LOGM": "*fp32", "SCALE": "fp32",
+    "MU": "*u8",
+    **{n: "*i8" for n in ("V", "T")},
+    "EST": "*fp32", "LOGM": "*fp32", "PMX": "*fp32", "PSM": "*fp32",
+    "SCALE": "fp32",
 }
+
+_UNION_PTRS = {n: "*fp32" for n in ("ESTH", "PMX", "PSM", "EST")}
 
 #: One ``ws`` per structural case in :func:`window_tiling`, not a sweep — each
 #: entry is a real compile, and they are slow. ``1`` is the degenerate
@@ -109,18 +116,44 @@ def test_the_fused_decode_kernel_compiles(gated, ws, key_anchor):
         GATED=gated, KEY_ANCHOR=key_anchor))
 
 
+@pytest.mark.parametrize("head_norm", [False, True])
 @pytest.mark.parametrize("ws", WINDOW_SIZES)
-def test_the_gate_kernel_compiles(ws):
+def test_the_gate_kernel_compiles(ws, head_norm):
     """``_gate_kernel`` at every window size — the one that found a real bug.
 
     It indexed its token axis with ``tl.arange(0, WS)``, which admits only powers
     of two, so a ``window_size`` of 12 (which ``window_tiling`` documents and
     ``tests/test_window_scores.py`` exercises) could not compile at all. Now the
     axis is padded to ``BLOCK_WS`` and masked.
+
+    Both ``HEAD_NORM`` specializations: per-query-head ``est`` plus per-tile
+    partials (the GQA union in head units), or the in-kernel group max.
     """
     _compile(gk._gate_kernel, _GATE_PTRS, dict(
         HEAD_DIM=128, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
-        BLOCK_D=128, BLOCK_W=64))
+        BLOCK_D=128, BLOCK_W=64, HEAD_NORM=head_norm))
+
+
+@pytest.mark.parametrize("block_r", [2, 4, 8])
+def test_the_gate_union_kernel_compiles(block_r):
+    """``_gate_union_kernel`` at every ``BLOCK_R`` a GQA model reaches with
+    ``rep > 1`` (``_gate_triton`` skips it at ``rep == 1``): 2, 4 (Llama-3.1),
+    8 (Qwen2.5-7B's rep=7, one padded head lane)."""
+    _compile(gk._gate_union_kernel, _UNION_PTRS, dict(
+        BLOCK_R=block_r, BLOCK_T=gk._UNION_BLOCK_T, BLOCK_U=gk._UNION_BLOCK_U))
+
+
+def test_the_qwen25_gate_specialization_compiles():
+    """The gate Qwen2.5 launches: a bf16 query, ``HEAD_NORM`` on (its
+    projections carry a bias, so ``quant_gate_head_norm`` resolves on), and the
+    union kernel at rep = 28 / 4 = 7."""
+    ptrs = dict(_GATE_PTRS)
+    ptrs["Q"] = "*bf16"
+    _compile(gk._gate_kernel, ptrs, dict(
+        HEAD_DIM=128, WS=8, BLOCK_WS=8, BLOCK_D=128, BLOCK_W=64, HEAD_NORM=True))
+    _compile(gk._gate_union_kernel, _UNION_PTRS, dict(
+        BLOCK_R=triton.next_power_of_2(7), BLOCK_T=gk._UNION_BLOCK_T,
+        BLOCK_U=gk._UNION_BLOCK_U))
 
 
 @pytest.mark.parametrize("ws", [3, 5, 7, 12, 24, 48])

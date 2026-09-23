@@ -335,6 +335,14 @@ def test_recall_at_the_shipped_25_percent_ratio():
     (32 query heads over 8 KV heads, rep=4) -- and measured as **attention mass
     recall per KV head**, which is the quantity a quality loss would come out of.
     Deliberately the worst head, not the mean: a mean hides the head that breaks.
+
+    **It is not, and it hid a head that breaks.** ``mass_kv`` pools raw
+    ``exp(logit)`` over the group's query heads, so it is dominated by the head
+    with the largest constant offset -- the same head the raw-logit union
+    serves. Per QUERY head, on this exact fixture, the worst head keeps 0.000 of
+    its own Q-tier mass at 0.25. Kept as the pin on the pooled quantity; the
+    per-query-head recall, and the fix (``quant_gate_head_norm``), are in
+    ``tests/test_gate_head_units.py``.
     """
     hkv, hq, nw = 8, 32, 271
     g = torch.Generator().manual_seed(31)

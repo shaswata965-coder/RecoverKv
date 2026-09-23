@@ -1,16 +1,128 @@
 # Qwen port plan — bring `int2_qwen`'s logic and structure onto `int2_clustered_rep`
 
-## The LongBench-20% gap against `int2_qwen` (QEvict) — diagnosed and fixed
+## The LongBench-20% gap against `int2_qwen` (QEvict)
 
-The first full Qwen2.5 LongBench run at 20% (gated, q=0.70) fell short of the
-`int2_qwen` / QEvict column, worst on **triviaqa (82.40 vs 89.63)**, then trec
-(64.5 vs 67.0) and musique (22.14 vs 24.37). triviaqa is the tell: on Llama it
-barely noticed the cache halving (91.21 -> 91.09, ACCURACY_RECOVERY_PLAN §1),
-because its answers are memorised facts. A task that does not need the context
-losing 7 points means the int2 tier was *corrupting* attention, not merely
-missing context.
+| task | QEvict | first run | after the key anchor (`efba5db`) |
+|---|---|---|---|
+| trec | 67.00 | 64.50 | 62.00 |
+| triviaqa | 89.63 | 82.40 | 79.97 |
+| qasper | 35.74 | 35.44 | 36.96 |
+| multifieldqa_en | 44.28 | 43.86 | 44.40 |
+| hotpotqa | 49.15 | 48.53 | 47.92 |
+| 2wikimqa | 37.43 | 39.31 | 36.55 |
+| musique | 24.37 | 22.14 | 21.58 |
+| samsum | 44.17 | 45.00 | 44.18 |
 
-**Cause — the one-byte grid (`8a8cdc0`) cannot hold Qwen2's biased keys.**
+The key-anchor fix below (round 1) is real but was **not the cause**: the gap
+survived it and trec/triviaqa/musique moved further down. What it fixed was how
+the int2 windows the gate READS are scored; what was broken was WHICH windows it
+reads.
+
+### Round 2 — the cause: the read gate's GQA union was taken over raw logits
+
+QEvict has no read gate: it dequantizes the whole int2 tier on every step, so
+every query head attends to its own hot tokens exactly. Here the gate reads
+`quant_gate_ratio` = 25% of the tier per **KV head**, chosen by a max over the
+`rep` query heads sharing it (`group_max`), and the other 75% attend only through
+each window's value centroid. A max over query heads is only a union if the
+heads are in the same units, and raw logits are not: each head carries its own
+constant `q_h . k_common` (its query's projection onto the keys' common mode),
+which its own softmax discards and a cross-head max does not. Whichever head has
+the largest offset picks the whole group's windows; its siblings' hot windows are
+read only as centroids -- the mean of 8 values, which for a head attending to one
+token (retrieval, induction, answer copying) is the wrong vector.
+
+Why Qwen2.5 and why these tasks:
+- **rep = 7** (28 q / 4 kv heads) puts seven heads behind each union, not four.
+- **q/k biases** make the offsets larger by construction (a token-independent
+  key component each query projects onto differently), and through the
+  mid-frequency RoPE pairs they also put large smooth positional swings on some
+  heads' logits, which outvote a sibling's content match the same way.
+- **The Q tier is ~88% of the retained windows** at q = 0.70.
+- The tasks that fell are the ones that need exact in-context retrieval
+  (trec's label copying, triviaqa's few-shot answers, musique's multi-hop);
+  summarization (samsum) and single-doc QA did not move.
+- The key anchor could not help: it made the READ windows' logits exact, and for
+  six of seven heads the windows that mattered were not read.
+
+It was invisible because the test that set the 0.25 operating point
+(`test_sketch.py::test_recall_at_the_shipped_25_percent_ratio`) pools raw
+`exp(logit)` over a KV head's query heads before measuring recall -- a quantity
+dominated by the same head the raw union serves.
+
+**Measured (CPU), on that test's own fixture** (keys with a massive-activation
+common mode, one hot token per window; 271 windows, 8 seeds), share of each
+query head's OWN Q-tier attention mass in the windows read:
+
+| ratio 0.25 | raw union: mean / p10 / worst | head units: mean / p10 / worst |
+|---|---|---|
+| rep 4 (Llama-3.1 GQA) | 0.947 / 0.966 / **0.000** | 0.9999 / 0.9998 / 0.998 |
+| rep 7 (Qwen2.5-7B GQA) | 0.857 / **0.164** / **0.000** | 0.9997 / 0.9992 / 0.998 |
+
+Attention OUTPUT, through the decode kernel's CPU oracle
+(`two_tier_window_reference`: skipped windows attend via centroids at the
+calibrated weight) against a full read, synthetic Qwen-like groups (rep 7,
+per-head offsets sd 40 nats, retrieval / moderate / diffuse heads), error in
+units of |v|, mean over heads:
+
+| union | retrieval heads | all heads |
+|---|---|---|
+| raw logits (shipped) | 0.433 | 0.231 |
+| minus `q . anchor` only | 0.004 (0.393 with positional-swing heads) | 0.042 |
+| **head units (fix)** | **0.004** (0.036 with positional-swing heads) | **0.041** |
+
+Subtracting the anchor term alone fixes the constant offset but not the
+positional swings; per-head normalization fixes both.
+
+**Fix -- `quant_gate_head_norm`.** Before the group max, each query head's
+estimate is taken relative to that head's own Q-tier log-partition
+(`sketch.in_head_units`: `est - logsumexp_w logmass`), i.e. heads are compared
+in probability, the only unit they share. Within a head it is a constant shift,
+so each head's own ranking, every `rep == 1` selection, `logmass` (what skipped
+windows score and attend with), the card, the budget and `N_q` are all
+unchanged; `quant_gate_ratio = 1.0` still selects everything. On the flash path
+the scan kernel gains a `HEAD_NORM` constexpr (per-head `est` + per-tile
+`(max, sum)` partials) and a small `_gate_union_kernel` merges the partials and
+takes the max: **one extra launch per layer per step, Qwen only, zero bytes per
+window**; without it the scan runs the arithmetic it always did.
+
+- **Auto-on where the attention projections carry a bias** (the same
+  `key_projection_has_bias` test as the key anchor): Qwen2.5 on, Llama-3.1 and
+  Mistral off, so their columns are byte-identical. Every runner threads the YAML
+  knob (`cache.quant_gate_head_norm: null|true|false`) and the LongBench sidecar
+  records it (`resolved_geometry_first_example.quant_gate_head_norm`). Every
+  runner's `read_gate` record also says which union the layers that actually
+  ran used (`"union": "per-head" | "raw" | "mixed"`); **a Qwen2.5 row whose
+  `read_gate.union` is not `per-head` is not this method.**
+- **Llama is affected too** (rep 4 row above: worst head 0.000). It stays off
+  there only because CLAUDE.md forbids moving the Llama/Mistral scores without a
+  LongBench run. To measure it: `quant_gate_head_norm: true` on the Llama config.
+- **Verified:** both Triton kernels compile for sm80 in both specializations
+  (`test_kernel_compiles.py`) and were **executed** under Triton's CPU
+  interpreter against `gate_reference`, selection identical at rep 3/4/7 with
+  window counts off every tile boundary (`test_gate_head_units.py`). The fused
+  decode kernel that consumes the selection -- including round 1's `KEY_ANCHOR`
+  -- was executed the same way against `two_tier_window_reference` on a real
+  Qwen2 cache after eviction: 7e-6 relative output error in fp32, anchored and
+  not, gated and not (`test_decode_kernel_interpreted.py`; swapping the anchor's
+  halves takes it to 1.5). So round 1's kernel change is correct as written and
+  is not what moved the second run down. Not yet run on a GPU, and the LongBench
+  effect is not yet measured.
+
+**The decisive check on the next GPU run** is the gate's own control arm:
+Qwen2.5 at `quant_gate_ratio: 1.0` (every window read -- QEvict's read path) next
+to the default 0.25 with this fix. If 1.0 recovers the QEvict column, the gate
+was the gap and 0.25 in head units should sit close to it; whatever 1.0 does NOT
+recover is elsewhere -- the remaining differences from QEvict are the operating
+point (q = 0.70 vs 0.5: 70 vs 117 fp windows at a 10K prompt) and the YaRN
+flag below. Qwen2.5 quality rows do not compare across this commit.
+
+### Round 1 — the key zero-point anchor (kept: correct, but not the gap)
+
+Diagnosed first, and it is a real defect, but the run after it (table above)
+shows it was not what separated the columns.
+
+**Defect — the one-byte grid (`8a8cdc0`) cannot hold Qwen2's biased keys.**
 Qwen2's `k_proj` has a bias, which puts a large, near-CONSTANT value on some key
 channels: pre-RoPE, such a channel's per-window range is ~0 and its zero-point
 (the window min) is the bias, hundreds. `int2_qwen` stored the zero per entry in
@@ -69,7 +181,7 @@ compiles exactly as before. The sidecar records it
 `max_position_embeddings`, so this is NOT Qwen's YaRN (which uses the original
 32768, what Qwen's own config.json keeps): 23 of 64 RoPE frequency pairs differ
 by >1%, up to 2.2x at pair 40. `int2_qwen`'s config carries the identical
-override, so it does not explain the gap above and changing it would move the
+override, so it does not explain the gap and changing it would move the
 column off the protocol QEvict was measured at; fix it for both together.
 
 Status: **CPU-validated** (mechanism, fix, store/cache/kernel plumbing, and all

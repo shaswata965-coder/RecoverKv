@@ -36,6 +36,7 @@ cache:
   local_window_size: 128                    # fixed tokens; ratio 0.25 exceeds cache_budget 0.20
   quant_ratio: 0.70                         # two-tier int2 split; window_size 8 is divisible by 4
   quant_gate_ratio: 0.25                    # read-gate selectivity (the rank-1 card gate)
+  quant_gate_head_norm: null               # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
   quant_budget_mode: bytes
   first_eviction_step: 0                    # compress the prompt on decode step 0
 

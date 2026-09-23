@@ -68,7 +68,11 @@ _PENDING: dict = {"ctx": None}
 #: values already in hand (``n_sel`` from the context, ``n_active`` from a tensor
 #: SHAPE), so it costs no kernel launch and no device sync — the read fraction is
 #: readable without a ``.item()`` anywhere on the decode path.
-_STATS: dict = {"armed": 0, "fired": 0, "gated": 0,
+#:
+#: ``head_norm`` counts the gated layers whose GQA union was taken in per-query-
+#: head units (``quant_gate_head_norm``) -- which union a quality number was
+#: produced under, recorded rather than inferred from a config default.
+_STATS: dict = {"armed": 0, "fired": 0, "gated": 0, "head_norm": 0,
                 "windows_read": 0, "windows_active": 0}
 
 
@@ -88,6 +92,12 @@ def stats() -> dict:
     s = dict(_STATS)
     s["read_fraction"] = (s["windows_read"] / s["windows_active"]
                           if s["windows_active"] else None)
+    # Which units the union was taken in: "per-head" on every gated layer,
+    # "raw" on none, "mixed" is a run whose layers disagreed (a bug). None
+    # until the gate has run.
+    s["union"] = (None if not s["gated"] else
+                  "per-head" if s["head_norm"] == s["gated"] else
+                  "raw" if s["head_norm"] == 0 else "mixed")
     return s
 
 
@@ -169,7 +179,8 @@ def log_gate_report(log, label: str, expect_gated: bool) -> dict:
     rf_s = "n/a" if rf is None else f"{rf:.3f}"
     if r["verdict"] == GATE_OK:
         log.info("%s: read gate ran on all %d fused layers, realised read "
-                 "fraction %s", label, r["fired"], rf_s)
+                 "fraction %s, GQA union in %s units", label, r["fired"], rf_s,
+                 r.get("union"))
     elif r["verdict"] == GATE_NOT_EXPECTED:
         log.info("%s: no read gate expected (eager backend, or quant_ratio=0 so "
                  "there is no Q tier to select over)", label)
@@ -340,9 +351,11 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
             "of them through this same path."
         )
     sel, logmass = fused_gate(
-        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"],
+        head_norm=gate["head_norm"])
     # Shapes only — no device sync, no launch. See _STATS.
     _STATS["gated"] += 1
+    _STATS["head_norm"] += int(bool(gate["head_norm"]))
     _STATS["windows_read"] += int(sel.shape[-1])
     _STATS["windows_active"] += int(logmass.shape[-1])
 

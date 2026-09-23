@@ -469,6 +469,7 @@ class QuantizedStore:
         query: Tensor,
         scaling: float,
         ratio: float,
+        head_norm: bool = False,
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Which active Q windows this step dequantizes, and what the rest score.
 
@@ -480,6 +481,10 @@ class QuantizedStore:
             against the live ``n_active`` rather than a fixed count, because
             ``N_q`` moves with the shape and a pinned integer would not be the
             same fraction anywhere. At least one window always survives.
+        head_norm : take the GQA union in each query head's own units
+            (:func:`~modules.quant.sketch.in_head_units`), as the fused gate
+            does under ``quant_gate_head_norm``. Skipped at ``rep == 1``, where
+            it is a constant shift of one head's ranking.
 
         Returns
         -------
@@ -500,11 +505,14 @@ class QuantizedStore:
                 "gate_and_select needs sketch cards; construct the store with "
                 "sketch_enabled=True and demote at least once."
             )
-        from .sketch import Sketch, gate_and_score, group_max, select_windows
+        from .sketch import (Sketch, gate_and_score, group_max, in_head_units,
+                             select_windows)
 
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
         logmass, est = gate_and_score(query, card, self._anchor, scaling)
+        if head_norm and query.shape[1] > self.num_kv_heads:
+            est = in_head_units(est, logmass)
         # Union the GQA group FIRST, then select. The KV head is the unit of
         # work -- one program loads a window once for every query head sharing
         # it -- so the cap has to bind there. Capping per query head and unioning
@@ -554,6 +562,8 @@ class QuantizedStore:
         top-k pays 2.5% of the worst head's mass for the same traffic. So each KV
         head picks its own windows, and the cost is that positions become
         per-head: ``[B, H_kv, n_sel*ws]`` rather than the shared ``[B, n*ws]``.
+        (Those recalls are pooled over each KV head's query heads; per query
+        head, see :func:`~modules.quant.sketch.in_head_units`.)
 
         Counts are equal across rows and heads (the cap is a fixed
         ``ceil(ratio * n_active)``), so the result is still dense and needs no

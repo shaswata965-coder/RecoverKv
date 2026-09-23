@@ -855,7 +855,7 @@ def main() -> None:
             "read gate tiling (BLOCK_W x num_warps), per geometry",
             _gk.gate_choice, _gk.gate_timings,
             lambda s: (f"NW={s[0]} H_kv={s[1]} head_dim={s[2]} ws={s[3]} "
-                       f"B={s[4]} rep={s[5]}"),
+                       f"B={s[4]} rep={s[5]} head_norm={s[6]}"),
             lambda r: f"BLOCK_W={r[0]}x{r[1]}w",
         )
 

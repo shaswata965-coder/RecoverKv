@@ -246,6 +246,11 @@ class CacheConfig:
     # tier. 1.0 selects every window, which makes the gate a provable no-op and
     # is the control arm for pricing it.
     quant_gate_ratio: float = 0.25
+    # Units of the read gate's GQA union. None (default) = auto: per-query-head
+    # units where the model's attention projections carry a bias (Qwen2), raw
+    # logits elsewhere (Llama, Mistral: byte-identical). An explicit bool
+    # overrides. See WindowedCacheConfig.quant_gate_head_norm.
+    quant_gate_head_norm: Optional[bool] = None
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
@@ -321,6 +326,11 @@ class CacheConfig:
                 f"quant_budget_mode must be 'tokens' or 'bytes', got "
                 f"{self.quant_budget_mode!r}"
             )
+        if (self.quant_gate_head_norm is not None
+                and not isinstance(self.quant_gate_head_norm, bool)):
+            raise ConfigValidationError(
+                "quant_gate_head_norm must be null (auto) or a bool, got "
+                f"{self.quant_gate_head_norm!r}")
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.

@@ -215,6 +215,20 @@ def validate_backend_attn_pairing(
         )
 
 
+def quant_gate_head_norm_kwargs(cache_config_cls: Type,
+                                requested: Optional[bool]) -> dict:
+    """``{"quant_gate_head_norm": requested}``, or ``{}`` if the config lacks it.
+
+    Threaded through every runner for the reason ``quant_gate_ratio`` is: a
+    YAML knob a runner forgets to pass is silently inert, and this one decides
+    which int2 windows the gate reads. ``None`` is passed through as-is -- it
+    is the auto setting, resolved against the model config at ``resolve()``.
+    """
+    if "quant_gate_head_norm" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"quant_gate_head_norm": requested}
+    return {}
+
+
 def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
     """``{"quant_gate_ratio": requested}``, or ``{}`` if the backend lacks it.
 

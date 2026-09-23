@@ -472,6 +472,7 @@ class LongBenchRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
+                                 quant_gate_head_norm_kwargs,
                                  quant_gate_ratio_kwargs)
 
         cfg = self.config
@@ -505,6 +506,12 @@ class LongBenchRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Which units the gate's GQA union is taken in. None = auto (per
+            # query head where the model's projections carry a bias). Threaded
+            # so a YAML override is never silently inert.
+            **quant_gate_head_norm_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_gate_head_norm", None)),
             # The gate itself. LongBench must be able to take the same arm the
             # throughput table takes, or the two describe different methods --
             # which is the exact defect 8ef579a fixed for quant_ratio.
@@ -571,6 +578,11 @@ class LongBenchRunner:
                 # anchor (auto: on iff the model's k_proj has a bias). A Qwen2.5
                 # row without it is the one-byte-grid regression, not the method.
                 "quant_key_anchor": bool(getattr(r, "quant_key_anchor", False)),
+                # Whether the read gate's GQA union was taken per query head
+                # (auto: on iff the model's projections carry a bias). A Qwen2.5
+                # row without it is the raw-logit union, where one head per
+                # group picks every window the gate reads.
+                "quant_gate_head_norm": bool(getattr(r, "quant_gate_head_norm", False)),
             }
 
         hooks = self.install_score_hooks(model, cache, cache_config)

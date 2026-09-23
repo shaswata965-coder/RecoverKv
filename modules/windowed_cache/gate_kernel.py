@@ -29,6 +29,22 @@ Two dot products per window give both outputs::
 ``bound`` and ``est`` are different quantities with different jobs; see
 :func:`modules.quant.sketch.select_windows` for why the cap ranks on the second.
 
+The union, in each head's own units (``head_norm``)
+---------------------------------------------------
+The group's union is a max over its ``rep`` query heads, and a max is only a
+union if the heads are measured in the same units. Raw logits are not: each head
+carries its own constant ``q . k_common``, which its softmax discards and a cross-
+head max does not, so the head with the largest offset picks the whole group's
+windows (:func:`modules.quant.sketch.in_head_units` has the mechanism and the
+per-query-head recall). With ``head_norm`` each head's ``est`` is taken relative
+to its own Q-tier log-partition first. That needs a reduction over the WHOLE
+window axis, which is split across programs, so it is two launches: the scan
+writes per-head ``est`` and a per-tile ``(max, sum)`` of ``logmass``; a small
+union kernel merges the partials into each head's partition and takes the group
+max. Without ``head_norm`` the scan does exactly the arithmetic it always did
+(``HEAD_NORM`` is a constexpr; the partials' pointers ride along unused) and
+there is no second launch, so a raw-union selection is unchanged bit for bit.
+
 A separate kernel, for now
 --------------------------
 This could be a prologue inside ``_two_tier_decode_kernel`` -- one program
@@ -76,6 +92,7 @@ def gate_reference(
     anchor: Tensor,
     scaling: float,
     n_sel: int,
+    head_norm: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """``(sel, logmass)`` — the oracle.
 
@@ -88,6 +105,10 @@ def gate_reference(
         object.
     anchor : ``[B, H_kv, D]`` or ``[H_kv, D]``.
     n_sel : windows to keep per ``(row, KV head)``.
+    head_norm : take the group union in each query head's own units
+        (:func:`modules.quant.sketch.in_head_units`) instead of over raw logits.
+        At ``rep == 1`` that is a constant shift of one head's ranking, so it is
+        skipped there -- by the kernel dispatcher too, so the two agree exactly.
 
     Returns
     -------
@@ -96,11 +117,13 @@ def gate_reference(
         free to the memory system.
     logmass : ``[B, H_q, Nw]`` the estimate for every window.
     """
-    from modules.quant.sketch import Sketch, gate_and_score, group_max
+    from modules.quant.sketch import Sketch, gate_and_score, group_max, in_head_units
 
     card = Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, vm_q, vm_s)
     logmass, est = gate_and_score(q, card, anchor, scaling)
     hkv = mu_q.shape[2]
+    if head_norm and q.shape[1] > hkv:
+        est = in_head_units(est, logmass)
     top = group_max(est, hkv).topk(n_sel, dim=-1).indices          # [B,Hkv,n_sel]
     return _sorted_pick(top), logmass
 
@@ -206,12 +229,12 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
     @triton.jit
     def _gate_kernel(
         Q, MU, MUS, V, VS, T, TS, ANCH,
-        EST, LOGM,
+        EST, LOGM, PMX, PSM,
         qb, qh, pmb, pmn, pmh, mub, mun, muh, sb, sn, sh, tb, tn, th, ab, ah,
-        lb, lh, eb, eh,
+        lb, lh, eb, eh, xb, xh,
         NW, REP, SCALE,
         HEAD_DIM: tl.constexpr, WS: tl.constexpr, BLOCK_WS: tl.constexpr,
-        BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr,
+        BLOCK_D: tl.constexpr, BLOCK_W: tl.constexpr, HEAD_NORM: tl.constexpr,
     ):
         """One program per ``(row, KV head, window tile)``.
 
@@ -244,6 +267,13 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
         bound cost a ``[B, H_q, NW]`` fp32 store and the whole ``eps`` field of
         every card, to be discarded by :func:`_gate_triton`. The cap ranks on the
         estimate; see :func:`modules.quant.sketch.select_windows`.
+
+        **Under ``HEAD_NORM`` ``est`` leaves per query head instead**, ``[B, H_q,
+        NW]``, with this tile's ``(max, sum exp(logmass - max))`` per head in
+        ``PMX``/``PSM`` at column ``program_id(2)``. The group max cannot be taken
+        here, because putting the heads in common units needs each head's
+        partition over the whole window axis, which no one program sees;
+        :func:`_gate_union_kernel` finishes it. The cards are still read once.
         """
         b = tl.program_id(0)
         kv = tl.program_id(1)
@@ -296,10 +326,85 @@ if _HAS_TRITON:  # pragma: no cover - GPU-only
             lm = xm + tl.log(tl.sum(tl.exp(x - xm[:, None]), axis=1))
             tl.store(LOGM + b * lb + hq * lh + cols,
                      tl.where(cm, lm, -float("inf")), mask=cm)
-            est_g = tl.maximum(est_g, xm)
+            if HEAD_NORM:
+                tl.store(EST + b * eb + hq * eh + cols,
+                         tl.where(cm, xm, -float("inf")), mask=cm)
+                # Every tile holds at least one real column (the grid is a
+                # ceil-div), so `pmx` is finite and the masked lanes' exp is 0.
+                lv = tl.where(cm, lm, -float("inf"))
+                pmx = tl.max(lv, axis=0)
+                tl.store(PMX + b * xb + hq * xh + tl.program_id(2), pmx)
+                tl.store(PSM + b * xb + hq * xh + tl.program_id(2),
+                         tl.sum(tl.exp(lv - pmx), axis=0))
+            else:
+                est_g = tl.maximum(est_g, xm)
 
-        tl.store(EST + b * eb + kv * eh + cols,
-                 tl.where(cm, est_g, -float("inf")), mask=cm)
+        if HEAD_NORM:
+            pass                     # the union kernel writes the group's EST
+        else:
+            tl.store(EST + b * eb + kv * eh + cols,
+                     tl.where(cm, est_g, -float("inf")), mask=cm)
+
+    @triton.jit
+    def _gate_union_kernel(
+        ESTH, PMX, PSM, EST,
+        hb, hh, xb, xh, eb, eh,
+        NW, NT, REP,
+        BLOCK_R: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_U: tl.constexpr,
+    ):
+        """The GQA union in each query head's own units. One program per
+        ``(row, KV head, column tile)``.
+
+        1. Merge the scan's ``NT`` per-tile ``(max, sum)`` partials into each of
+           the group's heads' log-partition over the whole Q tier -- the online
+           softmax merge, one tile of partials at a time.
+        2. ``EST[kv, w] = max_r (est_r[w] - lse_r)``: the largest share of its
+           OWN head's Q-tier mass that window ``w``'s hot token carries.
+
+        Every program redoes step 1 for its ``rep`` heads. That is ``rep * NT``
+        values (``NT = NW / BLOCK_W`` of the scan: 10 to 39 at 624 windows) against the
+        ``rep * BLOCK_U`` it then reads for step 2, so sharing it would cost a
+        third launch to save less than it reads anyway.
+
+        Padded head lanes (``r >= REP``) keep ``m = -inf, s = 0`` without ever
+        forming ``-inf - -inf``: the merge exponentiates against ``m_ref``, which
+        is 0 where the running max is still ``-inf``, and their ``lse`` is pinned
+        to a finite 0. They are removed from the max by the ``em`` select, never
+        by arithmetic. (Run under ``TRITON_INTERPRET=1`` this is checked: numpy
+        warns on any ``log(0)`` or ``inf - inf``, even in a lane selected away.)
+        """
+        b = tl.program_id(0)
+        kv = tl.program_id(1)
+        r = tl.arange(0, BLOCK_R)
+        rm = r < REP
+        hq = kv * REP + r
+
+        m = tl.full([BLOCK_R], -float("inf"), tl.float32)
+        s = tl.zeros([BLOCK_R], tl.float32)
+        for t0 in range(0, NT, BLOCK_T):
+            t = t0 + tl.arange(0, BLOCK_T)
+            tm = rm[:, None] & (t < NT)[None, :]
+            pm = tl.load(PMX + b * xb + hq[:, None] * xh + t[None, :],
+                         mask=tm, other=-float("inf"))
+            ps = tl.load(PSM + b * xb + hq[:, None] * xh + t[None, :],
+                         mask=tm, other=0.0)
+            m_new = tl.maximum(m, tl.max(pm, axis=1))
+            m_ref = tl.where(m_new == -float("inf"), 0.0, m_new)
+            s = s * tl.exp(m - m_ref) + tl.sum(
+                tl.where(tm, ps * tl.exp(pm - m_ref[:, None]), 0.0), axis=1)
+            m = m_new
+        # A padded lane has s == 0; give it a finite 0 rather than log(0), so no
+        # lane ever forms -inf - -inf below (the select would drop it, but a NaN
+        # that is only ever selected away is one refactor from being read).
+        lse = tl.where(rm, m, 0.0) + tl.log(tl.where(rm, s, 1.0))
+
+        cols = tl.program_id(2) * BLOCK_U + tl.arange(0, BLOCK_U)
+        cm = cols < NW
+        em = rm[:, None] & cm[None, :]
+        e = tl.load(ESTH + b * hb + hq[:, None] * hh + cols[None, :],
+                    mask=em, other=-float("inf"))
+        crit = tl.max(tl.where(em, e - lse[:, None], -float("inf")), axis=0)
+        tl.store(EST + b * eb + kv * eh + cols, crit, mask=cm)
 
 
 def _sm_count(device) -> int:  # pragma: no cover - GPU-only
@@ -309,7 +414,17 @@ def _sm_count(device) -> int:  # pragma: no cover - GPU-only
         return 64
 
 
-def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-only
+#: Column tile and partials tile of :func:`_gate_union_kernel`. Not searched: the
+#: kernel reads ``rep * NW`` floats that the scan has just written (L2-resident),
+#: a few percent of the scan's card traffic, and its tiling cannot move a result
+#: bit -- every reduction in it is a max, or a merge whose order is fixed by the
+#: loop over ``NT`` rather than by the grid.
+_UNION_BLOCK_U = 256
+_UNION_BLOCK_T = 64
+
+
+def _gate_triton(q, card, anchor, scaling, n_sel,
+                 head_norm=False):  # pragma: no cover - GPU-only
     if not _HAS_TRITON:
         raise RuntimeError("fused_gate requires triton")
     mu_q, mu_s, v_q, v_s, t_q, t_s, _vm_q, _vm_s = card
@@ -319,7 +434,12 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     B, NW, HKV = mu_q.shape[0], mu_q.shape[1], mu_q.shape[2]
     D = v_q.shape[-1]
     HQ = q.shape[1]
+    REP = HQ // HKV
     ws = t_q.shape[-1]
+    # A group of one has nothing to put in common units: the shift would move
+    # its one head's ranking by a constant. Skipped, exactly as `gate_reference`
+    # skips it, so rep == 1 is the raw kernel with no second launch.
+    head_norm = bool(head_norm) and REP > 1
     if anchor.dim() == 2:
         anchor = anchor.unsqueeze(0).expand(B, HKV, D).contiguous()
     # Both are dead by the end of `_run_fused`: `est` is consumed by the topk
@@ -346,11 +466,25 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
     ladder += [(bw, nw) for bw in (16, 32, 64, 128) for nw in (4, 8)
                if (bw, nw) != (derived, 4)]
 
+    if head_norm:
+        # The scan's `est` goes out per query head; the union kernel folds it
+        # into `est`. Partials are sized for the narrowest rung, so every rung
+        # the search tries writes into the same buffers.
+        est_h = _scratch("est_h", (B, HQ, NW), torch.float32, q.device)
+        nt_max = -(-NW // min(bw for bw, _ in ladder))
+        pmx = _scratch("gate_pmx", (B, HQ, nt_max), torch.float32, q.device)
+        psm = _scratch("gate_psm", (B, HQ, nt_max), torch.float32, q.device)
+        scan_est, xb, xh = est_h, pmx.stride(0), pmx.stride(1)
+    else:
+        # Never dereferenced: HEAD_NORM is a constexpr and compiles them out.
+        scan_est, pmx, psm, xb, xh = est, est, est, 0, 0
+
     def _launch(rung):
         block_w, num_warps = rung
-        _gate_kernel[(B, HKV, -(-NW // block_w))](
+        n_tiles = -(-NW // block_w)
+        _gate_kernel[(B, HKV, n_tiles)](
             q, mu_q, mu_s, v_q, v_s, t_q, t_s, anchor,
-            est, logm,
+            scan_est, logm, pmx, psm,
             q.stride(0), q.stride(1),
             mu_q.stride(0), mu_q.stride(1), mu_q.stride(2),
             v_q.stride(0), v_q.stride(1), v_q.stride(2),
@@ -358,20 +492,35 @@ def _gate_triton(q, card, anchor, scaling, n_sel):  # pragma: no cover - GPU-onl
             t_q.stride(0), t_q.stride(1), t_q.stride(2),
             anchor.stride(0), anchor.stride(1),
             logm.stride(0), logm.stride(1),
-            est.stride(0), est.stride(1),
-            NW, HQ // HKV, scaling,
+            scan_est.stride(0), scan_est.stride(1),
+            xb, xh,
+            NW, REP, scaling,
             HEAD_DIM=D, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
             BLOCK_D=triton.next_power_of_2(D),
-            BLOCK_W=block_w,
+            BLOCK_W=block_w, HEAD_NORM=head_norm,
             num_warps=num_warps,
         )
+        if head_norm:
+            # Inside the rung, not after the search: the partials are laid out by
+            # THIS rung's tile count, and the search re-launches its winner last,
+            # so the `est` the top-k reads always comes from one consistent pair.
+            _gate_union_kernel[(B, HKV, -(-NW // _UNION_BLOCK_U))](
+                est_h, pmx, psm, est,
+                est_h.stride(0), est_h.stride(1), xb, xh,
+                est.stride(0), est.stride(1),
+                NW, n_tiles, REP,
+                BLOCK_R=triton.next_power_of_2(REP), BLOCK_T=_UNION_BLOCK_T,
+                BLOCK_U=_UNION_BLOCK_U,
+                num_warps=4,
+            )
 
     # `NW` is exact in the signature, not bucketed as `Sfp` is in the decode
     # kernel: the active window count is FROZEN between evictions (design §10
     # moves the active set only there), so it takes one value per budget regime
     # and an exact key costs no extra searches while a bucketed one could serve a
-    # tile chosen for a tier 40% larger.
-    sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(HQ // HKV))
+    # tile chosen for a tier 40% larger. `head_norm` is a different compile (and
+    # a second launch), so it tunes separately.
+    sig = (int(NW), int(HKV), int(D), int(ws), int(B), int(REP), head_norm)
     _search_rungs(_GATE_CHOICE, _GATE_TIMINGS, _GATE_ANNOUNCED, _GATE_SEEN,
                   sig, ladder, _launch, "read gate tiling")
     # `est` already carries the group max, so this is a bare top-k. Sorted
@@ -387,6 +536,7 @@ def fused_gate(
     scaling: float,
     n_sel: int,
     force_reference: bool = False,
+    head_norm: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Dispatch: Triton on CUDA (**required**), the reference on CPU.
 
@@ -403,9 +553,14 @@ def fused_gate(
 
     So on CUDA it raises, like ``fused_two_tier_decode``. ``force_reference``
     remains for tests that want the oracle on purpose.
+
+    ``head_norm`` takes the GQA union in each query head's own units; see the
+    module docstring. Both backends honour it identically, including skipping
+    it at ``rep == 1``.
     """
     if force_reference or not q.is_cuda:
-        return gate_reference(*( (q,) + tuple(card) + (anchor, scaling, n_sel) ))
+        return gate_reference(*((q,) + tuple(card) + (anchor, scaling, n_sel)),
+                              head_norm=head_norm)
     if not _HAS_TRITON:
         raise RuntimeError(
             "the read gate requires the Triton kernel on CUDA and triton is not "
@@ -415,4 +570,4 @@ def fused_gate(
             "regression. Install triton, or set STICKYKV_FUSED_DECODE=0 to run "
             "the materialize path (which does not gate at all)."
         )
-    return _gate_triton(q, card, anchor, scaling, n_sel)
+    return _gate_triton(q, card, anchor, scaling, n_sel, head_norm=head_norm)

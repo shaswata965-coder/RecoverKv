@@ -212,7 +212,12 @@ one per-window block is the real fix and needs a GPU to verify.
 * **Triton cannot run on this dev box.** Kernels ship unvalidated by contract;
   the *algorithm* does not. Every kernel has a CPU reference mirroring its tiling
   and masking (`two_tier_window_reference`, `gate_reference`,
-  `gated_decode_step`), and tests pin the reference.
+  `gated_decode_step`), and tests pin the reference. **But the kernels CAN be
+  executed here**: Triton's interpreter (`TRITON_INTERPRET=1`, set before import,
+  so in a subprocess) runs the real `@triton.jit` body on CPU tensors.
+  `test_gate_head_units.py` and `test_decode_kernel_interpreted.py` compare the
+  gate and the fused decode kernel against their references that way (fp32:
+  7e-6). Do that for any kernel change; it checks numbers, not speed.
 * **Scores must not move** unless the change is explicitly a quality change with
   a LongBench run behind it. Anything that alters which windows the cache keeps
   is out regardless of what it would buy.
@@ -227,6 +232,20 @@ one per-window block is the real fix and needs a GPU to verify.
   same in every window, so it shifts the whole int2 tier's logits by nats. It is
   auto-on from the model config (`key_projection_has_bias`) and off on
   Llama/Mistral; `QWEN_PORT_PLAN.md` has the measurement. Qwen2.5 quality rows do
-  not compare across the commit that added it.
+  not compare across the commit that added it. **It was not the Qwen gap** — the
+  next bullet was.
+* **The gate's GQA union must compare query heads in their own units
+  (`quant_gate_head_norm`).** It keeps `n_sel` windows per KV head by a max
+  over the `rep` query heads sharing it, and a max over raw logits is decided by
+  each head's constant `q·k_common` — which that head's softmax discards — so one
+  head picks for the whole group and the rest read their hot windows only as
+  centroids. Per query head at ratio 0.25 on `test_sketch.py`'s own recall
+  fixture, the raw union leaves the worst head **0.000** of its Q-tier mass at
+  rep 4 and rep 7; in head units, 0.998. That test measured recall **pooled**
+  over the group's raw `exp(logit)`, which is blind to it — **measure gate
+  recall per query head, never pooled.** Auto-on where the projections carry a
+  bias (Qwen2: rep 7, bias offsets); off on Llama/Mistral to keep their columns
+  byte-identical, though the rep-4 row says Llama has it too — measure there
+  before flipping the default. `QWEN_PORT_PLAN.md` has the numbers.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.

@@ -108,6 +108,12 @@ class ResolvedConfig:
     # bool (auto = the model's k_proj has a bias, and there is a Q tier). Costs
     # no bytes per window, so it does not enter the budget arithmetic.
     quant_key_anchor: bool = False
+    # Take the read gate's GQA union in each query head's own units (est over
+    # that head's Q-tier log-partition) rather than over raw logits. RESOLVED
+    # like `quant_key_anchor`: auto = the model's attention projections carry a
+    # bias, and there is a Q tier. Costs no bytes; one extra launch per layer
+    # per step on the flash path, and none at rep == 1.
+    quant_gate_head_norm: bool = False
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -338,6 +344,23 @@ class WindowedCacheConfig:
     # several nats. Anchored, a bias channel's stored residual is exactly 0.
     # Zero bytes per window: one [H_kv, D] fp32 vector per (layer, row).
     quant_key_anchor: Optional[bool] = None
+    # -- read-gate union units (modules/quant/sketch.in_head_units) -----------
+    # None (default) = auto: ON iff the model's attention projections carry a
+    # bias (`key_projection_has_bias`, the same test as `quant_key_anchor`), so
+    # the Llama and Mistral columns stay byte-identical. An explicit bool
+    # overrides -- which is how a Llama run can measure it.
+    #
+    # Why it exists: the gate picks each KV head's windows by a max over the
+    # group's query heads, and a max over raw logits is decided by each head's
+    # constant offset q.k_common -- which that head's own softmax discards -- not
+    # by what it attends to. The head with the largest offset picks for all rep
+    # of them; the rest read their hot windows only through value centroids.
+    # Per query head, on the repo's own recall fixture at ratio 0.25, the worst
+    # head keeps 0.0000 of its Q-tier mass raw and 0.998 in head units. A q/k
+    # bias (Qwen2) makes the offsets larger by construction, and rep=7 puts more
+    # heads behind each union. Selection only: every head's ranking of its own
+    # windows, the card, the budget and the kernel's fill are unchanged.
+    quant_gate_head_norm: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # -- window_size --
@@ -477,6 +500,15 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_key_anchor must be None (auto) or bool, got "
                 f"{type(self.quant_key_anchor).__name__}"
+            )
+
+        # -- quant_gate_head_norm (tri-state) --
+        if self.quant_gate_head_norm is not None and not isinstance(
+            self.quant_gate_head_norm, bool
+        ):
+            raise ValueError(
+                f"quant_gate_head_norm must be None (auto) or bool, got "
+                f"{type(self.quant_gate_head_norm).__name__}"
             )
 
         # -- first_eviction_step (non-negative int; bool rejected before int) --
@@ -719,6 +751,13 @@ class WindowedCacheConfig:
             quant_key_anchor=q > 0.0 and (
                 key_projection_has_bias(model_config)
                 if self.quant_key_anchor is None else self.quant_key_anchor
+            ),
+            # A property of the gate, so only meaningful with a Q tier; auto
+            # follows the same bias test (see WindowedCacheConfig).
+            quant_gate_head_norm=q > 0.0 and (
+                key_projection_has_bias(model_config)
+                if self.quant_gate_head_norm is None
+                else self.quant_gate_head_norm
             ),
         )
 

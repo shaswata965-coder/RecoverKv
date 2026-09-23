@@ -12,7 +12,8 @@ import numpy as np
 import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
-from utils.cache_factory import (get_cache_classes, quant_gate_ratio_kwargs,
+from utils.cache_factory import (get_cache_classes, quant_gate_head_norm_kwargs,
+                                 quant_gate_ratio_kwargs,
                                  validate_backend_attn_pairing)
 from utils.config import (
     FIRST_EVICTION_STEP_DEFAULT, ConfigValidationError, ExperimentConfig,
@@ -321,7 +322,9 @@ class OursParityRunner:
                 quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
                 first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
                 **quant_gate_ratio_kwargs(
-                    WCC, getattr(cfg.cache, "quant_gate_ratio", 0.25)),)
+                    WCC, getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+                **quant_gate_head_norm_kwargs(
+                    WCC, getattr(cfg.cache, "quant_gate_head_norm", None)),)
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),

@@ -32,6 +32,7 @@ cache:
   local_window_size: 128                    # fixed tokens
   quant_ratio: 0.70
   quant_gate_ratio: 0.25                    # read-gate selectivity; 1.0 = read everything
+  quant_gate_head_norm: null               # gate's GQA union per query head; null = auto (on: Qwen2 has q/k bias, rep 7)
   quant_budget_mode: bytes
   rerotate_on_evict: false
   first_eviction_step: 0

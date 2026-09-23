@@ -71,7 +71,10 @@ its window, worse than useless.
    owns a KV head and every query head sharing it, so that is the unit of work.
    Measured at `ratio=0.25` on a 271-window tier: per (row, KV head) reads
    68/271 at 100% mass recall; a per-row union reads 240/271 and the gate buys
-   nothing.
+   nothing. (That recall pools raw `exp(logit)` over the group; per *query*
+   head the raw-logit union starves some heads entirely, which is why the
+   union is taken in each head's own units where `quant_gate_head_norm` is on
+   — `QWEN_PORT_PLAN.md`.)
 3. **Attend** over `[sink | fp body | the selected int2 windows]`. The selection
    reaches the kernel as an indirection (`widx = tl.load(SEL + …)`), not a
    re-gather, and the int2 unpack + dequant + RoPE all happen in registers.
