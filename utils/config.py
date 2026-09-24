@@ -106,6 +106,8 @@ OPERATING_POINT_EXEMPT = {
         "the Qwen gate's control arm (quant_gate_ratio 1.0)",
     "longbench_qwen_ours_gate50.yaml":
         "the Qwen gate at half the tier (quant_gate_ratio 0.5), an ablation",
+    "longbench_qwen_ours_q0.yaml":
+        "the Qwen eviction with no int2 tier (quant_ratio 0.0), an ablation",
     "ruler_qwen_niah_mk3_omega16.yaml":
         "the omega=16 arm; window_size is the ablation",
     "longbench_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",

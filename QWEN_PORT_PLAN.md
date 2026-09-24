@@ -21,6 +21,46 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 7 — the gate sweep is flat: the gate is NOT the Qwen gap
+
+LongBench, Qwen2.5-7B, flash, q = 0.70, budget 0.20, GPU; the realised read
+fraction was checked against each ratio (the knob is live), and 0.10 was run
+too and is flat with the rest:
+
+| dataset | gate 0.25 | gate 0.50 | gate 0.75 |
+|---|---|---|---|
+| triviaqa | 81.40 | 80.39 | 79.95 |
+| trec | 62.50 | 63.00 | 62.50 |
+| hotpotqa | 48.76 | 46.95 | 48.03 |
+| multifieldqa_en | 44.95 | 45.86 | 44.25 |
+| samsum | 44.16 | 43.45 | 43.81 |
+| qasper | 36.83 | 37.09 | 37.44 |
+| 2wikimqa | 36.52 | 37.67 | 37.02 |
+| musique | 20.71 | 20.65 | 20.69 |
+| **average (8)** | **46.98** | **46.88** | **46.71** |
+
+The GPU diagnostic (same config, same four gap datasets) puts the gate's output error at 0.75 about
+10x below 0.25 (median ~0.001-0.003, p90 0.01-0.03), and 1.00 reads exactly
+0. Cutting the gate's error tenfold moves no task beyond noise, and none of the
+three gap tasks (triviaqa, trec, musique) moves toward QEvict. **The gate is
+ruled out as the cause.** Round 6's measurements stand as measurements -- the
+card IS less accurate on Qwen and in its last layers -- but that error does not
+cost LongBench points. Rounds 2, 4, 5 and 6 all pointed at the gate; the sweep
+is what refutes them.
+
+What is left is anything that does not depend on the gate ratio OR the budget
+(triviaqa is ~81 at every budget 5-20% and every ratio 0.10-0.75, against
+QEvict's 89.63): the protocol, the eviction/fp path, or the int2 tier itself
+(one-byte grid + anchor, fused two-tier kernel). Two config arms separate them
+(`scripts/run_longbench_qwen_ablation.sh`, default `ARMS="full q0"`):
+- `full` (no compression) on this branch's runner. If it scores ~81 on
+  triviaqa, the gap is not the method: the runner/protocol differs from the one
+  QEvict's column was produced with, and every earlier round was chasing
+  machinery.
+- `q0` (same eviction, quant_ratio 0.0: no int2 tier, no card, no fused
+  kernel). q0 ~ full -> the int2 tier is the gap; q0 ~ ours -> the eviction
+  or the fp path is.
+
 ### Round 6 — measured on the real models: why Qwen and not Llama
 
 Real weights, real LongBench prompts (triviaqa x2, narrativeqa, musique at

@@ -1,0 +1,22 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours with NO int2 tier (quant_ratio 0.0)
+# ============================================================================
+# One-field ablation of longbench_qwen_ours_flash_attn.yaml: the same windowed
+# cache, budget, sinks, local window and prefill-score eviction, with every
+# retained window kept in bf16. No Q tier means no card and no fused two-tier
+# decode kernel, so read_gate reads "not-expected" here -- that is a pass.
+#
+# Why: the gate sweep (0.10-0.75) left the Qwen scores flat, and so did the
+# budget sweep (triviaqa ~81.6 from 5% to 20%), so the gap to QEvict does not
+# depend on how many windows are read or kept. Beside `full` and `ours`:
+#   full ~ ours          -> not the method at all: the protocol/runner
+#   q0 ~ full, ours low  -> the int2 tier (storage format, fused decode kernel)
+#   q0 ~ ours, full high -> the eviction / fp path (ranking, score kernel)
+# scripts/run_longbench_qwen_ablation.sh runs it as the `q0` arm.
+_base_: longbench_qwen_ours_flash_attn.yaml
+
+cache:
+  quant_ratio: 0.0
+
+longbench:
+  output_dir: outputs/longbench/qwen_ours_q0_compression_0.8

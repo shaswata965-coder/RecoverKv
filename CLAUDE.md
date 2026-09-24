@@ -254,8 +254,12 @@ one per-window block is the real fix and needs a GPU to verify.
   Qwen (TV 0.27 vs 0.17; unread windows under-weighted to 22% vs 53% of their
   weight in the worst decile) and the error concentrates in Qwen's LAST two
   layers (p90 0.21 vs 0.07). GQA sharing (rep 7) costs less than the card. At
-  0.5 Qwen's last layers drop to Llama's 0.25 level. The history below is how
-  it got here.
+  0.5 Qwen's last layers drop to Llama's 0.25 level. **But that error does not
+  cost points: the Qwen gate sweep is flat** (average 46.98 / 46.88 / 46.71 at
+  0.25 / 0.50 / 0.75 over eight datasets, triviaqa ~81 at every ratio 0.10-0.75
+  and every budget 5-20%), so **the gate is ruled out as the Qwen gap**
+  (Round 7). Next: the `full` and `q0` arms. The history below is how it got
+  here.
 * **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
   Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate
@@ -268,8 +272,8 @@ one per-window block is the real fix and needs a GPU to verify.
   10% -> 20% gains nothing on average, and the longest-context tasks LOSE with
   the extra cache (narrativeqa 23.7 -> 18.3), i.e. the loss scales with the
   number of windows read only through a centroid. Three rounds of fixes chosen
-  from synthetic arguments moved nothing; **do not ship a fourth until the
-  gate100/gate50 arms (`scripts/run_longbench_qwen_ablation.sh`) have run.**
+  from synthetic arguments moved nothing; the gate arms then ran and were flat,
+  which refuted this whole line (Round 7).
   The diagnostic's `skip_mass_err` is whether those windows get the right
   TOTAL weight, which `card_tv` cannot see.
 * **Ask how the reference was actually invoked before reading its config.**
