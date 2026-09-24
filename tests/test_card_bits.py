@@ -30,8 +30,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from modules.quant.sketch import (CARD_BITS_DEFAULT, CardBits, Sketch,
-                                  _dq_symb, _q_symb, build_sketch,
+from modules.quant.sketch import (CARD_BITS_ALLOWED, CARD_BITS_DEFAULT,
+                                  CardBits, Sketch, _dq_symb, _q_symb, _width,
+                                  build_sketch,
                                   card_field_layout, decode_sketch,
                                   gate_and_score, parse_card_bits,
                                   sketch_bytes_per_head)
@@ -120,6 +121,43 @@ def test_4_bit_path_is_the_old_int4_encoder():
 def test_a_field_that_does_not_fill_whole_bytes_raises():
     with pytest.raises(ValueError):
         card_field_layout(6, 2)
+
+
+def _symbolic(v: int):
+    """``v`` as a SymInt: what a width read off ``store.card_bits`` becomes
+    inside the compiled eviction (``torch.compile(dynamic=True)``) on torch
+    2.6, where Dynamo unspecializes ints reached from a frame local."""
+    from torch._dynamo.source import ConstantSource
+    from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+    return ShapeEnv().create_unspecified_symint_and_symbol(
+        v, ConstantSource(f"bits{v}"), DimDynamic.DYNAMIC)
+
+
+@pytest.mark.parametrize("bits", CARD_BITS_ALLOWED)
+def test_width_turns_a_symbolic_width_into_a_python_int(bits):
+    w = _width(_symbolic(bits))
+    assert type(w) is int and w == bits
+
+
+@pytest.mark.parametrize("spec", [None, 2, "mu=2,v=4,t=2,vm=8"])
+def test_a_symbolic_card_width_packs_the_same_codes(spec):
+    """The encoder must pin a symbolic width before doing arithmetic on it.
+
+    Unpinned, ``demote_many``'s ``build_sketch`` raised ``cannot determine
+    truth value of Relational`` on torch 2.6 (``1 << (s - 1)``), which knocked
+    the eviction off its ``dynamic=True`` compile, at every width including
+    the default. torch 2.14 accepts the arithmetic and silently packs
+    DIFFERENT codes at 4 and 2 bits, so this compares bytes, not just "runs".
+    """
+    bits = parse_card_bits(spec)
+    k, a, v, va = _fixture()
+    want = build_sketch(k, a, v, va, bits)
+    got = build_sketch(k, a, v, va, CardBits(*map(_symbolic, bits)))
+    for name, x, y in zip(Sketch._fields, got, want):
+        assert x.dtype == y.dtype and torch.equal(x, y), name
+    # The decoder takes the same pin (the gate's CPU reference unpacks with it).
+    assert torch.equal(_dq_symb(want.mu_q, want.mu_s, _symbolic(bits.mu)),
+                       _dq_symb(want.mu_q, want.mu_s, bits.mu))
 
 
 # ---------------------------------------------------------------------------

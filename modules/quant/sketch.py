@@ -331,6 +331,26 @@ _NIB_BIAS = 8
 _NIB_MAX = 7
 
 
+def _width(bits: Any) -> int:
+    """``bits`` as a plain Python int, found by ``==`` against the allowed widths.
+
+    Inside the compiled eviction (``torch.compile(dynamic=True)``) a width read
+    off ``store.card_bits`` arrives as a SymInt: Dynamo unspecializes ints from
+    local sources, and a NamedTuple field on ``self`` is one. The packers below
+    then do arithmetic on it, and torch 2.6 cannot lower ``1 << (s - 1)``
+    (``cannot determine truth value of Relational``). ``int()`` does not help --
+    2.6 traces it as ``sym_int`` and the value stays symbolic. An ``==`` does:
+    it is a guard, and the branch it takes returns a literal. torch 2.14
+    specializes the field on its own, which is why CPU tests never saw this.
+    Eager, it is at most three int compares.
+    """
+    for w in CARD_BITS_ALLOWED:
+        if bits == w:
+            return w
+    raise ValueError(
+        f"card field width {bits!r} is not one of {CARD_BITS_ALLOWED}")
+
+
 def _q_symb(x: Tensor, bits: int) -> Tuple[Tensor, Tensor]:
     """Symmetric ``bits``-wide codes along the last axis, + a per-row fp16 scale.
 
@@ -346,6 +366,7 @@ def _q_symb(x: Tensor, bits: int) -> Tuple[Tensor, Tensor]:
     to ``amax / qmax`` rather than inherited from the wider grid, so the codes
     use the whole range. At 2 bits ``qmax`` is 1, so the codes are ternary.
     """
+    bits = _width(bits)
     if bits == 8:
         return _q_sym(x)
     per = 8 // bits
@@ -367,6 +388,7 @@ def _q_symb(x: Tensor, bits: int) -> Tuple[Tensor, Tensor]:
 
 def _dq_symb(packed: Tensor, scale: Tensor, bits: int) -> Tensor:
     """Unpack + dequantize :func:`_q_symb`. ``[..., n * bits // 8]`` -> ``[..., n]``."""
+    bits = _width(bits)
     if bits == 8:
         return _dq_sym(packed, scale)
     per = 8 // bits
