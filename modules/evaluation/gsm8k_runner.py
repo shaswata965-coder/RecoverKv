@@ -339,7 +339,8 @@ class GSM8KRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache + hooks. Returns ``(cache, hooks, resolved)``."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
-                                 quant_gate_ratio_kwargs)
+                                         quant_gate_ratio_kwargs,
+                                         quant_tier_policy_kwargs)
 
         cfg = self.config
         model = self.model
@@ -365,6 +366,7 @@ class GSM8KRunner:
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
             # Gate-card field widths (sketch.CardBits); None means the shipped card.
             quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+            **quant_tier_policy_kwargs(cfg.cache),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -508,10 +510,12 @@ class GSM8KRunner:
         cfg = self.config
         budget = cfg.cache.cache_budget
 
-        from utils.cache_factory import quant_card_bits_record
+        from utils.cache_factory import (quant_card_bits_record,
+                                         quant_tier_policy_record)
         meta = {
             "read_gate": self._read_gate_report("gsm8k"),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "task": "gsm8k",
             "run_name": output_dir.name,
             "num_examples": n_examples,

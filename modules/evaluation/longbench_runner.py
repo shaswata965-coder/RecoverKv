@@ -479,7 +479,8 @@ class LongBenchRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
-                                 quant_gate_ratio_kwargs)
+                                         quant_gate_ratio_kwargs,
+                                         quant_tier_policy_kwargs)
 
         cfg = self.config
         model = self.model
@@ -514,6 +515,7 @@ class LongBenchRunner:
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
             # Gate-card field widths (sketch.CardBits); None means the shipped card.
             quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+            **quant_tier_policy_kwargs(cfg.cache),
             # The gate itself. LongBench must be able to take the same arm the
             # throughput table takes, or the two describe different methods --
             # which is the exact defect 8ef579a fixed for quant_ratio.
@@ -758,10 +760,12 @@ class LongBenchRunner:
         else:
             lws_resolved = None
 
-        from utils.cache_factory import quant_card_bits_record
+        from utils.cache_factory import (quant_card_bits_record,
+                                         quant_tier_policy_record)
         meta = {
             "read_gate": read_gate,
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "dataset": dataset_name,
             "num_examples": num_examples,
             "model_name": cfg.model.name,

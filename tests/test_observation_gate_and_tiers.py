@@ -264,7 +264,8 @@ class TestDecodeReadLedger:
 
 
 def _sim_pair(*, T=48, L=2, H=4, H_kv=2, prefill_len=8, local=2, k_fp=3, n_q=4,
-              evict_every=4, gate=True, bad_kv=1, record_heads=True):
+              evict_every=4, gate=True, bad_kv=1, record_heads=True,
+              gate_ratio=0.5, oneway=False):
     """``window_size = 1`` so a window is a token; no sink tokens.
 
     Heads of KV group 0 follow a drifting hot window; group 1 attends a second
@@ -302,8 +303,13 @@ def _sim_pair(*, T=48, L=2, H=4, H_kv=2, prefill_len=8, local=2, k_fp=3, n_q=4,
                 band = [w for w in range(ew[t]) if w not in evicted]
                 score = cum[0, t, li].mean(0)
                 order = sorted(band, key=lambda w: -score[w])
-                q_set = set(order[k_fp:k_fp + n_q])
-                evicted |= set(order[k_fp + n_q:])
+                if oneway:     # an int2 window never takes an fp slot
+                    fp = [w for w in order if w not in q_set][:k_fp]
+                    rest = [w for w in order if w not in fp]
+                    q_set, drop = set(rest[:n_q]), rest[n_q:]
+                else:
+                    q_set, drop = set(order[k_fp:k_fp + n_q]), order[k_fp + n_q:]
+                evicted |= set(drop)
             surv = [w for w in range(w_act[t]) if w not in evicted]
             ids[0, t, li, :len(surv)] = surv
             tags = [1 if w in q_set else (2 if w >= ew[t] else 0) for w in surv]
@@ -311,7 +317,7 @@ def _sim_pair(*, T=48, L=2, H=4, H_kv=2, prefill_len=8, local=2, k_fp=3, n_q=4,
             if gate and q_set and t >= 1:
                 gfired[0, t, li] = True
                 qs = sorted(q_set)
-                n_sel = math.ceil(0.5 * len(qs))
+                n_sel = math.ceil(gate_ratio * len(qs))
                 for kv in range(H_kv):
                     heads = slice(kv * rep, (kv + 1) * rep)
                     mass = step[0, t, li, heads][:, qs].sum(0)
@@ -346,9 +352,11 @@ def _sim_pair(*, T=48, L=2, H=4, H_kv=2, prefill_len=8, local=2, k_fp=3, n_q=4,
     if gate:
         ours_arrays["gate_read"] = gread
         ours_arrays["gate_fired"] = gfired
-        ours_meta.update(read_gate={"verdict": "gated", "read_fraction": 0.5,
+        ours_meta.update(read_gate={"verdict": "gated", "read_fraction": gate_ratio,
                                     "gated": 10, "fired": 10},
-                         gate_recorded=True, quant_gate_ratio=0.5)
+                         gate_recorded=True, quant_gate_ratio=gate_ratio,
+                         quant_promotion="oneway" if oneway else "bidir",
+                         bytes_per_q_window=8608, bytes_per_gate_card=2176)
     else:
         ours_meta.update(read_gate={"verdict": "not-expected"},
                          gate_recorded=False)

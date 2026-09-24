@@ -1099,6 +1099,10 @@ class WindowedCache(_HFCacheBase):
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
                     card_bits=self.resolved.quant_card_bits,
+                    # The promotion-payload oracle keeps each window's original
+                    # fp K/V beside its codes; off unless asked for.
+                    shadow_dtype=(kv_dtype if self.resolved.quant_promote_source
+                                  == "original" else None),
                 )
                 for _ in range(num_layers)
             ]
@@ -2713,7 +2717,17 @@ class WindowedCache(_HFCacheBase):
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
-        retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # `quant_promotion="oneway"` (an ablation; the shipped policy is
+        # "bidir"): a window already in the int2 tier may not take an fp slot,
+        # so the chain is F -> Q -> E. That needs the CURRENT tier over the whole
+        # merged axis before ranking -- one extra lookup, only on this arm. The
+        # branch is a config string, a trace-time constant.
+        no_promote = None
+        if self.resolved.quant_promotion == "oneway":
+            store.ensure(B, device)
+            no_promote = store.lookup(state.original_window_ids)[1]
+        retained_idx, new_tier = policy.compute_two_tier_retain(
+            state.window_scores, no_promote)
         # W is a concrete int (above), so these are Python ints even under
         # torch.compile; the int() is belt-and-suspenders against a future
         # tier_counts that returns a tensor scalar.
@@ -2804,12 +2818,21 @@ class WindowedCache(_HFCacheBase):
         prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
         prom_k = prom_v = prom_pos = None
         if p_max > 0:
-            k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
-            prom_k = rotate_key_window(
-                k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
-                pos_pre.reshape(B, p_max * ws),
-                rope,
-            ).to(dtype)                                                # [B,H,p*ws,D]
+            if store.shadow_enabled:
+                # Evaluation-only oracle (`quant_promote_source="original"`):
+                # the window comes back exactly as it was demoted, keys already
+                # rotated, so there is no dequant and no RoPE here.
+                k_orig, v_pre, pos_pre = store.promote_many_original(
+                    prom_slot, prom_valid, dtype)
+                prom_k = k_orig.permute(0, 2, 1, 3, 4).reshape(
+                    B, H_kv, p_max * ws, D).to(dtype)                  # [B,H,p*ws,D]
+            else:
+                k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
+                prom_k = rotate_key_window(
+                    k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
+                    pos_pre.reshape(B, p_max * ws),
+                    rope,
+                ).to(dtype)                                            # [B,H,p*ws,D]
             prom_v = v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
                 B, H_kv, p_max * ws, D)
             prom_pos = pos_pre.reshape(B, p_max * ws).to(body_pos.dtype)
@@ -2847,7 +2870,7 @@ class WindowedCache(_HFCacheBase):
                 # for the window's whole life (§5, §10).
                 keys_post_rope=(
                     k_post.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4)
-                    if store.sketch_enabled else None
+                    if (store.sketch_enabled or store.shadow_enabled) else None
                 ),
             )
 

@@ -20,6 +20,8 @@ __all__ = [
     "ConfigValidationError",
     "get_cache_classes",
     "quant_budget_mode_kwargs",
+    "quant_tier_policy_kwargs",
+    "quant_tier_policy_record",
     "validate_backend_attn_pairing",
     "assert_transformers_version_supported",
     "is_transformers_version_supported",
@@ -226,6 +228,39 @@ def quant_card_bits_record(cache_cfg: Any) -> dict:
     """
     from modules.quant.sketch import parse_card_bits
     return parse_card_bits(getattr(cache_cfg, "quant_card_bits", None))._asdict()
+
+
+def quant_tier_policy_kwargs(cache_cfg: Any) -> dict:
+    """``quant_promotion`` / ``quant_promote_source`` for a WindowedCacheConfig.
+
+    Passed only when they differ from the shipped method, so a default run
+    constructs its cache exactly as before these knobs existed. Every runner
+    that builds a cache goes through here -- a knob threaded by hand into some
+    runners and not others is how ``quant_budget_mode`` came to be inert in
+    three of them (ACCURACY_RECOVERY_PLAN.md §2).
+    """
+    out = {}
+    promo = getattr(cache_cfg, "quant_promotion", "bidir") or "bidir"
+    src = getattr(cache_cfg, "quant_promote_source", "dequant") or "dequant"
+    if promo != "bidir":
+        out["quant_promotion"] = promo
+    if src != "dequant":
+        out["quant_promote_source"] = src
+    return out
+
+
+def quant_tier_policy_record(cache_cfg: Any) -> dict:
+    """``{"quant_promotion": ..., "quant_promote_source": ...}`` for sidecars.
+
+    Next to ``read_gate`` and ``quant_card_bits``: either knob changes which
+    windows the cache keeps or what a promoted one holds, so a quality number
+    without them does not say which method produced it.
+    """
+    return {
+        "quant_promotion": getattr(cache_cfg, "quant_promotion", "bidir") or "bidir",
+        "quant_promote_source": (getattr(cache_cfg, "quant_promote_source",
+                                         "dequant") or "dequant"),
+    }
 
 
 def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:

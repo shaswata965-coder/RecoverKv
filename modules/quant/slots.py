@@ -75,6 +75,16 @@ drops it with its window, ``set_active`` reactivates it on re-demotion without
 recomputation, and ``join_layers`` folds it layer-major. None of those needed a
 code change -- only this name list."""
 
+SHADOW_FIELDS = ("sh_key", "sh_val")
+"""The ORIGINAL fp K (post-RoPE) and V of each window, ``[B, N, H, ws, D]``.
+
+Evaluation-only (``quant_promote_source="original"``): the oracle arm of the
+promotion-payload experiment, where a promoted window gets back exactly what it
+was demoted from instead of its int2 reconstruction. It rides the slot table
+for the same reason the card does -- written once at first demotion, dropped
+with its window, kept across re-demotions -- and is NOT in the byte budget,
+which is what makes it an oracle rather than a method."""
+
 
 def n_slots_for(top_k_fp: int, n_q: int) -> int:
     """Slots needed per row, with margin. Bounded — no growth policy (§4).
@@ -119,6 +129,7 @@ class QuantSlotTable:
         device: torch.device,
         sketch: bool = False,
         card_bits=None,
+        shadow_dtype: Optional[torch.dtype] = None,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
         self.batch_size = B
@@ -187,6 +198,15 @@ class QuantSlotTable:
             self.sk_vm_q = field(D, cb.vm)
             self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
 
+        # The oracle's fp shadow (SHADOW_FIELDS). Not allocated unless asked for,
+        # so every shipped configuration is byte-identical to before it existed.
+        self.shadow = shadow_dtype is not None
+        if self.shadow:
+            self.sh_key = torch.zeros((B, N, H, S, D), dtype=shadow_dtype,
+                                      device=device)
+            self.sh_val = torch.zeros((B, N, H, S, D), dtype=shadow_dtype,
+                                      device=device)
+
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
         # ws//2] index tensor would allocate an int64 index the size of the codes
         # themselves (GBs at max B); flattening (B, N) -> B*N and indexing dim 0
@@ -216,9 +236,10 @@ class QuantSlotTable:
         ref = tables[0]
         for i, t in enumerate(tables):
             if (t.n_slots, t.window_size, t.head_dim, t.num_kv_heads,
-                    t.batch_size, t.card_bits) != (
+                    t.batch_size, t.card_bits, getattr(t, "shadow", False)) != (
                         ref.n_slots, ref.window_size, ref.head_dim,
-                        ref.num_kv_heads, ref.batch_size, ref.card_bits):
+                        ref.num_kv_heads, ref.batch_size, ref.card_bits,
+                        getattr(ref, "shadow", False)):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s slot table geometry differs from "
                     "layer 0's; every layer resolves the same config, so this "
@@ -232,10 +253,13 @@ class QuantSlotTable:
         joint.num_kv_heads = ref.num_kv_heads
         joint.sketch = ref.sketch
         joint.card_bits = ref.card_bits
+        joint.shadow = getattr(ref, "shadow", False)
         fields = ["key_codes", *GRID_FIELDS, "val_codes",
                   "slot_wid", "slot_active", "slot_pos"]
         if ref.sketch:
             fields += list(SKETCH_FIELDS)
+        if joint.shadow:
+            fields += list(SHADOW_FIELDS)
         for field in fields:
             setattr(joint, field, torch.cat(
                 [getattr(t, field) for t in tables], dim=0
@@ -338,6 +362,7 @@ class QuantSlotTable:
         v_zero: QGrid,
         pos: Tensor,
         sketch: Optional[Sequence[Tensor]] = None,
+        shadow: Optional[Sequence[Tensor]] = None,
     ) -> None:
         """Write ``n`` fresh entries per row, masked by ``valid``.
 
@@ -383,6 +408,18 @@ class QuantSlotTable:
                 )
             for name, src in zip(SKETCH_FIELDS, sketch):
                 put(getattr(self, name), src)
+        if shadow is not None:
+            if not self.shadow:
+                raise RuntimeError(
+                    "write() was given shadow fields but the table was built "
+                    "without them; pass shadow_dtype to QuantSlotTable.")
+            for name, src in zip(SHADOW_FIELDS, shadow):
+                put(getattr(self, name), src)
+        elif self.shadow:
+            raise RuntimeError(
+                "this table keeps an fp shadow (quant_promote_source='original') "
+                "but write() got none: a window demoted without its original "
+                "would be promoted back from zeros.")
         put(self.slot_wid, wid)
         put(self.slot_active, torch.ones_like(valid))
 
@@ -426,6 +463,19 @@ class QuantSlotTable:
             take(self.val_codes), QGrid(g[4], g[5]), QGrid(g[6], g[7]),
             take(self.slot_pos),
         )
+
+    def gather_shadow(self, slot_idx: Tensor) -> Tuple[Tensor, Tensor]:
+        """The original fp ``(K post-RoPE, V)`` of ``[B, n]`` slots, each
+        ``[B*n, H, ws, D]`` (flattened like :meth:`gather`)."""
+        if not self.shadow:
+            raise RuntimeError("this slot table keeps no fp shadow")
+        fi = self._flat(slot_idx)
+
+        def take(store: Tensor) -> Tensor:
+            return store.view(store.shape[0] * store.shape[1],
+                              *store.shape[2:])[fi]
+
+        return take(self.sh_key), take(self.sh_val)
 
     def gather_sketch(self, slot_idx: Tensor) -> Tuple[Tensor, ...]:
         """The eight card fields for ``[B, n]`` slots, keeping the ``[B, n]``

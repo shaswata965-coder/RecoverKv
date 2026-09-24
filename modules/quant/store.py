@@ -73,6 +73,7 @@ class QuantizedStore:
         memoize_read: bool = True,
         sketch_enabled: bool = False,
         card_bits=None,
+        shadow_dtype: Optional[torch.dtype] = None,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
@@ -88,6 +89,11 @@ class QuantizedStore:
         # the slot table the same validated object.
         from .sketch import parse_card_bits
         self.card_bits = parse_card_bits(card_bits)
+        # Evaluation-only fp shadow of every demoted window's ORIGINAL K and V
+        # (`quant_promote_source="original"`, slots.SHADOW_FIELDS). `None` in
+        # every shipped configuration: nothing is allocated and promotion
+        # dequantizes, as it always has.
+        self.shadow_dtype = shadow_dtype
         # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
         # be frozen, not running: a card is written once and never revisited
         # (§10), so a later anchor change would silently reinterpret every card
@@ -130,6 +136,7 @@ class QuantizedStore:
                 device=device,
                 sketch=self.sketch_enabled,
                 card_bits=self.card_bits,
+                shadow_dtype=self.shadow_dtype,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -164,8 +171,9 @@ class QuantizedStore:
                     f"layer 0 has {ref._n_active} — layers must stay in lockstep"
                 )
             if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots,
-                    s.card_bits) != (ref.window_size, ref.head_dim,
-                                     ref.num_kv_heads, ref.n_slots, ref.card_bits):
+                    s.card_bits, s.shadow_dtype) != (
+                        ref.window_size, ref.head_dim, ref.num_kv_heads,
+                        ref.n_slots, ref.card_bits, ref.shadow_dtype):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s store geometry differs from layer 0's"
                 )
@@ -185,6 +193,7 @@ class QuantizedStore:
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
             card_bits=ref.card_bits,
+            shadow_dtype=ref.shadow_dtype,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
@@ -322,13 +331,29 @@ class QuantizedStore:
             vanc = self._v_anchor.repeat_interleave(n, dim=0)
             sketch = tuple(build_sketch(kp, anc, vp, vanc, self.card_bits))
 
+        shadow = None
+        if self.shadow_dtype is not None:
+            if keys_post_rope is None:
+                raise ValueError(
+                    "the fp shadow (quant_promote_source='original') needs "
+                    "keys_post_rope: the oracle returns the keys exactly as the "
+                    "fp store held them.")
+            shadow = (keys_post_rope.to(self.shadow_dtype),
+                      values.to(self.shadow_dtype))
+
         self.table.write(
             slot_idx, valid, wid,
             k_codes, k_scale, k_zero,
             v_codes, v_scale, v_zero,
             position_ranges.to(torch.long),
             sketch=sketch,
+            shadow=shadow,
         )
+
+    @property
+    def shadow_enabled(self) -> bool:
+        """Whether promotion returns the original fp window (the oracle arm)."""
+        return self.shadow_dtype is not None
 
     # -- promotion -----------------------------------------------------------
 
@@ -370,6 +395,34 @@ class QuantizedStore:
         return (
             keys.reshape(B, n, H, S, D),
             values.reshape(B, n, H, S, D),
+            pos.reshape(B, n, S),
+        )
+
+    def promote_many_original(
+        self, slot_idx: Tensor, valid: Tensor, out_dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """:meth:`promote_many`, returning the window's ORIGINAL fp K and V.
+
+        The evaluation-only oracle of the promotion-payload experiment
+        (``quant_promote_source="original"``): same bookkeeping -- the entry goes
+        dormant, not free -- but the payload is the shadow written at first
+        demotion, so a promoted window is bit-identical to what was demoted.
+
+        Returns ``(keys_post_rope, values, position_ranges)``: the keys are
+        ALREADY rotated (the shadow holds them as the fp store did), so the
+        caller must not apply RoPE again.
+        """
+        self._invalidate()
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
+        keys, values = self.table.gather_shadow(slot_idx)
+        sp = self.table.slot_pos
+        pos = sp.view(sp.shape[0] * sp.shape[1], S)[self.table._flat(slot_idx)]
+        self.table.set_active(slot_idx, valid, False)
+        return (
+            keys.to(out_dtype).reshape(B, n, H, S, D),
+            values.to(out_dtype).reshape(B, n, H, S, D),
             pos.reshape(B, n, S),
         )
 

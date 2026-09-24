@@ -29,6 +29,8 @@ from torch import Tensor
 from data.corpus_loader import CorpusLoader
 from utils.cache_factory import (get_cache_classes, quant_budget_mode_kwargs,
                                  quant_card_bits_record, quant_gate_ratio_kwargs,
+                                 quant_tier_policy_kwargs,
+                                 quant_tier_policy_record,
                                  validate_backend_attn_pairing)
 from utils.config import (
     FIRST_EVICTION_STEP_DEFAULT, ConfigValidationError, ExperimentConfig,
@@ -425,7 +427,8 @@ class OursParityRunner:
                 # run used to drop it, so a 'tokens' request ran 'bytes'.
                 **quant_budget_mode_kwargs(
                     WCC, getattr(cfg.cache, "quant_budget_mode", "bytes")),
-                quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),)
+                quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+                **quant_tier_policy_kwargs(cfg.cache),)
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -770,8 +773,15 @@ class OursParityRunner:
                 resolved_cfg, "quant_budget_mode",
                 getattr(cfg.cache, "quant_budget_mode", "bytes"))),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "read_gate": read_gate,
             "gate_recorded": bool(record_gate),
+            # Per-window prices (all KV heads), so a read-traffic axis can be
+            # drawn from this npz alone: an int2 window costs its card plus its
+            # data, and the gate reads every card plus `ratio` of the data.
+            "bytes_per_fp_window": int(getattr(resolved_cfg, "bytes_per_fp_window", 0) or 0),
+            "bytes_per_q_window": int(getattr(resolved_cfg, "bytes_per_q_window", 0) or 0),
+            "bytes_per_gate_card": int(getattr(resolved_cfg, "bytes_per_gate_card", 0) or 0),
             "score_accum_dtype": "float32",
             "num_attention_heads": int(model.config.num_attention_heads),
             "num_key_value_heads": n_kv,

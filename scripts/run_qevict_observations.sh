@@ -17,8 +17,15 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 # The ours run is on the FLASH backend, because that is the only path where
 # the read gate exists (flash_decode.expect_gated): an eager ours run reads the
 # whole int2 tier and Observation IV would describe a method we do not ship.
-# Each gate ratio in GATES is its own ours run against ONE shared base run;
-# 1.0 is the gate's control arm (selects every window through the same code).
+# Each ARM is its own ours run against ONE shared base run:
+#   gate<r>      read-gate ratio r (gate1.0 is the gate's control arm: it
+#                selects every window through the same code)
+#   card<spec>   gate 0.25 with card widths <spec> (4, 2, or mu4v4t2vm2 ->
+#                "mu=4,v=4,t=2,vm=2"); under bytes mode a quality change
+#   oneway       gate 0.25, quant_promotion=oneway (F -> Q -> E, no promotion)
+#   original     gate 0.25, quant_promote_source=original (promotion oracle:
+#                exact fp windows from a shadow OUTSIDE the budget)
+# Default ARMS="gate0.25 gate1.0". GATES / CARD_BITS still work as before.
 #
 # Usage
 # -----
@@ -27,6 +34,8 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 #   DATASET=ruler:niah_single_3       scripts/run_qevict_observations.sh  # RULER task
 #   DATASET=/path/to/corpus.jsonl TEXT_FIELD=body scripts/run_qevict_observations.sh
 #   STAGE=observe DATASET=...         scripts/run_qevict_observations.sh  # re-analyse
+#   ARMS="gate0.10 gate0.25 gate0.50 gate1.0 card4 oneway original" DATASET=... \
+#                                     scripts/run_qevict_observations.sh
 #
 # DATASET resolves to a parity corpus:
 #   wikitext-103 | pg19           HF corpora
@@ -40,7 +49,7 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 # dataset's text; it is not the task's prompt template and not a task score.
 #
 # Knobs (env): MODEL_PATH PREFILL GEN SAMPLES ARTICLE_INDEX BUDGET QUANT
-#   QUANT_MODE GATES CARD_BITS WINDOW LOCAL SINK FMM_HORIZON PRIMARY_M
+#   QUANT_MODE ARMS (or GATES + CARD_BITS) WINDOW LOCAL SINK FMM_HORIZON PRIMARY_M
 #   PRIMARY_H PRIMARY_DELTA TRACE_AXIS LAYER_STRIDE BOOTSTRAP SEED STAGE
 #   OUT_ROOT FORCE
 #
@@ -68,8 +77,16 @@ DATASET="${DATASET:-wikitext-103}"
 BUDGET="${BUDGET:-0.20}"
 QUANT="${QUANT:-0.70}"
 QUANT_MODE="${QUANT_MODE:-bytes}"
-read -r -a GATES <<< "${GATES:-0.25 1.0}"
-CARD_BITS="${CARD_BITS:-}"         # empty = the shipped card (mu4/v8/t8/vm4)
+CARD_BITS="${CARD_BITS:-}"         # legacy: card widths for every GATES arm
+if [[ -n "${ARMS:-}" ]]; then
+  read -r -a ARM_LIST <<< "$ARMS"
+else                               # legacy GATES (+ CARD_BITS) spelling
+  ARM_LIST=()
+  for g in ${GATES:-0.25 1.0}; do
+    if [[ -n "$CARD_BITS" ]]; then ARM_LIST+=("gate${g}_card${CARD_BITS}")
+    else ARM_LIST+=("gate${g}"); fi
+  done
+fi
 WINDOW="${WINDOW:-8}"
 LOCAL="${LOCAL:-128}"
 SINK="${SINK:-5}"
@@ -121,7 +138,7 @@ if [[ "$STAGE" != "observe" && ! -e "$MODEL_PATH" ]]; then
 fi
 (( WINDOW % 4 == 0 )) || die "WINDOW=$WINDOW must be a multiple of 4 when QUANT > 0 (int2 packing)"
 (( LOCAL % WINDOW == 0 )) || die "LOCAL=$LOCAL is not a multiple of WINDOW=$WINDOW"
-(( ${#GATES[@]} > 0 )) || die "GATES is empty"
+(( ${#ARM_LIST[@]} > 0 )) || die "ARMS is empty"
 if [[ "$STAGE" != "observe" ]]; then
   python - <<'PY' || exit 2
 import sys
@@ -149,7 +166,7 @@ mkdir -p "$RUN_DIR"
   echo "commit=$(git rev-parse HEAD 2>/dev/null || echo nogit) started=$(date -Is) host=$(hostname)"
   echo "dataset=$DATASET corpus=$CORPUS text_field=${TEXT_FIELD:-auto} record_filter=${RECORD_FILTER:-none}"
   echo "model=$MODEL_PATH prefill=$PREFILL gen=$GEN samples=$SAMPLES article_index=$ARTICLE_INDEX seed=$SEED"
-  echo "budget=$BUDGET q=$QUANT mode=$QUANT_MODE gates=${GATES[*]} card_bits=${CARD_BITS:-default} window=$WINDOW local=$LOCAL sink=$SINK"
+  echo "budget=$BUDGET q=$QUANT mode=$QUANT_MODE arms=${ARM_LIST[*]} window=$WINDOW local=$LOCAL sink=$SINK"
 } > "$RUN_DIR/run.env"
 
 COMMON=(
@@ -167,11 +184,29 @@ COMMON=(
 if [[ -n "$TEXT_FIELD" ]]; then COMMON+=("parity.text_field=$TEXT_FIELD"); fi
 if [[ -n "$RECORD_FILTER" ]]; then COMMON+=("parity.record_filter=$RECORD_FILTER"); fi
 
-# One tag per ours arm: the gate ratio, plus the card widths when not the
-# shipped card (a CARD_BITS sweep must not overwrite the default arm).
-CB_TAG=""
-if [[ -n "$CARD_BITS" ]]; then CB_TAG="_cb$(echo "$CARD_BITS" | tr -cd 'A-Za-z0-9')"; fi
-arm() { printf 'gate%s%s' "$1" "$CB_TAG"; }
+# An arm name -> its cache overrides. Every arm not naming a gate ratio runs at
+# the shipped 0.25, so each differs from gate0.25 in exactly one knob.
+card_spec() {   # "4" | "2" | "mu4v4t2vm2" -> quant_card_bits value
+  local c="$1"
+  if [[ "$c" =~ ^[0-9]+$ ]]; then echo "$c"
+  else echo "$c" | sed -E 's/([a-z]+)([0-9])/\1=\2,/g; s/,$//'; fi
+}
+arm_overrides() {
+  local a="$1" gate="0.25" out=()
+  case "$a" in
+    gate*_card*) gate="${a#gate}"; gate="${gate%%_card*}"
+                 out+=("cache.quant_card_bits=$(card_spec "${a##*_card}")") ;;
+    gate*)       gate="${a#gate}" ;;
+    card*)       out+=("cache.quant_card_bits=$(card_spec "${a#card}")") ;;
+    oneway)      out+=("cache.quant_promotion=oneway") ;;
+    original)    out+=("cache.quant_promote_source=original") ;;
+    *)           die "unknown arm '$a' (gate<r> | card<spec> | oneway | original)" ;;
+  esac
+  [[ "$gate" =~ ^[0-9.]+$ ]] || die "arm '$a': bad gate ratio '$gate'"
+  out+=("cache.quant_gate_ratio=$gate")
+  printf '%s\n' "${out[@]}"
+}
+for a in "${ARM_LIST[@]}"; do arm_overrides "$a" > /dev/null; done   # validate early
 
 npz_ok() { [[ -s "$1" ]] && python -c "import numpy as np,sys; np.load(sys.argv[1], allow_pickle=True).files" "$1" 2>/dev/null; }
 
@@ -190,30 +225,29 @@ fi
 # ---- 2. ours: flash backend (the gated read path), one run per gate ratio ----
 if [[ "$STAGE" == "all" || "$STAGE" == "ours" ]]; then
   npz_ok "$BASE_NPZ" || die "no base npz at $BASE_NPZ -- run STAGE=base first"
-  for g in "${GATES[@]}"; do
-    OURS_NPZ="$RUN_DIR/parity_ours_$(arm "$g").npz"
+  for a in "${ARM_LIST[@]}"; do
+    OURS_NPZ="$RUN_DIR/parity_ours_${a}.npz"
     if [[ "$FORCE" != 1 ]] && npz_ok "$OURS_NPZ"; then
-      echo "[ours gate=$g] exists -- skipping"; continue
+      echo "[ours $a] exists -- skipping"; continue
     fi
-    echo "[ours gate=$g] three-tier cache, q=$QUANT ($QUANT_MODE), gate $g ..."
-    EXTRA=("parity.record_gate=true")
-    if [[ -n "$CARD_BITS" ]]; then EXTRA+=("cache.quant_card_bits=$CARD_BITS"); fi
+    mapfile -t EXTRA < <(arm_overrides "$a")
+    echo "[ours $a] three-tier cache, q=$QUANT ($QUANT_MODE): ${EXTRA[*]} ..."
     python main.py --config configs/eval_parity_ours_flash.yaml --override \
       "${COMMON[@]}" \
       "cache.quant_ratio=$QUANT" "cache.quant_budget_mode=$QUANT_MODE" \
-      "cache.quant_gate_ratio=$g" "cache.first_eviction_step=0" \
+      "cache.first_eviction_step=0" "parity.record_gate=true" \
       "${EXTRA[@]}" \
-      "base_run_npz=$BASE_NPZ" "output_path=$OURS_NPZ" 2>&1 | tee "$RUN_DIR/ours_$(arm "$g").log"
+      "base_run_npz=$BASE_NPZ" "output_path=$OURS_NPZ" 2>&1 | tee "$RUN_DIR/ours_${a}.log"
   done
 fi
 
 # ---- 3. observations I..V, per gate ratio ------------------------------------
 if [[ "$STAGE" == "all" || "$STAGE" == "observe" ]]; then
-  for g in "${GATES[@]}"; do
-    OURS_NPZ="$RUN_DIR/parity_ours_$(arm "$g").npz"
-    OBS_DIR="$RUN_DIR/obs_$(arm "$g")"
-    npz_ok "$OURS_NPZ" || { echo "[observe $(arm "$g")] no $OURS_NPZ -- skipped" >&2; continue; }
-    echo "[observe $(arm "$g")] ..."
+  for a in "${ARM_LIST[@]}"; do
+    OURS_NPZ="$RUN_DIR/parity_ours_${a}.npz"
+    OBS_DIR="$RUN_DIR/obs_${a}"
+    npz_ok "$OURS_NPZ" || { echo "[observe $a] no $OURS_NPZ -- skipped" >&2; continue; }
+    echo "[observe $a] ..."
     python -m modules.evaluation.qevict_observations \
       --base-npz "$BASE_NPZ" --ours-npz "$OURS_NPZ" \
       --output-dir "$OBS_DIR" \
@@ -223,29 +257,28 @@ if [[ "$STAGE" == "all" || "$STAGE" == "observe" ]]; then
       --trace-axis "$TRACE_AXIS" --layer-stride "$LAYER_STRIDE" \
       --bootstrap-samples "$BOOTSTRAP" --seed "$SEED" \
       > "$OBS_DIR.log" 2>&1 \
-      || { echo "[observe $(arm "$g")] FAILED -- $OBS_DIR.log" >&2; continue; }
+      || { echo "[observe $a] FAILED -- $OBS_DIR.log" >&2; continue; }
   done
 
-  ARMS="$(for g in "${GATES[@]}"; do arm "$g"; printf ' '; done)"
-  RUN_DIR="$RUN_DIR" ARMS="$ARMS" python - <<'PY' | tee "$RUN_DIR/summary$CB_TAG.txt"
+  RUN_DIR="$RUN_DIR" ARMS="${ARM_LIST[*]}" python - <<'PY' | tee "$RUN_DIR/summary.txt"
 import json, os
 d = os.environ["RUN_DIR"]
 def pct(x): return "   n/a" if x is None else f"{100 * x:6.1f}%"
 def num(x): return "   n/a" if x is None else f"{x:6.2f}"
 print(f"QEvict observations -- {os.path.basename(d)}")
-print(f"{'arm':>12} {'path':>10} {'recall':>7} {'oracle':>7} {'worst':>7} "
+print(f"{'arm':>14} {'path':>10} {'recall':>7} {'oracle':>7} {'worst':>7} "
       f"{'skipped':>8} {'evicted':>8} {'promote':>8} {'swap':>6} {'fidelity':>9}")
 for a in os.environ["ARMS"].split():
     f = f"{d}/obs_{a}/all_results.json"
     if not os.path.exists(f):
-        print(f"{a:>12}  (no results)"); continue
+        print(f"{a:>14}  (no results)"); continue
     r = json.load(open(f))
     o4, o5 = r.get("observation4", {}), r.get("observation5", {})
     rs = o4.get("recall_summary", {})
     led = {x["part"]: x["share_of_head_mass"] for x in o4.get("ledger_table", [])}
     sm = o5.get("summary", {})
     lift = {x["move"]: x["lift"] for x in o5.get("outcome_table", [])}
-    print(f"{a:>12} {r['metadata'].get('read_path', '?'):>10} "
+    print(f"{a:>14} {r['metadata'].get('read_path', '?'):>10} "
           f"{pct(rs.get('head_recall_mean')):>7} {pct(rs.get('oracle_recall_mean')):>7} "
           f"{pct(rs.get('worst_head_overall')):>7} {pct(led.get('q_skipped')):>8} "
           f"{pct(led.get('evicted')):>8} {num(lift.get('promote')):>8} "

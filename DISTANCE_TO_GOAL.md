@@ -1890,3 +1890,28 @@ carried the §11 fp16 defect. Five things, all fixed together:
 No decode output, eviction decision or score moves: the only production-path
 change is the unset observer check. The base run's oracle *does* move (item 1),
 so observation numbers do not compare across this commit.
+
+### 13.1 Every experiment, one command — and the two ablation knobs it needed
+
+`scripts/run_recoverkv_all.sh` runs the whole programme on one GPU queue,
+resumably, then scores and writes `report/report.html`
+(`modules/evaluation/recoverkv_report.py`): Observations I–V on a dataset panel
+(arms `gate0.10/0.25/0.50/1.0`, `card4`, `oneway`, `original`), and the accuracy
+grids for E1 (gate ratio), E2 (Bidir vs OneWay, LongBench 16 × 5/10/20% +
+RULER 13 × 20%) and E3 (A dequantized / B original oracle / C no promotion).
+`DRY_RUN=1` prints the 224-job list; `SMOKE=1` runs a trimmed grid in about an
+hour. The report refuses any accuracy file whose `read_gate` is not `gated` or
+whose sidecar knobs contradict its arm, and lists it.
+
+Two knobs, both **quality changes**, both off by default (the shipped method is
+`bidir` / `dequant`, byte- and code-path-identical to before):
+
+| knob | values | what it is |
+|---|---|---|
+| `quant_promotion` | `bidir` \| `oneway` | `oneway` blocks int2 → fp promotion (`F → Q → E`) at exactly matched tier sizes: fp slots go to the best non-int2 windows, int2 slots to the best of the rest. One extra `lookup` per eviction, on that arm only. |
+| `quant_promote_source` | `dequant` \| `original` | `original` keeps each demoted window's exact fp K (post-RoPE) and V in a slot-table shadow and promotes from it. The shadow is **outside the byte budget**: an evaluation-only oracle, never a method; config construction warns. |
+
+Pinned on CPU through the real compiled eviction (`tests/test_promotion_knobs.py`,
+15): Bidir promotes and OneWay never does, at identical fp/int2 counts every
+step; the oracle's promoted windows are bit-identical to what was fed while
+dequant's differ by the int2 error. Not run on a GPU.

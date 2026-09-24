@@ -86,6 +86,10 @@ class ResolvedConfig:
     # Each gate-card field's width, already parsed (WindowedCacheConfig's
     # `quant_card_bits`). `bytes_per_gate_card` above is priced from it.
     quant_card_bits: CardBits = CARD_BITS_DEFAULT
+    # Tier-movement policy and promotion payload (WindowedCacheConfig), carried
+    # verbatim. Defaults are the shipped method.
+    quant_promotion: str = "bidir"
+    quant_promote_source: str = "dequant"
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -308,6 +312,19 @@ class WindowedCacheConfig:
     # read-traffic one. Under "tokens" the window count is unchanged and only
     # the bytes move.
     quant_card_bits: Any = None
+    # How windows may move between tiers at an eviction. "bidir" (shipped):
+    # F <-> Q -> E, an int2 window whose score recovers is promoted back to fp.
+    # "oneway": F -> Q -> E, an int2 window can be kept or evicted but never
+    # promoted -- the ablation that prices promotion at exactly matched bytes
+    # (the tier sizes come from the budget resolver either way, so both arms
+    # hold the same fp and int2 window counts). A quality change.
+    quant_promotion: str = "bidir"
+    # What a promoted window is made of. "dequant" (shipped): its int2
+    # reconstruction, re-rotated -- no extra memory. "original": the exact fp
+    # K/V it was demoted from, kept in an fp shadow beside the codes. That
+    # shadow is NOT in the byte budget, so "original" is an evaluation-only
+    # ORACLE for the promotion-payload experiment, never a method.
+    quant_promote_source: str = "dequant"
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -407,6 +424,20 @@ class WindowedCacheConfig:
                 and self.quant_gate_max_windows < 1):
             raise ValueError("quant_gate_max_windows must be >= 1 or None")
         self.quant_card_bits = parse_card_bits(self.quant_card_bits)
+        if self.quant_promotion not in ("bidir", "oneway"):
+            raise ValueError(
+                f"quant_promotion must be 'bidir' or 'oneway', got "
+                f"{self.quant_promotion!r}")
+        if self.quant_promote_source not in ("dequant", "original"):
+            raise ValueError(
+                f"quant_promote_source must be 'dequant' or 'original', got "
+                f"{self.quant_promote_source!r}")
+        if self.quant_promote_source == "original":
+            warnings.warn(
+                "quant_promote_source='original' keeps an fp copy of every int2 "
+                "window OUTSIDE the byte budget. It is the evaluation-only "
+                "oracle of the promotion-payload experiment; its memory and "
+                "quality are not the method's.", stacklevel=2)
 
         # -- quant_budget_mode (what quant_ratio divides) --
         if self.quant_budget_mode not in ("tokens", "bytes"):
@@ -685,6 +716,8 @@ class WindowedCacheConfig:
             quant_gate_margin=self.quant_gate_margin,
             quant_gate_max_windows=self.quant_gate_max_windows,
             quant_card_bits=self.quant_card_bits,
+            quant_promotion=self.quant_promotion,
+            quant_promote_source=self.quant_promote_source,
             first_eviction_step=self.first_eviction_step,
         )
 

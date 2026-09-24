@@ -235,6 +235,10 @@ def read_path_info(ours_meta: Dict[str, Any]) -> Dict[str, Any]:
         "quant_card_bits": ours_meta.get("quant_card_bits"),
         "realised_read_fraction": rg.get("read_fraction"),
         "gate_recorded": recorded,
+        "quant_promotion": ours_meta.get("quant_promotion", "bidir"),
+        "quant_promote_source": ours_meta.get("quant_promote_source", "dequant"),
+        "bytes_per_q_window": ours_meta.get("bytes_per_q_window"),
+        "bytes_per_gate_card": ours_meta.get("bytes_per_gate_card"),
     }
 
 
@@ -1325,8 +1329,23 @@ def build_paper_summary(
 def _obs4_lines(obs4: Dict[str, Any], g: Dict[str, Any]) -> List[str]:
     rs = obs4["recall_summary"]
     lines = ["", "## Observation IV: the decode read ledger", "",
-             "Each query head's ground-truth attention at every decode step, by "
-             "how the decode read it (per head, then averaged).", "",
+             "Each query head's ground-truth attention (the full-KV model's) at "
+             "every decode step, split by how this cache's decode step read it, "
+             "per head and then averaged:", "",
+             "- `fp`, `local`, `fresh` — read exactly (full-precision windows, "
+             "the recency tail, tokens appended since the last score column);",
+             "- `q_read` — int2 windows the read gate OPENED for that head's KV "
+             "group (read at 2 bits);",
+             "- `q_skipped` — int2 windows the gate skipped: they reach the "
+             "output only through their value centroid, at the card's weight;",
+             "- `evicted` — windows the cache no longer holds; `sink` — the rest.",
+             "",
+             "`decode_missed_mass` = skipped + evicted (not read exactly or at "
+             "int2); `hard_missed_mass` = evicted only. Recall below is the share "
+             "of a head's int2-tier attention in windows its group opened; the "
+             "hindsight pick opens the same number per KV head using the true "
+             "attention, so recall / hindsight is how close the card gets to the "
+             "best any gate of that size could do.", "",
              "| part | share of head mass | share of window mass |",
              "| --- | --- | --- |"]
     for r in obs4["ledger_table"]:
@@ -1372,6 +1391,11 @@ def _obs4_lines(obs4: Dict[str, Any], g: Dict[str, Any]) -> List[str]:
 def _obs5_lines(obs5: Dict[str, Any]) -> List[str]:
     sm = obs5["summary"]
     lines = ["", "## Observation V: tier dynamics (F / Q / E)", "",
+             "Every window in the evictable band is in one of three states at a "
+             "routing event: F (full precision), Q (int2), E (evicted, permanent). "
+             "Rates are `P(to | from)` over the given lag; unlike Observation "
+             "III's policy flips, an evicted window is never counted as a "
+             "window that could have been promoted.", "",
              "| lag | move | rate | pooled | count |", "| --- | --- | --- | --- | --- |"]
     for r in obs5["rate_table"]:
         lines.append(f"| {r['delta']} | `{r['from']}→{r['to']}` {r['move']} | "
@@ -1383,6 +1407,12 @@ def _obs5_lines(obs5: Dict[str, Any]) -> List[str]:
             + "."]
     lines += ["", f"Did the move land on future attention? (next {sm['horizon']} "
               f"steps, {sm['events_scored']} events)", "",
+              "The candidates are the windows an eviction actually decided. "
+              "*Share* is the fraction of their next-H-step attention sitting on "
+              "the windows that made the move; *lift* is a moved window's mean "
+              "over the candidate mean. A good bidirectional policy shows "
+              "promote lift > 1 and demote lift < 1; `evict_*` shares are what "
+              "eviction cost.", "",
               "| move | count | share of candidates' future mass | lift |",
               "| --- | --- | --- | --- |"]
     for r in obs5["outcome_table"]:

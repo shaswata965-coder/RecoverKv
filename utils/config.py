@@ -144,6 +144,15 @@ def log_operating_point(config, is_windowed: bool) -> None:
         getattr(cache, "backend_package", None),
         getattr(getattr(config, "model", None), "attn_implementation", None),
     )
+    promo = getattr(cache, "quant_promotion", "bidir")
+    src = getattr(cache, "quant_promote_source", "dequant")
+    if q > 0 and (promo != "bidir" or src != "dequant"):
+        log.warning(
+            "operating point: ABLATION -- quant_promotion=%s, "
+            "quant_promote_source=%s (shipped: bidir / dequant)%s",
+            promo, src,
+            "; 'original' is an oracle holding fp copies OUTSIDE the budget"
+            if src == "original" else "")
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +205,23 @@ class CacheConfig:
     # Under quant_budget_mode "bytes" a narrower card buys more int2 windows,
     # so this moves what the cache keeps, not only what it reads.
     quant_card_bits: Any = None
+    # Tier-movement ablation and promotion-payload oracle
+    # (modules/windowed_cache/config.py). "bidir" / "dequant" are the shipped
+    # method; "oneway" forbids int2 -> fp promotion at matched bytes, and
+    # "original" promotes the exact fp window from a shadow OUTSIDE the budget
+    # (evaluation-only). Both are quality changes; sidecars record them.
+    quant_promotion: str = "bidir"
+    quant_promote_source: str = "dequant"
 
     def __post_init__(self) -> None:
+        if self.quant_promotion not in ("bidir", "oneway"):
+            raise ConfigValidationError(
+                f"quant_promotion must be 'bidir' or 'oneway', got "
+                f"{self.quant_promotion!r}")
+        if self.quant_promote_source not in ("dequant", "original"):
+            raise ConfigValidationError(
+                f"quant_promote_source must be 'dequant' or 'original', got "
+                f"{self.quant_promote_source!r}")
         if self.cache_budget is not None:
             # Type guards mirror WindowedCacheConfig.__post_init__: reject
             # bool before int (bool subclasses int) and reject non-float

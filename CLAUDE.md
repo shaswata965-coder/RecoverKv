@@ -153,6 +153,15 @@ attacked the 3%. A window's fields live in six separate tensors plus four card
 tensors, so one selected window is ten scattered fetches; interleaving them into
 one per-window block is the real fix and needs a GPU to verify.
 
+### Two ablation knobs, off by default
+
+`quant_promotion: oneway` (no int2 → fp promotion, matched tier sizes) and
+`quant_promote_source: original` (promote the exact fp window from a shadow held
+OUTSIDE the byte budget — an evaluation-only oracle, never a method). Both are
+quality changes and every sidecar records them next to `read_gate`. They exist
+for `scripts/run_recoverkv_all.sh` (E2 / E3, `DISTANCE_TO_GOAL.md` §13.1); do not
+quote either as the method.
+
 ## How to read a decode number here
 
 * **Decode barely tracks cache size.** A run holding 2.5× more keys was 22%

@@ -253,7 +253,7 @@ class EvictionPolicy:
         return k_fp, n_q, local_w
 
     def compute_two_tier_retain(
-        self, window_scores: Tensor
+        self, window_scores: Tensor, no_promote: "Tensor | None" = None,
     ) -> "tuple[Tensor, Tensor]":
         """Rank the evictable band and assign each survivor a tier.
 
@@ -272,6 +272,13 @@ class EvictionPolicy:
         ----------
         window_scores : Tensor
             Shape ``[B, H_q, W]`` — merged-axis cumulative scores.
+        no_promote : Tensor, optional
+            ``[B, W]`` bool — windows that may NOT be given an fp slot. The
+            ``quant_promotion="oneway"`` ablation passes the windows currently
+            in the int2 tier, so the chain is ``F -> Q -> E`` with no way back:
+            fp slots go to the best non-Q windows, and the int2 slots to the
+            best of everything left (current Q included). ``None`` (the shipped
+            bidirectional policy) is the code path this method always had.
 
         Returns
         -------
@@ -315,9 +322,24 @@ class EvictionPolicy:
         ev_scores = mean[:, :evictable_w]
 
         # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
-        order = torch.argsort(ev_scores, dim=-1, descending=True)
-        fp_sel = order[:, :k_fp]
-        q_sel = order[:, k_fp:k_fp + n_q]
+        if no_promote is None:
+            order = torch.argsort(ev_scores, dim=-1, descending=True)
+            fp_sel = order[:, :k_fp]
+            q_sel = order[:, k_fp:k_fp + n_q]
+        else:
+            # One-way: blocked windows rank last for the fp slots (-inf; if a row
+            # ever had fewer unblocked windows than k_fp the remainder would be
+            # filled from the blocked ones, which steady state cannot reach: the
+            # band holds the previous k_fp fp windows plus every entrant). The
+            # int2 slots then go to the best of what the fp pick left.
+            neg = torch.full_like(ev_scores, float("-inf"))
+            blocked = no_promote[:, :evictable_w]
+            fp_sel = torch.argsort(torch.where(blocked, neg, ev_scores),
+                                   dim=-1, descending=True)[:, :k_fp]
+            taken = torch.zeros_like(blocked)
+            taken.scatter_(1, fp_sel, True)
+            q_sel = torch.argsort(torch.where(taken, neg, ev_scores),
+                                  dim=-1, descending=True)[:, :n_q]
 
         # Chronological order over the retained evictable windows. Their SET is
         # what the ranking decided; their order is just ascending merged index,
