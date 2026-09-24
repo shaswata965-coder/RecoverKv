@@ -248,8 +248,16 @@ one per-window block is the real fix and needs a GPU to verify.
   byte-identical, though the rep-4 row says Llama has it too — measure there
   before flipping the default. `QWEN_PORT_PLAN.md` has the numbers. A real
   defect; the LongBench run with it on moved nothing beyond noise.
-* **The gate's card accuracy on Qwen2.5 is unmeasured, and it is the leading
-  suspect for the Qwen gap.** With the operating point and protocol equal, the
+* **Measured on the real models (CPU, real weights, `QWEN_PORT_PLAN.md`
+  Round 6):** at 0.25 the gate's AVERAGE error is about the same on Qwen2.5 and
+  Llama-3.1 (output-error p90 0.089 vs 0.072), but the card is ~2x worse on
+  Qwen (TV 0.27 vs 0.17; unread windows under-weighted to 22% vs 53% of their
+  weight in the worst decile) and the error concentrates in Qwen's LAST two
+  layers (p90 0.21 vs 0.07). GQA sharing (rep 7) costs less than the card. At
+  0.5 Qwen's last layers drop to Llama's 0.25 level. The history below is how
+  it got here.
+* **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
+  Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate
   reads 75% of the int2 tier through cards. A card is one mean plus one
   direction; a q_proj bias makes some query channels large, and then key

@@ -21,6 +21,70 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 6 — measured on the real models: why Qwen and not Llama
+
+Real weights, real LongBench prompts (triviaqa x2, narrativeqa, musique at
+~6K tokens), every layer, on CPU (`scripts/measure_gate_real_cpu.py`: weights
+streamed by range reads, linears bf16, attention fp32). Each layer's cache is
+laid out as after the first eviction -- tier sizes from `resolve()` at the
+operating point, ranking by the policy's prefill scores -- and the repo's own
+`build_sketch` / `gate_reference` / decode oracle (with centroids) are compared
+against reading every window. Keys are not int2-quantized in either arm, so the
+difference is the gate alone. Shipped settings: head-unit union on Qwen, raw
+on Llama. Llama-3.1-8B from the ungated `unsloth` copy of the same weights.
+
+**The harness reproduces the GPU diagnostic on Qwen** (GPU at 0.25: triviaqa
+recall 0.846, output-error p90 0.10-0.14 on triviaqa/narrativeqa/musique and
+0.22 on trec; CPU: 0.839 and 0.089 pooled), so its Llama column is a fair
+comparison.
+
+At `quant_gate_ratio` 0.25, per (query head x query x layer x prompt):
+
+| | Qwen2.5-7B | Llama-3.1-8B |
+|---|---|---|
+| output error, median / p90 | 0.005 / 0.089 | 0.008 / 0.072 |
+| heads with output error > 0.3 | 2.1% | 1.3% |
+| recall: solo oracle -> shared oracle -> card (median) | 0.951 -> 0.905 -> 0.839 | 0.867 -> 0.832 -> 0.772 |
+| same, p10 | 0.788 -> 0.691 -> 0.569 | 0.700 -> 0.644 -> 0.533 |
+| card_tv median / p90 | **0.274 / 0.509** | 0.170 / 0.304 |
+| skip_mass_err median / p10 (nats) | **-0.42 / -1.51** | -0.20 / -0.64 |
+| **last two layers: output error p90** | **0.206** (4.6% > 0.3) | 0.068 (0.3% > 0.3) |
+
+What it says:
+- **Averaged over layers, the gate is barely worse on Qwen** (p90 0.089 vs
+  0.072), and Qwen's selection recall is HIGHER than Llama's -- its attention
+  over the int2 tier is more concentrated. Average error does not explain why
+  one model loses points and the other does not.
+- **GQA sharing is real but secondary.** Sharing one selection across the
+  query heads costs 0.046 median / 0.097 p10 of recall on Qwen (rep 7) against
+  0.035 / 0.056 on Llama (rep 4).
+- **The card is ~2x worse on Qwen.** Its weights over the unread windows are
+  further from the truth (TV 0.27 vs 0.17), and it UNDER-weights them twice as
+  hard: in the worst decile of heads they get e^-1.5 = 22% of their true weight,
+  against 53% on Llama.
+- **And the error lands in Qwen's LAST layers**, the ones that write the next
+  token: layers 26-27 have output-error p90 0.20-0.21 (Llama's last two:
+  0.09 / 0.05), card TV 0.35-0.39, and a p10 skip_mass_err of -2.0 / -2.2 --
+  unread windows get ~11% of their weight. Their card recall p10 is 0.54-0.55
+  against 0.72-0.76 for a perfect card at the same sharing, so there the card,
+  not the sharing, is what loses. Qwen's layers 0-2 are also bad (p90
+  0.31-0.44), but Llama's layer 0 is worse (1.0) and Llama is fine, so early
+  layers are tolerated.
+- Layer 27 carries the model's largest key bias (511 per RoPE pair, 920 in
+  total) and a query bias with a third of its energy rotating inside a window;
+  layer 0 is second. But the biases are almost all in STATIC RoPE pairs (93-100%
+  of the big ones' energy), so the card's post-RoPE anchor cancels them, and
+  layer 26 is bad with a small bias -- the card error there is not the anchor.
+- **At 0.5 Qwen's last layers fall to 0.064-0.072 p90, Llama's level at
+  0.25**, and the pooled share over 0.3 to 0.5%. 0.5 is under the 0.66
+  break-even. The `gate50` arm tests whether that recovers the scores.
+
+**Correction to Round 5:** `skip_mass_err` is NEGATIVE on both models -- the
+unread windows are under-weighted, not over-weighted, so the output is too
+concentrated on the read windows and the fp tier, not blurred toward the tier
+mean. The inverse-budget pattern is not explained by this measurement; with
+n = 200 it may be partly noise (narrativeqa's -5.4 is ~2 sigma).
+
 ### Round 5 — the budget sweep says the loss scales with the UNREAD windows
 
 Three rounds fixed real defects and none moved the column beyond noise,
