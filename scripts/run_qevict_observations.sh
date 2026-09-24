@@ -1,128 +1,260 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 # ============================================================================
-# Run the QEvict Observation Suite (skew / window-level decisions / revival)
+# QEvict observation suite, one dataset: parity base -> parity ours -> I..V
 # ============================================================================
-# Produces: $OUT_DIR/{observation*.csv, paper_results.md, all_results.json,
-#                     qevict_observations.npz + .meta.json, *.pdf}
+# Five observations over one matched (base, ours) parity pair
+# (modules/evaluation/qevict_observations.py):
+#   I    skewed importance            III  revival (oracle + policy fp)
+#   II   future missed mass / churn   IV   the decode READ ledger + per-head
+#                                          gate recall (needs the gated run)
+#   V    tier dynamics: promotion / demotion / eviction, and whether each
+#        move landed on the attention that arrived next
 #
-# Runs the full chain by default — parity base -> parity ours -> observations —
-# because the observations need a *matched* pair and a base npz at schema >= 1.2
-# (the fp32 per-step mass array; differencing the fp16 cumulative scores is
-# noise past a few hundred decode steps).  Set STAGE=observe to reuse npzs you
-# already have.
+# The ours run is on the FLASH backend, because that is the only path where
+# the read gate exists (flash_decode.expect_gated): an eager ours run reads the
+# whole int2 tier and Observation IV would describe a method we do not ship.
+# Each gate ratio in GATES is its own ours run against ONE shared base run;
+# 1.0 is the gate's control arm (selects every window through the same code).
 #
 # Usage
 # -----
-#   bash scripts/run_qevict_observations.sh                  # full chain
-#   STAGE=observe bash scripts/run_qevict_observations.sh    # analysis only
-#   PROFILE=kaggle bash scripts/run_qevict_observations.sh   # T4/P100-sized
-#   PROFILE=hpc    bash scripts/run_qevict_observations.sh   # A100-sized
+#   DATASET=wikitext-103              scripts/run_qevict_observations.sh
+#   DATASET=narrativeqa               scripts/run_qevict_observations.sh  # LongBench
+#   DATASET=ruler:niah_single_3       scripts/run_qevict_observations.sh  # RULER task
+#   DATASET=/path/to/corpus.jsonl TEXT_FIELD=body scripts/run_qevict_observations.sh
+#   STAGE=observe DATASET=...         scripts/run_qevict_observations.sh  # re-analyse
 #
-# Every knob is an env var; the two profiles below just set defaults.
-#   MODEL PREFILL GEN SAMPLES WINDOW SINK LOCAL BUDGET QUANT
-#   FMM_HORIZON POOL_FACTOR PRIMARY_M PRIMARY_H PRIMARY_DELTA TRACE_AXIS
-#   MAX_SAMPLES LAYER_STRIDE BOOTSTRAP SEED OUT_DIR
-# ----------------------------------------------------------------------------
-# Sizing notes
-#   * The base run needs output_attentions=True, so prefill memory grows as
-#     L x H x prefill^2.  PREFILL=2048 on 8B needs an A100; a T4/P100 wants
-#     PREFILL<=1024.
-#   * SAMPLES is the honest bootstrap axis.  With SAMPLES=1 the confidence
-#     intervals are over layers of one prompt — fine for a sanity pass, not for
-#     a paper number.  Use SAMPLES>=8 for reported results (TRACE_AXIS=sample).
-#   * The observation step itself is CPU-only post-processing: seconds.
+# DATASET resolves to a parity corpus:
+#   wikitext-103 | pg19           HF corpora
+#   <LongBench name>              $LONGBENCH_LOCAL_DIR/<name>.jsonl, field "context"
+#   ruler:<task>                  $RULER_DATA (save_to_disk), field "context",
+#                                 records with task == <task>
+#   <path>                        a local .jsonl/.json/.txt/dir (TEXT_FIELD optional)
+# The prompt is the first PREFILL tokens of each document (documents shorter
+# than PREFILL are skipped) and the continuation is the base run's greedy
+# decode, teacher-forced into ours. So this characterises attention on that
+# dataset's text; it is not the task's prompt template and not a task score.
+#
+# Knobs (env): MODEL_PATH PREFILL GEN SAMPLES ARTICLE_INDEX BUDGET QUANT
+#   QUANT_MODE GATES CARD_BITS WINDOW LOCAL SINK FMM_HORIZON PRIMARY_M
+#   PRIMARY_H PRIMARY_DELTA TRACE_AXIS LAYER_STRIDE BOOTSTRAP SEED STAGE
+#   OUT_ROOT FORCE
+#
+# Sizing (Llama-3.1-8B, 32 layers x 32 heads, fp16):
+#   The base run needs output_attentions (eager): L x H x PREFILL^2 per forward,
+#   ~9 GB at PREFILL=2048 -- fine on an 80 GB A100. The base npz holds two
+#   [S, T, L, H, W] fp16 arrays (cumulative + per-head step mass): at ws=8,
+#   PREFILL 2048, GEN 1024, SAMPLES 8 that is ~13 GB uncompressed, and the
+#   observation step loads it into host RAM. Halve GEN or raise LAYER_STRIDE
+#   if RAM is tight. SAMPLES is the honest bootstrap axis -- use TRACE_AXIS=sample
+#   for a reported number (>= 8 samples).
 # ============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-PROFILE="${PROFILE:-hpc}"
-case "$PROFILE" in
-  kaggle)
-    : "${PREFILL:=1024}"; : "${GEN:=256}";  : "${SAMPLES:=4}"
-    : "${FMM_HORIZON:=16}"; : "${LAYER_STRIDE:=1}"
-    ;;
-  hpc)
-    : "${PREFILL:=2048}"; : "${GEN:=1024}"; : "${SAMPLES:=8}"
-    : "${FMM_HORIZON:=32}"; : "${LAYER_STRIDE:=1}"
-    ;;
-  *) echo "Unknown PROFILE=$PROFILE (expected kaggle|hpc)" >&2; exit 2 ;;
-esac
+# ---- your cluster defaults (same as the RULER / LongBench scripts) ----------
+MODEL_PATH="${MODEL_PATH:-/home/ee/phd/eez228470/llama-3.1-8b-instruct}"
+LONGBENCH_LOCAL_DIR="${LONGBENCH_LOCAL_DIR:-/home/ee/phd/eez228470/kv_cache/qwen_longbench_final_int2/RecoverKv/data/longbench}"
+RULER_DATA="${RULER_DATA:-/home/ee/phd/eez228470/kv_cache/defensive_kv_new/DefensiveKV/defensivekv_dataset/ruler/32768}"
 
-MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
-WINDOW="${WINDOW:-32}"          # must be divisible by 4 when QUANT > 0
-SINK="${SINK:-4}"
-LOCAL="${LOCAL:-256}"
-BUDGET="${BUDGET:-0.25}"
-QUANT="${QUANT:-0.5}"           # two-tier int2 split; 0 = fp16-only cache
+# ---- the operating point (utils.config.OPERATING_POINT) ---------------------
+DATASET="${DATASET:-wikitext-103}"
+BUDGET="${BUDGET:-0.20}"
+QUANT="${QUANT:-0.70}"
+QUANT_MODE="${QUANT_MODE:-bytes}"
+read -r -a GATES <<< "${GATES:-0.25 1.0}"
+CARD_BITS="${CARD_BITS:-}"         # empty = the shipped card (mu4/v8/t8/vm4)
+WINDOW="${WINDOW:-8}"
+LOCAL="${LOCAL:-128}"
+SINK="${SINK:-5}"
+
+PREFILL="${PREFILL:-2048}"
+GEN="${GEN:-1024}"
+SAMPLES="${SAMPLES:-8}"
+ARTICLE_INDEX="${ARTICLE_INDEX:-0}"
 SEED="${SEED:-42}"
-STAGE="${STAGE:-all}"           # all | observe
 
-POOL_FACTOR="${POOL_FACTOR:-2}"
+FMM_HORIZON="${FMM_HORIZON:-32}"
 PRIMARY_M="${PRIMARY_M:-4}"
 PRIMARY_H="${PRIMARY_H:-8}"
 PRIMARY_DELTA="${PRIMARY_DELTA:-1}"
-TRACE_AXIS="${TRACE_AXIS:-sample_layer}"
+TRACE_AXIS="${TRACE_AXIS:-sample}"
+LAYER_STRIDE="${LAYER_STRIDE:-1}"
 BOOTSTRAP="${BOOTSTRAP:-2000}"
+STAGE="${STAGE:-all}"              # all | base | ours | observe
+FORCE="${FORCE:-0}"                # 1 = redo stages whose outputs exist
 
-OUT_DIR="${OUT_DIR:-outputs/qevict_observations}"
-BASE_NPZ="${BASE_NPZ:-outputs/qevict_parity_base.npz}"
-OURS_NPZ="${OURS_NPZ:-outputs/qevict_parity_ours.npz}"
+die() { echo "error: $*" >&2; exit 2; }
 
-mkdir -p outputs "$OUT_DIR"
-{
-  echo "commit=$(git rev-parse HEAD 2>/dev/null || echo no_git)"
-  echo "profile=$PROFILE model=$MODEL prefill=$PREFILL gen=$GEN samples=$SAMPLES"
-  echo "window=$WINDOW sink=$SINK local=$LOCAL budget=$BUDGET quant=$QUANT seed=$SEED"
-} > "$OUT_DIR/run.env"
-pip freeze >> "$OUT_DIR/run.env" 2>/dev/null || true
+# ---- resolve the dataset ----------------------------------------------------
+TEXT_FIELD="${TEXT_FIELD:-}"
+RECORD_FILTER="${RECORD_FILTER:-}"
+LB_NAMES=" narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique gov_report qmsum multi_news trec triviaqa samsum passage_count passage_retrieval_en lcc repobench-p "
+case "$DATASET" in
+  wikitext-103|pg19) CORPUS="$DATASET"; SLUG="$DATASET" ;;
+  ruler:*)
+    task="${DATASET#ruler:}"
+    [[ -f "$RULER_DATA/dataset_info.json" ]] || die "RULER save_to_disk dir not found: $RULER_DATA"
+    CORPUS="$RULER_DATA"; TEXT_FIELD="${TEXT_FIELD:-context}"
+    RECORD_FILTER="task=$task"; SLUG="ruler$(basename "$RULER_DATA")-$task" ;;
+  *)
+    if [[ "$LB_NAMES" == *" $DATASET "* ]]; then
+      CORPUS="$LONGBENCH_LOCAL_DIR/$DATASET.jsonl"; TEXT_FIELD="${TEXT_FIELD:-context}"
+      [[ -s "$CORPUS" ]] || die "missing $CORPUS"
+      SLUG="lb-$DATASET"
+    elif [[ -e "$DATASET" ]]; then
+      CORPUS="$DATASET"; SLUG="$(basename "${DATASET%.*}")"
+    else
+      die "DATASET=$DATASET is not wikitext-103, pg19, a LongBench name, ruler:<task>, or a path"
+    fi ;;
+esac
 
-GEOM_OVERRIDES=(
-  "model.name=$MODEL"
-  "run.seed=$SEED"
-  "parity.prefill_len=$PREFILL" "parity.gen_len=$GEN"
-  "data.prefill_len=$PREFILL"   "data.gen_len=$GEN"
-  "data.num_samples=$SAMPLES"
-  "window.window_size=$WINDOW"  "window.num_sink_tokens=$SINK"
-  "window.local_window_size=$LOCAL"
-  "cache.window_size=$WINDOW"   "cache.num_sink_tokens=$SINK"
-  "cache.local_window_size=$LOCAL" "cache.cache_budget=$BUDGET"
-)
-
-if [ "$STAGE" = "all" ]; then
-  echo "[1/3] Parity base (full cache, records step_window_scores)..."
-  python main.py --config configs/eval_parity_base.yaml --override \
-      "${GEOM_OVERRIDES[@]}" "output_path=$BASE_NPZ"
-
-  echo "[2/3] Parity ours (two-tier cache, quant_ratio=$QUANT)..."
-  python main.py --config configs/eval_parity_ours_eager.yaml --override \
-      "${GEOM_OVERRIDES[@]}" "cache.quant_ratio=$QUANT" \
-      "base_run_npz=$BASE_NPZ" "output_path=$OURS_NPZ"
-else
-  echo "[1-2/3] STAGE=observe — reusing $BASE_NPZ and $OURS_NPZ"
+# ---- preflight ----------------------------------------------------------------
+if [[ "$STAGE" != "observe" && ! -e "$MODEL_PATH" ]]; then
+  echo "note: $MODEL_PATH is not a local path; treating it as a HF hub id" >&2
+fi
+(( WINDOW % 4 == 0 )) || die "WINDOW=$WINDOW must be a multiple of 4 when QUANT > 0 (int2 packing)"
+(( LOCAL % WINDOW == 0 )) || die "LOCAL=$LOCAL is not a multiple of WINDOW=$WINDOW"
+(( ${#GATES[@]} > 0 )) || die "GATES is empty"
+if [[ "$STAGE" != "observe" ]]; then
+  python - <<'PY' || exit 2
+import sys
+try:
+    import torch
+except ImportError:
+    sys.exit("error: torch not importable -- 'conda activate sticky_env'")
+if not torch.cuda.is_available():
+    sys.exit("error: no CUDA device -- the read gate only exists on the CUDA flash path.")
+try:
+    import flash_attn  # noqa: F401
+except ImportError:
+    sys.exit("error: flash_attn not importable; the ours run needs flash_attention_2.")
+from utils.cache_factory import assert_transformers_version_supported
+assert_transformers_version_supported()
+PY
 fi
 
-echo "[3/3] QEvict observations..."
-python -m modules.evaluation.qevict_observations \
-    --base-npz "$BASE_NPZ" \
-    --ours-npz "$OURS_NPZ" \
-    --output-dir "$OUT_DIR" \
-    --fmm-horizon "$FMM_HORIZON" \
-    --pool-factor "$POOL_FACTOR" \
-    --primary-inactivity "$PRIMARY_M" \
-    --primary-lir-horizon "$PRIMARY_H" \
-    --primary-transition-delta "$PRIMARY_DELTA" \
-    --trace-axis "$TRACE_AXIS" \
-    --layer-stride "$LAYER_STRIDE" \
-    --bootstrap-samples "$BOOTSTRAP" \
-    --seed "$SEED" \
-    ${MAX_SAMPLES:+--max-samples "$MAX_SAMPLES"} \
-    "$@"
+COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo nogit)"
+OUT_ROOT="${OUT_ROOT:-$PROJECT_ROOT/outputs/qevict_obs_${COMMIT}}"
+RUN_DIR="$OUT_ROOT/${SLUG}_p${PREFILL}_g${GEN}_w${WINDOW}_b${BUDGET}_q${QUANT}"
+BASE_NPZ="$RUN_DIR/parity_base.npz"
+mkdir -p "$RUN_DIR"
+{
+  echo "commit=$(git rev-parse HEAD 2>/dev/null || echo nogit) started=$(date -Is) host=$(hostname)"
+  echo "dataset=$DATASET corpus=$CORPUS text_field=${TEXT_FIELD:-auto} record_filter=${RECORD_FILTER:-none}"
+  echo "model=$MODEL_PATH prefill=$PREFILL gen=$GEN samples=$SAMPLES article_index=$ARTICLE_INDEX seed=$SEED"
+  echo "budget=$BUDGET q=$QUANT mode=$QUANT_MODE gates=${GATES[*]} card_bits=${CARD_BITS:-default} window=$WINDOW local=$LOCAL sink=$SINK"
+} > "$RUN_DIR/run.env"
 
-echo "Done — results in $OUT_DIR (start with paper_results.md)."
+COMMON=(
+  "model.name=$MODEL_PATH" "run.seed=$SEED"
+  "parity.dataset=$CORPUS" "data.dataset=$CORPUS"
+  "parity.article_index=$ARTICLE_INDEX"
+  "parity.prefill_len=$PREFILL" "parity.gen_len=$GEN"
+  "data.prefill_len=$PREFILL" "data.gen_len=$GEN" "data.num_samples=$SAMPLES"
+  "window.window_size=$WINDOW" "window.num_sink_tokens=$SINK"
+  "window.local_window_size=$LOCAL"
+  "cache.window_size=$WINDOW" "cache.num_sink_tokens=$SINK"
+  "cache.local_window_size=$LOCAL" "cache.cache_budget=$BUDGET"
+  "telemetry.output_dir=$RUN_DIR"
+)
+if [[ -n "$TEXT_FIELD" ]]; then COMMON+=("parity.text_field=$TEXT_FIELD"); fi
+if [[ -n "$RECORD_FILTER" ]]; then COMMON+=("parity.record_filter=$RECORD_FILTER"); fi
+
+# One tag per ours arm: the gate ratio, plus the card widths when not the
+# shipped card (a CARD_BITS sweep must not overwrite the default arm).
+CB_TAG=""
+if [[ -n "$CARD_BITS" ]]; then CB_TAG="_cb$(echo "$CARD_BITS" | tr -cd 'A-Za-z0-9')"; fi
+arm() { printf 'gate%s%s' "$1" "$CB_TAG"; }
+
+npz_ok() { [[ -s "$1" ]] && python -c "import numpy as np,sys; np.load(sys.argv[1], allow_pickle=True).files" "$1" 2>/dev/null; }
+
+# ---- 1. base: full cache, eager attentions, per-head step mass ---------------
+if [[ "$STAGE" == "all" || "$STAGE" == "base" ]]; then
+  if [[ "$FORCE" != 1 ]] && npz_ok "$BASE_NPZ"; then
+    echo "[base] $BASE_NPZ exists -- skipping (FORCE=1 to redo)"
+  else
+    echo "[base] full-KV parity base on $DATASET ..."
+    python main.py --config configs/eval_parity_base.yaml --override \
+      "${COMMON[@]}" "parity.record_head_step_mass=true" \
+      "output_path=$BASE_NPZ" 2>&1 | tee "$RUN_DIR/base.log"
+  fi
+fi
+
+# ---- 2. ours: flash backend (the gated read path), one run per gate ratio ----
+if [[ "$STAGE" == "all" || "$STAGE" == "ours" ]]; then
+  npz_ok "$BASE_NPZ" || die "no base npz at $BASE_NPZ -- run STAGE=base first"
+  for g in "${GATES[@]}"; do
+    OURS_NPZ="$RUN_DIR/parity_ours_$(arm "$g").npz"
+    if [[ "$FORCE" != 1 ]] && npz_ok "$OURS_NPZ"; then
+      echo "[ours gate=$g] exists -- skipping"; continue
+    fi
+    echo "[ours gate=$g] three-tier cache, q=$QUANT ($QUANT_MODE), gate $g ..."
+    EXTRA=("parity.record_gate=true")
+    if [[ -n "$CARD_BITS" ]]; then EXTRA+=("cache.quant_card_bits=$CARD_BITS"); fi
+    python main.py --config configs/eval_parity_ours_flash.yaml --override \
+      "${COMMON[@]}" \
+      "cache.quant_ratio=$QUANT" "cache.quant_budget_mode=$QUANT_MODE" \
+      "cache.quant_gate_ratio=$g" "cache.first_eviction_step=0" \
+      "${EXTRA[@]}" \
+      "base_run_npz=$BASE_NPZ" "output_path=$OURS_NPZ" 2>&1 | tee "$RUN_DIR/ours_$(arm "$g").log"
+  done
+fi
+
+# ---- 3. observations I..V, per gate ratio ------------------------------------
+if [[ "$STAGE" == "all" || "$STAGE" == "observe" ]]; then
+  for g in "${GATES[@]}"; do
+    OURS_NPZ="$RUN_DIR/parity_ours_$(arm "$g").npz"
+    OBS_DIR="$RUN_DIR/obs_$(arm "$g")"
+    npz_ok "$OURS_NPZ" || { echo "[observe $(arm "$g")] no $OURS_NPZ -- skipped" >&2; continue; }
+    echo "[observe $(arm "$g")] ..."
+    python -m modules.evaluation.qevict_observations \
+      --base-npz "$BASE_NPZ" --ours-npz "$OURS_NPZ" \
+      --output-dir "$OBS_DIR" \
+      --fmm-horizon "$FMM_HORIZON" \
+      --primary-inactivity "$PRIMARY_M" --primary-lir-horizon "$PRIMARY_H" \
+      --primary-transition-delta "$PRIMARY_DELTA" \
+      --trace-axis "$TRACE_AXIS" --layer-stride "$LAYER_STRIDE" \
+      --bootstrap-samples "$BOOTSTRAP" --seed "$SEED" \
+      > "$OBS_DIR.log" 2>&1 \
+      || { echo "[observe $(arm "$g")] FAILED -- $OBS_DIR.log" >&2; continue; }
+  done
+
+  ARMS="$(for g in "${GATES[@]}"; do arm "$g"; printf ' '; done)"
+  RUN_DIR="$RUN_DIR" ARMS="$ARMS" python - <<'PY' | tee "$RUN_DIR/summary$CB_TAG.txt"
+import json, os
+d = os.environ["RUN_DIR"]
+def pct(x): return "   n/a" if x is None else f"{100 * x:6.1f}%"
+def num(x): return "   n/a" if x is None else f"{x:6.2f}"
+print(f"QEvict observations -- {os.path.basename(d)}")
+print(f"{'arm':>12} {'path':>10} {'recall':>7} {'oracle':>7} {'worst':>7} "
+      f"{'skipped':>8} {'evicted':>8} {'promote':>8} {'swap':>6} {'fidelity':>9}")
+for a in os.environ["ARMS"].split():
+    f = f"{d}/obs_{a}/all_results.json"
+    if not os.path.exists(f):
+        print(f"{a:>12}  (no results)"); continue
+    r = json.load(open(f))
+    o4, o5 = r.get("observation4", {}), r.get("observation5", {})
+    rs = o4.get("recall_summary", {})
+    led = {x["part"]: x["share_of_head_mass"] for x in o4.get("ledger_table", [])}
+    sm = o5.get("summary", {})
+    lift = {x["move"]: x["lift"] for x in o5.get("outcome_table", [])}
+    print(f"{a:>12} {r['metadata'].get('read_path', '?'):>10} "
+          f"{pct(rs.get('head_recall_mean')):>7} {pct(rs.get('oracle_recall_mean')):>7} "
+          f"{pct(rs.get('worst_head_overall')):>7} {pct(led.get('q_skipped')):>8} "
+          f"{pct(led.get('evicted')):>8} {num(lift.get('promote')):>8} "
+          f"{num(sm.get('swap_gain_mean')):>6} {pct(sm.get('decision_fidelity_mean')):>9}")
+print("\nrecall/oracle/worst: per-head int2 recall of the gate, the same-size "
+      "hindsight pick, and the worst (trace, head); skipped/evicted: share of "
+      "head mass read only through centroids / not at all; promote: future-mass "
+      "lift of promoted windows; swap: lift(promote) - lift(demote).")
+print(f"Full reports: {d}/obs_*/paper_results.md")
+PY
+fi
+echo "done -- $RUN_DIR"

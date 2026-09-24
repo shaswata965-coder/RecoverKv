@@ -17,6 +17,26 @@ Two window-score arrays are recorded:
                           QEvict observation suite scores routing decisions
                           against future attention and needs this signal
                           (``modules/evaluation/qevict_observations.py``).
+  ``step_window_scores_heads``  ``[S, T, L, H, W]`` fp16 — the same per-step
+                          mass PER QUERY HEAD, recorded only with
+                          ``parity.record_head_step_mass``.  The read gate picks
+                          per KV head, and a cross-head sum of attention must be
+                          normalised per head first (CLAUDE.md, §12), so gate
+                          recall and the decode read ledger are per head.
+
+Both cumulative arrays are **accumulated in fp32** (schema >= 1.3), matching the
+cache's own ``hooks.SCORE_ACCUM_DTYPE``.  They used to accumulate in the
+attention dtype (fp16): one decode step adds well under 1e-2 to a window, below
+half an fp16 ULP of any total above ~8, so the oracle ranking that Observations
+I–III and the tier study score against was the prompt's ranking — the exact
+defect ``DISTANCE_TO_GOAL.md`` §11 fixed in the cache, left standing in the
+ground truth it is measured against.  Storage stays fp16; only the running sum
+changed.
+
+Articles shorter than ``prefill_len`` tokens are **skipped** (schema >= 1.3),
+and the indices actually used are recorded as ``article_indices``.  Every
+observation assumes the metadata ``prefill_len`` for every sample — a short
+article silently shifts its whole window geometry.
 """
 from __future__ import annotations
 import json, math, time
@@ -32,6 +52,44 @@ from utils.hashing import sha256_string, sha256_tokenizer
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+#: Running-sum dtype of the cumulative window scores. Mirrors
+#: ``modules.windowed_cache.hooks.SCORE_ACCUM_DTYPE`` (not imported: this runner
+#: must not touch the windowed cache -- ``test_base_no_hooks_installed``).
+SCORE_ACCUM_DTYPE = torch.float32
+
+
+def select_parity_articles(articles: List[str], tokenizer, start: int, n: int,
+                           prefill_len: int) -> List[int]:
+    """Indices of the first ``n`` articles from ``start`` with >= ``prefill_len`` tokens.
+
+    Shared by both parity runners (the ours run replays the base run's recorded
+    ``article_indices`` rather than re-deriving them, and checks the shas).
+    Returns fewer than ``n`` when the corpus runs out, and warns; raises if none
+    qualify.
+    """
+    picked: List[int] = []
+    skipped = 0
+    for idx in range(max(0, int(start)), len(articles)):
+        n_tok = len(tokenizer.encode(articles[idx], add_special_tokens=True))
+        if n_tok >= prefill_len:
+            picked.append(idx)
+            if len(picked) >= n:
+                break
+        else:
+            skipped += 1
+    if not picked:
+        raise ParityValidationError(
+            f"no article from index {start} has >= {prefill_len} tokens "
+            f"({len(articles)} articles in the corpus). Lower prefill_len or use "
+            "a corpus of longer documents.")
+    if skipped:
+        log.info("skipped %d article(s) shorter than prefill_len=%d tokens",
+                 skipped, prefill_len)
+    if len(picked) < n:
+        log.warning("only %d article(s) from index %d reach prefill_len=%d "
+                    "(asked for %d)", len(picked), start, prefill_len, n)
+    return picked
 
 
 def _base_row_topk(ws_row: Tensor, eW: int, tk: int):
@@ -89,17 +147,14 @@ class BaseParityRunner:
         prefill_len, gen_len = cfg.data.resolved_lengths(p.prefill_len, p.gen_len)
 
         # 1. Load corpus once.
-        loader = CorpusLoader(p.dataset)
+        text_field = getattr(p, "text_field", None)
+        record_filter = getattr(p, "record_filter", None)
+        loader = CorpusLoader(
+            p.dataset,
+            text_field=text_field if isinstance(text_field, str) else None,
+            record_filter=record_filter if isinstance(record_filter, str) else None)
         articles = loader.load()
-
-        # Clamp num_samples to available articles starting at article_index.
-        available = len(articles) - p.article_index
-        if num_samples > available:
-            log.warning(
-                "num_samples=%d exceeds %d available articles from index %d; "
-                "clamping to %d", num_samples, available, p.article_index, available,
-            )
-            num_samples = max(1, available)
+        record_heads = bool(getattr(p, "record_head_step_mass", False) is True)
 
         log.info(
             "Sampling %d article(s) from index %d, prefill_len=%d, gen_len=%d "
@@ -115,6 +170,13 @@ class BaseParityRunner:
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         tok_sha = sha256_tokenizer(tokenizer)
+
+        # Only articles that fill the whole prefill: the observation geometry
+        # assumes the metadata prefill_len for every sample.
+        article_indices = select_parity_articles(
+            articles, tokenizer, p.article_index, num_samples, prefill_len)
+        num_samples = len(article_indices)
+
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model.name, revision=cfg.model.revision,
             torch_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -131,6 +193,7 @@ class BaseParityRunner:
         samples_topk: List[np.ndarray] = []     # each: [num_steps, num_layers, K]
         samples_ws: List[np.ndarray] = []        # each: [num_steps, num_layers, H_q, W]
         samples_step_ws: List[np.ndarray] = []   # each: [num_steps, num_layers, W]
+        samples_step_ws_h: List[np.ndarray] = [] # each: [num_steps, num_layers, H, W]
         samples_gen_toks: List[np.ndarray] = []  # each: [num_steps]
         samples_shas: List[str] = []
 
@@ -146,7 +209,7 @@ class BaseParityRunner:
             # prefill_len; batching requires they all reach that length).
             tok_list = []
             for sample_idx in chunk:
-                article_idx = p.article_index + sample_idx
+                article_idx = article_indices[sample_idx]
                 article_text = articles[article_idx]
                 samples_shas.append(sha256_string(article_text))
                 t = tokenizer.encode(article_text, return_tensors="pt",
@@ -165,7 +228,7 @@ class BaseParityRunner:
             log.info(
                 "── Chunk samples %d–%d/%d (articles %d–%d) ──",
                 chunk[0] + 1, chunk[-1] + 1, num_samples,
-                p.article_index + chunk[0], p.article_index + chunk[-1],
+                article_indices[chunk[0]], article_indices[chunk[-1]],
             )
 
             acc_scores: List[Optional[Tensor]] = [None] * n_layers
@@ -173,6 +236,7 @@ class BaseParityRunner:
             all_topk = [[] for _ in range(Bc)]
             all_ws   = [[] for _ in range(Bc)]
             all_step_ws = [[] for _ in range(Bc)]   # per-step (non-cumulative)
+            all_step_ws_h = [[] for _ in range(Bc)] # per-step, per query head
             gen_toks = [[] for _ in range(Bc)]
             input_ids = tokens.clone()
             next_tok = None          # loop-carried; step 0 uses input_ids
@@ -188,10 +252,13 @@ class BaseParityRunner:
                     for bi in range(Bc):
                         gen_toks[bi].append(int(next_tok[bi].item()))
                     step_ws_layers: List[np.ndarray] = []
+                    step_ws_h_layers: List[np.ndarray] = []
                     for li in range(n_layers):
                         a = out.attentions[li]
-                        # Sum over ALL query rows of this step (cumulative across steps via acc_scores).
-                        ts = a.sum(dim=-2)
+                        # Sum over ALL query rows of this step (cumulative across
+                        # steps via acc_scores), in SCORE_ACCUM_DTYPE: the running
+                        # sum below must not round a decode step away (module doc).
+                        ts = a.sum(dim=-2, dtype=SCORE_ACCUM_DTYPE)
                         # Per-step (non-cumulative) head-mean window mass: the
                         # same post-sink windowing as the cumulative path, but
                         # on this step's contribution alone.  Kept in fp32 —
@@ -201,10 +268,13 @@ class BaseParityRunner:
                         if rem_s:
                             sp = torch.nn.functional.pad(sp, (0, ws_sz - rem_s))
                         W_s = sp.shape[-1] // ws_sz
+                        sp_h = sp.reshape(sp.shape[0], sp.shape[1], W_s, ws_sz).sum(-1)
                         step_ws_layers.append(
-                            sp.reshape(sp.shape[0], sp.shape[1], W_s, ws_sz)
-                            .sum(-1).mean(dim=1)            # [B, W] head-mean
+                            sp_h.mean(dim=1)                # [B, W] head-mean
                             .float().cpu().numpy())
+                        if record_heads:                    # [B, H, W] per head
+                            step_ws_h_layers.append(
+                                sp_h.to(torch.float16).cpu().numpy())
                         if acc_scores[li] is None:
                             acc_scores[li] = ts.clone()
                         else:
@@ -251,6 +321,9 @@ class BaseParityRunner:
                         all_ws[bi].append(np.stack(step_ws, 0))
                         all_step_ws[bi].append(
                             np.stack([x[bi] for x in step_ws_layers], 0))  # [L, W]
+                        if record_heads:
+                            all_step_ws_h[bi].append(
+                                np.stack([x[bi] for x in step_ws_h_layers], 0))  # [L, H, W]
 
                     if (step+1) % 100 == 0:
                         log.info("  Step %d/%d", step+1, gen_len)
@@ -268,10 +341,14 @@ class BaseParityRunner:
                 samples_topk.append(np.stack(ptk, 0))
                 samples_ws.append(np.stack(pws, 0))
                 samples_step_ws.append(np.stack(psws, 0))
+                if record_heads:
+                    pswh = [np.pad(x, [(0, 0), (0, 0), (0, mW - x.shape[-1])])
+                            if x.shape[-1] < mW else x for x in all_step_ws_h[bi]]
+                    samples_step_ws_h.append(np.stack(pswh, 0))
                 samples_gen_toks.append(np.array(s_gen, dtype=np.int64))
 
             # Memory hygiene: free per-chunk tensors before the next chunk.
-            del acc_scores, all_topk, all_ws, all_step_ws, gen_toks, pkv, input_ids, tokens
+            del acc_scores, all_topk, all_ws, all_step_ws, all_step_ws_h, gen_toks, pkv, input_ids, tokens
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             import gc as _gc; _gc.collect()
@@ -280,6 +357,9 @@ class BaseParityRunner:
         max_K = max(x.shape[-1] for x in samples_topk)
         max_W = max(x.shape[-1] for x in samples_ws)
         aligned_topk, aligned_ws, aligned_step_ws = [], [], []
+        aligned_step_ws_h = [
+            np.pad(x, [(0, 0), (0, 0), (0, 0), (0, max(0, max_W - x.shape[-1]))])
+            for x in samples_step_ws_h] if record_heads else []
         for tkarr, wsarr, swsarr in zip(samples_topk, samples_ws, samples_step_ws):
             if tkarr.shape[-1] < max_K:
                 tkarr = np.pad(tkarr, [(0, 0), (0, 0), (0, max_K - tkarr.shape[-1])],
@@ -296,6 +376,10 @@ class BaseParityRunner:
         top_window_indices = np.stack(aligned_topk, 0)
         window_scores = np.stack(aligned_ws, 0)
         step_window_scores = np.stack(aligned_step_ws, 0).astype(np.float32)
+        extra_arrays: Dict[str, np.ndarray] = {}
+        if record_heads:
+            extra_arrays["step_window_scores_heads"] = np.stack(
+                aligned_step_ws_h, 0).astype(np.float16)     # [S, T, L, H, W]
         generated_tokens = np.stack(samples_gen_toks, 0)
         eviction_step_mask = np.zeros((num_samples, gen_len), dtype=bool)
 
@@ -316,12 +400,23 @@ class BaseParityRunner:
 
         env = capture_environment()
         meta = {
-            "schema_version": "1.2",                     # bumped: step_window_scores
+            # 1.3: fp32 score accumulation, full-prefill article selection
+            # (article_indices), optional step_window_scores_heads.
+            "schema_version": "1.3",
             "mode": "parity_base",
             "seed": cfg.run.seed,
             "dataset": p.dataset,
             "article_id": p.article_index,                # first article (back-compat)
             "article_index_start": p.article_index,
+            "article_indices": [int(i) for i in article_indices],
+            "text_field": text_field if isinstance(text_field, str) else None,
+            "record_filter": record_filter if isinstance(record_filter, str) else None,
+            "score_accum_dtype": "float32",
+            "record_head_step_mass": record_heads,
+            "num_attention_heads": int(model.config.num_attention_heads),
+            "num_key_value_heads": int(getattr(
+                model.config, "num_key_value_heads",
+                model.config.num_attention_heads)),
             "num_samples": num_samples,
             "article_shas": samples_shas,
             "article_sha": samples_shas[0],               # back-compat: first sample
@@ -354,6 +449,7 @@ class BaseParityRunner:
             top_window_indices=top_window_indices,
             window_scores=window_scores,
             step_window_scores=step_window_scores,   # [S, T, L, W] fp32, per-step
+            **extra_arrays,                          # step_window_scores_heads
             eviction_step_mask=eviction_step_mask,
             generated_tokens=generated_tokens,
             metadata_json=np.array([json.dumps(meta)], dtype=object),

@@ -1,6 +1,6 @@
 # Distance to the goal
 
-Updated 2026-09-23 (§12: what the RULER regression actually was). §11 as of 2026-09-22. Sections 1–10 as of 2026-09-18/19.
+Updated 2026-09-24 (§13: the observation path reads what the decode reads). §12 as of 2026-09-23. §11 as of 2026-09-22. Sections 1–10 as of 2026-09-18/19.
 
 **The goal:** beat Flash FullKV, int2 KIVI and QEvict across all six shape/batch
 cells. Today we beat Flash in **one of six**. At our best numbers ever we beat it
@@ -1832,3 +1832,61 @@ a GPU run can say. Step 2 below measures it.
    copy walks one window token by token.
 3. **LongBench at the operating point.** The gate reads different windows now,
    so quality rows do not compare across this commit.
+
+---
+
+## 13. The observation path now reads what the decode reads — 2026-09-24
+
+The QEvict observation suite (`modules/evaluation/qevict_observations.py`) and
+the parity runners behind it had not followed §11 or §12. They scored the cache
+as its tier tags describe it, not as a decode step reads it, and their oracle
+carried the §11 fp16 defect. Five things, all fixed together:
+
+| # | what was wrong | effect |
+|---|---|---|
+| 1 | `BaseParityRunner` accumulated the ground-truth cumulative scores in the attention dtype (fp16) | the oracle ranking behind Observations I, III and the tier study was the prompt's ranking — §11 defect 2, left standing in the ground truth |
+| 2 | nothing recorded which int2 windows the read gate opened | Future Missed Mass counted the whole Q tier as readable; on the flash path a decode opens ~25% of it per KV head |
+| 3 | the policy's Observation III `P01`/`P10` were reported as promotion/demotion | they are fp-membership flips: `0` pools Q with evicted windows, so an evicted window is a "promotable" 0 at every later event |
+| 4 | the parity ours run dropped `quant_budget_mode` and recorded no `read_gate` verdict | a `tokens` request ran `bytes`; a gated and an ungated run produced indistinguishable npzs |
+| 5 | articles shorter than `prefill_len` were used as-is | every observation assumes the metadata `prefill_len`, so a short article shifted its whole window geometry |
+
+### What changed
+
+* **Base, schema 1.3.** fp32 running sum (storage stays fp16); articles shorter
+  than the prefill are skipped and `article_indices` recorded (ours replays them);
+  opt-in `step_window_scores_heads` `[S,T,L,H,W]` — per-query-head step mass,
+  because anything summed across query heads must be normalised per head first.
+* **Ours, schema 1.3.** `gate_read` `[S,T,L,H_kv,W]` and `gate_fired` `[S,T,L]`:
+  the gate's pick, captured by an evaluation-only observer in `_run_fused`
+  (`flash_decode.set_gate_observer`; one dict read per fused layer when unset)
+  and mapped to window ids through `active_ids()` at the moment the gate reads
+  them. Metadata carries `read_gate`, `quant_gate_ratio`, `quant_budget_mode`,
+  `quant_card_bits`, and the GQA head counts.
+* **Observation IV — the decode read ledger.** Each query head's ground-truth
+  mass per decode step, split into fp / local / fresh (exact), `q_read`
+  (opened by the gate for that head's KV group), `q_skipped` (centroid only),
+  `evicted`, `sink`. Gate recall is per head, with the worst head and tail
+  fractions, beside a same-size hindsight pick (best per-step group share).
+  This is the §12 per-head recall table on real attention, which §11 listed as
+  untested.
+* **Observation V — tier dynamics.** The F / Q / E chain with promotion,
+  demotion and eviction rates, and whether each move landed on the next `H`
+  steps' attention (lift, hindsight hit rates, swap gain, eviction regret), plus
+  decision fidelity: the fp set vs the ground-truth ranking of the same
+  survivors, which is where gate-filled scores for skipped windows would show.
+  Tier study M7 gains the same chain rates.
+* **`scripts/run_qevict_observations.sh`** runs one dataset end to end at the
+  operating point, on the flash backend, with the gate 1.0 control arm, for
+  wikitext/pg19, any LongBench jsonl (`context` field) or a RULER task.
+
+### What is verified and what is not
+
+| check | result |
+|---|---|
+| `tests/test_observation_gate_and_tiers.py` (new, 37) | pass on CPU — including the observer driven through the real cache and `_run_fused` (CPU gate reference, stubbed decode kernel) on the per-layer and layer-major paths |
+| the observation, metric, parity and corpus suites | pass |
+| any number from a real run, any GPU execution of the recording path | **not done** |
+
+No decode output, eviction decision or score moves: the only production-path
+change is the unset observer check. The base run's oracle *does* move (item 1),
+so observation numbers do not compare across this commit.

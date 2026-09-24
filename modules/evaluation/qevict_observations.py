@@ -13,8 +13,24 @@ Where the other suites ask "how faithful is our cache?", this one asks "is the
   III. **Historical importance revives** — after a window has been cold for
        ``m`` events, how often does it become important again within ``H``?
        Computed both for the ground-truth oracle set (the upside a promotion
-       path could capture) and for our cache's real fp tier (what its Q→fp
-       promotion actually recovers), plus the lag-``delta`` flip matrix.
+       path could capture) and for our cache's real fp tier, plus the
+       lag-``delta`` flip matrix.  For the policy that matrix is fp-membership
+       flips, NOT promotions: its ``0`` pools the int2 tier with the evicted
+       windows (Observation V separates them).
+  IV.  **The decode read ledger** — at every decode step, where each query
+       head's ground-truth attention landed: fp / local / fresh (read exactly),
+       int2 windows the read gate OPENED, int2 windows it SKIPPED (reached only
+       through the centroid fill), evicted, sink.  Per query head, so the gate's
+       recall is the §12 per-head quantity on real attention, beside a
+       hindsight-optimal pick of the same size.  Needs an ours npz at schema
+       >= 1.3 (``gate_read``) and, for exact per-head mass, a base npz recorded
+       with ``parity.record_head_step_mass``.
+  V.   **Tier dynamics** — the three-state F / Q / E chain: promotion (Q→F),
+       demotion (F→Q), eviction from either tier, with rates, and whether each
+       move landed on the windows the next ``H`` steps attend (lift over the
+       candidates, hindsight hit rates, swap gain, eviction regret), plus how
+       closely the cache's own ranking — gate-filled scores for skipped int2
+       windows — matches the ground truth on the windows it holds.
 
 Inputs are the existing ``parity_base`` + ``parity_ours`` npzs — the same pair
 :mod:`modules.evaluation.faithfulness_runner` consumes.  Two things to know:
@@ -96,6 +112,12 @@ DEFAULTS: Dict[str, Any] = {
     "bootstrap_samples": 2000,
     "seed": 0,
     "trace_axis": "sample_layer",
+    # Observation IV: a head-step counts toward gate recall only when at least
+    # this share of the head's mass sits in the int2 tier (a head with ~0 int2
+    # mass has an undefined recall, not a perfect or a zero one).
+    "min_q_share": 0.01,
+    # Observation V: F/Q/E transition lags, in routing events.
+    "tier_deltas": (1, 2, 4),
 }
 
 
@@ -169,6 +191,9 @@ class ObservationInputs:
     trace_group: np.ndarray       # [M] bootstrap group id per trace
     geometry: Dict[str, Any] = field(default_factory=dict)
     diagnostics: Dict[str, Any] = field(default_factory=dict)
+    acc_q: Optional[np.ndarray] = None    # [M, R, W] bool — int2 survivors
+    band: Optional[np.ndarray] = None     # [R, W] bool — evictable band per event
+    states: Optional[np.ndarray] = None   # [M, R, W] int8 F/Q/E (qevict_metrics)
 
 
 def _as5d(x: np.ndarray) -> np.ndarray:
@@ -179,6 +204,38 @@ def _as5d(x: np.ndarray) -> np.ndarray:
 def _as4d(x: np.ndarray) -> np.ndarray:
     """Promote a legacy ``[T, L, W]`` array to ``[1, T, L, W]``."""
     return x[None] if x.ndim == 3 else x
+
+
+def read_path_info(ours_meta: Dict[str, Any]) -> Dict[str, Any]:
+    """How the ours run READ its int2 tier — the gate verdict and knobs.
+
+    ``read_path`` is one of ``gated`` (the read gate ran and its pick is
+    recorded), ``gated-unrecorded`` (it ran, schema < 1.3 or recording off, so
+    Observation IV cannot see which windows it opened), ``ungated`` (eager
+    backend or ``quant_ratio = 0``: no gate exists, the whole tier is read) or
+    ``NOT-GATED`` (it should have gated and did not — the run is not the
+    shipped method; ``flash_decode.gate_report``).
+    """
+    rg = ours_meta.get("read_gate") or {}
+    verdict = rg.get("verdict")
+    recorded = bool(ours_meta.get("gate_recorded", False))
+    if verdict is None:
+        path = "unknown"
+    elif verdict == "gated":
+        path = "gated" if recorded else "gated-unrecorded"
+    elif verdict == "not-expected":
+        path = "ungated"
+    else:
+        path = "NOT-GATED"
+    return {
+        "read_path": path,
+        "read_gate_verdict": verdict,
+        "quant_gate_ratio": ours_meta.get("quant_gate_ratio"),
+        "quant_budget_mode": ours_meta.get("quant_budget_mode"),
+        "quant_card_bits": ours_meta.get("quant_card_bits"),
+        "realised_read_fraction": rg.get("read_fraction"),
+        "gate_recorded": recorded,
+    }
 
 
 def build_observation_inputs(
@@ -326,6 +383,7 @@ def build_observation_inputs(
     # ── real accessible sets + our fp-tier selection, from ours' tier tags ──
     acc_fp = np.zeros((M, R, W), dtype=bool)
     acc_kept = np.zeros((M, R, W), dtype=bool)
+    acc_q = np.zeros((M, R, W), dtype=bool)
     out_of_range = 0
     for r, t in enumerate(event_steps):
         for m, (s, li) in enumerate(labels):
@@ -337,6 +395,7 @@ def build_observation_inputs(
             idx, tr = ids[ok], tier[ok]
             acc_kept[m, r, idx] = True
             acc_fp[m, r, idx[tr != TIER_Q]] = True
+            acc_q[m, r, idx[tr == TIER_Q]] = True
     if out_of_range:
         log.warning("%d survivor ids exceeded the base window axis (W=%d); ignored",
                     out_of_range, W)
@@ -357,6 +416,12 @@ def build_observation_inputs(
         if k > 0:
             sel = np.argsort(-rank_scores[:, r, :ew], axis=-1, kind="stable")[:, :k]
             np.put_along_axis(oracle[:, r, :ew], sel, 1, axis=-1)
+
+    # ── F / Q / E states over the evictable band (Observation V) ─────────
+    band = np.zeros((R, W), dtype=bool)
+    for r in range(R):
+        band[r, :max(int(ev_w[r]), 0)] = True
+    states = QM.tier_states(acc_fp, acc_q, band)
 
     # ── matched-byte fine vs coarse decision granularity (simulated) ─────
     accessible: Dict[str, np.ndarray] = {
@@ -405,6 +470,7 @@ def build_observation_inputs(
             "top_k_fp": top_k_fp, "N_q": n_q, "oracle_k": oracle_k,
             "quant_ratio": float(om.get("quant_ratio", 0.0)),
             "pool_factor": pool, "trace_axis": trace_axis,
+            **read_path_info(om),
         },
         diagnostics={
             "mass_source": mass_source,
@@ -413,7 +479,15 @@ def build_observation_inputs(
             "survivor_ids_out_of_range": int(out_of_range),
             "base_schema_version": str(bm.get("schema_version", "?")),
             "ours_schema_version": str(om.get("schema_version", "?")),
+            # fp32 since base schema 1.3; before it the oracle's running sum was
+            # fp16 and dropped most decode steps (base_parity_runner docstring).
+            "base_score_accum_dtype": str(bm.get("score_accum_dtype", "float16")),
+            "tier_resurrections": int(
+                QM.tier_transitions(states, 1)["resurrections"]) if R > 1 else 0,
         },
+        acc_q=acc_q,
+        band=band,
+        states=states,
     )
 
 
@@ -730,6 +804,320 @@ def analyse_revival(
 
 
 # ---------------------------------------------------------------------------
+# Observation IV — the decode read ledger
+# ---------------------------------------------------------------------------
+
+
+def _head_step_mass(base_arrays: Dict[str, np.ndarray], s: int, li: int, T: int,
+                    W: int) -> Tuple[np.ndarray, str]:
+    """``[T, H, W]`` float32 per-step per-query-head window mass for one trace."""
+    if "step_window_scores_heads" in base_arrays:
+        hm = base_arrays["step_window_scores_heads"]
+        hm = hm if hm.ndim == 5 else hm[None]
+        x = np.asarray(hm[s, :T, li], dtype=np.float32)
+        src = "recorded_head_step_mass"
+    else:
+        cum = _as5d(base_arrays["window_scores"])[s, :T, li].astype(np.float64)
+        x = np.clip(np.diff(cum, axis=0, prepend=np.zeros((1,) + cum.shape[1:])),
+                    0.0, None).astype(np.float32)
+        src = "differenced_cumulative"
+    if x.shape[-1] < W:
+        x = np.pad(x, [(0, 0), (0, 0), (0, W - x.shape[-1])])
+    return x[..., :W], src
+
+
+def analyse_decode_reads(
+    base: dict,
+    ours: dict,
+    inp: ObservationInputs,
+    min_q_share: float = 0.01,
+    confidence: float = 0.95,
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Observation IV: split every head's per-step mass by how the decode read it.
+
+    Per ``(sample, layer)`` trace and query head, over decode steps ``t >= 1``,
+    the ground-truth attention (the base run's, one query row per step, so each
+    head's mass sums to 1) is assigned to :data:`utils.qevict_metrics.LEDGER_PARTS`
+    by the ours run's tier tags and, where the gate ran, its recorded pick for
+    that head's KV group. Every statistic is per head first and then averaged;
+    nothing sums attention across query heads (CLAUDE.md).
+
+    Returns the ledger table, the per-head gate-recall table (gate vs the
+    hindsight-optimal pick of the same size), a per-layer recall table, and the
+    per-trace arrays behind them.
+    """
+    ba, oa = base["arrays"], ours["arrays"]
+    bm, om = base["metadata"], ours["metadata"]
+    g = inp.geometry
+    T, W = int(g["num_steps"]), int(g["num_windows"])
+    groups = inp.trace_group
+    all_ids = _as4d(np.asarray(oa["all_window_ids"]))
+    all_tier = _as4d(np.asarray(oa["all_window_tier"]))
+    gate_read = oa.get("gate_read")
+    gate_fired = oa.get("gate_fired")
+    if gate_read is not None:
+        gate_read = np.asarray(gate_read)
+        gate_read = gate_read if gate_read.ndim == 5 else gate_read[None]
+        gate_fired = np.asarray(gate_fired, dtype=bool)
+        gate_fired = gate_fired if gate_fired.ndim == 3 else gate_fired[None]
+
+    H = int(_as5d(np.asarray(ba["window_scores"])).shape[3])
+    if gate_read is not None:
+        H_kv = int(gate_read.shape[3])
+    else:
+        H_kv = int(om.get("num_key_value_heads") or bm.get("num_key_value_heads")
+                   or H)
+    rep = max(1, H // max(H_kv, 1))
+    P = len(QM.LEDGER_PARTS)
+    M = len(inp.trace_labels)
+
+    ledger = np.full((M, P), np.nan)          # mean over steps and heads
+    ledger_win = np.full((M, P), np.nan)      # share of post-sink window mass
+    recall = np.full((M, H), np.nan)
+    oracle = np.full((M, H), np.nan)
+    read_frac = np.full(M, np.nan)
+    gated_frac = np.zeros(M)
+    step_recalls: List[np.ndarray] = []
+    src = "none"
+    oob = 0
+    for m, (s, li) in enumerate(inp.trace_labels):
+        mass, src = _head_step_mass(ba, s, li, T, W)
+        cls, rd, o = QM.survivor_to_base(
+            all_ids[s, :T, li], all_tier[s, :T, li], W,
+            None if gate_read is None else gate_read[s, :T, li])
+        oob += o
+        fired = None if gate_fired is None else gate_fired[s, :T, li]
+        led = QM.decode_read_ledger(mass, cls, rd, fired, rep)
+        parts = led["parts"]
+        if parts.shape[0] == 0:
+            continue
+        ledger[m] = parts.mean(axis=(0, 1))
+        win = parts[..., :QM.LEDGER_PARTS.index("sink")].sum(-1)      # [T', H]
+        tot = win.sum()
+        if tot > 0:
+            ledger_win[m] = parts.sum(axis=(0, 1)) / tot
+            ledger_win[m, QM.LEDGER_PARTS.index("sink")] = np.nan
+        hr = QM.ledger_head_recall(parts, led["gated"], led["oracle_q_read"],
+                                   min_q_share=min_q_share)
+        recall[m] = hr["recall"]
+        oracle[m] = hr["oracle_recall"]
+        sr = hr["step_recall"]
+        step_recalls.append(sr[np.isfinite(sr)])
+        read_frac[m] = QM.nanmean(led["read_frac"])
+        gated_frac[m] = float(led["gated"].mean())
+    if oob:
+        log.warning("Observation IV: %d survivor ids exceeded the base window axis",
+                    oob)
+    if src == "differenced_cumulative":
+        log.warning(
+            "Observation IV: the base npz has no per-head step mass "
+            "(step_window_scores_heads) — differencing the fp16 cumulative "
+            "per-head scores instead. That is noise past a few hundred steps; "
+            "record the base run with parity.record_head_step_mass=true.")
+
+    rows = []
+    for i, name in enumerate(QM.LEDGER_PARTS):
+        mu, lo, hi = QM.bootstrap_mean_ci(
+            QM.group_reduce(ledger[:, i], groups), confidence, n_boot, seed + i)
+        wmu = float(QM.nanmean(ledger_win[:, i]))
+        rows.append({"part": name, "share_of_head_mass": mu,
+                     "ci_lower": lo, "ci_upper": hi,
+                     "share_of_window_mass": wmu})
+    derived = {
+        "decode_missed_mass": ledger[:, QM.LEDGER_PARTS.index("evicted")]
+        + ledger[:, QM.LEDGER_PARTS.index("q_skipped")],
+        "hard_missed_mass": ledger[:, QM.LEDGER_PARTS.index("evicted")],
+    }
+    for j, (name, vals) in enumerate(derived.items()):
+        mu, lo, hi = QM.bootstrap_mean_ci(
+            QM.group_reduce(vals, groups), confidence, n_boot, seed + 50 + j)
+        rows.append({"part": name, "share_of_head_mass": mu,
+                     "ci_lower": lo, "ci_upper": hi,
+                     "share_of_window_mass": np.nan})
+
+    any_gated = bool(np.any(gated_frac > 0))
+    head_mean = QM.nanmean(recall, axis=1)                       # [M]
+    orc_mean = QM.nanmean(oracle, axis=1)
+    worst = np.array([np.nanmin(r) if np.isfinite(r).any() else np.nan
+                      for r in recall])
+    flat = recall[np.isfinite(recall)]
+    steps_flat = (np.concatenate(step_recalls) if step_recalls
+                  else np.zeros(0))
+    rf = float(QM.nanmean(read_frac))
+
+    def ci(vals: np.ndarray, off: int) -> Tuple[float, float, float]:
+        return QM.bootstrap_mean_ci(QM.group_reduce(vals, groups),
+                                    confidence, n_boot, seed + 100 + off)
+
+    r_mu, r_lo, r_hi = ci(head_mean, 0)
+    o_mu, o_lo, o_hi = ci(orc_mean, 1)
+    w_mu, w_lo, w_hi = ci(worst, 2)
+    eff = np.divide(head_mean, orc_mean, out=np.full(M, np.nan),
+                    where=np.isfinite(orc_mean) & (orc_mean > 0))
+    e_mu, e_lo, e_hi = ci(eff, 3)
+    recall_summary = {
+        "gated": any_gated,
+        "gated_step_fraction": float(gated_frac.mean()) if M else np.nan,
+        "realised_read_fraction": rf,
+        "head_recall_mean": r_mu, "head_recall_ci_lower": r_lo,
+        "head_recall_ci_upper": r_hi,
+        "oracle_recall_mean": o_mu, "oracle_recall_ci_lower": o_lo,
+        "oracle_recall_ci_upper": o_hi,
+        "gate_efficiency_mean": e_mu, "gate_efficiency_ci_lower": e_lo,
+        "gate_efficiency_ci_upper": e_hi,
+        "worst_head_per_trace_mean": w_mu, "worst_head_ci_lower": w_lo,
+        "worst_head_ci_upper": w_hi,
+        "worst_head_overall": float(flat.min()) if flat.size else np.nan,
+        "heads_below_0.99": float(np.mean(flat < 0.99)) if flat.size else np.nan,
+        "heads_below_0.90": float(np.mean(flat < 0.90)) if flat.size else np.nan,
+        "heads_below_0.50": float(np.mean(flat < 0.50)) if flat.size else np.nan,
+        "step_recall_p01": float(np.quantile(steps_flat, 0.01)) if steps_flat.size else np.nan,
+        "step_recall_p05": float(np.quantile(steps_flat, 0.05)) if steps_flat.size else np.nan,
+        "step_recall_median": float(np.median(steps_flat)) if steps_flat.size else np.nan,
+        "head_steps_below_0.50": float(np.mean(steps_flat < 0.5)) if steps_flat.size else np.nan,
+        "mass_lift_per_opened_window": (r_mu / rf if np.isfinite(rf) and rf > 0
+                                        else np.nan),
+        "min_q_share": float(min_q_share),
+        "head_mass_source": src,
+        "num_query_heads": H, "num_kv_heads": H_kv, "gqa_rep": rep,
+    }
+    layers = sorted({li for _, li in inp.trace_labels})
+    layer_rows = []
+    for li in layers:
+        sel = np.array([lab[1] == li for lab in inp.trace_labels])
+        layer_rows.append({
+            "layer": int(li),
+            "head_recall_mean": float(QM.nanmean(recall[sel])),
+            "oracle_recall_mean": float(QM.nanmean(oracle[sel])),
+            "worst_head": float(np.nanmin(recall[sel]))
+            if np.isfinite(recall[sel]).any() else np.nan,
+            "q_skipped_share": float(QM.nanmean(
+                ledger[sel, QM.LEDGER_PARTS.index("q_skipped")])),
+            "evicted_share": float(QM.nanmean(
+                ledger[sel, QM.LEDGER_PARTS.index("evicted")])),
+        })
+    return {
+        "ledger_table": rows,
+        "recall_summary": recall_summary,
+        "layer_table": layer_rows,
+        "ledger_by_trace": ledger,
+        "head_recall": recall,
+        "oracle_recall": oracle,
+        "step_recall": steps_flat,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Observation V — tier dynamics (promotion / demotion / eviction)
+# ---------------------------------------------------------------------------
+
+
+def analyse_tier_dynamics(
+    inp: ObservationInputs,
+    horizon: int = DEFAULTS["fmm_horizon"],
+    deltas: Sequence[int] = (1, 2, 4),
+    confidence: float = 0.95,
+    n_boot: int = 2000,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Observation V: the F / Q / E chain and whether each move paid off."""
+    states = inp.states
+    groups = inp.trace_group
+    R = states.shape[1]
+    rate_rows: List[Dict[str, Any]] = []
+    first: Optional[Dict[str, Any]] = None
+    for i, d in enumerate(int(x) for x in deltas):
+        if not 0 < d < R:
+            continue
+        tr = QM.tier_transitions(states, d)
+        first = first or tr
+        counts = tr["counts_by_trace"]
+        for j, (move, (a, b)) in enumerate(QM.MOVES.items()):
+            num = counts[:, a, b]
+            den = counts[:, a, :].sum(-1)
+            mu, lo, hi = QM.bootstrap_mean_ci(
+                QM.group_ratio(num, den, groups), confidence, n_boot,
+                seed + 100 * i + j)
+            rate_rows.append({
+                "delta": d, "move": move,
+                "from": QM.STATE_NAMES[a], "to": QM.STATE_NAMES[b],
+                "rate_mean": mu, "ci_lower": lo, "ci_upper": hi,
+                "pooled_rate": float(tr["pooled_probabilities"][a, b]),
+                "count": int(num.sum()),
+            })
+    entry_rows = []
+    if first is not None:
+        ent = first["entry_counts"].sum(axis=0).astype(float)
+        tot = ent.sum()
+        for b in range(3):
+            entry_rows.append({"enters_as": QM.STATE_NAMES[b],
+                               "fraction": ent[b] / tot if tot > 0 else np.nan,
+                               "count": int(ent[b])})
+        if first["resurrections"]:
+            log.warning(
+                "Observation V: %d E -> F/Q pairs. Eviction is permanent in the "
+                "cache, so the survivor ids are being mapped onto the wrong "
+                "windows — check all_window_ids against the base window axis.",
+                first["resurrections"])
+
+    out = QM.transition_outcomes(states, inp.mass_step, inp.event_steps, horizon)
+    outcome_rows = []
+    for j, move in enumerate(QM.MOVES):
+        s_mu, s_lo, s_hi = QM.bootstrap_mean_ci(
+            QM.group_reduce(out[f"share_{move}"], groups), confidence, n_boot,
+            seed + 700 + j)
+        l_mu, l_lo, l_hi = QM.bootstrap_mean_ci(
+            QM.group_reduce(out[f"lift_{move}"], groups), confidence, n_boot,
+            seed + 800 + j)
+        outcome_rows.append({
+            "move": move, "count": int(np.nansum(out[f"count_{move}"])),
+            "future_mass_share": s_mu, "share_ci_lower": s_lo,
+            "share_ci_upper": s_hi,
+            "lift": l_mu, "lift_ci_lower": l_lo, "lift_ci_upper": l_hi,
+        })
+    summary: Dict[str, Any] = {"horizon": int(horizon),
+                               "events_scored": int(out["events_scored"])}
+    for j, key in enumerate(("swap_gain", "eviction_regret")):
+        mu, lo, hi = QM.bootstrap_mean_ci(
+            QM.group_reduce(out[key], groups), confidence, n_boot, seed + 900 + j)
+        summary.update({f"{key}_mean": mu, f"{key}_ci_lower": lo,
+                        f"{key}_ci_upper": hi})
+    for j, key in enumerate(("hit_promote", "hit_demote", "hit_evict",
+                             "fp_precision")):
+        mu, lo, hi = QM.bootstrap_mean_ci(
+            QM.group_ratio(out[f"{key}_num"], out[f"{key}_den"], groups),
+            confidence, n_boot, seed + 950 + j)
+        summary.update({f"{key}_mean": mu, f"{key}_ci_lower": lo,
+                        f"{key}_ci_upper": hi,
+                        f"{key}_count": int(np.nansum(out[f"{key}_den"]))})
+    fid = QM.tier_decision_fidelity(states, inp.rank_scores)
+    f_mu, f_lo, f_hi = QM.bootstrap_mean_ci(
+        QM.group_reduce(QM.nanmean(fid, axis=1), groups), confidence, n_boot,
+        seed + 990)
+    summary.update({"decision_fidelity_mean": f_mu,
+                    "decision_fidelity_ci_lower": f_lo,
+                    "decision_fidelity_ci_upper": f_hi})
+    if out["events_scored"] == 0:
+        log.warning("Observation V: no routing event has a full %d-step future "
+                    "— move outcomes are undefined; lower --fmm-horizon.", horizon)
+    return {
+        "rate_table": rate_rows,
+        "entry_table": entry_rows,
+        "outcome_table": outcome_rows,
+        "summary": summary,
+        "pooled_transition": (first["pooled_probabilities"] if first is not None
+                              else np.full((3, 3), np.nan)),
+        "transition_counts": (first["counts_by_trace"] if first is not None
+                              else np.zeros((0, 3, 3), np.int64)),
+        "decision_fidelity": fid,
+        "outcomes_by_trace": {k: v for k, v in out.items()
+                              if isinstance(v, np.ndarray)},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
@@ -765,6 +1153,29 @@ def _nearest(rows: List[Dict[str, Any]], key: str, target: float) -> Dict[str, A
     return min(rows, key=lambda r: abs(float(r[key]) - float(target)))
 
 
+def _read_path_line(g: Dict[str, Any]) -> str:
+    path = g.get("read_path", "unknown")
+    ratio = g.get("quant_gate_ratio")
+    rf = g.get("realised_read_fraction")
+    bits = g.get("quant_card_bits")
+    knobs = (f"gate ratio {ratio}, realised read fraction "
+             f"{'n/a' if rf is None else f'{float(rf):.3f}'}, card bits {bits}")
+    return {
+        "gated": f"Read path: **gated** — verdict `{g.get('read_gate_verdict')}`, "
+                 f"{knobs}; the gate's pick is recorded.",
+        "gated-unrecorded": f"Read path: **gated, pick NOT recorded** — {knobs}. "
+                            "Observation IV counts the whole int2 tier as read "
+                            "and so overstates what the decode read.",
+        "ungated": "Read path: **ungated** (eager backend or quant_ratio=0; "
+                   "verdict `not-expected`) — the whole int2 tier is read.",
+        "NOT-GATED": f"Read path: **NOT GATED** — verdict "
+                     f"`{g.get('read_gate_verdict')}`. The run should have gated "
+                     "and did not; it is not the shipped method.",
+    }.get(path, "Read path: **unknown** — the ours npz predates schema 1.3 "
+                "(no `read_gate` verdict). Observation IV counts the whole int2 "
+                "tier as read.")
+
+
 def build_paper_summary(
     inp: ObservationInputs,
     obs1: Dict[str, Any],
@@ -772,6 +1183,8 @@ def build_paper_summary(
     obs3: Dict[str, Dict[str, Any]],
     primary_top_fraction: float = DEFAULTS["primary_top_fraction"],
     primary_target_mass: float = DEFAULTS["primary_target_mass"],
+    obs4: Optional[Dict[str, Any]] = None,
+    obs5: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Render the observation results as a markdown report."""
     g = inp.geometry
@@ -793,6 +1206,8 @@ def build_paper_summary(
         "Intervals are percentile bootstrap CIs over the trace axis; with a "
         "single-article run those traces are layers of the same prompt, so read "
         "them as within-run variability rather than population CIs.",
+        "",
+        _read_path_line(g),
         "",
         "## Observation I: skewed importance",
         "",
@@ -834,10 +1249,19 @@ def build_paper_summary(
                   "entries came out negative and were clamped). Re-run "
                   "BaseParityRunner to record `step_window_scores` before "
                   "reporting Observation II."]
+    if inp.diagnostics.get("base_score_accum_dtype", "float16") != "float32":
+        lines += ["", "> **Caveat.** The base npz predates schema 1.3: its "
+                  "cumulative scores were accumulated in fp16, which drops most "
+                  "decode steps once a window's total passes ~8. The oracle "
+                  "ranking behind Observations I, III and V's decision fidelity "
+                  "is then close to the prompt's ranking. Re-run BaseParityRunner."]
 
     lines += ["", "## Observation III: historical importance revives", ""]
     for label, res in obs3.items():
         s = res["quantifiable_result"]
+        flips = (("cold→hot", "hot→cold") if label == "oracle" else
+                 ("not-fp→fp: pools Q with evicted, see Observation V",
+                  "fp→not-fp: pools demotion with eviction"))
         lines += [
             f"### {label}",
             "",
@@ -850,9 +1274,9 @@ def build_paper_summary(
             f"{_num(s['time_to_revival_q3'], 1)}).",
             f"- At lag delta={s['transition_delta']}: "
             f"P01={_ci_pct(s['P01_mean'], s['P01_ci_lower'], s['P01_ci_upper'])} "
-            f"(promotion), "
+            f"({flips[0]}), "
             f"P10={_ci_pct(s['P10_mean'], s['P10_ci_lower'], s['P10_ci_upper'])} "
-            f"(demotion).",
+            f"({flips[1]}).",
             "",
         ]
 
@@ -873,8 +1297,9 @@ def build_paper_summary(
             f"> Holding the low-rank band in int2 instead of dropping it lowers "
             f"Future Missed Mass over the next {obs2['horizon']} decode steps "
             f"from {_pct(fp_only['future_missed_mass_mean'])} to "
-            f"{_pct(fp_q['future_missed_mass_mean'])} at a matched measured "
-            f"budget.",
+            f"{_pct(fp_q['future_missed_mass_mean'])} at the same fp capacity "
+            f"(within one run, so not byte-matched: the byte-matched contrast "
+            f"is an evict-only run at the same cache_budget, tier study M6).",
             "",
         ]
     oracle = obs3.get("oracle")
@@ -890,7 +1315,106 @@ def build_paper_summary(
             f"{_pct(s['P01_mean'])} - the headroom a promotion path can recover.",
             "",
         ]
+    if obs4 is not None:
+        lines += _obs4_lines(obs4, g)
+    if obs5 is not None:
+        lines += _obs5_lines(obs5)
     return "\n".join(lines)
+
+
+def _obs4_lines(obs4: Dict[str, Any], g: Dict[str, Any]) -> List[str]:
+    rs = obs4["recall_summary"]
+    lines = ["", "## Observation IV: the decode read ledger", "",
+             "Each query head's ground-truth attention at every decode step, by "
+             "how the decode read it (per head, then averaged).", "",
+             "| part | share of head mass | share of window mass |",
+             "| --- | --- | --- |"]
+    for r in obs4["ledger_table"]:
+        lines.append(f"| `{r['part']}` | "
+                     f"{_ci_pct(r['share_of_head_mass'], r['ci_lower'], r['ci_upper'])} | "
+                     f"{_pct(r['share_of_window_mass'])} |")
+    lines.append("")
+    if rs["gated"]:
+        lines += [
+            f"- Per-head gate recall (int2 mass in opened windows / int2 mass): "
+            f"{_ci_pct(rs['head_recall_mean'], rs['head_recall_ci_lower'], rs['head_recall_ci_upper'])}"
+            f" at a realised read fraction of {_pct(rs['realised_read_fraction'])}"
+            f" — {_num(rs['mass_lift_per_opened_window'], 2)}x the mass per "
+            "opened window of a uniform pick.",
+            f"- Hindsight pick of the same size (best per-step group share): "
+            f"{_ci_pct(rs['oracle_recall_mean'], rs['oracle_recall_ci_lower'], rs['oracle_recall_ci_upper'])}"
+            f"; gate efficiency {_ci_pct(rs['gate_efficiency_mean'], rs['gate_efficiency_ci_lower'], rs['gate_efficiency_ci_upper'])}.",
+            f"- Worst head: {_pct(rs['worst_head_overall'])} overall; "
+            f"{_pct(rs['heads_below_0.99'])} of (trace, head) pairs under 99%, "
+            f"{_pct(rs['heads_below_0.50'])} under 50%. Head-steps holding "
+            f">= {_pct(rs['min_q_share'])} of their mass in int2: median recall "
+            f"{_pct(rs['step_recall_median'])}, 5th percentile "
+            f"{_pct(rs['step_recall_p05'])}, {_pct(rs['head_steps_below_0.50'])} "
+            "under 50%.",
+            "",
+            f"> At a {_pct(rs['realised_read_fraction'], 0)} read ratio the gate "
+            f"opens the int2 windows holding {_pct(rs['head_recall_mean'])} of "
+            f"each query head's int2-tier attention on real decoding, "
+            f"{_pct(rs['gate_efficiency_mean'])} of what a hindsight pick of "
+            "the same size reaches.",
+            ""]
+    else:
+        lines += ["- The gate did not run (or was not recorded) in this ours run, "
+                  "so every int2 window counts as read and recall is 1 by "
+                  "construction.", ""]
+    if rs["head_mass_source"] != "recorded_head_step_mass":
+        lines += ["> **Caveat.** Per-head step mass was differenced from the fp16 "
+                  "cumulative scores; record the base run with "
+                  "`parity.record_head_step_mass=true`.", ""]
+    return lines
+
+
+def _obs5_lines(obs5: Dict[str, Any]) -> List[str]:
+    sm = obs5["summary"]
+    lines = ["", "## Observation V: tier dynamics (F / Q / E)", "",
+             "| lag | move | rate | pooled | count |", "| --- | --- | --- | --- | --- |"]
+    for r in obs5["rate_table"]:
+        lines.append(f"| {r['delta']} | `{r['from']}→{r['to']}` {r['move']} | "
+                     f"{_ci_pct(r['rate_mean'], r['ci_lower'], r['ci_upper'])} | "
+                     f"{_pct(r['pooled_rate'])} | {r['count']} |")
+    if obs5["entry_table"]:
+        lines += ["", "Windows leaving the local tail enter as: " + ", ".join(
+            f"{e['enters_as']} {_pct(e['fraction'])}" for e in obs5["entry_table"])
+            + "."]
+    lines += ["", f"Did the move land on future attention? (next {sm['horizon']} "
+              f"steps, {sm['events_scored']} events)", "",
+              "| move | count | share of candidates' future mass | lift |",
+              "| --- | --- | --- | --- |"]
+    for r in obs5["outcome_table"]:
+        lines.append(f"| `{r['move']}` | {r['count']} | "
+                     f"{_ci_pct(r['future_mass_share'], r['share_ci_lower'], r['share_ci_upper'])} | "
+                     f"{_ci_num(r['lift'], r['lift_ci_lower'], r['lift_ci_upper'], 2)} |")
+    lines += [
+        "",
+        f"- Swap gain (lift of promoted − lift of demoted): "
+        f"{_ci_num(sm['swap_gain_mean'], sm['swap_gain_ci_lower'], sm['swap_gain_ci_upper'], 2)}.",
+        f"- Hindsight hit rates: promotions into the best fp set "
+        f"{_ci_pct(sm['hit_promote_mean'], sm['hit_promote_ci_lower'], sm['hit_promote_ci_upper'])}"
+        f" (n={sm['hit_promote_count']}); demotions out of it "
+        f"{_ci_pct(sm['hit_demote_mean'], sm['hit_demote_ci_lower'], sm['hit_demote_ci_upper'])}"
+        f"; evictions outside the best retained set "
+        f"{_ci_pct(sm['hit_evict_mean'], sm['hit_evict_ci_lower'], sm['hit_evict_ci_upper'])}"
+        f"; fp precision {_ci_pct(sm['fp_precision_mean'], sm['fp_precision_ci_lower'], sm['fp_precision_ci_upper'])}.",
+        f"- Eviction regret (candidates' future mass on windows evicted at the "
+        f"event): {_ci_pct(sm['eviction_regret_mean'], sm['eviction_regret_ci_lower'], sm['eviction_regret_ci_upper'])}.",
+        f"- Decision fidelity (Jaccard of the fp set vs the ground-truth ranking "
+        f"of the same survivors): "
+        f"{_ci_pct(sm['decision_fidelity_mean'], sm['decision_fidelity_ci_lower'], sm['decision_fidelity_ci_upper'])}.",
+        ""]
+    promote = next((r for r in obs5["outcome_table"] if r["move"] == "promote"), None)
+    if promote and promote["count"] > 0 and np.isfinite(float(promote["lift"])):
+        lines += [f"> Promotion is not bookkeeping noise: a window promoted from "
+                  f"int2 back to full precision receives "
+                  f"{_num(promote['lift'], 2)}x the average future attention of "
+                  f"the windows the eviction decided on, and "
+                  f"{_pct(sm['hit_promote_mean'])} of promotions land in the "
+                  "hindsight-best fp set.", ""]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1431,8 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, np.bool_):
         return bool(value)
     if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return _json_safe(value.item())
         return [_json_safe(v) for v in value.tolist()]
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
@@ -937,6 +1463,8 @@ def make_figures(
     obs3: Dict[str, Dict[str, Any]],
     out_dir: Path,
     dpi: int = 300,
+    obs4: Optional[Dict[str, Any]] = None,
+    obs5: Optional[Dict[str, Any]] = None,
 ) -> List[Path]:
     """Write the three paper figures; returns [] when matplotlib is absent."""
     if not HAS_MPL:
@@ -1015,6 +1543,67 @@ def make_figures(
         p = out_dir / f"observation3_revival_{label}.pdf"
         fig.tight_layout(); fig.savefig(p, dpi=dpi, bbox_inches="tight"); plt.close(fig)
         written.append(p)
+
+    if obs4 is not None:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+        rows = [r for r in obs4["ledger_table"] if r["part"] in QM.LEDGER_PARTS]
+        left = 0.0
+        for r in rows:
+            v = float(r["share_of_head_mass"]) if np.isfinite(
+                float(r["share_of_head_mass"])) else 0.0
+            axes[0].barh([0], [v], left=left, label=r["part"])
+            left += v
+        axes[0].set(xlim=(0, 1), yticks=[], xlabel="Share of each head's mass",
+                    title="Decode read ledger")
+        axes[0].legend(fontsize=7, ncol=4, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.25))
+        lt = obs4["layer_table"]
+        if lt:
+            axes[1].plot([r["layer"] for r in lt],
+                         [r["head_recall_mean"] for r in lt], "o-", label="gate")
+            axes[1].plot([r["layer"] for r in lt],
+                         [r["oracle_recall_mean"] for r in lt], "s--",
+                         label="hindsight pick, same size")
+            axes[1].plot([r["layer"] for r in lt],
+                         [r["worst_head"] for r in lt], "v:", label="worst head")
+        axes[1].set(xlabel="Layer", ylabel="Per-head int2 recall", ylim=(0, 1.02))
+        axes[1].legend(fontsize=8)
+        hr = obs4["head_recall"][np.isfinite(obs4["head_recall"])]
+        if hr.size:
+            axes[2].hist(hr, bins=np.linspace(0, 1, 41))
+        axes[2].set(xlabel="Per-(trace, head) recall", ylabel="count",
+                    title="Recall distribution")
+        p = out_dir / "observation4_read_ledger.pdf"
+        fig.tight_layout(); fig.savefig(p, dpi=dpi, bbox_inches="tight"); plt.close(fig)
+        written.append(p)
+
+    if obs5 is not None:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+        pooled = obs5["pooled_transition"]
+        im = axes[0].imshow(pooled, vmin=0, vmax=1)
+        for a in range(3):
+            for b in range(3):
+                v = pooled[a, b]
+                axes[0].text(b, a, f"{v:.3f}" if np.isfinite(v) else "nan",
+                             ha="center", va="center")
+        axes[0].set_xticks(range(3), [f"to {n}" for n in QM.STATE_NAMES])
+        axes[0].set_yticks(range(3), [f"from {n}" for n in QM.STATE_NAMES])
+        axes[0].set_title("Tier transitions (lag 1)")
+        fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.04)
+        rows = obs5["outcome_table"]
+        x = np.arange(len(rows))
+        lift = np.array([float(r["lift"]) for r in rows])
+        lo = np.array([float(r["lift_ci_lower"]) for r in rows])
+        hi = np.array([float(r["lift_ci_upper"]) for r in rows])
+        err = np.vstack([np.nan_to_num(lift - lo), np.nan_to_num(hi - lift)])
+        axes[1].bar(x, np.nan_to_num(lift), yerr=err, capsize=3)
+        axes[1].axhline(1.0, color="k", linestyle=":")
+        axes[1].set_xticks(x, [r["move"] for r in rows], rotation=30, ha="right")
+        axes[1].set(ylabel="Future-mass lift over candidates",
+                    title=f"Move outcomes (H={obs5['summary']['horizon']})")
+        p = out_dir / "observation5_tier_dynamics.pdf"
+        fig.tight_layout(); fig.savefig(p, dpi=dpi, bbox_inches="tight"); plt.close(fig)
+        written.append(p)
     return written
 
 
@@ -1026,6 +1615,8 @@ def write_outputs(
     out_dir: Path,
     meta: Dict[str, Any],
     figures: bool = True,
+    obs4: Optional[Dict[str, Any]] = None,
+    obs5: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Write CSVs, JSON, markdown, raw npz and (optionally) figures."""
     out_dir = Path(out_dir)
@@ -1047,7 +1638,18 @@ def write_outputs(
         _write_csv(out_dir / f"observation3_primary_episodes_{label}.csv",
                    res["primary_episode_rows"])
 
-    summary_md = build_paper_summary(inp, obs1, obs2, obs3)
+    if obs4 is not None:
+        _write_csv(out_dir / "observation4_ledger_table.csv", obs4["ledger_table"])
+        _write_csv(out_dir / "observation4_recall_summary.csv",
+                   [obs4["recall_summary"]])
+        _write_csv(out_dir / "observation4_layer_table.csv", obs4["layer_table"])
+    if obs5 is not None:
+        _write_csv(out_dir / "observation5_rate_table.csv", obs5["rate_table"])
+        _write_csv(out_dir / "observation5_entry_table.csv", obs5["entry_table"])
+        _write_csv(out_dir / "observation5_outcome_table.csv", obs5["outcome_table"])
+        _write_csv(out_dir / "observation5_summary.csv", [obs5["summary"]])
+
+    summary_md = build_paper_summary(inp, obs1, obs2, obs3, obs4=obs4, obs5=obs5)
     (out_dir / "paper_results.md").write_text(summary_md, encoding="utf-8")
 
     results = {
@@ -1080,6 +1682,14 @@ def write_outputs(
             for label, res in obs3.items()
         },
     }
+    if obs4 is not None:
+        results["observation4"] = {k: obs4[k] for k in
+                                   ("ledger_table", "recall_summary", "layer_table")}
+    if obs5 is not None:
+        results["observation5"] = {
+            "rate_table": obs5["rate_table"], "entry_table": obs5["entry_table"],
+            "outcome_table": obs5["outcome_table"], "summary": obs5["summary"],
+            "pooled_transition": obs5["pooled_transition"]}
     with open(out_dir / "all_results.json", "w", encoding="utf-8") as f:
         json.dump(_json_safe(results), f, indent=2)
 
@@ -1102,6 +1712,17 @@ def write_outputs(
         arrays[f"lir_ci_lower__{label}"] = res["lir_ci_lower"]
         arrays[f"lir_ci_upper__{label}"] = res["lir_ci_upper"]
         arrays[f"time_to_revival__{label}"] = res["time_to_revival"]
+    if obs4 is not None:
+        arrays["ledger_by_trace"] = obs4["ledger_by_trace"]
+        arrays["ledger_parts"] = np.array(QM.LEDGER_PARTS)
+        arrays["head_recall"] = obs4["head_recall"]
+        arrays["oracle_recall"] = obs4["oracle_recall"]
+    if obs5 is not None:
+        arrays["tier_states"] = inp.states
+        arrays["transition_counts"] = obs5["transition_counts"]
+        arrays["decision_fidelity"] = obs5["decision_fidelity"]
+        for k, v in obs5["outcomes_by_trace"].items():
+            arrays[f"outcome__{k}"] = v
     npz_path = out_dir / "qevict_observations.npz"
     np.savez_compressed(str(npz_path), **arrays)
     # Sidecar, matching every other suite's output convention.
@@ -1111,7 +1732,7 @@ def write_outputs(
                   default=str)
 
     if figures:
-        make_figures(inp, obs1, obs2, obs3, out_dir)
+        make_figures(inp, obs1, obs2, obs3, out_dir, obs4=obs4, obs5=obs5)
     log.info("Saved QEvict observations to %s", out_dir.resolve())
     return npz_path
 
@@ -1146,8 +1767,10 @@ def run_observations(
     n_boot: int = DEFAULTS["bootstrap_samples"],
     seed: int = DEFAULTS["seed"],
     figures: bool = True,
+    min_q_share: float = DEFAULTS["min_q_share"],
+    tier_deltas: Sequence[int] = DEFAULTS["tier_deltas"],
 ) -> Dict[str, Any]:
-    """End-to-end: load the parity pair, compute all three observations, write."""
+    """End-to-end: load the parity pair, compute all five observations, write."""
     t0 = time.time()
     base = load_parity_npz(base_npz)
     ours = load_parity_npz(ours_npz)
@@ -1193,6 +1816,19 @@ def run_observations(
     obs2 = analyse_window_level_decisions(
         inp, fmm_horizon, pairs, confidence, n_boot, seed + 100)
 
+    rp = read_path_info(ours["metadata"])
+    if rp["read_path"] == "NOT-GATED":
+        log.warning(
+            "the ours run should have gated and did not (read_gate verdict %r). "
+            "It is not the shipped method; Observation IV describes a different "
+            "read path than the one the paper reports.", rp["read_gate_verdict"])
+    elif rp["read_path"] in ("gated-unrecorded", "unknown"):
+        log.warning(
+            "the ours npz does not record the read gate's pick (read path %r) — "
+            "Observation IV counts the whole int2 tier as read. Re-run "
+            "OursParityRunner (schema >= 1.3) on the flash backend.",
+            rp["read_path"])
+
     obs3 = {
         label: analyse_revival(
             sel, label, groups=inp.trace_group,
@@ -1206,9 +1842,16 @@ def run_observations(
         for off, (label, sel) in enumerate(
             (("oracle", inp.oracle_selected), ("policy_fp", inp.policy_selected)))
     }
+    obs4 = analyse_decode_reads(base, ours, inp, min_q_share=min_q_share,
+                                confidence=confidence, n_boot=n_boot,
+                                seed=seed + 300)
+    obs5 = analyse_tier_dynamics(inp, horizon=fmm_horizon, deltas=tier_deltas,
+                                 confidence=confidence, n_boot=n_boot,
+                                 seed=seed + 400)
 
     meta = {
-        "schema_version": "1.0",
+        # 1.1: Observations IV (read ledger) and V (tier dynamics), read path.
+        "schema_version": "1.1",
         "mode": "qevict_observations",
         "base_npz_path": base["path"],
         "base_npz_sha256": sha256_file(base["path"]),
@@ -1244,10 +1887,17 @@ def run_observations(
         "primary_lir_horizon": int(primary_lir_horizon),
         "primary_transition_delta": int(primary_transition_delta),
         "mass_source": inp.diagnostics["mass_source"],
+        "head_mass_source": obs4["recall_summary"]["head_mass_source"],
+        "min_q_share": float(min_q_share),
+        "tier_deltas": [int(d) for d in tier_deltas],
+        **rp,
+        "base_score_accum_dtype": inp.diagnostics.get("base_score_accum_dtype"),
     }
-    npz_path = write_outputs(inp, obs1, obs2, obs3, Path(out_dir), meta, figures)
+    npz_path = write_outputs(inp, obs1, obs2, obs3, Path(out_dir), meta, figures,
+                             obs4=obs4, obs5=obs5)
     return {"inputs": inp, "observation1": obs1, "observation2": obs2,
-            "observation3": obs3, "npz_path": npz_path, "metadata": meta}
+            "observation3": obs3, "observation4": obs4, "observation5": obs5,
+            "npz_path": npz_path, "metadata": meta}
 
 
 class QEvictObservationRunner:
@@ -1326,6 +1976,12 @@ def _cli_main() -> None:
                     default=DEFAULTS["bootstrap_samples"])
     ap.add_argument("--seed", type=int, default=DEFAULTS["seed"])
     ap.add_argument("--no-figures", action="store_true")
+    ap.add_argument("--min-q-share", type=float, default=DEFAULTS["min_q_share"],
+                    help="Observation IV: minimum int2 share of a head's mass for "
+                         "a head-step to count toward gate recall.")
+    ap.add_argument("--tier-deltas", type=int, nargs="+",
+                    default=list(DEFAULTS["tier_deltas"]),
+                    help="Observation V: F/Q/E transition lags (events).")
     args = ap.parse_args()
 
     res = run_observations(
@@ -1350,10 +2006,13 @@ def _cli_main() -> None:
         n_boot=args.bootstrap_samples,
         seed=args.seed,
         figures=not args.no_figures,
+        min_q_share=args.min_q_share,
+        tier_deltas=args.tier_deltas,
     )
     print(build_paper_summary(
         res["inputs"], res["observation1"], res["observation2"],
-        res["observation3"]))
+        res["observation3"], obs4=res["observation4"],
+        obs5=res["observation5"]))
     print(f"\nSaved all outputs to: {Path(args.output_dir).resolve()}")
 
 

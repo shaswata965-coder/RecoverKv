@@ -97,6 +97,40 @@ def reset_stats() -> None:
         _STATS[k] = 0
 
 
+#: Evaluation-only observer of the gate's pick. ``None`` in every production run.
+#:
+#: The counters above say THAT the gate ran and how much it read. They cannot say
+#: WHICH windows it read, and that is the question the observation suite has to
+#: answer: how much of each query head's real attention mass sat in the int2
+#: windows the gate opened, versus the ones it skipped and credited through
+#: their centroids (``modules/evaluation/qevict_observations.py``, Observation
+#: IV). The pick only exists inside :func:`_run_fused`, because the gate needs
+#: the query, so this is the one place it can be seen.
+#:
+#: Called as ``fn(layer_idx, sel, logmass)`` with the tensors the gate returned,
+#: after the gate and before the kernel. The observer must not modify them. The
+#: cost with no observer installed is one dict read per fused layer.
+_OBSERVER: dict = {"fn": None}
+
+
+def set_gate_observer(fn) -> None:
+    """Install ``fn(layer_idx, sel, logmass)``. Raises if one is already installed.
+
+    Refusing a second observer, rather than replacing it, keeps a stale observer
+    from an earlier run in the same process from being silently shadowed (or
+    silently kept, which would record one run's picks into another's arrays).
+    """
+    if _OBSERVER["fn"] is not None and fn is not None:
+        raise RuntimeError(
+            "a gate observer is already installed; clear_gate_observer() first")
+    _OBSERVER["fn"] = fn
+
+
+def clear_gate_observer() -> None:
+    """Remove the gate observer. Idempotent."""
+    _OBSERVER["fn"] = None
+
+
 #: Verdicts :func:`gate_report` can return, as stable strings a runner can store
 #: in its output and a reader can grep for.
 GATE_OK = "gated"
@@ -327,6 +361,9 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     _STATS["gated"] += 1
     _STATS["windows_read"] += int(sel.shape[-1])
     _STATS["windows_active"] += int(logmass.shape[-1])
+    observer = _OBSERVER["fn"]
+    if observer is not None:
+        observer(ctx["layer_idx"], sel, logmass)
 
     # 2. Attend over [sink | fp body | selected Q], scoring as it goes. The
     #    kernel also scores the windows it skipped, from `logmass`, AND attends

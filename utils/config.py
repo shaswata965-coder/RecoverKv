@@ -379,6 +379,22 @@ class ParityConfig:
     decoding: str = "greedy"
     record_full_attention: bool = False
     full_attention_sample_rate: int = 10
+    # Which field of a local jsonl / save_to_disk record is the article, and an
+    # optional "key=value" record filter (data/corpus_loader.py). A LongBench
+    # jsonl needs text_field "context": auto-detection reaches the short
+    # "input" question first. RULER needs record_filter "task=<name>".
+    text_field: Optional[str] = None
+    record_filter: Optional[str] = None
+    # Base run: also record the PER-QUERY-HEAD per-step window mass
+    # ([S, T, L, H_q, W] fp16, the size of `window_scores` again). The read gate
+    # selects per KV head, and anything that adds attention across query heads
+    # must normalise per head first (CLAUDE.md), so the observation suite's gate
+    # recall and read ledger need it; without it they fall back to differencing
+    # the fp16 cumulative array, which is noise past a few hundred steps.
+    record_head_step_mass: bool = False
+    # Ours run: record which int2 windows the read gate opened, per step, layer
+    # and KV head (flash backend with a Q tier only -- elsewhere nothing gates).
+    record_gate: bool = True
 
 
 @dataclass

@@ -52,7 +52,9 @@ silent no-cards case, which looks exactly like success everywhere else.
 of "should this have gated" (flash backend, `quant_ratio > 0`, CUDA), and
 `gate_report` turns the counters into one of four stable verdicts — `gated`,
 `not-expected`, `NOT-GATED-kernel-never-fired`, `NOT-GATED-partial`. LongBench,
-GSM8K and RULER record it as `read_gate` in their metadata sidecars; perf records
+GSM8K, RULER and the parity ours run record it as `read_gate` in their metadata
+sidecars (the parity run also records the gate's pick, `gate_read`, which the
+observation suite's read ledger scores per query head — `DISTANCE_TO_GOAL.md` §13); perf records
 it under `diagnostics.<config>.gate` and prints it under the table. **If that
 verdict is missing or is not `gated`, the number beside it is not a gated
 number.** `not-expected` is a pass: eager, or `quant_ratio = 0`, has no Q tier to
