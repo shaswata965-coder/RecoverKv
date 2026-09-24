@@ -147,6 +147,24 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
             all_tier_arr[:eW][is_q] = 1                        # int2 Q tier
     return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr, all_ids_full, all_tier_arr
 
+
+def forward_at(model, input_ids: Tensor, cache, pos: int, **kwargs):
+    """One forward at ABSOLUTE token position ``pos``; returns ``(out, pos')``.
+
+    A hand-written decode loop must pass ``cache_position`` itself. Omitted,
+    transformers derives it from ``cache.get_seq_length()`` -- the RETAINED key
+    count, which drops at every eviction -- so positions run backward and the
+    cache refuses (``WindowedCache._check_position_contract``). ``generate()``
+    advances it on its own; this does the same for the runners that loop by
+    hand. ``position_ids`` follow from it inside the model.
+    """
+    n = int(input_ids.shape[1])
+    cp = torch.arange(pos, pos + n, device=input_ids.device)
+    out = model(input_ids=input_ids, past_key_values=cache, use_cache=True,
+                return_dict=True, cache_position=cp, **kwargs)
+    return out, pos + n
+
+
 def _gate_read_row(all_ids_row: np.ndarray, picked_row: Optional[np.ndarray],
                    n_kv: int) -> np.ndarray:
     """``[H_kv, W]`` bool: which survivor columns the gate opened, per KV head.
@@ -472,6 +490,7 @@ class OursParityRunner:
                 gen_kwargs["output_attentions"] = True
 
             try:
+                pos = 0          # absolute token index, advanced by forward_at
                 with torch.no_grad():
                     for step in range(gen_len):
                         if step == 0:
@@ -482,8 +501,7 @@ class OursParityRunner:
                                 device=model.device,
                             )   # [Bc, 1]
                         recorder.clear()
-                        out = model(input_ids=inp, past_key_values=cache, use_cache=True,
-                                    return_dict=True, **gen_kwargs)
+                        out, pos = forward_at(model, inp, cache, pos, **gen_kwargs)
                         # cache.update() increments _generation_step AFTER the
                         # eviction check, so the step that was checked is
                         # (_generation_step - 1). Ask the policy's should_evict

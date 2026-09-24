@@ -35,7 +35,7 @@ from modules.evaluation import observation_collector as OC
 
 
 def test_taps_rebuild_the_models_own_query_and_output():
-    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("transformers")
     from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 
     torch.manual_seed(0)
@@ -90,6 +90,80 @@ def test_window_mass_and_merged_ids():
 # ---------------------------------------------------------------------------
 # 2. the recorder, on the real cache and the real gate
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 1b. the decode loop hands the cache an absolute position
+# ---------------------------------------------------------------------------
+
+
+def _evicting_llama():
+    """A tiny eager Llama over a real WindowedCache that evicts every step.
+
+    Window scores come from a forward hook (random, correctly shaped) in place
+    of the flash score kernel, which cannot run on CPU.
+    """
+    pytest.importorskip("transformers")
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from modules.windowed_cache.cache import WindowedCache
+    from modules.windowed_cache.config import WindowedCacheConfig
+    import warnings
+
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=256, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, max_position_embeddings=512)
+    cfg._attn_implementation = "eager"
+    model = LlamaForCausalLM(cfg).eval()
+    ws, ns, prefill, gen = 4, 2, 48, 24
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cache = WindowedCache(
+            config=WindowedCacheConfig(
+                window_size=ws, num_sink_tokens=ns, local_window_size=ws,
+                cache_budget=0.35, quant_ratio=0.5, first_eviction_step=0),
+            prefill_len=prefill, model_config=cfg, kv_dtype=torch.float32,
+            rope_module=model.model.rotary_emb, num_layers=2, max_tokens=gen)
+    g = torch.Generator().manual_seed(1)
+
+    def scores(layer):
+        def hook(*_):
+            st, store = cache._states[layer], cache._stores[layer]
+            n_q = store.num_active_windows if store is not None else 0
+            w = -(-(st.seq_length - ns) // ws) + int(n_q)
+            cache.cache_kwargs.setdefault(layer, {})["window_scores"] = (
+                torch.rand(1, cfg.num_attention_heads, w, generator=g))
+        return hook
+
+    for i, blk in enumerate(model.model.layers):
+        blk.self_attn.register_forward_hook(scores(i))
+    return model, cache, torch.randint(0, 256, (1, prefill)), gen
+
+
+def test_decode_loop_passes_an_absolute_cache_position():
+    """Regression: the collector's loop omitted ``cache_position``, so
+    transformers derived it from the RETAINED key count, which runs backward at
+    the first eviction -- on the GPU, "cache_position starts at 353 but 513
+    tokens have been appended". ``forward_at`` passes it explicitly."""
+    from modules.evaluation.ours_parity_runner import forward_at
+
+    model, cache, ids, gen = _evicting_llama()
+    with torch.no_grad():
+        inp, pos = ids, 0
+        for _ in range(gen):
+            out, pos = forward_at(model, inp, cache, pos)
+            inp = out.logits[:, -1].argmax(-1, keepdim=True)
+    assert pos == ids.shape[1] + gen - 1                 # step 0 is the prefill
+    assert cache._tokens_seen == pos
+    assert cache.get_seq_length() < pos                    # it did evict
+
+    model, cache, ids, gen = _evicting_llama()
+    with torch.no_grad(), pytest.raises(RuntimeError,
+                                        match="cache_position starts at"):
+        inp = ids
+        for _ in range(gen):
+            out = model(input_ids=inp, past_key_values=cache, use_cache=True)
+            inp = out.logits[:, -1].argmax(-1, keepdim=True)
 
 
 class _Rope(torch.nn.Module):

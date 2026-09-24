@@ -729,7 +729,7 @@ class ObservationCollector:
         cfg = self.cfg
         from data.corpus_loader import CorpusLoader
         from modules.evaluation.base_parity_runner import select_parity_articles
-        from modules.evaluation.ours_parity_runner import GateRecorder
+        from modules.evaluation.ours_parity_runner import GateRecorder, forward_at
         from modules.windowed_cache import (WindowedCache, WindowedCacheConfig,
                                             flash_decode, install_score_hooks)
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -856,12 +856,14 @@ class ObservationCollector:
             fwd_kw = {"output_attentions": True} if cfg.backend == "eager" else {}
             try:
                 with torch.no_grad():
-                    inp = ids
+                    inp, pos = ids, 0
                     for t in range(T):
                         state["t"] = t
                         gate.clear()
-                        out = model(input_ids=inp, past_key_values=cache,
-                                    use_cache=True, return_dict=True, **fwd_kw)
+                        # Explicit, monotonic cache_position: derived, it would
+                        # be the RETAINED key count and run backward after the
+                        # first eviction (the cache refuses that).
+                        out, pos = forward_at(model, inp, cache, pos, **fwd_kw)
                         lp = torch.log_softmax(out.logits[0, -1].float(), -1)
                         nxt = int(lp.argmax())
                         top = lp.topk(5)
