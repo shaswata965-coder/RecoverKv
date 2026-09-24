@@ -1915,3 +1915,25 @@ Pinned on CPU through the real compiled eviction (`tests/test_promotion_knobs.py
 15): Bidir promotes and OneWay never does, at identical fp/int2 counts every
 step; the oracle's promoted windows are bit-identical to what was fed while
 dequant's differ by the int2 error. Not run on a GPU.
+
+### 13.2 One run, every datapoint: the observation collector
+
+`scripts/collect_observations.sh` (`modules/evaluation/observation_collector.py`)
+takes a model path, a dataset, the window size, cache budget, gate ratio and
+quant ratio, runs `--num-samples` prompts of `--prefill` tokens (default 512)
+plus `--gen` greedy decode steps (default 512) through the real cache, and
+writes one zip: `meta.json`, `SCHEMA.md`, `sample_NNN.npz`.
+
+No second run is needed for ground truth: `update()` is wrapped so a shadow of
+the full, never-evicted KV sits beside the cache, and at every step and layer
+the model's own post-RoPE query (off `q_proj`) is scored against it. So every
+per-step array -- full-KV window mass per head, tiers, the gate's per-KV-head
+pick and the card estimates it ranked on, the cache's own per-step mass (fill
+included), the exact ranking signal of every eviction, int2 reconstruction
+error, and a five-rung attention-output ladder (full / kept-original /
+kept-int2 / held / actual) that isolates eviction, quantization, the promotion
+payload and the read gate per head -- comes from one trajectory.
+`observation_collector export` writes the parity-npz pair the observation suite
+reads. CPU-only so far (`tests/test_observation_collector.py`, 9: the taps
+reproduce a tiny Llama's own attention output to 1e-5; the recorder on the real
+cache and gate; zip -> export -> Observations I-V); never run on a GPU.

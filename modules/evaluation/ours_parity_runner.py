@@ -181,13 +181,20 @@ class GateRecorder:
     def __init__(self) -> None:
         self.cache = None
         self.picks: Dict[int, Tensor] = {}
+        # The card estimates the gate ranked on, [B, H_q, n_active] in active
+        # order, and those active ids -- kept for callers that score the card
+        # itself (modules/evaluation/observation_collector.py).
+        self.logmass: Dict[int, Tensor] = {}
+        self.active_ids: Dict[int, Tensor] = {}
 
     def bind(self, cache) -> None:
         self.cache = cache
-        self.picks = {}
+        self.clear()
 
     def clear(self) -> None:
         self.picks = {}
+        self.logmass = {}
+        self.active_ids = {}
 
     def __call__(self, layer_idx: int, sel: Tensor, logmass: Tensor) -> None:
         ids = self.cache._stores[layer_idx].active_ids()        # [B, n_active]
@@ -201,6 +208,8 @@ class GateRecorder:
         B, hk, n = sel.shape
         self.picks[layer_idx] = torch.gather(
             ids, 1, sel.long().reshape(B, hk * n)).reshape(B, hk, n)
+        self.logmass[layer_idx] = logmass.detach()
+        self.active_ids[layer_idx] = ids
 
     def host(self) -> Dict[int, np.ndarray]:
         """``{layer: [B, H_kv, n_sel] int64 window ids}`` for this step."""
