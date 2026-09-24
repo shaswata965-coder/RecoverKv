@@ -263,9 +263,12 @@ one per-window block is the real fix and needs a GPU to verify.
   int2 storage matches `int2_qwen`'s to three digits at every layer, as do the
   scoring, policy and geometry. What is left runs only on the GPU: the fused
   decode kernel and the Triton prefill score kernel, which no GPU check has
-  ever compared against anything but themselves. Run
-  `scripts/check_fused_vs_torch.py` and the `q0` arm next. The history below
-  is how it got here.
+  ever compared against anything but themselves. **Both were then checked on
+  the GPU against PyTorch and are right** (prefill scores 1.5e-6, identical
+  kept set; decode 2e-3 median -- Round 9). Every measured component matches
+  QEvict; the next thing to check is how the QEvict column was produced (its
+  meta.json sidecars), not more machinery. The history below is how it got
+  here.
 * **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
   Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate

@@ -21,6 +21,37 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 9 — both GPU kernels verified against PyTorch: the machinery matches QEvict everywhere it has been measured
+
+`scripts/check_fused_vs_torch.py`, gate100 config, triviaqa, GPU:
+- **Prefill score kernel vs an exact causal softmax sum, 84 scoring calls:**
+  relative L1 median 1.5e-6 (worst 5.7e-6); top-20% window Jaccard 1.000 on
+  every call. The kept set is exactly what exact attention would choose.
+- **Fused decode kernel vs PyTorch attention over the same cache:** median
+  1.8e-3 to 4.8e-3 per layer (bf16/TF32 rounding), p90 under 1.4e-2 except
+  layer 0 (median 1.3e-2, p90 7.1e-2, max 1.0; layer 27 max 0.46). The layer-0
+  tail is the REFERENCE's rounding: `effective_q_tier` returns bf16 keys, and in
+  layer 0's massive static channels (~230 post-RoPE) bf16 steps by 1.0. Read at
+  fp32, the store's own layer-0 int2 error drops from 0.169 / 0.855 (median /
+  p90) to 0.132 / 0.747 while layers 14 and 27 do not move. The kernel reads at
+  fp32 (TF32), so at layer 0 it is closer to exact than a bf16 materialize path
+  -- QEvict's -- not further.
+
+So every component that selects or reads the cache has now been measured equal
+to `int2_qwen`'s or to exact attention: prefill scores, policy, schedule
+(`should_evict` is the same code), geometry, int2 storage, the decode read.
+And the column still sits ~6 points under full where QEvict's does not. The
+remaining unmeasured difference is **the QEvict column itself**: it was not
+produced in this environment. Its pattern is that of a column whose short
+answers were produced at FULL cache -- above this runner's full column on
+triviaqa (+2.2) and trec (+1.5), where answers are a few tokens, and BELOW
+this branch on qasper (35.74 vs 37.13), where answers run to 128 tokens.
+`first_eviction_step > 0`, a different runner, or a different commit would
+each do that. Its `<dataset>.meta.json` sidecars record the invocation
+(`first_eviction_step`, `quant_ratio`, `cache_budget`, the resolved geometry);
+read them before any more machinery work, and re-run `int2_qwen` on this
+runner if they do not match.
+
 ### Round 8 — gate 1.0 is QEvict's read path and still loses: the gap is the rest of the machinery
 
 GPU, 200 examples per dataset, commit `bce166c`:
