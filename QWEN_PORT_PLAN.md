@@ -21,6 +21,65 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 8 — gate 1.0 is QEvict's read path and still loses: the gap is the rest of the machinery
+
+GPU, 200 examples per dataset, commit `bce166c`:
+
+| dataset | full | ours (gate 0.25) | gate100 (1.00) | QEvict |
+|---|---|---|---|---|
+| triviaqa | 87.43 | 81.15 | 79.94 | 89.63 |
+| trec | 65.50 | 62.50 | 62.50 | 67.00 |
+| qasper | 44.66 | 37.13 | 37.64 | 35.74 |
+| musique | 27.72 | 20.78 | 21.65 | 24.37 |
+| narrativeqa | 24.92 | 17.79 | 17.66 | -- |
+| average (5) | 50.05 | 43.87 | 43.88 | |
+
+At gate 1.0 every int2 window is read exactly -- QEvict's read path -- and the
+column does not move (43.88 vs 43.87). So the Qwen gap to QEvict is in what the
+two branches do NOT share, and it is not the gate. The same cache costs Llama
+~1 point against its own full column; it costs Qwen 6.
+
+**Ruled out on CPU, both branches' OWN code on the same real Qwen2.5-7B
+activations** (4 LongBench prompts, ~6K tokens, all 28 layers;
+`scripts/measure_gate_real_cpu.py --dump-dir`, `scripts/compare_int2_store.py`
+run once per branch):
+- scoring semantics: both sum `softmax(q k^T)` over prefill query rows per
+  window from q_proj's output (bias included) + RoPE;
+- the eviction policy: identical code (rank by mean-over-heads score, top k_fp
+  fp, next N_q int2);
+- the geometry: same `top_k_fp`, `N_q` within 1.7% (the card is priced in);
+- **the int2 storage**: the one-byte grid + key anchor here against
+  `int2_qwen`'s per-entry bf16 grid, each through its own unrotate ->
+  `demote_many` -> `effective_q_tier`, give the same attention output error to
+  three digits at every layer (pooled median 0.0354 vs 0.0356, p90 0.323 vs
+  0.325), the same logit bias and the same int2-tier mass shift (+0.107 vs
+  +0.108 nats median).
+
+**Found, shared by both branches, so not the gap:** YaRN folds a = 1.1386 into
+cos/sin and HF hands them back in bf16, where 1.1386 rounds to 1.140625. The
+int2 path un-rotates with the rounded tables, divides out the EXACT a^2, and
+re-rotates with the rounded tables, so an int2 key comes back ~0.36% large in
+the static RoPE pairs -- where Qwen keeps its largest key biases (206 per pair
+at layer 0). At layer 0 that is a +0.17 nat logit bias on every int2 token
+(both branches); elsewhere it is under 0.05. Llama is fp16 with a = 1 and has
+none of it. Cheap to fix later (divide by the rounded a^2, or un-rotate in
+fp32); it does not explain the difference between the two columns.
+
+**What is left runs only on the GPU**, and nothing has ever checked it against
+anything but itself:
+- the fused two-tier decode kernel (bf16 inputs, the KEY_ANCHOR and rep-7
+  specializations): every GPU check compared it with the same kernel at another
+  gate ratio;
+- the Triton prefill score kernel, which decides the kept set from flash's
+  captured softmax normaliser L -- a mismatched L (layout, scale, the GQA
+  expansion Qwen2FlashAttention2 does before flash) changes every eviction and
+  raises nothing;
+- the compiled eviction and the decode-time promote/demote dynamics.
+
+`scripts/check_fused_vs_torch.py` checks the first two against PyTorch on real
+decode and prefill steps (minutes); the `q0` arm separates the int2 tier from
+the eviction.
+
 ### Round 7 — the gate sweep is flat: the gate is NOT the Qwen gap
 
 LongBench, Qwen2.5-7B, flash, q = 0.70, budget 0.20, GPU; the realised read

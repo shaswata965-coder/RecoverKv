@@ -214,6 +214,10 @@ def main():
                     help="directory holding LongBench's triviaqa/narrativeqa/musique .jsonl "
                          "(unzip data.zip from the THUDM/LongBench dataset repo)")
     ap.add_argument("--out-dir", default="outputs/gate_real")
+    ap.add_argument("--dump-dir", default=None,
+                    help="also save each layer's K/V/queries/prefill scores here "
+                         "(bf16, ~1 GB for Qwen at 4 prompts) for "
+                         "scripts/compare_int2_store.py")
     args = ap.parse_args()
     if args.summarize:
         return summarize(args.summarize, args.out_dir)
@@ -314,6 +318,15 @@ def main():
                 attn[hq] = pr @ v[kv]
                 colsum[hq] = pr.sum(0)
                 del lg, pr
+            if args.dump_dir:
+                # Real per-layer tensors for scripts/compare_int2_store.py.
+                os.makedirs(args.dump_dir, exist_ok=True)
+                torch.save({"k": k.to(torch.bfloat16), "v": v.to(torch.bfloat16),
+                            "q_last": q[:, -args.nq:].transpose(0, 1).contiguous()
+                            .to(torch.bfloat16),
+                            "colsum": colsum, "name": name,
+                            "gen": gen[name.split("[")[0]]},
+                           os.path.join(args.dump_dir, f"L{L:02d}_p{pi}.pt"))
             r = measure_layer(k, v, q[:, -args.nq:].transpose(0, 1).contiguous(),
                               colsum, resolved[pi], cfg, None, ratios, M["head_norm"])
             if r is not None:

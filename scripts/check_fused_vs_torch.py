@@ -1,4 +1,4 @@
-"""Does the fused two-tier decode kernel compute attention? Checked against PyTorch.
+"""Do the two Triton kernels compute what they claim? Checked against PyTorch.
 
 Every GPU check of the decode path so far compared the fused kernel with ITSELF
 (gate 0.25 vs sel=None through the same kernel), so a kernel that is wrong on
@@ -18,6 +18,14 @@ PyTorch dequantize + re-rotate, i.e. QEvict's read path.
 
     python scripts/check_fused_vs_torch.py \\
         --config configs/longbench_qwen_ours_gate100.yaml --dataset triviaqa
+
+It also checks the Triton PREFILL score kernel, which decides the kept set: at
+every prefill scoring call it recomputes ``softmax(scale q k^T)`` summed over
+query rows in fp32 (causal, no flash LSE) and reports the relative error of the
+per-key scores and the Jaccard overlap of the windows each would rank into the
+top 20%. The kernel reuses flash's softmax normaliser L; if that L is not the
+one these q and k produce (layout, scale, the GQA expansion), the scores -- and
+every eviction -- are wrong while nothing raises.
 
 Reading it: ``kernel_vs_torch`` should be ~1e-3 (bf16 inputs, TF32 dots). A
 layer at 1e-1 or worse is a kernel that does not compute attention there. Run
@@ -100,7 +108,53 @@ def install(max_steps: int):
         return out
 
     flash_decode._run_fused = wrapped
-    return stats, lambda: setattr(flash_decode, "_run_fused", orig)
+
+    # ---- prefill score kernel vs an exact recompute ----
+    from modules.windowed_cache import hooks
+    orig_scores = hooks.compute_token_scores
+    layer_ctr = {"i": 0}
+
+    def scores_wrapped(q, k, scaling, **kw):
+        out = orig_scores(q, k, scaling, **kw)
+        if q.shape[2] <= 1:
+            return out
+        with torch.no_grad():
+            B, Hq, T, D = q.shape
+            Hkv, S = k.shape[1], k.shape[2]
+            rep = Hq // Hkv
+            ref = torch.zeros(B, Hq, S, dtype=torch.float32, device=q.device)
+            q5 = q.float().reshape(B, Hkv, rep, T, D)
+            kt = k.float().unsqueeze(2).transpose(-1, -2)          # [B,Hkv,1,D,S]
+            for s0 in range(0, T, 512):
+                e0 = min(s0 + 512, T)
+                lg = torch.matmul(q5[:, :, :, s0:e0], kt) * scaling
+                mask = torch.ones(e0 - s0, S, dtype=torch.bool, device=q.device).triu(
+                    S - T + s0 + 1)
+                lg = lg.masked_fill(mask, float("-inf"))
+                ref += torch.softmax(lg, -1).sum(-2).reshape(B, Hq, S)
+            got = out.float()
+            rel = ((got - ref).abs().sum(-1) / ref.abs().sum(-1).clamp_min(1e-12))
+            # windows the policy would rank: 8-token windows after the sinks,
+            # mean over heads, top 20%
+            sink, ws = 5, 8
+            nb = (S - sink) // ws * ws
+            def top(t):
+                w = t[:, :, sink:sink + nb].reshape(B, Hq, -1, ws).sum(-1).mean(1)
+                kk = max(1, int(0.2 * w.shape[-1]))
+                return set(w[0].topk(kk).indices.tolist())
+            a, b = top(got), top(ref)
+            L = layer_ctr["i"]
+            layer_ctr["i"] += 1
+            stats[f"prefill_{L}"]["score_rel_l1"].extend(rel.flatten().tolist())
+            stats[f"prefill_{L}"]["top20_jaccard"].append(len(a & b) / max(1, len(a | b)))
+        return out
+
+    hooks.compute_token_scores = scores_wrapped
+
+    def uninstall():
+        flash_decode._run_fused = orig
+        hooks.compute_token_scores = orig_scores
+    return stats, uninstall
 
 
 def main() -> None:
@@ -131,11 +185,20 @@ def main() -> None:
         t = torch.tensor(xs, dtype=torch.float64)
         return float(t.quantile(p)) if t.numel() else float("nan")
 
-    summary = {int(L): {f"{k}_{n}": q(v, p) for k, v in d.items()
+    summary = {str(L): {f"{k}_{n}": q(v, p) for k, v in d.items()
                         for n, p in (("median", .5), ("p90", .9), ("max", 1.0))}
                for L, d in stats.items()}
+    pre = {k: v for k, v in summary.items() if k.startswith("prefill_")}
+    summary = {int(k): v for k, v in summary.items() if not k.startswith("prefill_")}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(summary, indent=2))
+    Path(args.out).write_text(json.dumps({"decode": summary, "prefill": pre}, indent=2))
+    if pre:
+        rel = [v["score_rel_l1_median"] for v in pre.values()]
+        jac = [v["top20_jaccard_median"] for v in pre.values()]
+        print(f"\nprefill score kernel vs exact softmax, {len(pre)} scoring calls: "
+              f"relative L1 median {sorted(rel)[len(rel)//2]:.2e} (worst {max(rel):.2e}); "
+              f"top-20% window Jaccard median {sorted(jac)[len(jac)//2]:.3f} "
+              f"(worst {min(jac):.3f}). Expect ~1e-3 and ~1.0.")
     if not summary:
         print("No fused decode layer ran -- check read_gate in the sidecar.")
         return

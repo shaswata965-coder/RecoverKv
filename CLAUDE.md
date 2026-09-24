@@ -258,8 +258,14 @@ one per-window block is the real fix and needs a GPU to verify.
   cost points: the Qwen gate sweep is flat** (average 46.98 / 46.88 / 46.71 at
   0.25 / 0.50 / 0.75 over eight datasets, triviaqa ~81 at every ratio 0.10-0.75
   and every budget 5-20%), so **the gate is ruled out as the Qwen gap**
-  (Round 7). Next: the `full` and `q0` arms. The history below is how it got
-  here.
+  (Round 7). **gate 1.0 -- QEvict's read path -- still loses 6 points to full
+  where QEvict does not** (Round 8), and on real Qwen activations this branch's
+  int2 storage matches `int2_qwen`'s to three digits at every layer, as do the
+  scoring, policy and geometry. What is left runs only on the GPU: the fused
+  decode kernel and the Triton prefill score kernel, which no GPU check has
+  ever compared against anything but themselves. Run
+  `scripts/check_fused_vs_torch.py` and the `q0` arm next. The history below
+  is how it got here.
 * **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
   Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate
