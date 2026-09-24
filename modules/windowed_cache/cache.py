@@ -2102,12 +2102,17 @@ class WindowedCache(_HFCacheBase):
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
+                # `**joint_gate` first, then override only the row-sliced
+                # tensors: every non-tensor key (`n_sel`, `bits`, and whatever
+                # _gate_ctx grows next) passes through. Listing keys by hand
+                # dropped `bits` here while the per-layer path carried it, and
+                # _run_fused died on every layer-major decode.
                 "gate": None if joint_gate is None else {
+                    **joint_gate,
                     "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
                     "anchor": joint_gate["anchor"][r0:r0 + B],
                     "centroid": tuple(t[r0:r0 + B]
                                       for t in joint_gate["centroid"]),
-                    "n_sel": joint_gate["n_sel"],
                 },
             }
 

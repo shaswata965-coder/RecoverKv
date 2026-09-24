@@ -254,6 +254,124 @@ def test_the_store_demotes_selects_and_centroids_at_every_width(spec):
 
 
 # ---------------------------------------------------------------------------
+# through the layer-major cache, into _run_fused
+# ---------------------------------------------------------------------------
+
+
+class _Rope(torch.nn.Module):
+    """Deterministic rotary stub, shaped like HF's. ``x`` is not always a
+    head-dim tensor (HF passes it for dtype/device only), so ``d`` is fixed."""
+
+    def __init__(self, d: int):
+        super().__init__()
+        self.d = d
+
+    def forward(self, x, position_ids):
+        freqs = position_ids.to(torch.float32).unsqueeze(-1) * torch.arange(
+            1, self.d // 2 + 1, dtype=torch.float32) * 0.01
+        emb = torch.cat([freqs, freqs], dim=-1)
+        return emb.cos(), emb.sin()
+
+
+# Two widths, not all: the defect is width-independent and each case pays
+# ~90 s of CPU Inductor compiles for the eviction.
+@pytest.mark.parametrize("spec", [None, 2])
+def test_the_layer_major_decode_hands_run_fused_the_card_widths(spec, monkeypatch):
+    """Every decode step the production cache arms reaches ``fused_gate`` with
+    the widths the card was built at.
+
+    The layer-major rebuild re-slices ``_gate_ctx``'s dict per layer. It used to
+    list the keys by hand and dropped ``bits``, so ``_run_fused`` raised
+    ``KeyError: 'bits'`` on the first gated step of every run at every width,
+    the default included. The store-level tests above never build that dict.
+
+    The gate runs for real (its CPU reference, at ``spec``'s widths); only the
+    decode kernel is stubbed, because it is Triton-or-raise.
+    """
+    from modules.windowed_cache import flash_decode
+    from modules.windowed_cache.cache import WindowedCache
+    from modules.windowed_cache.config import WindowedCacheConfig
+
+    L, Bt, h_kv, h_q, d, ws, P = 2, 2, 2, 4, 16, 4, 32
+    model_cfg = types.SimpleNamespace(
+        num_key_value_heads=h_kv, num_attention_heads=h_q,
+        hidden_size=h_q * d, head_dim=d)
+    cache = WindowedCache(
+        config=WindowedCacheConfig(
+            window_size=ws, num_sink_tokens=0, local_window_size=ws,
+            cache_budget=0.35, quant_ratio=0.5, first_eviction_step=0,
+            quant_card_bits=spec),
+        prefill_len=P, model_config=model_cfg, kv_dtype=torch.float32,
+        rope_module=_Rope(d), num_layers=L, max_tokens=P + 64)
+    cache._fused_decode_active = True      # what hooks.py sets on a CUDA flash run
+    want = parse_card_bits(spec)
+
+    armed, gate_bits, vm_seen = [], [], []
+    real_gate = flash_decode.fused_gate
+
+    def spy_gate(*a, **kw):
+        gate_bits.append(kw.get("bits"))
+        return real_gate(*a, **kw)
+
+    def stub_decode(q_hd, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
+                    *, sel, logmass, centroids, vm_bits: int = 4):
+        vm_seen.append(vm_bits)
+        w = n_body_win + qtier["k_codes"].shape[1]
+        return (torch.zeros_like(q_hd),
+                torch.rand(q_hd.shape[0], q_hd.shape[1], w))
+
+    monkeypatch.setattr(flash_decode, "set_pending", armed.append)
+    monkeypatch.setattr(flash_decode, "fused_gate", spy_gate)
+    monkeypatch.setattr(flash_decode, "fused_two_tier_decode", stub_decode)
+
+    def merged_windows(i):
+        st, store = cache._states[i], cache._stores[i]
+        return -(-st.seq_length // ws) + store.num_active_windows
+
+    g = torch.Generator().manual_seed(0)
+    for i in range(L):
+        k = torch.randn(Bt, h_kv, P, d, generator=g)
+        cache.update(k, torch.randn_like(k), i,
+                     cache_kwargs={"cache_position": torch.arange(P)})
+    for i in range(L):
+        cache.cache_kwargs[i]["window_scores"] = torch.rand(
+            Bt, h_q, merged_windows(i), generator=g)
+
+    # Step 0 arms on the per-layer path, steps 1-2 on the joint one.
+    fused = joint_fused = 0
+    for t in range(3):
+        for i in range(L):
+            k = torch.randn(Bt, h_kv, 1, d, generator=g)
+            k_fp, v_fp = cache.update(
+                k, torch.randn_like(k), i,
+                cache_kwargs={"cache_position": torch.tensor([P + t])})
+            if not armed:
+                # No Q tier yet: the score hook's job, emulated.
+                cache.cache_kwargs[i]["window_scores"] = torch.rand(
+                    Bt, h_q, merged_windows(i), generator=g)
+                continue
+            ctx = armed.pop()
+            assert not armed
+            joint = cache._joint is not None
+            store = cache._joint_store if joint else cache._stores[i]
+            n = store.num_active_windows
+            # The gate dict must carry everything _gate_ctx builds.
+            ref = cache._gate_ctx(store, store.table.active_order(n), n)
+            assert ctx["gate"].keys() == ref.keys()
+            assert ctx["gate"]["bits"] == want
+            q = torch.randn(Bt, 1, h_q, d, generator=g)
+            flash_decode._run_fused(ctx, q, k_fp.transpose(1, 2),
+                                    v_fp.transpose(1, 2))
+            fused += 1
+            joint_fused += joint
+
+    assert joint_fused > 0, (
+        "no layer-major step armed the fused decode: the test proves nothing")
+    assert gate_bits == [want] * fused
+    assert vm_seen == [want.vm] * fused
+
+
+# ---------------------------------------------------------------------------
 # config and budget
 # ---------------------------------------------------------------------------
 
