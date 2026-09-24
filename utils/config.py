@@ -111,6 +111,8 @@ OPERATING_POINT_EXEMPT = {
     "ruler_qwen_niah_mk3_omega16.yaml":
         "the omega=16 arm; window_size is the ablation",
     "longbench_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "longbench_qwen_full_cache_native.yaml":
+        "the FullKV baseline on native RoPE -- no eviction at all",
     "gsm8k_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",
 }
 

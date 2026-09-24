@@ -267,8 +267,11 @@ one per-window block is the real fix and needs a GPU to verify.
   the GPU against PyTorch and are right** (prefill scores 1.5e-6, identical
   kept set; decode 2e-3 median -- Round 9). Every measured component matches
   QEvict; the next thing to check is how the QEvict column was produced (its
-  meta.json sidecars), not more machinery. The history below is how it got
-  here.
+  meta.json sidecars), not more machinery. **And every Qwen row -- FullKV
+  included -- runs static YaRN x4** (logits x1.296, 33/64 RoPE pairs changed
+  at lengths the model handles natively), while published baselines above our
+  Qwen FullKV run native RoPE: the `full_native` / `ours_native` arms (Round 10)
+  come before any more method work. The history below is how it got here.
 * **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
   Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate

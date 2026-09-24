@@ -131,3 +131,19 @@ def test_the_ablation_script_runs_its_arms_into_separate_dirs():
     r = subprocess.run(["bash", "-n", str(ROOT / "scripts/run_longbench_qwen_ablation.sh")],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize("native,yarn", [
+    ("longbench_qwen_full_cache_native.yaml", "longbench_qwen_full_cache.yaml"),
+    ("longbench_qwen_ours_native.yaml", "longbench_qwen_ours_flash_attn.yaml"),
+])
+def test_the_native_rope_rows_differ_only_in_the_positional_setup(native, yarn):
+    """The native pair is the YaRN pair with the checkpoint's own RoPE (no
+    rope_scaling, its 32768 window) and THUDM's 31500 truncation -- the cache
+    and the dtype are the same, so the two columns differ in RoPE alone."""
+    n, y = _load(native), _load(yarn)
+    assert n.model.rope_scaling is None and n.model.max_position_embeddings is None
+    assert n.model.dtype == y.model.dtype == "bfloat16"
+    assert n.cache == y.cache
+    assert n.longbench.max_length == 31500
+    assert n.longbench.output_dir != y.longbench.output_dir

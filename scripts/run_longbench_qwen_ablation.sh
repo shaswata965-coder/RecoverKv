@@ -21,6 +21,12 @@
 #            the same eviction with NO int2 tier (quant_ratio 0.0): no card,
 #            no fused two-tier kernel.
 #   full     configs/longbench_qwen_full_cache.yaml (no compression)
+#   full_native / ours_native
+#            configs/longbench_qwen_{full_cache,ours}_native.yaml: the same two
+#            rows on the checkpoint's NATIVE RoPE (no YaRN, prompts truncated to
+#            31500 as THUDM does for 32K models). Every other Qwen row runs
+#            static YaRN x4, which rescales every logit by 1.296 and changes 33
+#            of 64 RoPE pairs at lengths the model handles natively.
 #
 # What each comparison says:
 #   gate100 vs ours     -> what reading 25% of the int2 tier costs on Qwen
@@ -69,7 +75,7 @@ else
     DATASETS="trec triviaqa musique narrativeqa qasper"
 fi
 LIST="[$(echo "$DATASETS" | tr -s ' ' ',')]"
-ARMS="${ARMS:-full q0}"
+ARMS="${ARMS:-full_native ours_native}"
 ROOT_OUT="outputs/longbench/qwen_ablation"
 
 config_for() {
@@ -79,7 +85,9 @@ config_for() {
         gate50)  echo "configs/longbench_qwen_ours_gate50.yaml" ;;
         q0)      echo "configs/longbench_qwen_ours_q0.yaml" ;;
         full)    echo "configs/longbench_qwen_full_cache.yaml" ;;
-        *) echo "unknown arm: $1 (ours|gate100|gate50|q0|full)" >&2; exit 2 ;;
+        full_native) echo "configs/longbench_qwen_full_cache_native.yaml" ;;
+        ours_native) echo "configs/longbench_qwen_ours_native.yaml" ;;
+        *) echo "unknown arm: $1 (ours|gate100|gate50|q0|full|full_native|ours_native)" >&2; exit 2 ;;
     esac
 }
 

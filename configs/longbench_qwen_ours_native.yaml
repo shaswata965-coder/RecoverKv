@@ -1,0 +1,19 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours at the operating point, NATIVE RoPE
+# ============================================================================
+# longbench_qwen_ours_flash_attn.yaml with the model on its native positional
+# setup (no YaRN: max_position_embeddings 32768, no rope_scaling) and prompts
+# middle-truncated to 31500 tokens, as THUDM/LongBench does for 32K models.
+# The cache is unchanged: q 0.70, budget 0.20, gate 0.25. Compare against
+# longbench_qwen_full_cache_native.yaml, not the YaRN FullKV column.
+# With no YaRN, rope_attention_scaling is 1.0, so the int2 RoPE inverse is a
+# plain un-rotation (the a^2 division is a skipped branch).
+_base_: longbench_qwen_ours_flash_attn.yaml
+
+model:
+  max_position_embeddings: null
+  rope_scaling: null
+
+longbench:
+  max_length: 31500
+  output_dir: outputs/longbench/qwen_ours_native_compression_0.8

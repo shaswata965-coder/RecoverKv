@@ -1,0 +1,25 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, FullKV, NATIVE RoPE (no YaRN)
+# ============================================================================
+# The checkpoint's own positional setup: rope_theta 1e6, max_position_embeddings
+# 32768, no rope_scaling -- what Qwen2.5 was trained with and what published
+# LongBench baselines on this model run. Prompts over the window are
+# middle-truncated to 31500 tokens exactly as THUDM/LongBench does for 32K
+# models (most LongBench prompts fit untruncated).
+#
+# Why: every other Qwen config here runs STATIC YaRN x4 with
+# max_position_embeddings 131072 (QEvict's protocol). That rescales every logit
+# by a^2 = 1.296 and changes 33 of 64 RoPE frequency pairs (17 stretched 4x) at
+# lengths the model handles natively, which Qwen's model card warns degrades
+# shorter inputs; and published baselines at 20% compression score above this
+# repo's YaRN FullKV column. This row says what the model scores without it.
+# Pair with longbench_qwen_ours_native.yaml.
+_base_: longbench_qwen_full_cache.yaml
+
+model:
+  max_position_embeddings: null
+  rope_scaling: null
+
+longbench:
+  max_length: 31500
+  output_dir: outputs/longbench/qwen_full_cache_native

@@ -21,6 +21,41 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 10 — every Qwen column runs static YaRN; published baselines do not
+
+Published LongBench baselines on Qwen2.5-7B-Instruct (DefensiveKV and others,
+as tabulated in the QEvict paper) score ABOVE this repo's uncompressed Qwen
+column even at 20% compression. So the handicap is not only in the compressed
+rows: it is in the setup every Qwen row shares.
+
+Every Qwen config since Round 3 runs static YaRN x4 with
+`max_position_embeddings: 131072` (QEvict's protocol). Measured against the
+checkpoint's native RoPE (rope_theta 1e6, window 32768, no scaling):
+- every logit is multiplied by a^2 = 1.296 (YaRN's attention_scaling folded
+  into cos/sin) -- sharper attention at every length;
+- 33 of 64 RoPE frequency pairs are changed, 17 of them stretched 4x; at a
+  6000-token distance 8 pairs' angles move by more than 0.5 rad;
+- on transformers 4.47.1 `original_max_position_embeddings` is ignored, so this
+  is not even Qwen's documented YaRN (which changes 40 pairs).
+
+Qwen's model card advises adding rope_scaling only when long context is
+needed, because static YaRN can degrade shorter inputs -- and LongBench's
+prompts fit the native 32K window after THUDM's standard truncation. It also
+plausibly makes COMPRESSION cost more on Qwen than on Llama (Llama-3.1's rope
+has attention_factor 1): the 1.296 logit scale multiplies every int2 key error
+in nats by 1.3, and the bf16 rounding of a = 1.1386 is what leaves layer 0's
+int2 tier +0.17 nats hot (Round 8). With a = 1 both go away.
+
+Arms (`scripts/run_longbench_qwen_ablation.sh`, default now
+`ARMS="full_native ours_native"`): `longbench_qwen_full_cache_native.yaml` and
+`longbench_qwen_ours_native.yaml`, the same two rows on native RoPE with
+prompts middle-truncated to 31500. What they say:
+- full_native well above full -> the YaRN setup handicaps every Qwen column,
+  QEvict's included; re-baseline Qwen on native RoPE.
+- ours_native within ~1 of full_native (Llama's cost) -> YaRN was also why
+  compression cost 6 on Qwen. Still ~6 -> the int2 tier on Qwen is next
+  (`q0`).
+
 ### Round 9 — both GPU kernels verified against PyTorch: the machinery matches QEvict everywhere it has been measured
 
 `scripts/check_fused_vs_torch.py`, gate100 config, triviaqa, GPU:
