@@ -15,18 +15,27 @@
 #   gate100  configs/longbench_qwen_ours_gate100.yaml
 #            the same with every int2 window read exactly (quant_gate_ratio
 #            1.0): QEvict's read path through this branch's code.
+#   gate50   configs/longbench_qwen_ours_gate50.yaml
+#            the same reading half the tier (quant_gate_ratio 0.5).
 #   full     configs/longbench_qwen_full_cache.yaml (optional baseline)
 #
 # What each comparison says:
 #   gate100 vs ours     -> what reading 25% of the int2 tier costs on Qwen
+#   gate50 vs the two   -> whether that cost is the selection's capacity (rep 7
+#                          shares one selection among seven heads) or the card
 #   gate100 vs QEvict   -> what the rest of the machinery costs (one-byte
 #                          grid + anchor, Triton score/decode kernels)
+#
+# `ours` is not in the default ARMS: its 20% numbers on these datasets are
+# already measured (the budget sweep in QWEN_PORT_PLAN.md), and its one rerun
+# reproduced six of eight tasks to the digit and the other two within 0.31.
+# Add it back to compare within one build.
 #
 # Usage:
 #   scripts/run_longbench_qwen_ablation.sh                  # default datasets
 #   scripts/run_longbench_qwen_ablation.sh trec triviaqa    # choose datasets
 #   ARMS="gate100" scripts/run_longbench_qwen_ablation.sh   # one arm only
-#   ARMS="full ours gate100" ...                            # with the baseline
+#   ARMS="full ours gate50 gate100" ...                     # everything
 #
 # Check each arm's <dataset>.meta.json before quoting it: read_gate.verdict
 # must be "gated" and, on Qwen, read_gate.union "per-head".
@@ -39,23 +48,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-# The three tasks that fell against QEvict, plus two that did not (controls:
-# a cause of the gap should move the first three and leave these alone).
+# trec and triviaqa fell against QEvict at every budget (triviaqa is flat at
+# ~81.6 from 5% to 20%); musique and narrativeqa got WORSE as the budget grew
+# (20.7/23.5/25.2 and 18.3/23.7/22.7 at 20/10/5%) -- the signature of an error
+# that scales with the number of unread windows. qasper is the control: it
+# improved with budget and sits at parity with QEvict.
 if [ "$#" -gt 0 ]; then
     DATASETS="$*"
 else
-    DATASETS="trec triviaqa musique qasper multifieldqa_en"
+    DATASETS="trec triviaqa musique narrativeqa qasper"
 fi
 LIST="[$(echo "$DATASETS" | tr -s ' ' ',')]"
-ARMS="${ARMS:-ours gate100}"
+ARMS="${ARMS:-gate100 gate50}"
 ROOT_OUT="outputs/longbench/qwen_ablation"
 
 config_for() {
     case "$1" in
         ours)    echo "configs/longbench_qwen_ours_flash_attn.yaml" ;;
         gate100) echo "configs/longbench_qwen_ours_gate100.yaml" ;;
+        gate50)  echo "configs/longbench_qwen_ours_gate50.yaml" ;;
         full)    echo "configs/longbench_qwen_full_cache.yaml" ;;
-        *) echo "unknown arm: $1 (ours|gate100|full)" >&2; exit 2 ;;
+        *) echo "unknown arm: $1 (ours|gate100|gate50|full)" >&2; exit 2 ;;
     esac
 }
 

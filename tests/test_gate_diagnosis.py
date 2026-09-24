@@ -47,17 +47,69 @@ def test_the_full_read_measures_as_exact():
     m = gate_diagnosis.gate_error_metrics(out_g, out_f, wsum_f, nbw, sel, lm)
     assert m["out_err"].max() < 1e-5
     assert torch.allclose(m["recall"], torch.ones_like(m["recall"]), atol=1e-5)
+    assert m["skip_share"].abs().max() < 1e-6
+    assert torch.equal(m["skip_mass_err"], torch.zeros_like(m["skip_mass_err"]))
 
 
 def test_a_partial_read_reports_its_cost():
     out_g, out_f, wsum_f, nbw, sel, lm = _step(0.25)
     m = gate_diagnosis.gate_error_metrics(out_g, out_f, wsum_f, nbw, sel, lm)
-    assert set(m) == {"out_err", "card_tv", "recall", "q_share"}
+    assert set(m) == {"out_err", "card_tv", "recall", "q_share", "skip_share",
+                      "skip_mass_err"}
     assert all(t.shape == (1, 6) for t in m.values())
     assert (m["out_err"] > 0).all()
     assert ((m["recall"] > 0) & (m["recall"] <= 1 + 1e-6)).all()
     assert ((m["card_tv"] >= 0) & (m["card_tv"] <= 1 + 1e-6)).all()
     assert ((m["q_share"] > 0) & (m["q_share"] < 1)).all()
+    assert torch.allclose(m["skip_share"], m["q_share"] * (1 - m["recall"]),
+                          atol=1e-6)
+    assert torch.isfinite(m["skip_mass_err"]).all()
+
+
+def test_skip_mass_err_is_the_kernels_fill_against_the_truth():
+    """The metric is computed from the card alone; the oracle's GATED window
+    scores carry the fill the kernel actually applied. Their skipped:read mass
+    ratio against the full read's must be the same number -- or the metric
+    describes some other estimator than the one that ran."""
+    ratio, seed = 0.25, 3
+    out_g, out_f, wsum_f, nbw, sel, lm = _step(ratio, seed=seed)
+    m = gate_diagnosis.gate_error_metrics(out_g, out_f, wsum_f, nbw, sel, lm)
+
+    # Re-run the gated oracle to get its window scores (fill included).
+    g = torch.Generator().manual_seed(seed)
+    hkv, rep, n_q, n_fp = 2, 3, 40, 10
+    s_fp = SINK + n_fp * WS
+    S = s_fp + n_q * WS
+    q = torch.randn(1, hkv * rep, D, generator=g) * 2.0
+    k = torch.randn(1, hkv, S, D, generator=g)
+    k[0, :, s_fp::13] += 3.0
+    v = torch.randn(1, hkv, S, D, generator=g)
+    _, wsum_g = two_tier_window_reference(q, k, v, D ** -0.5, SINK, WS, nbw,
+                                          Sfp=s_fp, sel=sel, logmass=lm)
+    read = torch.zeros(1, hkv, n_q, dtype=torch.bool)
+    read.scatter_(-1, sel.long(), True)
+    read = read.repeat_interleave(rep, dim=1)
+    gq, fq = wsum_g[..., nbw:], wsum_f[..., nbw:]
+    applied = ((gq * ~read).sum(-1) / (gq * read).sum(-1)).log()
+    truth = ((fq * ~read).sum(-1) / (fq * read).sum(-1)).log()
+    assert torch.allclose(m["skip_mass_err"], applied - truth, atol=1e-4)
+
+
+def test_skip_mass_err_reads_zero_for_an_exact_card_and_its_sign_for_a_biased_one():
+    out_g, out_f, wsum_f, nbw, sel, _ = _step(0.25)
+    wq = wsum_f[..., nbw:]
+    exact = wq.clamp_min(1e-30).log()
+    m = gate_diagnosis.gate_error_metrics(out_g, out_f, wsum_f, nbw, sel, exact)
+    assert m["skip_mass_err"].abs().max() < 1e-4
+
+    read = torch.zeros(1, sel.shape[1], wq.shape[-1], dtype=torch.bool)
+    read.scatter_(-1, sel.long(), True)
+    read = read.repeat_interleave(wq.shape[1] // sel.shape[1], dim=1)
+    doubled = exact + torch.where(read, 0.0, math.log(2.0))    # skipped x2
+    m = gate_diagnosis.gate_error_metrics(out_g, out_f, wsum_f, nbw, sel, doubled)
+    assert torch.allclose(m["skip_mass_err"],
+                          torch.full_like(m["skip_mass_err"], math.log(2.0)),
+                          atol=1e-4)
 
 
 def test_card_tv_is_zero_for_an_exact_card_and_one_for_a_disjoint_one():

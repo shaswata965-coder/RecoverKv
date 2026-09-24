@@ -48,6 +48,7 @@ QWEN_ALL_CONFIGS = QWEN_METHOD_CONFIGS + [
     "longbench_qwen_full_cache.yaml",
     "gsm8k_qwen_full_cache.yaml",
     "longbench_qwen_ours_gate100.yaml",
+    "longbench_qwen_ours_gate50.yaml",
 ]
 
 
@@ -101,6 +102,7 @@ def test_the_yarn128k_alias_is_the_same_run():
 
 @pytest.mark.parametrize("arm,field,value", [
     ("longbench_qwen_ours_gate100.yaml", "quant_gate_ratio", 1.0),
+    ("longbench_qwen_ours_gate50.yaml", "quant_gate_ratio", 0.5),
 ])
 def test_each_ablation_arm_changes_exactly_one_cache_field(arm, field, value):
     """An arm that moved two things measures neither."""
@@ -119,6 +121,7 @@ def test_the_ablation_script_runs_its_arms_into_separate_dirs():
     src = (ROOT / "scripts/run_longbench_qwen_ablation.sh").read_text()
     for cfg in ("longbench_qwen_ours_flash_attn.yaml",
                 "longbench_qwen_ours_gate100.yaml",
+                "longbench_qwen_ours_gate50.yaml",
                 "longbench_qwen_full_cache.yaml"):
         assert f"configs/{cfg}" in src
     assert 'longbench.output_dir=$out' in src

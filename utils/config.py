@@ -104,6 +104,8 @@ OPERATING_POINT_EXEMPT = {
     # are at the operating point -- the QEvict column ran there too.
     "longbench_qwen_ours_gate100.yaml":
         "the Qwen gate's control arm (quant_gate_ratio 1.0)",
+    "longbench_qwen_ours_gate50.yaml":
+        "the Qwen gate at half the tier (quant_gate_ratio 0.5), an ablation",
     "ruler_qwen_niah_mk3_omega16.yaml":
         "the omega=16 arm; window_size is the ablation",
     "longbench_qwen_full_cache.yaml": "the FullKV baseline -- no eviction at all",

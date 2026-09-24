@@ -28,6 +28,18 @@ compares the two, per query head:
 ``q_share``
     the int2 tier's share of the head's whole attention -- how much any of the
     above can matter for this head.
+``skip_share``
+    the share of the head's whole attention that sits in the windows the gate
+    did NOT read -- what the centroid path carries.
+``skip_mass_err``
+    ``log`` of (the skipped windows' total mass as the step gives it) over (their
+    true total mass), both relative to the read windows'. The kernel fills a
+    skipped window at ``(read mass) * card_w / (card mass of the read set)``, so
+    this is ``log(C_skip / C_read) - log(S / R)``. Positive: the centroids get
+    too much weight and the output is pulled toward the tier's average value
+    (a blur that grows with the number of skipped windows); negative: too little.
+    ``card_tv`` cannot see this -- it is the skipped windows' TOTAL, not their
+    shape, that decides how much the centroids move the output.
 
 Diagnostic only: one extra kernel launch per measured layer, no effect on what
 is generated. ``scripts/diagnose_gate_error.py`` is the entry point.
@@ -65,7 +77,9 @@ def gate_error_metrics(
     logmass : ``[B, H_q, n_active]`` the card's log-mass for every active window,
         columns in the same order as ``wsum_full[..., n_body_win:]``.
 
-    Returns ``{"out_err", "card_tv", "recall", "q_share"}``, each ``[B, H_q]``.
+    Returns ``{"out_err", "card_tv", "recall", "q_share", "skip_share",
+    "skip_mass_err"}``, each ``[B, H_q]``. ``skip_mass_err`` is 0 where nothing
+    was skipped.
     """
     og, of = out_gated.float(), out_full.float()
     out_err = (og - of).norm(dim=-1) / of.norm(dim=-1).clamp_min(1e-12)
@@ -80,9 +94,22 @@ def gate_error_metrics(
     H_kv = sel.shape[1]
     keep = torch.zeros(B, H_kv, n, dtype=torch.bool, device=p_true.device)
     keep.scatter_(-1, sel.long(), True)
-    recall = (p_true * keep.repeat_interleave(H_q // H_kv, dim=1)).sum(-1)
+    read = keep.repeat_interleave(H_q // H_kv, dim=1)
+    recall = (p_true * read).sum(-1)
+
+    tiny = 1e-30
+    true_read = (wq * read).sum(-1)
+    true_skip = (wq * ~read).sum(-1)
+    card_read = (p_card * read).sum(-1)
+    card_skip = (p_card * ~read).sum(-1)
+    skip_mass_err = torch.where(
+        (~read).any(-1),
+        (card_skip.clamp_min(tiny).log() - card_read.clamp_min(tiny).log())
+        - (true_skip.clamp_min(tiny).log() - true_read.clamp_min(tiny).log()),
+        torch.zeros_like(true_skip))
     return {"out_err": out_err, "card_tv": card_tv, "recall": recall,
-            "q_share": q_share}
+            "q_share": q_share, "skip_share": true_skip,
+            "skip_mass_err": skip_mass_err}
 
 
 def install(max_steps: int = 16):

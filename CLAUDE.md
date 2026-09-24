@@ -256,7 +256,14 @@ one per-window block is the real fix and needs a GPU to verify.
   content the card does not capture dominates the logit (synthetic: 0.28 ->
   1.4-3.5 nats, TV 0.09 -> 0.56-0.89, int8 or int4). Measure it on the model with
   `scripts/diagnose_gate_error.py` before touching the card; the control arm is
-  `longbench_qwen_ours_gate100.yaml`.
+  `longbench_qwen_ours_gate100.yaml`. **The budget sweep points the same way**:
+  10% -> 20% gains nothing on average, and the longest-context tasks LOSE with
+  the extra cache (narrativeqa 23.7 -> 18.3), i.e. the loss scales with the
+  number of windows read only through a centroid. Three rounds of fixes chosen
+  from synthetic arguments moved nothing; **do not ship a fourth until the
+  gate100/gate50 arms (`scripts/run_longbench_qwen_ablation.sh`) have run.**
+  The diagnostic's `skip_mass_err` is whether those windows get the right
+  TOTAL weight, which `card_tv` cannot see.
 * **Ask how the reference was actually invoked before reading its config.**
   One round of the Qwen investigation (`1db0488`, reverted) moved the Qwen
   configs to `quant_ratio 0.5` because `int2_qwen`'s YAML says 0.5 — but the

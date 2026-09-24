@@ -21,6 +21,80 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 5 — the budget sweep says the loss scales with the UNREAD windows
+
+Three rounds fixed real defects and none moved the column beyond noise,
+because each was chosen from a synthetic argument and none was checked against
+the one run that attributes the gap (the gate's control arm, below). The
+budget sweep is the first new evidence since, and it narrows things. Flash,
+q = 0.70, head-unit gate + key anchor on; the 20% column reproduces run 3 (six
+of eight tasks to the digit, the other two within 0.31):
+
+| dataset | 20% / l128 | 10% / l128 | 5% / l32 |
+|---|---|---|---|
+| triviaqa | 81.40 | 81.90 | 81.66 |
+| trec | 62.50 | 62.25 | 58.50 |
+| hotpotqa | 48.76 | 49.84 | 47.60 |
+| multifieldqa_en | 44.95 | 41.08 | 36.31 |
+| samsum | 44.16 | 43.72 | 33.14 |
+| qasper | 36.83 | 34.57 | 32.58 |
+| 2wikimqa | 36.52 | 36.75 | 38.01 |
+| gov_report | 28.06 | 30.22 | 26.07 |
+| multi_news | 25.29 | 23.39 | 24.24 |
+| qmsum | 21.95 | 22.31 | 21.54 |
+| musique | 20.71 | 23.51 | 25.15 |
+| narrativeqa | 18.28 | 23.69 | 22.68 |
+| **average (12)** | **39.12** | **39.44** | **37.29** |
+
+What it says, against n = 200 noise of ~2.5-3 points per task:
+- **Doubling the budget from 10% to 20% buys nothing on average** (-0.3).
+  The tasks that should use the extra cache do (multifieldqa +3.9, qasper
+  +2.3); the longest-context ones LOSE with it -- narrativeqa -5.4 (about
+  twice the noise), musique -2.8 (monotone over all three budgets),
+  gov_report -2.2.
+  Retaining more windows making an answer worse means the retained windows are
+  being read wrongly, and the longest prompts have the most of them.
+- **triviaqa is flat at ~81.6 from 5% to 20%**, 8 points under QEvict's 20%.
+  Its loss does not depend on how much is kept, so it is in how every step
+  reads, not in what eviction chose.
+- At q = 0.70 ~88% of retained windows are int2 and the gate reads 25% of
+  them, so **~66% of what the cache retains reaches attention only as a value
+  centroid at a card-estimated weight.** That share is fixed across budgets;
+  the NUMBER of such windows roughly doubles from 10% to 20%. An error per
+  unread window -- the card's weight, or the centroid standing in for the
+  window -- grows the way the long-context tasks fell. int2 noise also grows
+  with window count, and QEvict carries the same noise; it scores higher at 20%
+  on these tasks (musique 24.37), but whether ITS long-context scores also
+  fall with budget is unmeasured -- QEvict's 10% column would settle that.
+
+So the next measurement is the attribution, and nothing about the method changes
+until it has run:
+- `ARMS="gate100 gate50" scripts/run_longbench_qwen_ablation.sh` -- trec,
+  triviaqa, musique, narrativeqa, qasper (control) at every window read
+  (1.0) and at half (0.5). The 0.25 row is the table above.
+  - gate100 recovers, gate50 recovers most: the selection's CAPACITY. rep 7
+    shares one selection among seven query heads where Llama shares it among
+    four; the ratio should scale with rep. Still under the 0.66 break-even.
+  - gate100 recovers, gate50 does not: the CARD. The unread windows' weight or
+    centroid is wrong on Qwen, and reading more of them only shrinks the error.
+  - gate100 does not recover: the gate is exonerated. The rest of the machinery
+    (one-byte grid + anchor, Triton score/decode kernels) is next.
+- `scripts/diagnose_gate_error.py --dataset narrativeqa` (and triviaqa), with
+  and without `--override cache.quant_gate_ratio=0.5`, minutes each. New this
+  round: **`skip_mass_err`**, the log ratio of the unread windows' total weight
+  as the kernel fills it to their true total, relative to the read windows'
+  (pinned to the oracle's applied fill in `tests/test_gate_diagnosis.py`), and
+  `skip_share`, the head's attention that rides the centroid path. `card_tv`
+  measures the card's shape over the tier and cannot see a wrong TOTAL, which
+  is what pulls the output toward the tier's mean value. On the plain synthetic
+  fixture it already reads -0.32 nats median at 0.25 with a p10-p90 of -1.26 to
+  +0.39: the fill is right on average and off by e^1 for some heads even on
+  benign keys.
+
+If gate100 recovers the column, `quant_gate_ratio: 1.0` is the immediate Qwen
+setting (CLAUDE.md: 1.0 ties 0.25 in TPOT, `130de24`) while the card is fixed
+against the diagnostic's numbers.
+
 ### Round 4 — where the gap can still be: the decode READ
 
 Established with the operating point and protocol equal (both columns

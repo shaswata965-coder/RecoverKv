@@ -17,7 +17,12 @@ Reading it: ``out_err`` is what the approximation does to each layer's
 attention output; ``card_tv`` says whether the card's weights for the windows
 it does NOT read are right (0 exact, 1 disjoint); ``recall`` says whether it
 reads the right windows; ``q_share`` says how much the int2 tier matters for
-that head at all.
+that head at all; ``skip_share`` is how much of the head's attention the
+centroid path carries, and ``skip_mass_err`` whether it carries the right total
+(log ratio, nats: + over-weighted, - under-weighted).
+
+Run it at a larger ratio to see how much of the error is the SELECTION's
+capacity rather than the card: ``--override cache.quant_gate_ratio=0.5``.
 """
 
 from __future__ import annotations
@@ -83,18 +88,26 @@ def main() -> None:
         return
     print(f"\n{args.config} / {args.dataset}: per layer, medians (p90) over "
           "query heads x measured steps")
-    print(f"{'layer':>5}  {'out_err':>15}  {'card_tv':>15}  {'recall':>15}  {'q_share':>15}")
+    print(f"{'layer':>5}  {'out_err':>15}  {'card_tv':>15}  {'recall':>15}  "
+          f"{'q_share':>15}  {'skip_share':>15}  {'skip_mass_err':>17}")
     for layer, r in summary["layers"].items():
         print(f"{layer:>5}  "
               f"{r['out_err_median']:7.4f} ({r['out_err_p90']:.4f})  "
               f"{r['card_tv_median']:7.3f} ({r['card_tv_p90']:.3f})  "
               f"{r['recall_median']:7.3f} ({r['recall_p10']:.3f}*)  "
-              f"{r['q_share_median']:7.3f} ({r['q_share_p90']:.3f})")
+              f"{r['q_share_median']:7.3f} ({r['q_share_p90']:.3f})  "
+              f"{r['skip_share_median']:7.3f} ({r['skip_share_p90']:.3f})  "
+              f"{r['skip_mass_err_median']:+7.2f} ({r['skip_mass_err_p10']:+.2f}, "
+              f"{r['skip_mass_err_p90']:+.2f})")
     o = summary["overall"]
     print(f"\nall layers: out_err median {o['out_err_median']:.4f} p90 {o['out_err_p90']:.4f} | "
           f"card_tv median {o['card_tv_median']:.3f} | recall median {o['recall_median']:.3f} "
-          f"p10 {o['recall_p10']:.3f} | q_share median {o['q_share_median']:.3f}")
-    print("(* recall's LOW decile: the heads the selection serves worst)")
+          f"p10 {o['recall_p10']:.3f} | q_share median {o['q_share_median']:.3f} | "
+          f"skip_share median {o['skip_share_median']:.3f} | skip_mass_err median "
+          f"{o['skip_mass_err_median']:+.2f} nats (p10 {o['skip_mass_err_p10']:+.2f}, "
+          f"p90 {o['skip_mass_err_p90']:+.2f})")
+    print("(* recall's LOW decile: the heads the selection serves worst. "
+          "skip_mass_err: + = centroids over-weighted, - = under-weighted)")
     print(f"written: {args.out}")
 
 

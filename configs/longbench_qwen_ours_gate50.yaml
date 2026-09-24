@@ -1,0 +1,24 @@
+# ============================================================================
+# LongBench — Qwen2.5-7B-Instruct, Ours with the read gate at HALF the tier
+# ============================================================================
+# One-field ablation of longbench_qwen_ours_flash_attn.yaml: quant_gate_ratio
+# 0.5, between the shipped 0.25 and the control arm's 1.0 (every window read).
+# Still below the gate's 0.66 break-even, so the gate still reads fewer bytes
+# than it skips.
+#
+# What it separates: at rep 7 (28 query heads on 4 KV heads) the gate's
+# per-KV-head selection is shared by seven heads, against four on Llama-3.1, so
+# at 0.25 each Qwen query head gets ~4/7 of the exact reads a Llama head gets.
+#   gate50 ~ gate100  -> the gap is the selection's CAPACITY: a ratio that
+#                        scales with rep is the fix, and the card is fine.
+#   gate50 ~ ours     -> the gap is the CARD (the weight and centroid every
+#                        unread window attends with), and more reads do not
+#                        rescue it; the card is what to change.
+# scripts/run_longbench_qwen_ablation.sh runs it beside the other arms.
+_base_: longbench_qwen_ours_flash_attn.yaml
+
+cache:
+  quant_gate_ratio: 0.5
+
+longbench:
+  output_dir: outputs/longbench/qwen_ours_gate50_compression_0.8
