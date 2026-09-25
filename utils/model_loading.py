@@ -267,6 +267,18 @@ def load_model_and_tokenizer(
     )
     model.eval()
 
+    # What the model RUNS, read off its rotary module -- the line above logs
+    # only what was requested. A native-RoPE arm and a YaRN arm once came back
+    # identical to the digit, and no output said which had really run.
+    r = describe_realised_rope(model)
+    log.warning(
+        "REALISED RoPE: rotary=%s attention_scaling=%s max_position_embeddings=%s "
+        "rope_scaling=%s inv_freq[first,last]=%s",
+        r["rotary_type"], r["rotary_attention_scaling"],
+        r["config_max_position_embeddings"], r["config_rope_scaling"],
+        r["rotary_inv_freq_first_last"],
+    )
+
     _warn_on_dtype_mismatch(model, m)
 
     changed = pin_greedy_generation_defaults(model)
