@@ -51,6 +51,7 @@ button { font: 600 13px system-ui, -apple-system, "Segoe UI", sans-serif; color:
 button:hover { border-color: var(--muted); }
 button.primary { background: var(--s1); color: #fff; border-color: transparent; }
 .spacer { flex: 1; }
+.status { flex-basis: 100%; text-align: right; font-size: 12.5px; color: var(--ink2); min-height: 1em; }
 section { margin-top: 36px; }
 section > h2 { font-size: 21px; margin: 0 0 4px; }
 section > .lede { color: var(--ink2); margin: 0 0 14px; font-size: 14px; }
@@ -92,7 +93,8 @@ canvas.fig { display: block; width: 100%; }
       <nav id="nav" class="bar"></nav>
       <span class="spacer"></span>
       <button id="theme" type="button">Theme: auto</button>
-      <button id="exportAll" class="primary" type="button">Export all as PNG</button>
+      <button id="exportAll" class="primary export" type="button">Export all (ZIP of PNGs)</button>
+      <span id="status" class="status" aria-live="polite"></span>
     </div>
   </header>
   <main id="main"></main>
@@ -296,10 +298,10 @@ function build() {
       if (card.table) html += '<div class="tbl"><table><thead><tr>' + card.table.cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>'
         + card.table.rows.map(r => '<tr>' + r.map(c => `<td>${esc(c)}</td>`).join('') + '</tr>').join('') + '</tbody></table></div>';
       html += `<p class="meaning"><b>What the data means.</b> ${esc(card.meaning)}</p>`;
-      html += `<div class="actions"><button type="button">Export PNG</button></div>`;
+      html += `<div class="actions"><button type="button" class="export">Export PNG</button></div>`;
       a.innerHTML = html; s.appendChild(a);
       const entry = { card, section: sec.title, canvas: a.querySelector('canvas'), hits: [] };
-      a.querySelector('.actions button').addEventListener('click', () => download(entry));
+      a.querySelector('.actions button').addEventListener('click', () => exportCard(entry));
       if (entry.canvas) attachTip(entry);
       CARDS.push(entry);
     });
@@ -370,15 +372,65 @@ function composeCard(entry, W = 1100, scale = 2) {
   layout(ctx, true);
   return cv;
 }
-function download(entry) {
-  return new Promise(res => composeCard(entry).toBlob(b => {
-    const a = document.createElement('a'); a.href = URL.createObjectURL(b);
-    a.download = `recoverkv-${entry.card.id}.png`; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 2000); res();
-  }, 'image/png'));
+// ---- saving: the viewer's save prompt when hosted, a plain download when opened as a file
+const statusEl = document.getElementById('status');
+const say = msg => { statusEl.textContent = msg; };
+const hosted = !!(window.claude && typeof window.claude.use === 'function');
+let DL;   // undefined until asked; null when this view cannot save files
+if (hosted) window.claude.use('downloads').then(d => { DL = d; if (!d) document.querySelectorAll('.export').forEach(b => { b.hidden = true; }); },
+  () => { DL = null; });
+async function saveFile(filename, blob) {
+  if (hosted) {
+    const d = DL === undefined ? await window.claude.use('downloads') : DL;
+    if (!d) { say('Saving files is not available in this view.'); return false; }
+    try { await d.save({ filename, data: blob }); say('Saved ' + filename); return true; }
+    catch (e) {
+      const c = e && e.code;
+      say(c === 'declined' ? 'Save cancelled.' : c === 'rate_limited' ? 'A save prompt is already open; try again in a moment.'
+        : 'Could not save the file (' + (c || 'error') + ').');
+      return false;
+    }
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  say('Saved ' + filename); return true;
+}
+const toBlob = cv => new Promise(r => cv.toBlob(r, 'image/png'));
+async function exportCard(entry) { return saveFile(`recoverkv-${entry.card.id}.png`, await toBlob(composeCard(entry))); }
+
+// a stored (uncompressed) ZIP: PNGs are already compressed
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function zipStore(files) {
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 0x21, true);
+    h.setUint32(14, crc, true); h.setUint32(18, n, true); h.setUint32(22, n, true); h.setUint16(26, name.length, true);
+    parts.push(h, name, f.data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 0x21, true);
+    c.setUint32(16, crc, true); c.setUint32(20, n, true); c.setUint32(24, n, true); c.setUint16(28, name.length, true);
+    c.setUint32(42, off, true);
+    central.push(c, name);
+    off += 30 + name.length + n;
+  }
+  const cd = central.reduce((a, p) => a + p.byteLength, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+  e.setUint32(12, cd, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, e], { type: 'application/zip' });
+}
+async function exportAllZip() {
+  say(`Rendering ${CARDS.length} images...`);
+  const files = [];
+  for (const e of CARDS) files.push({ name: `recoverkv-${e.card.id}.png`,
+    data: new Uint8Array(await (await toBlob(composeCard(e))).arrayBuffer()) });
+  return zipStore(files);
 }
 document.getElementById('exportAll').addEventListener('click', async () => {
-  for (const e of CARDS) { await download(e); await new Promise(r => setTimeout(r, 350)); }
+  saveFile('recoverkv-observations-png.zip', await exportAllZip());
 });
 
 // ---- theme -------------------------------------------------------------------
@@ -394,7 +446,7 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', ren
 let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderAll, 120); });
 
 build(); applyTheme();
-window.__RKV = { CARDS, composeCard };
+window.__RKV = { CARDS, composeCard, exportAllZip };
 </script>
 </body>
 </html>
