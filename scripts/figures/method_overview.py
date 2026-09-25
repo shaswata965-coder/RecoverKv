@@ -53,14 +53,15 @@ OUT = Path(__file__).resolve().parents[2] / "reports" / "figures" / "method_over
 # ---------------------------------------------------------------------------
 # palette
 # ---------------------------------------------------------------------------
-INK, INK2, INK3 = "#1d2329", "#4b5563", "#8a939c"
-RULE = "#c9d0d7"
+# every notation is one solid ink: no greys, no in-between tints for text or marks
+INK = INK2 = INK3 = "#1d2329"
+RULE = INK
 SINK_F, SINK_S = "#e2e6eb", "#5b6878"
 FP_F, FP_S, FP_T = "#cfe0f3", "#3c6ea8", "#2c5a8f"
 LOC_F = "#eef4fb"
 Q_F, Q_S, Q_T, Q_L = "#dccff2", "#6446a4", "#51368a", "#f4f0fb"
 CARD_F, CARD_S, CARD_T = "#d4ecdc", "#3b8a5a", "#2a6d45"
-DROP_F, DROP_S = "#ececec", "#a3a3a3"
+DROP_F, DROP_S = "#ffffff", INK
 QRY_F, QRY_S, QRY_T = "#f6cdc9", "#c0392b", "#a93226"
 BLUES = ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6",
          "#2171b5", "#08519c", "#08306b"]
@@ -68,7 +69,7 @@ PURPLES = ["#fcfbfd", "#efedf5", "#dadaeb", "#bcbddc", "#9e9ac8", "#807dba",
            "#6a51a3", "#54278f", "#3f007d"]
 SANS = "Arial, 'Liberation Sans', Helvetica, sans-serif"
 
-HATCH = {"blue": (LOC_F, "#b8cfe8"), "gray": ("#f4f4f4", "#b9b9b9"),
+HATCH = {"blue": (LOC_F, "#b8cfe8"), "gray": ("#ffffff", INK),
          "violet": (Q_L, "#c9bce8")}
 
 
@@ -263,7 +264,7 @@ YB = 352                                    # the cache bar's baseline, same in 
 
 
 def frame(g, tag, title, sub):
-    g.rect(0, 0, PW, PH, fill="#ffffff", stroke=RULE, sw=1.2, rx=9)
+    g.rect(0, 0, PW, PH, fill="#ffffff", stroke=RULE, sw=1, rx=9)
     g.text(16, 26, f"{tag}  {title}", size=16.5, weight="bold")
     g.text(16, 45, sub, size=13, fill=INK2, italic=True)
 
@@ -298,7 +299,7 @@ def panel_a(g):
     pmax = max(P[i][j] for i in range(N) for j in range(SINK, i + 1))
     for i in range(N):
         for j in range(N):
-            col = "#f3f4f6" if j > i else ramp(BLUES, (P[i][j] / pmax) ** 0.6)
+            col = "#ffffff" if j > i else ramp(BLUES, (P[i][j] / pmax) ** 0.6)
             g.rect(hx + j * cell, hy + i * cell, cell, cell, fill=col, stroke="#ffffff", sw=0.4)
     hw = N * cell
     g.rect(hx, hy, hw, hw, stroke=INK3, sw=0.7)
@@ -312,31 +313,33 @@ def panel_a(g):
     colsum = [sum(P[i][j] for i in range(N)) for j in range(N)]
     cmax = max(colsum[SINK:])
     by, bh = hy + hw + 24, 20
-    HL = 1                                      # the window traced into the ranking
+    HL = 1                   # the window holding the hot token: it ranks first, stays fp16
     for j in range(N):
         hh = bh * min(1.0, colsum[j] / cmax)
         w_ = (j - SINK) // WSZ
-        col = INK3 if j < SINK else (ramp(BLUES, 0.55) if w_ % 2 == 0 else ramp(BLUES, 0.35))
+        col = SINK_S if j < SINK else (ramp(BLUES, 0.55) if w_ % 2 == 0 else ramp(BLUES, 0.35))
         g.rect(hx + j * cell + 0.6, by - hh, cell - 1.2, hh, fill=col)
-    g.line(hx, by, hx + hw, by, stroke=INK3, sw=0.7)
-    for w_ in range(3):
-        x1 = hx + (SINK + w_ * WSZ) * cell
-        bracket(g, x1 + 0.5, x1 + WSZ * cell - 0.5, by + 4, up=False, stroke=INK if w_ == HL else INK3,
-                sw=1.4 if w_ == HL else 0.9, tick=4)
-    g.text(hx + hw / 2, by + 46, "tokens of one window", size=11.5, anchor="middle", fill=INK2)
-    g.text(hx - 3, by - 4, "sink", size=10.5, anchor="end", fill=INK3)
+    g.line(hx, by, hx + hw, by, stroke=INK, sw=0.8)
+    x1 = hx + (SINK + HL * WSZ) * cell
+    xw = x1 + WSZ * cell / 2
+    bracket(g, x1 + 0.5, x1 + WSZ * cell - 0.5, by + 4, up=False, stroke=INK, sw=1.4, tick=4)
+    g.text(xw, by + 32, "one window", size=11.5, anchor="middle", fill=INK)
+    g.text(hx - 3, by - 4, "sink", size=10.5, anchor="end", fill=SINK_S, weight="bold")
 
-    # ---- window scores, ranked: each bar is its 8 tokens stacked, plus what decode added
+    # ---- window scores, ranked: each bar is one window's tokens stacked, plus what decode added
     sx, sbase, smax, bw, bgp = 208, by, 128, 8, 2
     n = N_FP + N_Q + N_DROP
     scores = [1.0 - 0.9 * (k / (n - 1)) ** 0.8 for k in range(n)]
     kinds = ["fp"] * N_FP + ["q"] * N_Q + ["drop"] * N_DROP
-    hl_bar = N_FP + 2
+    hl_bar = 0
     rr = random.Random(12)
     for k, (v, kd) in enumerate(zip(scores, kinds)):
         a, b_, st = TIER_TINT[kd]
         x = sx + k * (bw + bgp)
         total = smax * v
+        if kd == "drop":                       # dropped: outline only, it is not kept
+            g.rect(x, sbase - total, bw, total, fill="#ffffff", stroke=INK, sw=0.8, dash="2 1.5")
+            continue
         pre = total * 0.8                      # prefill attention, token by token
         parts = [rr.uniform(0.4, 1.6) for _ in range(8)]
         if k == hl_bar:
@@ -347,11 +350,12 @@ def panel_a(g):
             hseg = pre * pz / z
             g.rect(x, y - hseg, bw, hseg, fill=a if t % 2 == 0 else b_)
             y -= hseg
-        g.rect(x, sbase - total, bw, total - pre, fill="hatch-" + {"fp": "blue", "q": "violet",
-                                                                   "drop": "gray"}[kd])
+        g.rect(x, sbase - total, bw, total - pre, fill="hatch-" + {"fp": "blue", "q": "violet"}[kd])
         g.rect(x, sbase - total, bw, total, stroke=INK if k == hl_bar else st,
-               sw=1.4 if k == hl_bar else 0.7)
-    g.line(sx - 2, sbase, sx + n * (bw + bgp), sbase, stroke=INK3, sw=0.7)
+               sw=1.6 if k == hl_bar else 0.7)
+    g.line(sx - 2, sbase, sx + n * (bw + bgp), sbase, stroke=INK, sw=0.8)
+    g.text(sx - 8, sbase - 62, "cumulative window score", size=11, anchor="middle", fill=INK,
+           rotate=-90)
     # which bars are which
     ex_ = lambda k: sx + k * (bw + bgp)
     lab_y = 92
@@ -363,31 +367,31 @@ def panel_a(g):
            anchor="middle", weight="bold", fill=Q_T)
     g.text((ex_(N_FP) + ex_(N_FP + N_Q)) / 2 + 8, lab_y, "int2 + card", size=11.5,
            anchor="middle", fill=Q_T)
-    bracket(g, ex_(N_FP + N_Q), ex_(n) - bgp, lab_y + 6, up=False, stroke=DROP_S, sw=1.2, tick=4)
-    g.text((ex_(N_FP + N_Q) + ex_(n)) / 2, lab_y, "drop", size=11.5, anchor="middle", fill=INK3)
-    # the traced window: its 8 token bars become one stacked bar
-    x1 = hx + (SINK + HL * WSZ) * cell
-    g.path(f"M{x1 + WSZ * cell / 2},{by + 9} C{x1 + WSZ * cell / 2},{by + 40} "
-           f"{ex_(hl_bar) + bw / 2},{by + 40} {ex_(hl_bar) + bw / 2},{by + 3}",
-           stroke=INK, sw=1, dash="3 2", arrow="dark")
-    g.text(ex_(hl_bar) + bw + 6, by + 34, "its tokens, stacked", size=11.5, fill=INK)
+    bracket(g, ex_(N_FP + N_Q), ex_(n) - bgp, lab_y + 6, up=False, stroke=INK, sw=1.2, tick=4)
+    g.text((ex_(N_FP + N_Q) + ex_(n)) / 2, lab_y, "dropped", size=11.5, anchor="middle", fill=INK)
     # stack key
-    kx, ky = 318, 150
+    kx, ky = 296, 126
     g.rect(kx, ky - 9, 9, 10, fill=Q_F)
     g.rect(kx, ky - 19, 9, 10, fill="#c6b6e8")
-    g.text(kx + 14, ky - 6, "one token each", size=11, fill=INK2)
+    g.text(kx + 14, ky - 5, "one token's attention", size=11, fill=INK)
     g.rect(kx, ky + 6, 9, 10, fill="hatch-violet", stroke=Q_S, sw=0.6)
-    g.text(kx + 14, ky + 15, "+ every decode step", size=11, fill=INK2)
+    g.text(kx + 14, ky + 15, "added per decode step", size=11, fill=INK)
 
-    # ---- into the tiers
-    xfp, xq, xd = (ex_(0) + ex_(N_FP)) / 2, (ex_(N_FP) + ex_(N_FP + N_Q)) / 2, \
-        (ex_(N_FP + N_Q) + ex_(n)) / 2
-    ya = by + 48
-    g.path(f"M{xfp},{ya} C{xfp},{ya + 30} {C['fp']},{ya + 14} {C['fp']},{YB - FP_H - 5}",
+    # ---- the traced window: its tokens become the top bar (straight connector)
+    xb0 = ex_(hl_bar) + bw / 2
+    yt = by + 14
+    g.path(f"M{xw},{by + 5} L{xw},{yt} L{xb0},{yt} L{xb0},{by + 2}", stroke=INK, sw=1.1,
+           dash="3 2", arrow="dark")
+
+    # ---- into the tiers, straight
+    xfp = ex_(1) + bw / 2 + 1                  # leaves from the second fp16 bar
+    xq = (ex_(N_FP) + ex_(N_FP + N_Q)) / 2     # the int2 group sits over the int2 section
+    xd = (ex_(N_FP + N_Q) + ex_(n)) / 2
+    yturn = YB - FP_H - 18
+    g.path(f"M{xfp},{by + 2} L{xfp},{yturn} L{C['fp']},{yturn} L{C['fp']},{YB - FP_H - 3}",
            stroke=FP_S, sw=1.6, arrow="blue")
-    g.path(f"M{xq},{ya} C{xq},{ya + 26} {C['q']},{ya + 18} {C['q']},{card_top(YB) - 5}",
-           stroke=Q_S, sw=1.6, arrow="violet")
-    xmark(g, xd, by + 16, r=4.5, sw=1.8)
+    g.line(xq, by + 2, xq, card_top(YB) - 3, stroke=Q_S, sw=1.6, arrow="violet")
+    xmark(g, xd, by + 16, r=4.5, stroke=INK, sw=1.8)
 
     cache_bar(g, YB)
 
@@ -431,8 +435,8 @@ def panel_a(g):
     # ---- demotion, magnified: the card clusters the window, and what an int2 window holds
     zh = 176
     zx, zy, zw = 16, YB + 128, PW - 32
-    g.rect(zx, zy, zw, zh, fill="#fbfcfd", stroke=RULE, sw=1, rx=6)
-    g.text(zx + 12, zy + 19, "demoting one window", size=12.5, weight="bold", fill=INK2)
+    g.rect(zx, zy, zw, zh, fill="#ffffff", stroke=RULE, sw=1, rx=6)
+    g.text(zx + 12, zy + 19, "demoting a window to int2", size=12.5, weight="bold", fill=INK)
     cx, cy = zx + 98, zy + 62
     vd = (0.83, -0.56)
     pts = [(-15, 6), (-8, -10), (6, 11), (13, -3), (-19, -3), (2, -13), (9, 4)]
@@ -448,12 +452,13 @@ def panel_a(g):
     g.text(cx - 34, cy + 4, "centroid", size=11.5, anchor="end", fill=INK)
     g.line(cx - 32, cy, cx - 6, cy, stroke=INK3, sw=0.7)
     g.text(cx + hot[0] + 8, cy + hot[1] + 4, "outlier", size=11.5, fill=QRY_T)
+    g.text(cx - 28, cy - 24, "its keys", size=11.5, anchor="end", fill=INK)
     rx0 = zx + 206
     g.line(rx0 - 30, cy, rx0 - 6, cy, stroke=INK2, sw=1.3, arrow="dark")
     g.use("card", rx0, cy - 20, 40, 40)
-    g.text(rx0 + 48, cy - 7, "card: the window", size=11.5, fill=CARD_T, weight="bold")
-    g.text(rx0 + 48, cy + 8, "as one cluster:", size=11.5, fill=INK2)
-    g.text(rx0 + 48, cy + 22, "centroid + outlier axis", size=11.5, fill=INK2)
+    g.text(rx0 + 48, cy - 7, "card: the keys", size=11.5, fill=CARD_T, weight="bold")
+    g.text(rx0 + 48, cy + 8, "as one cluster, kept as", size=11.5, fill=INK)
+    g.text(rx0 + 48, cy + 22, "centroid + outlier axis", size=11.5, fill=INK)
 
     # one int2 window, to scale against the same window in fp16, in one row
     L0, L1 = zx + 12, zx + zw - 12
@@ -502,8 +507,8 @@ def panel_b(g):
     umax = max(UNION)
     for c in range(N_Q):
         v = UNION[c] / umax
-        g.line(C["q"], qy + 34, QX[c], top - 2, stroke=Q_S if c in SEL else "#c3c8ce",
-               sw=0.7 + 2.4 * v)
+        g.line(C["q"], qy + 34, QX[c], top - 2, stroke=Q_S if c in SEL else INK,
+               sw=0.8 + 2.4 * v if c in SEL else 0.5)
     g.text(C["q"] + 34, qy + 62, "score every card", size=12, fill=INK2)
     for key in ("fp", "loc"):
         x1, x2 = SPAN[key]
@@ -548,7 +553,7 @@ def panel_b(g):
         pale = {"fp": "#e3edf8", "sel": "#ece6f7", "skip": "#ece6f7"}[kd]
         g.rect(x, base - before, wd, before, fill=pale, stroke="none")
         if kd == "skip":
-            g.rect(x, base - before - add, wd, add, fill="hatch-violet", stroke="#a996d6", sw=0.8)
+            g.rect(x, base - before - add, wd, add, fill="hatch-violet", stroke=Q_S, sw=0.8)
         else:
             g.rect(x, base - before - add, wd, add, fill=FP_S if kd == "fp" else Q_S)
     g.line(BX0 - 4, base, LAY["new"] + 8, base, stroke=INK3, sw=0.8)
@@ -557,7 +562,7 @@ def panel_b(g):
     g.text(41, ky, "score so far", size=11.5, fill=INK2)
     g.rect(122, ky - 10, 12, 11, fill=Q_S)
     g.text(139, ky, "+ exact mass (read)", size=11.5, fill=INK2)
-    g.rect(262, ky - 10, 12, 11, fill="hatch-violet", stroke="#a996d6", sw=0.8)
+    g.rect(262, ky - 10, 12, 11, fill="hatch-violet", stroke=Q_S, sw=0.8)
     g.text(279, ky, "+ its card's credit", size=11.5, fill=INK2)
 
     # key
@@ -604,7 +609,7 @@ def panel_c(g):
     g.text(nx0 - 8, ny0 + 9, "last token closes it:", size=11.5, anchor="end", fill=QRY_T,
            weight="bold")
     g.text(nx0 - 8, ny0 + 24, "window boundary", size=11.5, anchor="end", fill=QRY_T)
-    g.rect(chx, chy, chw, chh, fill="#f3f4f6", stroke=INK2, sw=1, rx=12)
+    g.rect(chx, chy, chw, chh, fill="#ffffff", stroke=INK2, sw=1, rx=12)
     g.text(chx + chw / 2, chy + 16, "re-rank by cumulative score", size=12, anchor="middle",
            weight="bold")
     # promote into fp16
@@ -629,7 +634,7 @@ def panel_c(g):
     # ---- what the one fused pass reads
     ky0, ky1 = YB + 34, YB + 116
     kb = ky1 - 8
-    g.rect(16, ky0, PW - 32, ky1 - ky0, fill="#f6f7f9", stroke=INK3, sw=1, rx=6)
+    g.rect(16, ky0, PW - 32, ky1 - ky0, fill="#ffffff", stroke=INK3, sw=1, rx=6)
     g.text(26, ky0 + 16, "fused two-tier attention: what it reads", size=12, weight="bold")
     for x in LAY["fp"]:
         g.rect(x, kb - FP_H * 0.9, FP_W, FP_H * 0.9, fill=FP_F, stroke=FP_S, sw=0.8)
@@ -679,7 +684,7 @@ def panel_c(g):
             g.line(cxm, Y(est[c]) - 4, cxm, Y(v) + 1.5, stroke=INK, sw=1.1)
         else:
             v = est[c] + gap_mean
-            g.rect(x, Y(v), Q_W, base - Y(v), fill="hatch-violet", stroke="#a996d6", sw=0.8,
+            g.rect(x, Y(v), Q_W, base - Y(v), fill="hatch-violet", stroke=Q_S, sw=0.8,
                    dash="2 1.5")
             g.circle(cxm, Y(est[c]), 3.3, fill="#ffffff", stroke=CARD_S, sw=1.4)
             g.line(cxm, Y(est[c]) - 4, cxm, Y(v) + 2.5, stroke=CARD_S, sw=1, arrow="green")
@@ -690,7 +695,7 @@ def panel_c(g):
     g.text(lx + 16, ry + 22, "card's estimate", size=11.5, fill=INK2)
     g.rect(lx + 112, ry + 12, 10, 11, fill=Q_F, stroke=Q_S, sw=0.8)
     g.text(lx + 128, ry + 22, "opened: exact → measures the card's gap", size=11.5, fill=INK2)
-    g.rect(lx + 112, ry + 30, 10, 11, fill="hatch-violet", stroke="#a996d6", sw=0.8, dash="2 1.5")
+    g.rect(lx + 112, ry + 30, 10, 11, fill="hatch-violet", stroke=Q_S, sw=0.8, dash="2 1.5")
     g.text(lx + 128, ry + 40, "unread: lifted by the average gap", size=11.5, fill=INK2)
 
 
@@ -701,7 +706,7 @@ def legend(g):
     x, y = LM, 24
     items = [("sink", SINK_F, SINK_S, None), ("fp16 window", FP_F, FP_S, None),
              ("local window", "hatch-blue", FP_S, None), ("int2 window", Q_F, Q_S, None),
-             ("card", "card", None, None), ("credited from its card", "hatch-violet", "#a996d6", "2 1.5"),
+             ("card", "card", None, None), ("credited from its card", "hatch-violet", Q_S, "2 1.5"),
              ("query / new token", QRY_F, QRY_S, None), ("dropped", "x", None, None)]
     for lab, f, s, d in items:
         if f == "card":
