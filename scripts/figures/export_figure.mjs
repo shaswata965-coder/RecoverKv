@@ -32,8 +32,14 @@ const shotsDir = shotsIdx >= 0 ? args[shotsIdx + 1] : null;
 const launch = { headless: true };
 if (process.env.CHROMIUM_PATH) launch.executablePath = process.env.CHROMIUM_PATH;
 const browser = await chromium.launch(launch);
-const page = await browser.newPage({ viewport: { width: 1800, height: 1224 }, deviceScaleFactor: 1 });
+const page = await browser.newPage({ viewport: { width: 2400, height: 1600 }, deviceScaleFactor: 1 });
 await page.goto('file://' + src);
+// The canvas size lives in the SVG; everything below is sized from it.
+const dims = await page.evaluate(() => {
+  const s = document.getElementById('figure');
+  return { w: +s.getAttribute('width'), h: +s.getAttribute('height') };
+});
+await page.setViewportSize({ width: dims.w, height: dims.h });
 await page.evaluate(() => document.fonts.ready);
 
 const { W, H, problems } = await page.evaluate(() => {
@@ -82,7 +88,7 @@ if (shotsDir) {
   }));
   const hi = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: 2 });
   await hi.goto('file://' + src);
-  await hi.evaluate(() => { document.getElementById('figure').style.width = '1800px'; });
+  await hi.evaluate((w) => { document.getElementById('figure').style.width = w + 'px'; }, W);
   for (const [k, p] of panels.entries()) {
     await hi.screenshot({ path: path.join(shotsDir, `panel_${k}.png`),
       clip: { x: p.x - 4, y: p.y - 4, width: p.w + 8, height: p.h + 8 } });
@@ -102,7 +108,7 @@ if (!checkOnly) {
   await page.emulateMedia({ media: 'screen' });
   const png = await browser.newPage({ viewport: { width: W, height: H }, deviceScaleFactor: 3 });
   await png.goto('file://' + src);
-  await png.evaluate(() => { document.getElementById('figure').style.width = '1800px'; });
+  await png.evaluate((w) => { document.getElementById('figure').style.width = w + 'px'; }, W);
   await png.screenshot({ path: outBase + '.png', clip: { x: 0, y: 0, width: W, height: H } });
   console.log(`wrote ${outBase}.{svg,pdf,png}`);
 }
