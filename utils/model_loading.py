@@ -330,6 +330,34 @@ def _warn_on_dtype_mismatch(model: Any, model_cfg: Any) -> None:
     )
 
 
+def describe_realised_rope(model: Any) -> Dict[str, Any]:
+    """The positional setup the LOADED model actually runs, read off the model.
+
+    Not the config's request: a Qwen2.5 FullKV row on native RoPE and one on
+    static YaRN once came back identical to the digit on four of five datasets,
+    and nothing in the sidecar could say which of the two had really run. This
+    reads the rotary module the forward pass uses, so a request that never
+    reached the model is visible in every finished run.
+    """
+    cfg = getattr(model, "config", None)
+    inner = getattr(model, "model", None)
+    rotary = getattr(inner, "rotary_emb", None)
+    inv = getattr(rotary, "inv_freq", None)
+    return {
+        "config_max_position_embeddings": getattr(cfg, "max_position_embeddings", None),
+        "config_rope_scaling": getattr(cfg, "rope_scaling", None),
+        "config_rope_theta": getattr(cfg, "rope_theta", None),
+        "rotary_type": getattr(rotary, "rope_type", None),
+        "rotary_attention_scaling": (
+            float(rotary.attention_scaling)
+            if getattr(rotary, "attention_scaling", None) is not None else None),
+        # Two inv_freq entries pin the frequency table: the fastest pair and a
+        # low-frequency one that YaRN stretches (native and YaRN differ there).
+        "rotary_inv_freq_first_last": (
+            [float(inv[0]), float(inv[-1])] if inv is not None and inv.numel() else None),
+    }
+
+
 def describe_model_load(cfg: Any) -> Dict[str, Any]:
     """The load-time knobs a meta sidecar needs to be self-describing."""
     m = cfg.model

@@ -142,7 +142,12 @@ def test_the_native_rope_rows_differ_only_in_the_positional_setup(native, yarn):
     rope_scaling, its 32768 window) and THUDM's 31500 truncation -- the cache
     and the dtype are the same, so the two columns differ in RoPE alone."""
     n, y = _load(native), _load(yarn)
-    assert n.model.rope_scaling is None and n.model.max_position_embeddings is None
+    # Explicit, so a checkpoint config.json edited to carry YaRN cannot leak in.
+    # (The loader deep-merges the parent's YaRN block, so its other keys ride
+    # along; rope_type default ignores them and factor is pinned inert.)
+    assert n.model.rope_scaling["rope_type"] == "default"
+    assert n.model.rope_scaling["factor"] == 1.0
+    assert n.model.max_position_embeddings == 32768
     assert n.model.dtype == y.model.dtype == "bfloat16"
     assert n.cache == y.cache
     assert n.longbench.max_length == 31500

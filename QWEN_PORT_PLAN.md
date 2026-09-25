@@ -21,6 +21,48 @@ qasper, multifieldqa_en, hotpotqa, 2wikimqa and samsum sit at parity -- with
 qasper and multifieldqa_en slightly ABOVE QEvict. Neither round's hypothesis
 predicted anything going up.
 
+### Round 11 — the native-RoPE arm came back identical to the YaRN arm: one of them did not run its config
+
+| dataset | full (YaRN) | full_native | ours (YaRN) | ours_native |
+|---|---|---|---|---|
+| triviaqa | 87.43 | 87.43 | 81.15 | 80.85 |
+| trec | 65.50 | 65.50 | 62.50 | 62.50 |
+| qasper | 44.66 | 44.66 | 37.13 | 37.21 |
+| musique | 27.72 | 27.72 | 20.78 | 21.79 |
+| narrativeqa | 24.92 | 23.74 | 17.79 | 16.02 |
+
+The FullKV rows are identical to the digit on four of five datasets. The one
+that moved, narrativeqa, is the one whose prompts exceed the native arm's
+31500-token truncation. A real RoPE change cannot leave 800 greedy
+generations bit-identical, so **one of the two FullKV runs did not run the
+positional setup its config names.** On this branch the two configs load
+different models: with Qwen2.5-0.5B through the same loader, YaRN gives a
+`yarn` rotary at a = 1.1386 and native a `default` one, and their last-token
+logits on one prompt differ by up to 10 with a different argmax. So the
+difference is in how the GPU box runs them (its local ablation scripts, its
+model-path override, or a local checkpoint `config.json` carrying its own
+YaRN), and the Round 10 question -- does YaRN handicap Qwen -- is NOT answered
+by this table.
+
+What it does say: in both pairs compression costs the same ~6 points
+(49.81 -> 43.67 native, 50.05 -> 43.87 YaRN), so whatever RoPE actually ran,
+it ran in both arms of each pair.
+
+Changes so this cannot recur unseen:
+- the LongBench sidecar records `model_load_requested` (the YAML's overrides)
+  AND `model_rope_realised` (read off the loaded model's rotary module: type,
+  attention_scaling, first/last inv_freq). A row whose two disagree is not the
+  row its config names. Before this, nothing in a sidecar said which RoPE ran.
+- the native configs are EXPLICIT (`max_position_embeddings: 32768`,
+  `rope_scaling: {rope_type: default, factor: 1.0}`) instead of null, because
+  null keeps whatever the checkpoint's config.json says -- and a local copy
+  edited per Qwen's long-context instructions carries YaRN. Checked: on a
+  YaRN-edited config the native arm now loads a `default` rotary at a = 1.0.
+
+Next: the run logs already carry `Loading model: ... rope_scaling=...` for
+each arm (utils/model_loading.py); grep them, and re-run the two native arms
+on this commit so their sidecars carry `model_rope_realised`.
+
 ### Round 10 — every Qwen column runs static YaRN; published baselines do not
 
 Published LongBench baselines on Qwen2.5-7B-Instruct (DefensiveKV and others,

@@ -26,6 +26,7 @@ from data.longbench_loader import (
 )
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.prompting import encode_prompt
+from utils.model_loading import describe_model_load, describe_realised_rope
 from utils.env_capture import capture_environment
 from utils.hashing import sha256_file
 from utils.logger import get_logger
@@ -798,6 +799,12 @@ class LongBenchRunner:
             "track_scores": False,
             "attn_implementation": cfg.model.attn_implementation,
             "dtype": cfg.model.dtype,
+            # What was ASKED for (the YAML's model overrides) and what the loaded
+            # model actually RAN (its rotary module). A row whose two disagree
+            # is not the row its config names.
+            "model_load_requested": describe_model_load(cfg),
+            "model_rope_realised": (describe_realised_rope(self.model)
+                                    if self.model is not None else None),
             "max_length": getattr(self.lb, "max_length", 7500),
             "max_gen_len": max_gen_len,
             "num_samples_requested": getattr(self.lb, "num_samples", "max"),

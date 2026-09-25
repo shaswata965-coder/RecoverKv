@@ -271,7 +271,11 @@ one per-window block is the real fix and needs a GPU to verify.
   included -- runs static YaRN x4** (logits x1.296, 33/64 RoPE pairs changed
   at lengths the model handles natively), while published baselines above our
   Qwen FullKV run native RoPE: the `full_native` / `ours_native` arms (Round 10)
-  come before any more method work. The history below is how it got here.
+  come before any more method work. **They came back identical to the YaRN
+  arms to the digit on 4/5 datasets** (Round 11) -- one arm did not run its
+  config. Every LongBench sidecar now carries `model_rope_realised` (read off
+  the loaded model); **a Qwen row whose realised RoPE is not what its config
+  asked for is not that row.** The history below is how it got here.
 * **(History) The gate's card accuracy on Qwen2.5 was unmeasured until
   Round 6, and was the leading suspect for the Qwen gap.** With the operating point and protocol equal, the
   columns differ only in how a decode step READS the kept cache, and the gate

@@ -17,8 +17,14 @@
 _base_: longbench_qwen_full_cache.yaml
 
 model:
-  max_position_embeddings: null
-  rope_scaling: null
+  # EXPLICIT, not null: null means "keep whatever the checkpoint's config.json
+  # says", and a local Qwen2.5 copy edited per Qwen's long-context instructions
+  # carries a YaRN rope_scaling of its own -- the native arm would then run
+  # YaRN without a word. rope_type default is plain RoPE at rope_theta 1e6.
+  max_position_embeddings: 32768
+  rope_scaling:
+    rope_type: default
+    factor: 1.0          # the YAML loader deep-merges the parent's YaRN block; pin it inert
 
 longbench:
   max_length: 31500
