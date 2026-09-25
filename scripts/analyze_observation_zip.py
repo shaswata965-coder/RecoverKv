@@ -152,7 +152,8 @@ def analyze_sample(a: Dict[str, np.ndarray], geom: Dict, ax: Dict,
 
     ph = (n, L, H)
     for k in ("sink", "m_local", "m_fp", "m_int2", "m_evict", "miss_h2o",
-              "miss_inst", "miss_recent", "miss_h2o_fp8", "miss_agenorm",
+              "miss_inst", "miss_recent", "miss_recent_fp8", "miss_h2o_fp8",
+              "miss_agenorm",
               "m_evict_gen", "body_w90",
               "top1_share", "recall", "recall_oracle", "recall_perhead",
               "unread", "hot_in_pick", "card_spearman", "card_top_overlap",
@@ -201,11 +202,13 @@ def analyze_sample(a: Dict[str, np.ndarray], geom: Dict, ax: Dict,
         ev_rec = sim_evicted(lambda t: np.arange(W, dtype=f32), W_t, ev,
                              k_fp + k_q, local_w, W)
         ev_fp8 = sim_evicted(lambda t: cum[t - 1], W_t, ev, k_fp8, local_w, W)
+        ev_rec8 = sim_evicted(lambda t: np.arange(W, dtype=f32), W_t, ev, k_fp8,
+                              local_w, W)
         ev_ins = instant_evicted(hm[1:], W_t[1:], k_fp + k_q, local_w)
         ev_age = sim_evicted(lambda t: cum[t - 1] / np.maximum(exposure(t), 1), W_t,
                              ev, k_fp + k_q, local_w, W)
         for name, msk in (("miss_h2o", ev_h2o[1:]), ("miss_recent", ev_rec[1:]),
-                          ("miss_agenorm", ev_age[1:]),
+                          ("miss_agenorm", ev_age[1:]), ("miss_recent_fp8", ev_rec8[1:]),
                           ("miss_h2o_fp8", ev_fp8[1:]), ("miss_inst", ev_ins)):
             R[name][:, l] = np.einsum("thw,tw->th", m, msk.astype(f32))
         # ---- read gate (measured) vs same-count oracle picks -----------
@@ -463,6 +466,7 @@ def main() -> None:
     names = [("cache (measured)", "m_evict"), ("exact cumulative ranker, same tiers", "miss_h2o"),
              ("per-step best set (ceiling)", "miss_inst"), ("recency, same count", "miss_recent"),
              ("exact ranker, fp-only at same bytes", "miss_h2o_fp8"),
+             ("recency, fp-only at same bytes", "miss_recent_fp8"),
              ("exact ranker, age-normalised (mass per query that saw it)", "miss_agenorm")]
     rows = [(r, [fmt(v, 1) for v in by_band(cat(k))]) for r, k in names]
     md += ["\n## 3. Missed mass: the cache against oracle policies\n", table(rows, cols)]
@@ -602,12 +606,21 @@ def main() -> None:
             ("missed (cache)", [fmt(v, 1) for v in over_t("m_evict")]),
             ("missed (exact ranker)", [fmt(v, 1) for v in over_t("miss_h2o")]),
             ("missed on generated-token windows", [fmt(v, 1) for v in over_t("m_evict_gen")]),
+            ("missed (exact ranker, fp-only, same bytes)", [fmt(v, 1) for v in over_t("miss_h2o_fp8")]),
+            ("missed (recency, fp-only, same bytes)", [fmt(v, 1) for v in over_t("miss_recent_fp8")]),
             ("missed (age-normalised ranker)", [fmt(v, 1) for v in over_t("miss_agenorm")]),
             ("gate recall", [fmt(v, 1) for v in over_t("recall")]),
             ("output error, actual", [fmt(v) for v in over_t("out_err", 3)]),
             ("next-token entropy (nats)", [fmt(float(ent[:, a_:b_].mean()), nd=2)
                                            for a_, b_ in zip(edges[:-1], edges[1:])])]
     md += ["\n## 12. Over the decode (decode steps, all layers)\n", table(rows, tcols)]
+    J["over_decode"] = {"steps": tcols, **{k: over_t(k) for k in (
+        "sink", "m_int2", "m_evict", "miss_h2o", "m_evict_gen", "miss_agenorm",
+        "miss_h2o_fp8", "miss_recent_fp8", "miss_recent", "recall")},
+        "out_err_actual": over_t("out_err", 3)}
+    J["tails"] = {k: {"p90": by_band(cat(k), q(90)), "p99": by_band(cat(k), q(99)),
+                      "gt10": by_band((cat(k) > 0.1).astype(f32))}
+                  for k in ("m_evict", "miss_h2o_fp8", "miss_recent_fp8", "miss_inst")}
 
     # 13. per sample
     rows = []
