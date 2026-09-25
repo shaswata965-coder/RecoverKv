@@ -9,27 +9,29 @@ drawn identically in every panel and annotated differently in each, so the
 reader learns the cache once and then watches it being scored, gated and read:
 
   (a) the attention map (keys across, queries down) is summed per token, each
-      window's 8 tokens stack into its score, the ranked scores split into
+      window's tokens stack into its score, the ranked scores split into
       top-k fp16 / next top-k int2 / dropped, and the cache sections are mapped
       onto the byte budget they share. A zoom shows the card as a cluster
-      summary of the window, and an int2 window broken into its parts.
+      summary of the window, and an int2 window's parts in one row, to scale
+      against the same window in fp16.
   (b) the query scores every card; each head's preferences are unioned and the
-      top quarter of the int2 windows is opened -- and every window's
+      top windows are opened at the gate ratio -- and every window's
       cumulative score still grows, exactly if read, from its card if not
-  (c) a generated token fills the newest window; the 8th closes it and the
+  (c) a generated token fills the newest window; the last closes it and the
       cache re-ranks (promote / demote / drop). One fused pass reads fp16 and
       the opened windows decoded on chip, the unread through their cards, and
       the gap measured on the opened windows lifts every unread card's estimate
 
-The toy cache holds 2 fp16 and 16 int2 windows: 16 x 1076 B against 2 x 4096 B
-per head puts ~68% of the evictable bytes in int2, the shipped 70 : 30 split,
-drawn to count. The budget bar is to scale for a 4096-token prompt with 256
-generated at budget 0.20.
+No label names a configuration value -- window size, quant ratio, budget or
+gate ratio -- so the figure describes the method at any setting. The drawing
+itself is proportioned from one real setting (2 fp16 against 16 int2 windows
+keeps the int2 share of the evictable bytes near the shipped split; the budget
+bar and the int2 row are to scale for it), but that is geometry, never text.
 
 Three more components are reused rather than redrawn: the card glyph (an SVG
 ``<symbol>``), the window bar (score in (a) and (b), mass in (c)) and the query
-glyph. An int2 window is drawn about 4x shorter than an fp16 one, which is its
-price with the card included (1076 B vs 4096 B per head).
+glyph. An int2 window is drawn shorter than an fp16 one, in proportion to its
+price with the card included, so the bar itself carries the compression.
 
 The figure is one self-contained SVG in a bare HTML page, so it exports without
 a converter: ``scripts/figures/export_figure.mjs`` writes .svg, a one-page vector
@@ -278,7 +280,7 @@ TIER_TINT = {"fp": (FP_F, "#b7d0ec", FP_S), "q": (Q_F, "#f3b57f", Q_S),
 
 
 def panel_a(g):
-    frame(g, "(a)", "Cumulative attention ranks windows", "re-tiered every 8 decode steps")
+    frame(g, "(a)", "Cumulative attention ranks windows", "re-tiered at every window boundary")
 
     # ---- attention map, with its axes named
     N, SINK, WSZ, cell = 26, 2, 8, 4.6
@@ -320,7 +322,7 @@ def panel_a(g):
         x1 = hx + (SINK + w_ * WSZ) * cell
         bracket(g, x1 + 0.5, x1 + WSZ * cell - 0.5, by + 4, up=False, stroke=INK if w_ == HL else INK3,
                 sw=1.4 if w_ == HL else 0.9, tick=4)
-    g.text(hx + hw / 2, by + 46, "8 tokens = 1 window", size=11.5, anchor="middle", fill=INK2)
+    g.text(hx + hw / 2, by + 46, "tokens of one window", size=11.5, anchor="middle", fill=INK2)
     g.text(hx - 3, by - 4, "sink", size=10.5, anchor="end", fill=INK3)
 
     # ---- window scores, ranked: each bar is its 8 tokens stacked, plus what decode added
@@ -367,7 +369,7 @@ def panel_a(g):
     g.path(f"M{x1 + WSZ * cell / 2},{by + 9} C{x1 + WSZ * cell / 2},{by + 40} "
            f"{ex_(hl_bar) + bw / 2},{by + 40} {ex_(hl_bar) + bw / 2},{by + 3}",
            stroke=INK, sw=1, dash="3 2", arrow="dark")
-    g.text(ex_(hl_bar) + bw + 6, by + 34, "its 8 tokens, stacked", size=11.5, fill=INK)
+    g.text(ex_(hl_bar) + bw + 6, by + 34, "its tokens, stacked", size=11.5, fill=INK)
     # stack key
     kx, ky = 318, 150
     g.rect(kx, ky - 9, 9, 10, fill=Q_F)
@@ -419,17 +421,18 @@ def panel_a(g):
     # what the budget is, and how it divides
     ly = byt + bht + 16
     bracket(g, seg["fp"][0], seg["card"][1], byt + bht + 4, up=False, stroke=INK3, tick=4)
-    g.text((seg["fp"][0] + seg["card"][1]) / 2, ly + 2, "evictable bytes: 30% fp16, 70% int2 + card",
+    g.text((seg["fp"][0] + seg["card"][1]) / 2, ly + 2, "evictable bytes, split by the quant ratio",
            size=11.5, anchor="middle", fill=INK2)
     g.text(seg["loc"][1], ly + 2, "fixed", size=11.5, anchor="end", fill=INK3)
-    g.text((bx0 + bx1) / 2, ly + 19, "all four together = the budget, 20% of the full KV cache",
+    g.text((bx0 + bx1) / 2, ly + 19, "all four together make up the cache budget",
            size=11.5, anchor="middle", fill=INK, weight="bold")
 
     # ---- demotion, magnified: the card clusters the window, and what an int2 window holds
-    zx, zy, zw, zh = 16, YB + 118, PW - 32, PH - (YB + 118) - 12
+    zh = 176
+    zx, zy, zw = 16, YB + 128, PW - 32
     g.rect(zx, zy, zw, zh, fill="#fbfcfd", stroke=RULE, sw=1, rx=6)
     g.text(zx + 12, zy + 19, "demoting one window", size=12.5, weight="bold", fill=INK2)
-    cx, cy = zx + 98, zy + 60
+    cx, cy = zx + 98, zy + 62
     vd = (0.83, -0.56)
     pts = [(-15, 6), (-8, -10), (6, 11), (13, -3), (-19, -3), (2, -13), (9, 4)]
     hot = (52, -30)
@@ -451,34 +454,33 @@ def panel_a(g):
     g.text(rx0 + 48, cy + 8, "as one cluster:", size=11.5, fill=INK2)
     g.text(rx0 + 48, cy + 22, "centroid + outlier axis", size=11.5, fill=INK2)
 
-    # an int2 window, broken into its parts (bytes per head, each row to its own scale)
+    # one int2 window, to scale against the same window in fp16, in one row
     L0, L1 = zx + 12, zx + zw - 12
-    rw = L1 - L0
-    r1, r2, r3, rh = zy + 104, zy + 136, zy + 168, 15
-
-    def row(y, items, total, dark=False):
-        x = L0
-        out = []
-        for lab, val, fill, tcol in items:
-            wd = rw * val / total
-            g.rect(x, y, wd, rh, fill=fill, stroke="#ffffff", sw=1)
-            g.text(x + wd / 2, y + 11, lab, size=10.5, anchor="middle", fill=tcol)
-            out.append((x, x + wd))
-            x += wd
-        return out
-
-    win = row(r1, [("K codes · 256", 256, "#f6b37a", INK), ("V codes · 256", 256, "#fad0a8", INK),
-                   ("scale + zero · 292", 292, "#dca27a", INK)], 804)
-    whole = row(r2, [("2-bit window · 804 B", 804, Q_F, Q_T), ("card · 272 B", 272, CARD_F, CARD_T)],
-                1076)
-    card = row(r3, [("centroid · 66", 66, "#a9d8bb", INK), ("outlier axis + positions · 140", 140,
-                    "#72b98f", "#ffffff"), ("value centroid · 66", 66, "#cfe9d9", INK)], 272)
-    for (a0, a1), yy0, yy1 in ((whole[0], r2, r1 + rh), (whole[1], r2 + rh, r3)):
-        top = yy0 if yy1 < yy0 else yy0
-        g.path(f"M{a0},{yy0} L{L0},{yy1} M{a1},{yy0} L{L1},{yy1}", stroke=INK3, sw=0.7, dash="2 2")
-    g.text(L1, r1 - 6, "bytes per head", size=10.5, anchor="end", fill=INK3)
-    g.text(L1, r3 + rh + 14, "1076 B in all, against 4096 B for the same window in fp16",
-           size=11, anchor="end", fill=INK2)
+    rw, rh = L1 - L0, 12
+    r1, r2 = zy + 108, zy + 128
+    g.rect(L0, r1, rw, rh, fill=FP_F, stroke=FP_S, sw=0.8)
+    g.text(L1 - 6, r1 + 9.5, "the same window in fp16", size=10.5, anchor="end", fill=FP_T)
+    # relative sizes of the parts (their ratio, not a byte count, is what is drawn)
+    parts = [("K codes", 256, "#f6b37a"), ("V codes", 256, "#fad0a8"), ("scale + zero", 292, "#dca27a"),
+             ("centroid", 66, "#a9d8bb"), ("outlier axis", 140, "#5fae82"),
+             ("value centroid", 66, "#cfe9d9")]
+    tot = sum(v for _, v, _ in parts)
+    wq = rw * tot / 4096
+    x = L0
+    for _, v, col in parts:
+        g.rect(x, r2, wq * v / tot, rh, fill=col, stroke="#ffffff", sw=0.6)
+        x += wq * v / tot
+    g.rect(L0, r2, wq, rh, stroke=Q_S, sw=0.9)
+    g.text(L0, r2 + rh + 14, "int2 window + card", size=11, fill=Q_T, weight="bold")
+    # the key to the parts, beside the bar
+    kx = L0 + wq + 14
+    for line, items in enumerate((parts[:3], parts[3:])):
+        xx = kx
+        yy = r2 + 1 + line * 16
+        for lab, _, col in items:
+            g.rect(xx, yy, 9, 9, fill=col, stroke=INK3, sw=0.4)
+            g.text(xx + 13, yy + 8.5, lab, size=10.5, fill=INK2)
+            xx += 24 + len(lab) * 5.6
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +494,7 @@ def panel_b(g):
     for h in range(4):
         g.rect(qx, qy + h * 8, 44, 6, fill=QRY_F, stroke=QRY_S, sw=0.8, rx=1.5)
     g.text(qx - 8, qy + 14, "query", size=12.5, anchor="end", weight="bold", fill=QRY_T)
-    g.text(qx - 8, qy + 29, "4 heads", size=12, anchor="end", fill=QRY_T)
+    g.text(qx - 8, qy + 29, "heads of one group", size=12, anchor="end", fill=QRY_T)
 
     # every card is scored against it
     top = card_top(YB)
@@ -525,7 +527,8 @@ def panel_b(g):
         g.rect(x, uy, Q_W, ch, fill=ramp(ORANGES, UNION[c] ** 0.6 * 1.05), stroke="#ffffff", sw=0.6)
         if c in SEL:
             g.rect(x - 1, uy - 1, Q_W + 2, ch + 2, stroke=INK, sw=1.5)
-    g.text(C["q"], uy + 30, "top 25% opened", size=12.5, anchor="middle", weight="bold", fill=Q_T)
+    g.text(C["q"], uy + 30, "top windows opened, at the gate ratio", size=12.5, anchor="middle",
+           weight="bold", fill=Q_T)
 
     # the cumulative score keeps rolling, read or not
     ry = uy + 58
@@ -597,7 +600,7 @@ def panel_c(g):
     ym = chy + chh / 2
     g.path(f"M{xb},{ny0 + 26} L{xb},{ym - 6} Q{xb},{ym} {xb - 6},{ym} L{chx + chw + 3},{ym}",
            stroke=QRY_S, sw=1.4, arrow="dark")
-    g.text(nx0 - 8, ny0 + 9, "8th token closes it:", size=11.5, anchor="end", fill=QRY_T,
+    g.text(nx0 - 8, ny0 + 9, "last token closes it:", size=11.5, anchor="end", fill=QRY_T,
            weight="bold")
     g.text(nx0 - 8, ny0 + 24, "window boundary", size=11.5, anchor="end", fill=QRY_T)
     g.rect(chx, chy, chw, chh, fill="#f3f4f6", stroke=INK2, sw=1, rx=12)
@@ -708,8 +711,6 @@ def legend(g):
             g.rect(x, y - 11, 16, 13, fill=f, stroke=s, sw=0.9, dash=d)
         g.text(x + 22, y, lab, size=12.5, fill=INK2)
         x += 40 + len(lab) * 6.6
-    g.text(W - 14, y, "Llama-3.1-8B · window = 8 tokens · budget 20% · gate opens 25%",
-           size=12.5, anchor="end", fill=INK3)
 
 
 def arrows(g):

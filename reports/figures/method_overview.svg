@@ -22,11 +22,10 @@
 <text x="718.40" y="24.00" font-size="12.5" text-anchor="start" fill="#4b5563">query / new token</text>
 <path d="M852.0999999999999,14.5 L861.0999999999999,23.5 M852.0999999999999,23.5 L861.0999999999999,14.5" fill="none" stroke="#a3a3a3" stroke-width="1.8"/>
 <text x="870.60" y="24.00" font-size="12.5" text-anchor="start" fill="#4b5563">dropped</text>
-<text x="1414.00" y="24.00" font-size="12.5" text-anchor="end" fill="#8a939c">Llama-3.1-8B · window = 8 tokens · budget 20% · gate opens 25%</text>
 <g transform="translate(34,46)" class="panel" data-w="440" data-h="684">
 <rect x="0.00" y="0.00" width="440.00" height="684.00" rx="9" fill="#ffffff" stroke="#c9d0d7" stroke-width="1.2"/>
 <text x="16.00" y="26.00" font-size="16.5" text-anchor="start" fill="#1d2329" font-weight="bold">(a)  Cumulative attention ranks windows</text>
-<text x="16.00" y="45.00" font-size="13" text-anchor="start" fill="#4b5563" font-style="italic">re-tiered every 8 decode steps</text>
+<text x="16.00" y="45.00" font-size="13" text-anchor="start" fill="#4b5563" font-style="italic">re-tiered at every window boundary</text>
 <rect x="46.00" y="84.00" width="4.60" height="4.60" rx="0" fill="#08306b" stroke="#ffffff" stroke-width="0.4"/>
 <rect x="50.60" y="84.00" width="4.60" height="4.60" rx="0" fill="#f3f4f6" stroke="#ffffff" stroke-width="0.4"/>
 <rect x="55.20" y="84.00" width="4.60" height="4.60" rx="0" fill="#f3f4f6" stroke="#ffffff" stroke-width="0.4"/>
@@ -738,7 +737,7 @@
 <path d="M55.7,227.6 L55.7,231.6 L91.5,231.6 L91.5,227.6" fill="none" stroke="#8a939c" stroke-width="0.9"/>
 <path d="M92.5,227.6 L92.5,231.6 L128.3,231.6 L128.3,227.6" fill="none" stroke="#1d2329" stroke-width="1.4"/>
 <path d="M129.3,227.6 L129.3,231.6 L165.10000000000002,231.6 L165.10000000000002,227.6" fill="none" stroke="#8a939c" stroke-width="0.9"/>
-<text x="105.80" y="273.60" font-size="11.5" text-anchor="middle" fill="#4b5563">8 tokens = 1 window</text>
+<text x="105.80" y="273.60" font-size="11.5" text-anchor="middle" fill="#4b5563">tokens of one window</text>
 <text x="43.00" y="223.60" font-size="10.5" text-anchor="end" fill="#8a939c">sink</text>
 <rect x="208.00" y="213.99" width="8.00" height="13.61" rx="0" fill="#cfe0f3" stroke="none" stroke-width="1.0"/>
 <rect x="208.00" y="197.29" width="8.00" height="16.69" rx="0" fill="#b7d0ec" stroke="none" stroke-width="1.0"/>
@@ -1014,7 +1013,7 @@
 <path d="M388,94 L388,98 L426,98 L426,94" fill="none" stroke="#a3a3a3" stroke-width="1.2"/>
 <text x="408.00" y="92.00" font-size="11.5" text-anchor="middle" fill="#8a939c">drop</text>
 <path d="M110.4,236.6 C110.4,267.6 252.0,267.6 252.0,230.6" fill="none" stroke="#1d2329" stroke-width="1" stroke-dasharray="3 2" marker-end="url(#ah-dark)"/>
-<text x="262.00" y="261.60" font-size="11.5" text-anchor="start" fill="#1d2329">its 8 tokens, stacked</text>
+<text x="262.00" y="261.60" font-size="11.5" text-anchor="start" fill="#1d2329">its tokens, stacked</text>
 <rect x="318.00" y="141.00" width="9.00" height="10.00" rx="0" fill="#f8cfa6" stroke="none" stroke-width="1.0"/>
 <rect x="318.00" y="131.00" width="9.00" height="10.00" rx="0" fill="#f3b57f" stroke="none" stroke-width="1.0"/>
 <text x="332.00" y="144.00" font-size="11" text-anchor="start" fill="#4b5563">one token each</text>
@@ -1137,51 +1136,53 @@
 <text x="334.73" y="411.00" font-size="11.5" text-anchor="middle" fill="#2a6d45" font-weight="bold">cards</text>
 <text x="394.43" y="411.00" font-size="11.5" text-anchor="middle" fill="#2c5a8f" font-weight="bold">local</text>
 <path d="M24.310344827586206,416 L24.310344827586206,420 L364.855172413793,420 L364.855172413793,416" fill="none" stroke="#8a939c" stroke-width="1.0"/>
-<text x="194.58" y="434.00" font-size="11.5" text-anchor="middle" fill="#4b5563">evictable bytes: 30% fp16, 70% int2 + card</text>
+<text x="194.58" y="434.00" font-size="11.5" text-anchor="middle" fill="#4b5563">evictable bytes, split by the quant ratio</text>
 <text x="424.00" y="434.00" font-size="11.5" text-anchor="end" fill="#8a939c">fixed</text>
-<text x="223.00" y="451.00" font-size="11.5" text-anchor="middle" fill="#1d2329" font-weight="bold">all four together = the budget, 20% of the full KV cache</text>
-<rect x="16.00" y="470.00" width="408.00" height="202.00" rx="6" fill="#fbfcfd" stroke="#c9d0d7" stroke-width="1"/>
-<text x="28.00" y="489.00" font-size="12.5" text-anchor="start" fill="#4b5563" font-weight="bold">demoting one window</text>
-<line x1="85.78" y1="549.04" x2="173.76" y2="489.68" stroke="#3b8a5a" stroke-width="0.9" stroke-dasharray="4 3"/>
-<circle cx="114.00" cy="530.00" r="26" fill="none" stroke="#3b8a5a" stroke-width="0.9" stroke-dasharray="2 3"/>
-<circle cx="99.00" cy="536.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="106.00" cy="520.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="120.00" cy="541.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="127.00" cy="527.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="95.00" cy="527.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="116.00" cy="517.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="123.00" cy="534.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
-<circle cx="166.00" cy="500.00" r="4.6" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
-<line x1="114.00" y1="530.00" x2="161.00" y2="503.50" stroke="#2a6d45" stroke-width="1.8" marker-end="url(#ah-green)"/>
-<path d="M110,526 L118,534 M110,534 L118,526" fill="none" stroke="#1d2329" stroke-width="1.8"/>
-<text x="80.00" y="534.00" font-size="11.5" text-anchor="end" fill="#1d2329">centroid</text>
-<line x1="82.00" y1="530.00" x2="108.00" y2="530.00" stroke="#8a939c" stroke-width="0.7"/>
-<text x="174.00" y="504.00" font-size="11.5" text-anchor="start" fill="#a93226">outlier</text>
-<line x1="192.00" y1="530.00" x2="216.00" y2="530.00" stroke="#4b5563" stroke-width="1.3" marker-end="url(#ah-dark)"/>
-<use href="#card" xlink:href="#card" x="222.00" y="510.00" width="40" height="40"/>
-<text x="270.00" y="523.00" font-size="11.5" text-anchor="start" fill="#2a6d45" font-weight="bold">card: the window</text>
-<text x="270.00" y="538.00" font-size="11.5" text-anchor="start" fill="#4b5563">as one cluster:</text>
-<text x="270.00" y="552.00" font-size="11.5" text-anchor="start" fill="#4b5563">centroid + outlier axis</text>
-<rect x="28.00" y="574.00" width="122.27" height="15.00" rx="0" fill="#f6b37a" stroke="#ffffff" stroke-width="1"/>
-<text x="89.13" y="585.00" font-size="10.5" text-anchor="middle" fill="#1d2329">K codes · 256</text>
-<rect x="150.27" y="574.00" width="122.27" height="15.00" rx="0" fill="#fad0a8" stroke="#ffffff" stroke-width="1"/>
-<text x="211.40" y="585.00" font-size="10.5" text-anchor="middle" fill="#1d2329">V codes · 256</text>
-<rect x="272.54" y="574.00" width="139.46" height="15.00" rx="0" fill="#dca27a" stroke="#ffffff" stroke-width="1"/>
-<text x="342.27" y="585.00" font-size="10.5" text-anchor="middle" fill="#1d2329">scale + zero · 292</text>
-<rect x="28.00" y="606.00" width="286.93" height="15.00" rx="0" fill="#f8cfa6" stroke="#ffffff" stroke-width="1"/>
-<text x="171.46" y="617.00" font-size="10.5" text-anchor="middle" fill="#a0500f">2-bit window · 804 B</text>
-<rect x="314.93" y="606.00" width="97.07" height="15.00" rx="0" fill="#d4ecdc" stroke="#ffffff" stroke-width="1"/>
-<text x="363.46" y="617.00" font-size="10.5" text-anchor="middle" fill="#2a6d45">card · 272 B</text>
-<rect x="28.00" y="638.00" width="93.18" height="15.00" rx="0" fill="#a9d8bb" stroke="#ffffff" stroke-width="1"/>
-<text x="74.59" y="649.00" font-size="10.5" text-anchor="middle" fill="#1d2329">centroid · 66</text>
-<rect x="121.18" y="638.00" width="197.65" height="15.00" rx="0" fill="#72b98f" stroke="#ffffff" stroke-width="1"/>
-<text x="220.00" y="649.00" font-size="10.5" text-anchor="middle" fill="#ffffff">outlier axis + positions · 140</text>
-<rect x="318.82" y="638.00" width="93.18" height="15.00" rx="0" fill="#cfe9d9" stroke="#ffffff" stroke-width="1"/>
-<text x="365.41" y="649.00" font-size="10.5" text-anchor="middle" fill="#1d2329">value centroid · 66</text>
-<path d="M28,606 L28,589 M314.92936802973975,606 L412,589" fill="none" stroke="#8a939c" stroke-width="0.7" stroke-dasharray="2 2"/>
-<path d="M314.92936802973975,621 L28,638 M412.0,621 L412,638" fill="none" stroke="#8a939c" stroke-width="0.7" stroke-dasharray="2 2"/>
-<text x="412.00" y="568.00" font-size="10.5" text-anchor="end" fill="#8a939c">bytes per head</text>
-<text x="412.00" y="667.00" font-size="11" text-anchor="end" fill="#4b5563">1076 B in all, against 4096 B for the same window in fp16</text>
+<text x="223.00" y="451.00" font-size="11.5" text-anchor="middle" fill="#1d2329" font-weight="bold">all four together make up the cache budget</text>
+<rect x="16.00" y="480.00" width="408.00" height="176.00" rx="6" fill="#fbfcfd" stroke="#c9d0d7" stroke-width="1"/>
+<text x="28.00" y="499.00" font-size="12.5" text-anchor="start" fill="#4b5563" font-weight="bold">demoting one window</text>
+<line x1="85.78" y1="561.04" x2="173.76" y2="501.68" stroke="#3b8a5a" stroke-width="0.9" stroke-dasharray="4 3"/>
+<circle cx="114.00" cy="542.00" r="26" fill="none" stroke="#3b8a5a" stroke-width="0.9" stroke-dasharray="2 3"/>
+<circle cx="99.00" cy="548.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="106.00" cy="532.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="120.00" cy="553.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="127.00" cy="539.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="95.00" cy="539.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="116.00" cy="529.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="123.00" cy="546.00" r="3.6" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.7"/>
+<circle cx="166.00" cy="512.00" r="4.6" fill="#c0392b" stroke="#ffffff" stroke-width="0.8"/>
+<line x1="114.00" y1="542.00" x2="161.00" y2="515.50" stroke="#2a6d45" stroke-width="1.8" marker-end="url(#ah-green)"/>
+<path d="M110,538 L118,546 M110,546 L118,538" fill="none" stroke="#1d2329" stroke-width="1.8"/>
+<text x="80.00" y="546.00" font-size="11.5" text-anchor="end" fill="#1d2329">centroid</text>
+<line x1="82.00" y1="542.00" x2="108.00" y2="542.00" stroke="#8a939c" stroke-width="0.7"/>
+<text x="174.00" y="516.00" font-size="11.5" text-anchor="start" fill="#a93226">outlier</text>
+<line x1="192.00" y1="542.00" x2="216.00" y2="542.00" stroke="#4b5563" stroke-width="1.3" marker-end="url(#ah-dark)"/>
+<use href="#card" xlink:href="#card" x="222.00" y="522.00" width="40" height="40"/>
+<text x="270.00" y="535.00" font-size="11.5" text-anchor="start" fill="#2a6d45" font-weight="bold">card: the window</text>
+<text x="270.00" y="550.00" font-size="11.5" text-anchor="start" fill="#4b5563">as one cluster:</text>
+<text x="270.00" y="564.00" font-size="11.5" text-anchor="start" fill="#4b5563">centroid + outlier axis</text>
+<rect x="28.00" y="588.00" width="384.00" height="12.00" rx="0" fill="#cfe0f3" stroke="#3c6ea8" stroke-width="0.8"/>
+<text x="406.00" y="597.50" font-size="10.5" text-anchor="end" fill="#2c5a8f">the same window in fp16</text>
+<rect x="28.00" y="608.00" width="24.00" height="12.00" rx="0" fill="#f6b37a" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="52.00" y="608.00" width="24.00" height="12.00" rx="0" fill="#fad0a8" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="76.00" y="608.00" width="27.38" height="12.00" rx="0" fill="#dca27a" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="103.38" y="608.00" width="6.19" height="12.00" rx="0" fill="#a9d8bb" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="109.56" y="608.00" width="13.12" height="12.00" rx="0" fill="#5fae82" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="122.69" y="608.00" width="6.19" height="12.00" rx="0" fill="#cfe9d9" stroke="#ffffff" stroke-width="0.6"/>
+<rect x="28.00" y="608.00" width="100.88" height="12.00" rx="0" fill="none" stroke="#c8691f" stroke-width="0.9"/>
+<text x="28.00" y="634.00" font-size="11" text-anchor="start" fill="#a0500f" font-weight="bold">int2 window + card</text>
+<rect x="142.88" y="609.00" width="9.00" height="9.00" rx="0" fill="#f6b37a" stroke="#8a939c" stroke-width="0.4"/>
+<text x="155.88" y="617.50" font-size="10.5" text-anchor="start" fill="#4b5563">K codes</text>
+<rect x="206.07" y="609.00" width="9.00" height="9.00" rx="0" fill="#fad0a8" stroke="#8a939c" stroke-width="0.4"/>
+<text x="219.07" y="617.50" font-size="10.5" text-anchor="start" fill="#4b5563">V codes</text>
+<rect x="269.27" y="609.00" width="9.00" height="9.00" rx="0" fill="#dca27a" stroke="#8a939c" stroke-width="0.4"/>
+<text x="282.27" y="617.50" font-size="10.5" text-anchor="start" fill="#4b5563">scale + zero</text>
+<rect x="142.88" y="625.00" width="9.00" height="9.00" rx="0" fill="#a9d8bb" stroke="#8a939c" stroke-width="0.4"/>
+<text x="155.88" y="633.50" font-size="10.5" text-anchor="start" fill="#4b5563">centroid</text>
+<rect x="211.68" y="625.00" width="9.00" height="9.00" rx="0" fill="#5fae82" stroke="#8a939c" stroke-width="0.4"/>
+<text x="224.68" y="633.50" font-size="10.5" text-anchor="start" fill="#4b5563">outlier axis</text>
+<rect x="302.88" y="625.00" width="9.00" height="9.00" rx="0" fill="#cfe9d9" stroke="#8a939c" stroke-width="0.4"/>
+<text x="315.88" y="633.50" font-size="10.5" text-anchor="start" fill="#4b5563">value centroid</text>
 </g>
 <g transform="translate(504,46)" class="panel" data-w="440" data-h="684">
 <rect x="0.00" y="0.00" width="440.00" height="684.00" rx="9" fill="#ffffff" stroke="#c9d0d7" stroke-width="1.2"/>
@@ -1192,7 +1193,7 @@
 <rect x="200.00" y="86.00" width="44.00" height="6.00" rx="1.5" fill="#f6cdc9" stroke="#c0392b" stroke-width="0.8"/>
 <rect x="200.00" y="94.00" width="44.00" height="6.00" rx="1.5" fill="#f6cdc9" stroke="#c0392b" stroke-width="0.8"/>
 <text x="192.00" y="84.00" font-size="12.5" text-anchor="end" fill="#a93226" font-weight="bold">query</text>
-<text x="192.00" y="99.00" font-size="12" text-anchor="end" fill="#a93226">4 heads</text>
+<text x="192.00" y="99.00" font-size="12" text-anchor="end" fill="#a93226">heads of one group</text>
 <line x1="222.00" y1="104.00" x2="109.50" y2="322.00" stroke="#c3c8ce" stroke-width="0.8643659603933016"/>
 <line x1="222.00" y1="104.00" x2="124.50" y2="322.00" stroke="#c3c8ce" stroke-width="1.0202250160654245"/>
 <line x1="222.00" y1="104.00" x2="139.50" y2="322.00" stroke="#c8691f" stroke-width="1.678924123110561"/>
@@ -1408,7 +1409,7 @@
 <rect x="298.00" y="446.00" width="13.00" height="11.00" rx="0" fill="#fedbb9" stroke="#ffffff" stroke-width="0.6"/>
 <rect x="313.00" y="446.00" width="13.00" height="11.00" rx="0" fill="#fdd3a8" stroke="#ffffff" stroke-width="0.6"/>
 <rect x="328.00" y="446.00" width="13.00" height="11.00" rx="0" fill="#fdd5ac" stroke="#ffffff" stroke-width="0.6"/>
-<text x="222.00" y="476.00" font-size="12.5" text-anchor="middle" fill="#a0500f" font-weight="bold">top 25% opened</text>
+<text x="222.00" y="476.00" font-size="12.5" text-anchor="middle" fill="#a0500f" font-weight="bold">top windows opened, at the gate ratio</text>
 <line x1="16.00" y1="486.00" x2="424.00" y2="486.00" stroke="#c9d0d7" stroke-width="1" stroke-dasharray="3 3"/>
 <text x="16.00" y="504.00" font-size="12.5" text-anchor="start" fill="#1d2329" font-weight="bold">cumulative score keeps rolling, read or not</text>
 <rect x="52.00" y="559.69" width="20.00" height="40.31" rx="0" fill="#e3edf8" stroke="none" stroke-width="1.0"/>
@@ -1520,7 +1521,7 @@
 <line x1="424.00" y1="70.00" x2="424.00" y2="100.00" stroke="#c0392b" stroke-width="1.4" stroke-dasharray="3 2"/>
 <path d="M394.0,304 L310.0,98 M414.0,304 L420.0,98" fill="none" stroke="#c9d0d7" stroke-width="0.9" stroke-dasharray="3 3"/>
 <path d="M424.0,100 L424.0,142.0 Q424.0,148.0 418.0,148.0 L239,148.0" fill="none" stroke="#c0392b" stroke-width="1.4" marker-end="url(#ah-dark)"/>
-<text x="302.00" y="83.00" font-size="11.5" text-anchor="end" fill="#a93226" font-weight="bold">8th token closes it:</text>
+<text x="302.00" y="83.00" font-size="11.5" text-anchor="end" fill="#a93226" font-weight="bold">last token closes it:</text>
 <text x="302.00" y="98.00" font-size="11.5" text-anchor="end" fill="#a93226">window boundary</text>
 <rect x="40.00" y="136.00" width="196.00" height="24.00" rx="12" fill="#f3f4f6" stroke="#4b5563" stroke-width="1"/>
 <text x="138.00" y="152.00" font-size="12" text-anchor="middle" fill="#1d2329" font-weight="bold">re-rank by cumulative score</text>
