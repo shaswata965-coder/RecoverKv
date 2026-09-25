@@ -582,6 +582,9 @@ At this repo's 20% byte budget it resolves to r = 0.052 exact tokens plus
 every other token at 2.5 bits (*arithmetic*). Its decode is reference PyTorch
 (dequantize the whole cache, then attend), so **its TPOT is not a MiKV latency
 claim** — quote its memory and quality, not its speed. No GPU number exists.
+The one quality number is CPU, SmolLM2-1.7B, 30 samples of the paper's Line
+Retrieval (`MIKV.md` §7): full 96.7%, H2O 3.3%, MiKV INT2 56.7%, MiKV INT4
+96.7%. That is the paper's shape, not a Llama-3.1-8B result.
 
 This matters more than it looks. The two unmeasured baselines are the ones this
 method should be **strongest** against, because both are memory arguments and

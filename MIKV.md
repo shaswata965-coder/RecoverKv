@@ -172,7 +172,8 @@ window is never demoted; the dense read is `I(k·b)/b` bit for bit; error falls
 monotonically with `lo_bits` and with `r`; the GSM8K runner runs MiKV end to end
 and its sidecar says so.
 
-*Measured (CPU)*, Line Retrieval on a small Llama-architecture model — see §7.
+*Measured (CPU)*, Line Retrieval on a small Llama-architecture model (§7), and
+the perf seam running all four MiKV rows (§8).
 
 *Not measured*: anything on a GPU; anything on Llama-3.1-8B; GSM8K, LongBench,
 RULER or perf numbers for MiKV.
@@ -189,5 +190,54 @@ python scripts/mikv_line_retrieval.py --model HuggingFaceTB/SmolLM2-1.7B-Instruc
     --arms full,h2o,rtn2,mikv2-nobal,mikv2,mikv4,mikv2-hi8
 ```
 
-Full cache: **96.7%** (29/30). The other arms were still running when this
-commit was made; their rows land in the next commit.
+| arm | what happens to H2O's victims | accuracy | KV size (paper accounting) |
+|---|---|---|---|
+| full | — (`DynamicCache`) | **96.7%** (29/30) | 100% |
+| h2o | dropped | **3.3%** (1/30) | 20.0% |
+| rtn2 | no importance cache; all INT2 | 33.3% (10/30) | 18.8% |
+| mikv2-nobal | INT2, no balancer | 46.7% (14/30) | 35.0% |
+| **mikv2** | INT2 + balancer (the paper's point) | **56.7%** (17/30) | 35.0% |
+| mikv2-hi8 | mikv2 with an INT8 importance cache | 56.7% (17/30) | 26.3% |
+| **mikv4** | INT4 + balancer | **96.7%** (29/30) | 45.0% |
+
+*Measured (CPU)*, one seed, 30 samples. At n = 30 one sample is 3.3 points
+and the binomial standard error near 50% is ~9 points.
+
+What reproduces the paper, qualitatively:
+
+* **Eviction collapses and retention recovers it.** H2O at a 20% cache: 3.3%
+  here against the paper's 4.0% (Table 1). Keeping the same victims at INT4
+  instead returns the full-cache score exactly (Table 1: 100%).
+* **INT2 is where it gets hard.** 56.7% with the balancer, 46.7% without, 33.3%
+  with no importance cache at all. The order matches Table 2 (64.0% → 92.6%),
+  but the balancer's +10 points is three samples, **inside the noise**. It is
+  not evidence that the balancer works at this scale, only that it does not
+  hurt.
+* **The importance cache tolerates INT8.** mikv2-hi8 scores exactly what mikv2
+  does (Table 3: 92.6% → 92.4%).
+
+Why the sizes are larger than the paper's: this model's heads are `D = 64`, so a
+`D/2` group is 32 channels and INT2 costs 3 bits per element, not 2.5. The
+"paper accounting" column is `paper_cache_size(...)` at 16-bit; the script
+also prints the measured fraction against this fp32 run's dense cache.
+
+**What this does not show:** anything about Llama-3.1-8B, a GPU, or LongBench.
+Llama-3.1-8B has `D = 128` (so INT2 is 2.5 bits) and is far stronger at
+retrieval, so the INT2 rows should move. The command is in §5.
+
+## 8. The perf seam, exercised (CPU)
+
+`configs/eval_perf_mikv.yaml`'s four rows, run on SmolLM2-135M at prefill 256 /
+gen 32 / B = 2 (CPU, fp32, SDPA), all completed through
+`cache_backend: external`. The bytes-matched row resolved `cache_budget: 0.20`
+to `budget_tokens = 57` → `cache_budget = 0.1979` → `r = 0.115` for this
+model's `D = 64` fp32 heads, and `describe()` says "bytes-matched".
+
+Its timings are not reported. The run shared four CPU cores with the §7
+sweep, and it measured the control arm at 4.6× the full cache. Timed alone
+(one thread, same model, 256-token prompt, 16 steps), a decode step costs
+118 / 159 / 207 ms for `DynamicCache` / MiKV `r = 1.0` / MiKV `r = 0.2`, i.e.
++35% for the machinery and +76% with the INT2 read. `torch.profiler` puts the
+difference in dequantization (`__rshift__`), `scatter_` and `copy_`. *Measured
+(CPU)*; a statement about the reference implementation on a 135M model, not
+about MiKV on a GPU.
