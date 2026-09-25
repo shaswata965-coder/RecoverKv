@@ -35,7 +35,8 @@ price with the card included, so the bar itself carries the compression.
 
 The figure is one self-contained SVG in a bare HTML page, so it exports without
 a converter: ``scripts/figures/export_figure.mjs`` writes .svg, a one-page vector
-.pdf and a 3x .png, and fails loudly on text that overflows or collides.
+.pdf, a 3x .png and a diagrams.net / draw.io .xml of native, editable shapes
+(``svg_to_drawio.js``), and fails loudly on text that overflows or collides.
 
 Run:  python scripts/figures/method_overview.py
 """
@@ -54,21 +55,21 @@ OUT = Path(__file__).resolve().parents[2] / "reports" / "figures" / "method_over
 # ---------------------------------------------------------------------------
 INK, INK2, INK3 = "#1d2329", "#4b5563", "#8a939c"
 RULE = "#c9d0d7"
-SINK_F, SINK_S = "#e4ddf1", "#7b68a6"
+SINK_F, SINK_S = "#e2e6eb", "#5b6878"
 FP_F, FP_S, FP_T = "#cfe0f3", "#3c6ea8", "#2c5a8f"
 LOC_F = "#eef4fb"
-Q_F, Q_S, Q_T, Q_L = "#f8cfa6", "#c8691f", "#a0500f", "#fdf1e4"
+Q_F, Q_S, Q_T, Q_L = "#dccff2", "#6446a4", "#51368a", "#f4f0fb"
 CARD_F, CARD_S, CARD_T = "#d4ecdc", "#3b8a5a", "#2a6d45"
 DROP_F, DROP_S = "#ececec", "#a3a3a3"
 QRY_F, QRY_S, QRY_T = "#f6cdc9", "#c0392b", "#a93226"
 BLUES = ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6",
          "#2171b5", "#08519c", "#08306b"]
-ORANGES = ["#fff5eb", "#fee6ce", "#fdd0a2", "#fdae6b", "#fd8d3c", "#f16913",
-           "#d94801", "#a63603", "#7f2704"]
+PURPLES = ["#fcfbfd", "#efedf5", "#dadaeb", "#bcbddc", "#9e9ac8", "#807dba",
+           "#6a51a3", "#54278f", "#3f007d"]
 SANS = "Arial, 'Liberation Sans', Helvetica, sans-serif"
 
 HATCH = {"blue": (LOC_F, "#b8cfe8"), "gray": ("#f4f4f4", "#b9b9b9"),
-         "orange": (Q_L, "#efc59c")}
+         "violet": (Q_L, "#c9bce8")}
 
 
 def ramp(stops, t):
@@ -275,7 +276,7 @@ def arrow_down(g, x, y, lab=None):
 # ---------------------------------------------------------------------------
 # (a) cumulative attention ranks windows
 # ---------------------------------------------------------------------------
-TIER_TINT = {"fp": (FP_F, "#b7d0ec", FP_S), "q": (Q_F, "#f3b57f", Q_S),
+TIER_TINT = {"fp": (FP_F, "#b7d0ec", FP_S), "q": (Q_F, "#c6b6e8", Q_S),
              "drop": ("#ececec", "#dadada", DROP_S)}
 
 
@@ -346,7 +347,7 @@ def panel_a(g):
             hseg = pre * pz / z
             g.rect(x, y - hseg, bw, hseg, fill=a if t % 2 == 0 else b_)
             y -= hseg
-        g.rect(x, sbase - total, bw, total - pre, fill="hatch-" + {"fp": "blue", "q": "orange",
+        g.rect(x, sbase - total, bw, total - pre, fill="hatch-" + {"fp": "blue", "q": "violet",
                                                                    "drop": "gray"}[kd])
         g.rect(x, sbase - total, bw, total, stroke=INK if k == hl_bar else st,
                sw=1.4 if k == hl_bar else 0.7)
@@ -373,9 +374,9 @@ def panel_a(g):
     # stack key
     kx, ky = 318, 150
     g.rect(kx, ky - 9, 9, 10, fill=Q_F)
-    g.rect(kx, ky - 19, 9, 10, fill="#f3b57f")
+    g.rect(kx, ky - 19, 9, 10, fill="#c6b6e8")
     g.text(kx + 14, ky - 6, "one token each", size=11, fill=INK2)
-    g.rect(kx, ky + 6, 9, 10, fill="hatch-orange", stroke=Q_S, sw=0.6)
+    g.rect(kx, ky + 6, 9, 10, fill="hatch-violet", stroke=Q_S, sw=0.6)
     g.text(kx + 14, ky + 15, "+ every decode step", size=11, fill=INK2)
 
     # ---- into the tiers
@@ -385,7 +386,7 @@ def panel_a(g):
     g.path(f"M{xfp},{ya} C{xfp},{ya + 30} {C['fp']},{ya + 14} {C['fp']},{YB - FP_H - 5}",
            stroke=FP_S, sw=1.6, arrow="blue")
     g.path(f"M{xq},{ya} C{xq},{ya + 26} {C['q']},{ya + 18} {C['q']},{card_top(YB) - 5}",
-           stroke=Q_S, sw=1.6, arrow="orange")
+           stroke=Q_S, sw=1.6, arrow="violet")
     xmark(g, xd, by + 16, r=4.5, sw=1.8)
 
     cache_bar(g, YB)
@@ -461,7 +462,7 @@ def panel_a(g):
     g.rect(L0, r1, rw, rh, fill=FP_F, stroke=FP_S, sw=0.8)
     g.text(L1 - 6, r1 + 9.5, "the same window in fp16", size=10.5, anchor="end", fill=FP_T)
     # relative sizes of the parts (their ratio, not a byte count, is what is drawn)
-    parts = [("K codes", 256, "#f6b37a"), ("V codes", 256, "#fad0a8"), ("scale + zero", 292, "#dca27a"),
+    parts = [("K codes", 256, "#b7a3e3"), ("V codes", 256, "#d8ccf1"), ("scale + zero", 292, "#9a84cf"),
              ("centroid", 66, "#a9d8bb"), ("outlier axis", 140, "#5fae82"),
              ("value centroid", 66, "#cfe9d9")]
     tot = sum(v for _, v, _ in parts)
@@ -513,18 +514,18 @@ def panel_b(g):
     gy, ch = YB + 30, 11
     uy = gy + 4 * (ch + 2) + 12
     for c in SEL:
-        g.rect(LAY["q"][c] - 2.5, top - 6, Q_W + 5, uy + ch + 4 - (top - 6), fill="#fdebd9", rx=3)
+        g.rect(LAY["q"][c] - 2.5, top - 6, Q_W + 5, uy + ch + 4 - (top - 6), fill="#ebe4f7", rx=3)
     cache_bar(g, YB, mode="gated")
     for h in range(4):
         g.text(SPAN["q"][0] - 8, gy + h * (ch + 2) + 9, f"head {h + 1}", size=11, anchor="end",
                fill=INK2)
         for c, x in enumerate(LAY["q"]):
-            g.rect(x, gy + h * (ch + 2), Q_W, ch, fill=ramp(ORANGES, SHARE[h][c] ** 0.6 * 1.05),
+            g.rect(x, gy + h * (ch + 2), Q_W, ch, fill=ramp(PURPLES, SHARE[h][c] ** 0.6 * 1.05),
                    stroke="#ffffff", sw=0.6)
     g.text(SPAN["q"][1] + 8, gy + 3 * (ch + 2) + 9, "retrieval head", size=11, fill=INK3)
     g.text(SPAN["q"][0] - 8, uy + 9, "union", size=11, anchor="end", weight="bold", fill=INK)
     for c, x in enumerate(LAY["q"]):
-        g.rect(x, uy, Q_W, ch, fill=ramp(ORANGES, UNION[c] ** 0.6 * 1.05), stroke="#ffffff", sw=0.6)
+        g.rect(x, uy, Q_W, ch, fill=ramp(PURPLES, UNION[c] ** 0.6 * 1.05), stroke="#ffffff", sw=0.6)
         if c in SEL:
             g.rect(x - 1, uy - 1, Q_W + 2, ch + 2, stroke=INK, sw=1.5)
     g.text(C["q"], uy + 30, "top windows opened, at the gate ratio", size=12.5, anchor="middle",
@@ -544,19 +545,19 @@ def panel_b(g):
         before = {"fp": rr.uniform(38, 52), "sel": rr.uniform(26, 36),
                   "skip": rr.uniform(12, 26)}[kd]
         add = {"fp": rr.uniform(10, 16), "sel": rr.uniform(10, 18), "skip": rr.uniform(3, 7)}[kd]
-        pale = {"fp": "#e3edf8", "sel": "#fbe6d2", "skip": "#fbe6d2"}[kd]
+        pale = {"fp": "#e3edf8", "sel": "#ece6f7", "skip": "#ece6f7"}[kd]
         g.rect(x, base - before, wd, before, fill=pale, stroke="none")
         if kd == "skip":
-            g.rect(x, base - before - add, wd, add, fill="hatch-orange", stroke="#d9a57a", sw=0.8)
+            g.rect(x, base - before - add, wd, add, fill="hatch-violet", stroke="#a996d6", sw=0.8)
         else:
             g.rect(x, base - before - add, wd, add, fill=FP_S if kd == "fp" else Q_S)
     g.line(BX0 - 4, base, LAY["new"] + 8, base, stroke=INK3, sw=0.8)
     ky = base + 20
-    g.rect(24, ky - 10, 12, 11, fill="#fbe6d2")
+    g.rect(24, ky - 10, 12, 11, fill="#ece6f7")
     g.text(41, ky, "score so far", size=11.5, fill=INK2)
     g.rect(122, ky - 10, 12, 11, fill=Q_S)
     g.text(139, ky, "+ exact mass (read)", size=11.5, fill=INK2)
-    g.rect(262, ky - 10, 12, 11, fill="hatch-orange", stroke="#d9a57a", sw=0.8)
+    g.rect(262, ky - 10, 12, 11, fill="hatch-violet", stroke="#a996d6", sw=0.8)
     g.text(279, ky, "+ its card's credit", size=11.5, fill=INK2)
 
     # key
@@ -614,7 +615,7 @@ def panel_c(g):
     # demote into int2
     xdm = QX[5]
     g.path(f"M{chx + chw / 2 + 10},{chy + chh + 2} C{chx + chw / 2 + 10},{chy + 80} {xdm},{chy + 90} "
-           f"{xdm},{top - 5}", stroke=Q_S, sw=1.5, arrow="orange")
+           f"{xdm},{top - 5}", stroke=Q_S, sw=1.5, arrow="violet")
     g.text(xdm + 8, chy + chh + 60, "demote: fell → 2-bit", size=11.5, fill=Q_T, weight="bold")
     g.text(xdm + 8, chy + chh + 74, "+ card, written once", size=11.5, fill=Q_T)
     # drop
@@ -644,7 +645,7 @@ def panel_c(g):
             g.use("card", x, kb - CARD, CARD, CARD)
     g.line(BX0 - 4, kb, LAY["new"] + 8, kb, stroke=INK3, sw=0.7)
     for x, col, arrow, dash, sw in [(C["fp"], FP_S, "blue", None, 1.5), (C["loc"], FP_S, "blue", None, 1.5)] + \
-            [(QX[c], Q_S if c in SEL else CARD_S, "orange" if c in SEL else "green",
+            [(QX[c], Q_S if c in SEL else CARD_S, "violet" if c in SEL else "green",
               None if c in SEL else "2 2", 1.4 if c in SEL else 0.9) for c in range(N_Q)]:
         g.line(x, YB + 3, x, ky0 - 2, stroke=col, sw=sw, dash=dash, arrow=arrow)
 
@@ -678,7 +679,7 @@ def panel_c(g):
             g.line(cxm, Y(est[c]) - 4, cxm, Y(v) + 1.5, stroke=INK, sw=1.1)
         else:
             v = est[c] + gap_mean
-            g.rect(x, Y(v), Q_W, base - Y(v), fill="hatch-orange", stroke="#d9a57a", sw=0.8,
+            g.rect(x, Y(v), Q_W, base - Y(v), fill="hatch-violet", stroke="#a996d6", sw=0.8,
                    dash="2 1.5")
             g.circle(cxm, Y(est[c]), 3.3, fill="#ffffff", stroke=CARD_S, sw=1.4)
             g.line(cxm, Y(est[c]) - 4, cxm, Y(v) + 2.5, stroke=CARD_S, sw=1, arrow="green")
@@ -689,7 +690,7 @@ def panel_c(g):
     g.text(lx + 16, ry + 22, "card's estimate", size=11.5, fill=INK2)
     g.rect(lx + 112, ry + 12, 10, 11, fill=Q_F, stroke=Q_S, sw=0.8)
     g.text(lx + 128, ry + 22, "opened: exact → measures the card's gap", size=11.5, fill=INK2)
-    g.rect(lx + 112, ry + 30, 10, 11, fill="hatch-orange", stroke="#d9a57a", sw=0.8, dash="2 1.5")
+    g.rect(lx + 112, ry + 30, 10, 11, fill="hatch-violet", stroke="#a996d6", sw=0.8, dash="2 1.5")
     g.text(lx + 128, ry + 40, "unread: lifted by the average gap", size=11.5, fill=INK2)
 
 
@@ -700,7 +701,7 @@ def legend(g):
     x, y = LM, 24
     items = [("sink", SINK_F, SINK_S, None), ("fp16 window", FP_F, FP_S, None),
              ("local window", "hatch-blue", FP_S, None), ("int2 window", Q_F, Q_S, None),
-             ("card", "card", None, None), ("credited from its card", "hatch-orange", "#d9a57a", "2 1.5"),
+             ("card", "card", None, None), ("credited from its card", "hatch-violet", "#a996d6", "2 1.5"),
              ("query / new token", QRY_F, QRY_S, None), ("dropped", "x", None, None)]
     for lab, f, s, d in items:
         if f == "card":
@@ -748,7 +749,7 @@ def defs():
             f'<path d="M5.7,12.7 L7.9,14.9 M5.7,14.9 L7.9,12.7" stroke="{INK}" stroke-width="1"/>'
             f'</symbol>')
     return ("<defs>" + marker("dark", INK) + marker("gray", INK3) + marker("blue", FP_S)
-            + marker("orange", Q_S) + marker("green", CARD_S) + marker("red", QRY_S) + card
+            + marker("violet", Q_S) + marker("green", CARD_S) + marker("red", QRY_S) + card
             + "</defs>")
 
 

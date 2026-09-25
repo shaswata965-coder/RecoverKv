@@ -1,6 +1,7 @@
-// Export reports/figures/method_overview.html to .svg, .pdf (vector, one page)
-// and .png (3x), and report any text that overflows its panel or collides with
-// other text.
+// Export reports/figures/method_overview.html to .svg, .pdf (vector, one page),
+// .png (3x) and .xml (a diagrams.net / draw.io file of native, editable shapes,
+// built by svg_to_drawio.js), and report any text that overflows its panel or
+// collides with other text.
 //
 //   node scripts/figures/export_figure.mjs [--check-only] [--shots DIR]
 //
@@ -110,6 +111,9 @@ if (!checkOnly) {
   await png.goto('file://' + src);
   await png.evaluate((w) => { document.getElementById('figure').style.width = w + 'px'; }, W);
   await png.screenshot({ path: outBase + '.png', clip: { x: 0, y: 0, width: W, height: H } });
-  console.log(`wrote ${outBase}.{svg,pdf,png}`);
+  const conv = fs.readFileSync(path.join(here, 'svg_to_drawio.js'), 'utf8');
+  const xml = await page.evaluate(conv + '\n;svgToDrawio(document.getElementById("figure"));');
+  fs.writeFileSync(outBase + '.xml', xml);
+  console.log(`wrote ${outBase}.{svg,pdf,png,xml}`);
 }
 await browser.close();
