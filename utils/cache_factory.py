@@ -239,3 +239,15 @@ def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
     return {}
 
 
+
+
+def one_direction_kwargs(cache_config_cls: Type, requested: bool) -> dict:
+    """``{"one_direction": requested}``, or ``{}`` if the config lacks the field.
+
+    Same routing as :func:`quant_budget_mode_kwargs`: the eager cache package
+    has no such field and would reject the kwarg outright, and a silently
+    dropped flag would run the two-way cache under a config that says otherwise.
+    """
+    if "one_direction" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"one_direction": bool(requested)}
+    return {}

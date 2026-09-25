@@ -245,6 +245,8 @@ class LongBenchRunner:
         log.info("LongBench run complete. Outputs in %s", output_dir)
 
     def _run_dataset(self, name: str, output_dir: Path) -> None:
+        self._promote_totals = {"evictions": 0, "promote_sum": 0.0,
+                                "promote_max": 0, "forced": 0}
         """Run predictions on a single dataset."""
         log.info("=== Dataset: %s ===", name)
 
@@ -471,6 +473,26 @@ class LongBenchRunner:
         # 9. Post-processing (dataset-specific, matches THUDM pred.py)
         pred = self._post_process(pred, dataset_name)
 
+        # 10a. ONE-DIRECTION ablation evidence, before the cache is discarded.
+        # The cache is rebuilt per example, so these counters die with it; the
+        # sidecar needs the totals over the dataset. `promotions` is what the
+        # promote path actually did -- in the baseline arm it says how much work
+        # one_direction removes, and in the one_direction arm it MUST be 0.
+        if cache is not None:
+            try:
+                from modules.windowed_cache.cache import evict_width_stats
+                w = evict_width_stats(cache)
+                if w:
+                    self._promote_totals["evictions"] += int(w["evictions"])
+                    self._promote_totals["promote_sum"] += float(w["promote_mean"]) * int(w["evictions"])
+                    self._promote_totals["promote_max"] = max(
+                        self._promote_totals["promote_max"], int(w["promote_max"]))
+                f = getattr(cache, "forced_promotions", None)
+                if callable(f):
+                    self._promote_totals["forced"] += int(f())
+            except Exception as e:          # never fail a run over bookkeeping
+                self._promote_totals["errors"] = str(e)
+
         # 10. Memory hygiene
         self._cleanup_memory(cache)
 
@@ -478,7 +500,7 @@ class LongBenchRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
-        from utils.cache_factory import (quant_budget_mode_kwargs,
+        from utils.cache_factory import (quant_budget_mode_kwargs, one_direction_kwargs,
                                  quant_gate_ratio_kwargs)
 
         cfg = self.config
@@ -504,6 +526,12 @@ class LongBenchRunner:
             **quant_budget_mode_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_budget_mode", "bytes")),
+            # ONE-DIRECTION ablation, routed like the knobs above: the eager
+            # package has no such field, and a dropped flag would run the
+            # two-way cache under a config that says one-way.
+            **one_direction_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "one_direction", False)),
             # Same failure mode as first_eviction_step below: omitted, and the
             # YAML knob is silently inert. LongBench generates one example at a
             # time, so the auto rule (memo on at B == 1) hides it — a config
@@ -563,6 +591,13 @@ class LongBenchRunner:
             self._resolved_sample = {
                 "prefill_len": int(input_ids.shape[-1]),
                 "quant_budget_mode": r.quant_budget_mode,
+            "one_direction": bool(getattr(cfg.cache, "one_direction", False)),
+            "promote": {
+                **self._promote_totals,
+                "promote_mean": (self._promote_totals["promote_sum"]
+                                 / self._promote_totals["evictions"])
+                if self._promote_totals.get("evictions") else None,
+            },
                 "top_k_windows": int(r.top_k_windows),
                 "top_k_fp": int(r.top_k_fp),
                 "N_q": int(r.N_q),

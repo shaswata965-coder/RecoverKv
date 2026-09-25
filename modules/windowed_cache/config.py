@@ -43,6 +43,11 @@ class ResolvedConfig:
     total_budget_bytes: int
     total_budget_tokens: int
     rerotate_on_evict: bool = False
+    #: ONE-DIRECTION ablation: once a window is demoted to the Q tier it never
+    #: returns to fp. Scoring, budget, geometry and the gate are untouched; only
+    #: the fp picks change (policy.compute_two_tier_retain). Default False, so
+    #: an unset config is bit-identical to before.
+    one_direction: bool = False
     # Decode step at which the FIRST eviction fires, independent of window_size
     # (EvictionPolicy.should_evict). Default 0 = compress the prompt on the first
     # decode step. Carried verbatim from WindowedCacheConfig.
@@ -233,6 +238,11 @@ class WindowedCacheConfig:
     cache_budget: float
     track_scores: bool = False
     rerotate_on_evict: bool = False
+    #: ONE-DIRECTION ablation: once a window is demoted to the Q tier it never
+    #: returns to fp. Scoring, budget, geometry and the gate are untouched; only
+    #: the fp picks change (policy.compute_two_tier_retain). Default False, so
+    #: an unset config is bit-identical to before.
+    one_direction: bool = False
     quant_ratio: float = 0.0
     # What `quant_ratio` divides between the fp16 and int2 tiers.
     #
@@ -649,6 +659,7 @@ class WindowedCacheConfig:
             total_budget_bytes=total_budget_bytes,
             total_budget_tokens=total_budget_tokens,
             rerotate_on_evict=self.rerotate_on_evict,
+            one_direction=self.one_direction,
             quant_ratio=q,
             top_k_fp=top_k_fp,
             N_q=N_q,

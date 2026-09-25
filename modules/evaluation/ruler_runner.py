@@ -396,7 +396,7 @@ class RulerRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks (identical to LongBenchRunner)."""
-        from utils.cache_factory import (quant_budget_mode_kwargs,
+        from utils.cache_factory import (quant_budget_mode_kwargs, one_direction_kwargs,
                                  quant_gate_ratio_kwargs)
 
         cfg = self.config
@@ -422,6 +422,12 @@ class RulerRunner:
             **quant_budget_mode_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_budget_mode", "bytes")),
+            # ONE-DIRECTION ablation, routed like the knobs above: the eager
+            # package has no such field, and a dropped flag would run the
+            # two-way cache under a config that says one-way.
+            **one_direction_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "one_direction", False)),
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,

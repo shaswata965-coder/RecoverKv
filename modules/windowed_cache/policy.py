@@ -60,6 +60,9 @@ class EvictionPolicy:
         self.quant_ratio: float = resolved.quant_ratio
         self.top_k_fp: int = resolved.top_k_fp
         self.N_q: int = resolved.N_q
+        # ONE-DIRECTION ablation: a window that has reached the Q tier never
+        # returns to fp. See `compute_two_tier_retain`.
+        self.one_direction: bool = bool(getattr(resolved, "one_direction", False))
         # total_tokens tracks the MERGED length (T_fp + T_q) so window/region
         # counts stay aligned with the merged axis and get_seq_length (design §5).
         # At q=0, T_q == 0, so this is exactly the fp-only token count.
@@ -253,7 +256,7 @@ class EvictionPolicy:
         return k_fp, n_q, local_w
 
     def compute_two_tier_retain(
-        self, window_scores: Tensor
+        self, window_scores: Tensor, q_mask: "Tensor | None" = None
     ) -> "tuple[Tensor, Tensor]":
         """Rank the evictable band and assign each survivor a tier.
 
@@ -272,6 +275,10 @@ class EvictionPolicy:
         ----------
         window_scores : Tensor
             Shape ``[B, H_q, W]`` — merged-axis cumulative scores.
+        q_mask : Tensor, optional
+            Shape ``[B, W]`` bool — True where that window is ALREADY in the Q
+            tier. Read only when ``one_direction`` is set; ``None`` restores the
+            score-only ranking exactly.
 
         Returns
         -------
@@ -314,10 +321,37 @@ class EvictionPolicy:
         mean = window_scores.mean(dim=1)            # [B, W]
         ev_scores = mean[:, :evictable_w]
 
-        # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
-        order = torch.argsort(ev_scores, dim=-1, descending=True)
-        fp_sel = order[:, :k_fp]
-        q_sel = order[:, k_fp:k_fp + n_q]
+        if self.one_direction and q_mask is not None:
+            # ONE-DIRECTION: demotion is irreversible. A window already in the Q
+            # tier may keep a Q slot or be dropped, but it may not take an fp
+            # slot -- that would be a promotion.
+            #
+            # Implemented as a RANKING penalty, not a hard exclusion. Every
+            # eligible window outranks every ineligible one, and score order is
+            # preserved WITHIN each group, so the fp picks are exactly "the
+            # k_fp best windows that have never been demoted" whenever that many
+            # exist. If they do not -- the fp tier would otherwise under-fill and
+            # the retained count would stop being rectangular, which the compiled
+            # eviction requires -- the remainder falls back to the best Q
+            # windows, i.e. a forced promotion. The caller counts those
+            # (`_forced_promotions`); a run that reports any is not a clean
+            # one-direction run and must say so.
+            ev_q = q_mask[:, :evictable_w]
+            span = (ev_scores.amax(dim=-1, keepdim=True)
+                    - ev_scores.amin(dim=-1, keepdim=True) + 1.0)
+            fp_key = ev_scores - ev_q.to(ev_scores.dtype) * span
+            fp_sel = torch.argsort(fp_key, dim=-1, descending=True)[:, :k_fp]
+            # Q picks: the best of what fp did not take, by TRUE score, so the Q
+            # tier is unchanged in every respect except which windows fp left it.
+            taken = torch.zeros_like(ev_q)
+            taken.scatter_(1, fp_sel, True)
+            q_key = ev_scores - taken.to(ev_scores.dtype) * span
+            q_sel = torch.argsort(q_key, dim=-1, descending=True)[:, :n_q]
+        else:
+            # Rank the evictable band by score, descending: top k_fp → fp, next n_q → Q.
+            order = torch.argsort(ev_scores, dim=-1, descending=True)
+            fp_sel = order[:, :k_fp]
+            q_sel = order[:, k_fp:k_fp + n_q]
 
         # Chronological order over the retained evictable windows. Their SET is
         # what the ranking decided; their order is just ascending merged index,

@@ -1175,6 +1175,13 @@ class WindowedCache(_HFCacheBase):
         # Stays None at q == 0 (the hook reads state.key_states directly there).
         self._last_effective_k: List[Optional[Tensor]] = [None] * num_layers
 
+        # ONE-DIRECTION ablation bookkeeping. A device scalar so the eviction
+        # can accumulate into it without a host sync; read it with
+        # `forced_promotions()` once, at the end of a run.
+        # Starts as a plain int: `0 + tensor` yields a tensor on the eviction's
+        # own device, so this needs no device of its own and no sync to create.
+        self._forced_promotions = 0
+
         # Paired with _last_effective_k: the score-scatter map (order, q_token_len)
         # that undoes the unsorted [sink ‖ body ‖ Q] effective-K layout on the
         # score axis. None when the Q tier is empty (no reorder needed). Both
@@ -2353,6 +2360,19 @@ class WindowedCache(_HFCacheBase):
             out_dtype=state.key_states.dtype,
         )
 
+    def forced_promotions(self) -> int:
+        """Promotions the ONE-DIRECTION ablation could not avoid (0 = clean).
+
+        Non-zero means some eviction had fewer than ``top_k_fp`` never-demoted
+        windows to fill the fp tier with, so the policy fell back to promoting
+        a Q window rather than leaving the tier ragged. The run is then not a
+        pure one-direction run and must be reported as such.
+        """
+        v = getattr(self, "_forced_promotions", None)
+        if v is None:
+            return 0
+        return int(v.item()) if torch.is_tensor(v) else int(v)
+
     def _record_evict_widths(self, fresh: Tensor, promote: Tensor,
                              react: Tensor, n_q: int, W: int) -> None:
         """How many lanes each eviction actually used, against the width it got.
@@ -2703,7 +2723,34 @@ class WindowedCache(_HFCacheBase):
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
-        retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # ONE-DIRECTION: the policy needs to know which windows are ALREADY in
+        # the Q tier before it ranks, so the fp picks can avoid them. The store
+        # is keyed by window id, so this is the same lookup the retained set
+        # does below, widened to the whole merged axis -- no extra sync, and it
+        # is skipped entirely when the flag is off.
+        q_mask = None
+        if getattr(self.resolved, "one_direction", False):
+            # `store.lookup` goes through `store.table`, which does not exist
+            # until `ensure` allocates it -- and the two-way path only calls
+            # `ensure` further down, after the policy. Idempotent, so hoisting it
+            # here is free and leaves the original call below untouched.
+            store.ensure(B, device)
+            # lookup -> (has_entry, is_active, slot_of, keep_slots), read-only.
+            #
+            # has_entry, NOT is_active. `is_active` is "in the Q tier RIGHT NOW";
+            # a window demoted earlier and since dropped from the active set is
+            # dormant -- has_entry true, is_active false -- and `react` puts it
+            # back without requantizing. Masking on is_active would leave that
+            # window eligible for an fp slot, which is a promotion in every sense
+            # the ablation cares about: it reached the Q tier and came back.
+            # It is also the reading the request states -- "once sent to the
+            # second tier it does not return" -- and it avoids a second problem:
+            # a dormant window's tokens are no longer in the fp body, so picking
+            # it for fp would gather from a store that does not hold it.
+            has_entry_all, _, _, _ = store.lookup(state.original_window_ids)
+            q_mask = has_entry_all
+        retained_idx, new_tier = policy.compute_two_tier_retain(
+            state.window_scores, q_mask)
         # W is a concrete int (above), so these are Python ints even under
         # torch.compile; the int() is belt-and-suspenders against a future
         # tier_counts that returns a tensor scalar.
@@ -2731,6 +2778,14 @@ class WindowedCache(_HFCacheBase):
         promote = ~is_q_new & is_q_cur     # currently Q, wants fp
 
         self._record_evict_widths(fresh, promote, react, n_q, W)
+
+        # A one-direction run should promote NOTHING. The policy only demotes
+        # fp picks in rank, so a promotion can still be forced when fewer than
+        # k_fp never-demoted windows exist. Count it on device (no sync) rather
+        # than assert: an assert here costs a graph break every eviction, and a
+        # silent violation is exactly what this ablation cannot afford.
+        if getattr(self.resolved, "one_direction", False):
+            self._forced_promotions = self._forced_promotions + promote.sum()
 
         # --- 3a. Free dropped entries FIRST (§6) ----------------------------
         # Before allocating, not after: it is what makes n_slots_for's

@@ -190,6 +190,9 @@ class CacheConfig:
     # tier. 1.0 selects every window, which makes the gate a provable no-op and
     # is the control arm for pricing it.
     quant_gate_ratio: float = 0.25
+    #: ONE-DIRECTION ablation: demotion to the int2 tier is irreversible.
+    #: False (default) is the shipped two-way behaviour, bit-identical.
+    one_direction: bool = False
 
     def __post_init__(self) -> None:
         if self.cache_budget is not None:
