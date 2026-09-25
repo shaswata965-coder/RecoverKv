@@ -86,6 +86,9 @@ class RulerRunner:
             self.install_score_hooks = None
             self.cache_backend_package = None
             self.is_windowed = False
+        # cache.backend: external (e.g. MiKV) -- built once the model is loaded.
+        self.is_external = cache_backend == "external"
+        self.external = None
 
         self.model = None
         self.tokenizer = None
@@ -156,6 +159,12 @@ class RulerRunner:
             self._warn_on_cache_window_disagreement()
 
         self.model, self.tokenizer = self._load_model_and_tokenizer()
+        if self.is_external:
+            from utils.cache_factory import ExternalCacheMethod
+
+            self.external = ExternalCacheMethod(
+                self.config.cache, self.model, self.tokenizer, self.model.dtype)
+            log.info("external method: %s", self.external.describe())
 
         tasks = getattr(self.ruler, "tasks", None) or RULER_TASKS
         if isinstance(tasks, str):
@@ -286,6 +295,8 @@ class RulerRunner:
         self._write_meta(task_name, n_examples, run_start, run_end, eps, output_dir)
         if self._memory_reports:
             self._write_memory(task_name, output_dir)
+        if self.external is not None:
+            self.external.clear()  # the next task's sidecar starts fresh
 
     def _predict(
         self, ex: Dict[str, Any], capture_memory: bool = False
@@ -344,6 +355,8 @@ class RulerRunner:
 
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
+        elif self.external is not None:
+            cache, hooks = self.external.new_cache(max_gen_len)
 
         # 4. Generate
         try:
@@ -356,7 +369,9 @@ class RulerRunner:
                 "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
             }
 
-            if self.cache_backend_package == "eager":
+            if self.cache_backend_package == "eager" or (
+                    self.external is not None
+                    and self.external.requires_output_attentions):
                 gen_kwargs["output_attentions"] = True
 
             if cache is not None:
@@ -383,6 +398,10 @@ class RulerRunner:
             mem_dict = report.to_dict()
             mem_dict["task"] = ex["task"]
             self._last_report = report
+        if self.external is not None:
+            # Summarized into this task's meta sidecar (``external_method``);
+            # the per-example memory.jsonl is the windowed cache's schema.
+            self.external.record(cache)
 
         # 6. Decode only new tokens
         pred = tokenizer.decode(
@@ -593,7 +612,10 @@ class RulerRunner:
             "model_name": cfg.model.name,
             "model_revision": getattr(cfg.model, "revision", None),
             "tokenizer_sha": self._get_tokenizer_sha(),
-            "cache_type": "windowed" if self.is_windowed else "full_cache",
+            "cache_type": ("external" if self.is_external else
+                           "windowed" if self.is_windowed else "full_cache"),
+            "external_method": (self.external.summary()
+                                if self.external is not None else None),
             "cache_backend_package": self.cache_backend_package,
             "cache_budget": budget,
             "compression_ratio": compression_ratio,

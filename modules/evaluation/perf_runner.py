@@ -77,6 +77,9 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from utils.cache_memory import MemoryProbe, format_peak_report
+# The method_factory seam lives in utils.cache_factory, where the quality runners
+# (GSM8K, LongBench, RULER) reach it too; re-exported here, where it was defined.
+from utils.cache_factory import resolve_method_factory
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, ExperimentConfig
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -96,51 +99,6 @@ def _phase_mb(phase) -> float:
         return float("nan")
     peak = phase.device_used_peak or phase.torch_alloc_peak
     return peak / (1024 * 1024) if peak else float("nan")
-
-def resolve_method_factory(spec: str):
-    """Import a ``"package.module:callable"`` spec and return the callable.
-
-    This is the seam that lets Suite C benchmark a method it knows nothing
-    about. It matters more than it looks: the published efficiency protocols in
-    this space are UNDER-SPECIFIED (papers report "peak memory and decoding
-    latency" without stating context length, batch size, warmup rounds, dtype or
-    prompt), so quoting a number out of a paper and putting it beside ours is not
-    a controlled comparison. The only sound way to get a baseline is to run the
-    baseline yourself, in-process, under the identical protocol -- which requires
-    being able to plug one in.
-
-    The factory is called as::
-
-        factory(model=..., tokenizer=..., prefill_len=..., gen_len=...,
-                batch_size=..., budget_tokens=..., dtype=..., **method_kwargs)
-
-    and must return a *method handle* implementing:
-
-        new_cache()                  -> a fresh ``past_key_values`` per run (required)
-        install_hooks(model, cache)  -> object with .remove(), or None (optional)
-        requires_output_attentions   -> bool attribute (optional, default False)
-        describe()                   -> str for the npz metadata (optional)
-
-    Nothing here touches this project's cache packages, so an external method
-    needs no knowledge of them.
-    """
-    if not isinstance(spec, str) or ":" not in spec:
-        raise ValueError(
-            f"method_factory must be 'package.module:callable', got {spec!r}")
-    mod_name, _, attr = spec.partition(":")
-    import importlib
-    try:
-        mod = importlib.import_module(mod_name)
-    except ImportError as e:
-        raise ValueError(f"method_factory module {mod_name!r} is not importable: {e}") from e
-    try:
-        factory = getattr(mod, attr)
-    except AttributeError as e:
-        raise ValueError(f"method_factory {spec!r}: {mod_name} has no {attr!r}") from e
-    if not callable(factory):
-        raise ValueError(f"method_factory {spec!r} resolved to a non-callable")
-    return factory
-
 
 def resolve_budget_tokens(cache_budget, prefill_len: int, budget_horizon: int):
     """Absolute token budget an external method must honour.

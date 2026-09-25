@@ -1,0 +1,89 @@
+# ============================================================================
+# Suite C — MiKV (arXiv:2402.18096) through the `cache_backend: external` seam
+# ============================================================================
+# Four rows, each a claim against the one above it:
+#
+#   full_cache        DynamicCache + flash-attention-2. The reference.
+#   mikv_control      MiKV at importance_ratio=1.0: every token exact, nothing
+#                     demoted, so it computes what full_cache computes -- through
+#                     MiKV's code (per-step H2O scores, dense re-assembly). The
+#                     gap to full_cache is the price of the machinery alone.
+#   mikv_r20_int2     The paper's point: 20% fp16 + INT2, 32.5% of fp16.
+#   mikv_b20_int2     Held to THIS repo's budget: `cache_budget: 0.20` on the row
+#                     becomes budget_tokens, and the factory turns that into the
+#                     same BYTES at the end of the cell (describe() says
+#                     "bytes-matched"), not the same token count -- MiKV keeps
+#                     every token.
+#
+# WHAT THESE NUMBERS ARE. modules/mikv is the reference implementation: each
+# decode step dequantizes the whole cache into a dense fp16 K/V for one layer and
+# hands it to flash-attention. The paper ships no kernel (its §3.4 is a sketch),
+# and neither does this. So TPOT here measures unfused dequantize-then-attend and
+# is NOT a statement about what MiKV could do with a kernel; peak memory and the
+# cache's own memory_report() are real. Say so beside any number quoted from it.
+#
+# `compaction: prefill` -- MiKV forms its tiers inside the prefill forward, so
+# nothing is added to the prefill column. read_gate is `not-expected` on every
+# row: there is no windowed Q tier to gate.
+#
+# One row per OUT_DIR if you sweep it (perf npz names carry no config name; see
+# CLAUDE.md "Two traps in the harness").
+_base_: base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+
+perf:
+  data_source: "2wikimqa"
+  configs:
+    - name: full_cache
+      cache_backend: dynamic
+      cache_package: null
+      attn_implementation: flash_attention_2
+      cache_budget: null
+      requires_flash_attn: true
+    - name: mikv_control
+      cache_backend: external
+      method_factory: "modules.mikv:make_mikv_method"
+      method_kwargs: { importance_ratio: 1.0 }
+      compaction: prefill
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+    - name: mikv_r20_int2
+      cache_backend: external
+      method_factory: "modules.mikv:make_mikv_method"
+      method_kwargs: { importance_ratio: 0.20, lo_bits: 2 }
+      compaction: prefill
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+    - name: mikv_b20_int2
+      cache_backend: external
+      method_factory: "modules.mikv:make_mikv_method"
+      method_kwargs: { lo_bits: 2 }
+      cache_budget: 0.20
+      compaction: prefill
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+  grid:
+    - { prefill_len: 4096, gen_len: 256, batch_size: 1 }
+    - { prefill_len: 4096, gen_len: 256, batch_size: 32 }
+    - { prefill_len: 2048, gen_len: 512, batch_size: 32 }
+    - { prefill_len: 1024, gen_len: 1024, batch_size: 32 }
+  prefill_logits: last_only
+  num_warmup_runs: 2
+  num_measurement_runs: 5
+  cooldown_s: 3.0
+  enable_clock_locking: true
+  clock_settle_s: 5.0
+  allow_shared_gpu: false
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+telemetry:
+  output_dir: outputs/perf_mikv

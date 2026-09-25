@@ -567,9 +567,21 @@ change which number we are trying to move.
 | Flash FullKV | runs — `cache_backend: dynamic` + `flash_attention_2` |
 | int2 KIVI | no implementation, no config, no numbers |
 | QEvict | an observation suite only; no runnable cache backend |
+| MiKV (added 2026-09-25) | **implemented, CPU-tested, never run on a GPU** — `modules/mikv`, `MIKV.md` |
 
 `perf_runner` has the seam for both (`cache_backend: external` plus a
 `method_factory`). Nothing implements one.
+
+**MiKV is the fourth, and the closest relative.** Mixed-precision H2O
+(arXiv:2402.18096): important tokens exact, *every* other token kept at
+per-token INT2 with a channel balancer — nothing evicted. It is the one
+baseline that asks whether dropping tokens pays at all. It plugs into the perf
+seam above, and GSM8K / LongBench / RULER now take the same factory through
+`cache.backend: external` (`configs/{gsm8k,longbench,eval_perf}_mikv.yaml`).
+At this repo's 20% byte budget it resolves to r = 0.052 exact tokens plus
+every other token at 2.5 bits (*arithmetic*). Its decode is reference PyTorch
+(dequantize the whole cache, then attend), so **its TPOT is not a MiKV latency
+claim** — quote its memory and quality, not its speed. No GPU number exists.
 
 This matters more than it looks. The two unmeasured baselines are the ones this
 method should be **strongest** against, because both are memory arguments and

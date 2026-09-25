@@ -190,3 +190,9 @@ one per-window block is the real fix and needs a GPU to verify.
   stored format and the price of a window.
 * **Two of the three baselines have never been run.** int2 KIVI and QEvict have
   no implementation (§7). Do not write "beats KIVI" anywhere.
+* **MiKV (`modules/mikv`, `MIKV.md`) is a baseline, not this method.** Its INT2
+  tier is not a Q tier: the gate rule above does not apply to it, and it must
+  not be given one — reading every token is what MiKV *is*. Its decode is
+  reference PyTorch (dequantize-then-attend), so its TPOT is not a MiKV latency
+  claim. It is implemented and CPU-tested and has **never run on a GPU**; do not
+  write "beats MiKV" until it has, at a matched byte budget.

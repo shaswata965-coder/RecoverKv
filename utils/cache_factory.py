@@ -18,7 +18,9 @@ from utils.config import ConfigValidationError
 
 __all__ = [
     "ConfigValidationError",
+    "ExternalCacheMethod",
     "get_cache_classes",
+    "resolve_method_factory",
     "quant_budget_mode_kwargs",
     "validate_backend_attn_pairing",
     "assert_transformers_version_supported",
@@ -239,3 +241,140 @@ def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# External methods (``cache.backend: external``)
+# ---------------------------------------------------------------------------
+
+
+def resolve_method_factory(spec: str):
+    """Import a ``"package.module:callable"`` spec and return the callable.
+
+    This is the seam that lets Suite C benchmark a method it knows nothing
+    about. It matters more than it looks: the published efficiency protocols in
+    this space are UNDER-SPECIFIED (papers report "peak memory and decoding
+    latency" without stating context length, batch size, warmup rounds, dtype or
+    prompt), so quoting a number out of a paper and putting it beside ours is not
+    a controlled comparison. The only sound way to get a baseline is to run the
+    baseline yourself, in-process, under the identical protocol -- which requires
+    being able to plug one in.
+
+    The factory is called as::
+
+        factory(model=..., tokenizer=..., prefill_len=..., gen_len=...,
+                batch_size=..., budget_tokens=..., dtype=..., **method_kwargs)
+
+    and must return a *method handle* implementing:
+
+        new_cache()                  -> a fresh ``past_key_values`` per run (required)
+        install_hooks(model, cache)  -> object with .remove(), or None (optional)
+        requires_output_attentions   -> bool attribute (optional, default False)
+        describe()                   -> str for the npz metadata (optional)
+
+    Nothing here touches this project's cache packages, so an external method
+    needs no knowledge of them.
+    """
+    if not isinstance(spec, str) or ":" not in spec:
+        raise ValueError(
+            f"method_factory must be 'package.module:callable', got {spec!r}")
+    mod_name, _, attr = spec.partition(":")
+    import importlib
+    try:
+        mod = importlib.import_module(mod_name)
+    except ImportError as e:
+        raise ValueError(f"method_factory module {mod_name!r} is not importable: {e}") from e
+    try:
+        factory = getattr(mod, attr)
+    except AttributeError as e:
+        raise ValueError(f"method_factory {spec!r}: {mod_name} has no {attr!r}") from e
+    if not callable(factory):
+        raise ValueError(f"method_factory {spec!r} resolved to a non-callable")
+    return factory
+
+
+class ExternalCacheMethod:
+    """A ``method_factory`` handle, as the quality runners drive it.
+
+    The perf suite builds its external method inline (``perf_runner``); the
+    GSM8K / LongBench / RULER runners share this instead, so the three stay one
+    code path. Built once after the model loads; then per example
+    :meth:`new_cache` returns ``(past_key_values, hooks_or_None)`` and
+    :meth:`record` collects the cache's own memory report, if it has one, for
+    the metadata sidecar.
+
+    The runner does not size the method. A quality run's budget is the
+    method's own business, stated in ``cache.method_kwargs`` — which is why
+    :class:`~utils.config.CacheConfig` rejects ``cache_budget`` beside
+    ``backend: external``: forwarded, it could only be forwarded as the
+    eviction methods' token count, which a method that evicts nothing would
+    have to reinterpret; ignored, it would be a knob that does nothing.
+    """
+
+    def __init__(self, cache_cfg: Any, model: Any, tokenizer: Any = None,
+                 dtype: Any = None) -> None:
+        import inspect
+
+        spec = getattr(cache_cfg, "method_factory", None)
+        if not spec:
+            raise ConfigValidationError(
+                "cache.backend='external' requires cache.method_factory: "
+                "'package.module:callable'")
+        factory = resolve_method_factory(spec)
+        self.spec = spec
+        self.kwargs = dict(getattr(cache_cfg, "method_kwargs", None) or {})
+        self.method = factory(model=model, tokenizer=tokenizer, prefill_len=None,
+                              gen_len=None, batch_size=1, budget_tokens=None,
+                              dtype=dtype, **self.kwargs)
+        if not hasattr(self.method, "new_cache"):
+            raise TypeError(
+                f"method_factory {spec!r} returned {type(self.method).__name__}, "
+                "which has no new_cache() -- see resolve_method_factory")
+        params = inspect.signature(self.method.new_cache).parameters
+        self._takes_horizon = "max_new_tokens" in params
+        self.model = model
+        self._reports: list = []
+
+    @property
+    def requires_output_attentions(self) -> bool:
+        return bool(getattr(self.method, "requires_output_attentions", False))
+
+    def describe(self) -> str:
+        d = getattr(self.method, "describe", None)
+        return d() if d is not None else type(self.method).__name__
+
+    def new_cache(self, max_new_tokens: Optional[int] = None):
+        """``(past_key_values, hooks_or_None)`` for one example."""
+        if self._takes_horizon:
+            cache = self.method.new_cache(max_new_tokens=max_new_tokens)
+        else:
+            cache = self.method.new_cache()
+        inst = getattr(self.method, "install_hooks", None)
+        return cache, (inst(self.model, cache) if inst is not None else None)
+
+    def record(self, cache: Any) -> Optional[dict]:
+        """Keep this example's ``memory_report()``; return it for per-example stats."""
+        report = getattr(cache, "memory_report", None)
+        if report is None:
+            return None
+        r = report()
+        self._reports.append(r)
+        return r
+
+    def clear(self) -> None:
+        """Forget recorded reports (LongBench writes one sidecar per dataset)."""
+        self._reports.clear()
+
+    def summary(self) -> dict:
+        """What the sidecar records: the method, as configured and as measured."""
+        out: dict = {"method_factory": self.spec, "method_kwargs": self.kwargs,
+                     "describe": self.describe()}
+        meta = getattr(self.method, "metadata", None)
+        if meta is not None:
+            out["metadata"] = meta()
+        if self._reports:
+            n = len(self._reports)
+            for key in ("kv_fraction", "total_fraction"):
+                vals = [r[key] for r in self._reports if key in r]
+                if vals:
+                    out[f"mean_{key}"] = round(sum(vals) / len(vals), 6)
+            out["n_memory_reports"] = n
+        return out

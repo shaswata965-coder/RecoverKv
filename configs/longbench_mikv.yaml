@@ -1,0 +1,72 @@
+# ============================================================================
+# LongBench — MiKV (arXiv:2402.18096), held to this repo's memory budget
+# ============================================================================
+# The paper sizes MiKV by importance ratio; this config sizes it by BYTES, so a
+# row is comparable with the windowed cache's `cache_budget: 0.20`:
+# `method_kwargs.cache_budget: 0.20` solves the importance ratio at which codes +
+# grids + fp16 tokens are exactly 20% of the dense fp16 KV cache. At INT2 with
+# groups of D/2 that is r = 0.052 (the rest of the 20% buys every other token
+# at 2.5 bits). MiKV evicts nothing, so its floor is 15.6%; below that it raises.
+#
+# For the paper's own operating point instead, replace cache_budget with
+#   importance_ratio: 0.20        # 32.5% of fp16 in the paper's accounting
+#
+# Prefill cost: H2O's scores need softmax(QK^T) summed over every prompt row --
+# an O(L^2) pass per layer, done in row blocks of `score_chunk_bytes` (fp32).
+# At full LongBench context that is the same order as the attention itself.
+# Decode reads the whole cache dequantized every step (reference PyTorch, no
+# fused kernel), so wall-clock here is not a latency claim.
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: external
+  backend_package: null
+  cache_budget: null            # MiKV's budget is in method_kwargs
+  method_factory: "modules.mikv:make_mikv_method"
+  method_kwargs:
+    cache_budget: 0.20
+    recent_ratio: 0.5
+    hi_bits: 16
+    lo_bits: 2
+    channel_balancer: true
+    score_chunk_bytes: 1073741824   # 1 GiB fp32 transient for the prefill score pass
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: null
+  output_dir: outputs/longbench/mikv_b20_int2
+  seed: 42
+  resume: false
+  skip_oom: true
+  aggressive_cache_clear: false

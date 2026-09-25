@@ -99,6 +99,11 @@ OPERATING_POINT_EXEMPT = {
     # gate, scored under the same branch's name as LongBench at 0.70. It is now
     # at the operating point on every axis but the one it exists to vary.
     "ruler_niah_mk3_omega16.yaml": "the omega=16 arm; window_size is the ablation",
+    # A different method, not this cache off its operating point: none of the
+    # windowed knobs reach it, and CacheConfig rejects cache_budget beside
+    # backend=external. Its budget is cache.method_kwargs, stated in the file.
+    "gsm8k_mikv.yaml": "the MiKV baseline -- budget in cache.method_kwargs",
+    "longbench_mikv.yaml": "the MiKV baseline -- budget in cache.method_kwargs",
 }
 
 
@@ -122,6 +127,12 @@ def log_operating_point(config, is_windowed: bool) -> None:
     """
     cache = getattr(config, "cache", None)
     if cache is None:
+        return
+    if getattr(cache, "backend", None) == "external":
+        log.info("operating point: EXTERNAL method %s  method_kwargs=%s  attn=%s",
+                 getattr(cache, "method_factory", None),
+                 getattr(cache, "method_kwargs", None),
+                 getattr(getattr(config, "model", None), "attn_implementation", None))
         return
     if not is_windowed:
         log.info("operating point: FULL CACHE (no eviction, no quantization)")
@@ -162,7 +173,7 @@ class ModelConfig:
 @dataclass
 class CacheConfig:
 
-    backend: str = "dynamic"
+    backend: str = "dynamic"  # "dynamic" | "windowed" | "external"
     backend_package: Optional[str] = None  # "flash_attn" | "eager" | None
     cache_budget: Optional[float] = None  # float ratio in (0, 1]; None for baseline
     window_size: int = 8
@@ -190,8 +201,37 @@ class CacheConfig:
     # tier. 1.0 selects every window, which makes the gate a provable no-op and
     # is the control arm for pricing it.
     quant_gate_ratio: float = 0.25
+    # backend: external — a method built by a ``method_factory`` callable
+    # ("package.module:callable", the perf suite's protocol; see
+    # utils.cache_factory.resolve_method_factory), configured by method_kwargs.
+    # MiKV is ``modules.mikv:make_mikv_method``. None of the knobs above reach
+    # an external method; its operating point lives in method_kwargs.
+    method_factory: Optional[str] = None
+    method_kwargs: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
+        if self.backend not in ("dynamic", "windowed", "external"):
+            raise ConfigValidationError(
+                f"cache.backend must be 'dynamic', 'windowed' or 'external', "
+                f"got {self.backend!r}")
+        if self.backend == "external":
+            if not self.method_factory or ":" not in str(self.method_factory):
+                raise ConfigValidationError(
+                    "cache.backend='external' requires cache.method_factory: "
+                    f"'package.module:callable', got {self.method_factory!r}")
+            if self.cache_budget is not None:
+                raise ConfigValidationError(
+                    "cache.cache_budget does not reach an external method -- "
+                    "state its budget in cache.method_kwargs (MiKV: "
+                    "importance_ratio or cache_budget). Left here it would be a "
+                    "knob that changes nothing.")
+            if self.method_kwargs is not None and not isinstance(self.method_kwargs, dict):
+                raise ConfigValidationError(
+                    f"cache.method_kwargs must be a mapping, got {self.method_kwargs!r}")
+        elif self.method_factory is not None or self.method_kwargs:
+            raise ConfigValidationError(
+                f"cache.method_factory / method_kwargs are set but "
+                f"cache.backend={self.backend!r}; they only apply to 'external'")
         if self.cache_budget is not None:
             # Type guards mirror WindowedCacheConfig.__post_init__: reject
             # bool before int (bool subclasses int) and reject non-float

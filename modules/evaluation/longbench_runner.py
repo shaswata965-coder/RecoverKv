@@ -101,6 +101,9 @@ class LongBenchRunner:
             self.install_score_hooks = None
             self.cache_backend_package = None
             self.is_windowed = False
+        # cache.backend: external (e.g. MiKV) -- built once the model is loaded.
+        self.is_external = cache_backend == "external"
+        self.external = None
 
         # Load vendored configs (DO NOT reimplement)
         configs_dir = Path("data/longbench_configs")
@@ -206,6 +209,12 @@ class LongBenchRunner:
         # Lazy-load model
         self.model, self.tokenizer = self._load_model_and_tokenizer()
         self._warn_if_chat_gate_looks_wrong()
+        if self.is_external:
+            from utils.cache_factory import ExternalCacheMethod
+
+            self.external = ExternalCacheMethod(
+                self.config.cache, self.model, self.tokenizer, self.model.dtype)
+            log.info("external method: %s", self.external.describe())
 
         datasets = getattr(self.lb, "datasets", LONGBENCH_EN_DATASETS)
         if isinstance(datasets, str):
@@ -323,6 +332,8 @@ class LongBenchRunner:
 
         # Write metadata sidecar
         self._write_meta(name, n_examples, max_gen_len, run_start, run_end, eps, output_dir)
+        if self.external is not None:
+            self.external.clear()  # the next dataset's sidecar starts fresh
 
     def _predict(
         self,
@@ -418,6 +429,8 @@ class LongBenchRunner:
 
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
+        elif self.external is not None:
+            cache, hooks = self.external.new_cache(max_gen_len)
 
         # 6. Generate
         try:
@@ -440,7 +453,9 @@ class LongBenchRunner:
                 gen_kwargs["repetition_penalty"] = rep_pen
 
             # output_attentions only for eager backend
-            if self.cache_backend_package == "eager":
+            if self.cache_backend_package == "eager" or (
+                    self.external is not None
+                    and self.external.requires_output_attentions):
                 gen_kwargs["output_attentions"] = True
 
             if cache is not None:
@@ -462,6 +477,9 @@ class LongBenchRunner:
             # 7. Clean up hooks (no leakage between examples)
             if hooks is not None:
                 hooks.remove()
+
+        if self.external is not None:
+            self.external.record(cache)
 
         # 8. Decode only new tokens
         pred = tokenizer.decode(
@@ -761,7 +779,10 @@ class LongBenchRunner:
             "model_name": cfg.model.name,
             "model_revision": getattr(cfg.model, "revision", None),
             "tokenizer_sha": self._get_tokenizer_sha(),
-            "cache_type": "windowed" if self.is_windowed else "full_cache",
+            "cache_type": ("external" if self.is_external else
+                           "windowed" if self.is_windowed else "full_cache"),
+            "external_method": (self.external.summary()
+                                if self.external is not None else None),
             "cache_backend_package": self.cache_backend_package,
             "cache_budget": budget,
             "compression_ratio": compression_ratio,

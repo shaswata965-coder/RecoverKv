@@ -257,6 +257,9 @@ python scripts/profile_decode.py --config <generated.yaml> --prefill 4096 --batc
 scripts/run_longbench_ours_flash_attn.sh      # quality
 ```
 
+The MiKV baseline (mixed-precision H2O, nothing evicted) runs through the same
+runners with `cache.backend: external`; `MIKV.md` has its configs and status.
+
 Requires transformers 4.47.x (`utils/cache_factory.py` refuses newer),
 flash-attn, and Triton on CUDA. `quant_budget_mode: tokens` is for latency tables
 only; quote memory and quality against `bytes`.
@@ -290,6 +293,7 @@ modules/windowed_cache/   the cache: eviction, hooks, and the Triton kernels
   flash_decode.py         the flash_attn_func seam; where the gate runs
   policy.py state.py scorer.py config.py
 modules/quant/            the int2 tier: quantizer, slot table, cards
+modules/mikv/             MiKV baseline (arXiv:2402.18096) -- see MIKV.md
 utils/                    config, cache factory, memory probe
 scripts/                  perf table, decode profile, quality runners
 ```

@@ -78,6 +78,9 @@ class GSM8KRunner:
             self.install_score_hooks = None
             self.cache_backend_package = None
             self.is_windowed = False
+        # cache.backend: external (e.g. MiKV) -- built once the model is loaded.
+        self.is_external = cache_backend == "external"
+        self.external = None
 
         self.model = None
         self.tokenizer = None
@@ -159,6 +162,12 @@ class GSM8KRunner:
             return
 
         self.model, self.tokenizer = self._load_model_and_tokenizer()
+        if self.is_external:
+            from utils.cache_factory import ExternalCacheMethod
+
+            self.external = ExternalCacheMethod(
+                self.config.cache, self.model, self.tokenizer, self.model.dtype)
+            log.info("external method: %s", self.external.describe())
 
         output_dir = Path(getattr(self.gs, "output_dir", "outputs/gsm8k/run"))
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -265,6 +274,8 @@ class GSM8KRunner:
             cache, hooks, resolved = self._setup_windowed_cache(
                 input_ids, max_gen_len
             )
+        elif self.external is not None:
+            cache, hooks = self.external.new_cache(max_gen_len)
 
         # 3. Generate — pure greedy, matching the LongBench/RULER protocol.
         try:
@@ -279,7 +290,9 @@ class GSM8KRunner:
             if self._supports_stop_strings():
                 gen_kwargs["stop_strings"] = STOP_STRINGS
                 gen_kwargs["tokenizer"] = tokenizer
-            if self.cache_backend_package == "eager":
+            if self.cache_backend_package == "eager" or (
+                    self.external is not None
+                    and self.external.requires_output_attentions):
                 gen_kwargs["output_attentions"] = True
             if cache is not None:
                 gen_kwargs["past_key_values"] = cache
@@ -312,6 +325,10 @@ class GSM8KRunner:
             self._sequence_tokens.append(seq_tokens)
             if not evicted:
                 self._n_no_eviction += 1
+        if self.external is not None:
+            mem = self.external.record(cache)
+            if mem is not None:
+                stats["kv_fraction"] = round(mem["kv_fraction"], 6)
 
         self._cleanup_memory(cache)
         return pred, stats
@@ -446,7 +463,7 @@ class GSM8KRunner:
     def _compression_summary(self, n_examples: int) -> Dict[str, Any]:
         if not self._sequence_tokens:
             return {
-                "compression_active": bool(self.is_windowed),
+                "compression_active": bool(self.is_windowed or self.is_external),
                 "n_examples_no_eviction": None,
             }
         n = len(self._sequence_tokens)
@@ -463,6 +480,12 @@ class GSM8KRunner:
 
     def _report_compression_diagnostic(self, n_examples: int) -> None:
         """Print, and warn about, how much compression actually happened."""
+        if self.external is not None:
+            summ = self.external.summary()
+            log.info("external method %s: mean kv_fraction=%s over %s examples",
+                     summ["describe"], summ.get("mean_kv_fraction"),
+                     summ.get("n_memory_reports", 0))
+            return
         if not self.is_windowed:
             log.info("Full-cache baseline: no compression applied.")
             return
@@ -528,7 +551,10 @@ class GSM8KRunner:
             "tokenizer_sha": self._get_tokenizer_sha(),
             "dtype": cfg.model.dtype,
             "attn_implementation": cfg.model.attn_implementation,
-            "cache_type": "windowed" if self.is_windowed else "full_cache",
+            "cache_type": ("external" if self.is_external else
+                           "windowed" if self.is_windowed else "full_cache"),
+            "external_method": (self.external.summary()
+                                if self.external is not None else None),
             "cache_backend_package": self.cache_backend_package,
             "cache_budget": budget,
             "compression_ratio": round(1.0 - budget, 4) if budget else None,

@@ -1,0 +1,61 @@
+# ============================================================================
+# GSM8K — MiKV (arXiv:2402.18096), the paper's headline operating point
+# ============================================================================
+# 20% of the tokens seen stay in the fp16 importance cache (H2O: half heavy
+# hitters, half most-recent); every other token is kept at INT2 per-token with
+# groups of D/2 and the outlier-aware channel balancer. The paper's accounting
+# puts that at 32.5% of the fp16 KV cache (its Table 3: "33%").
+#
+# Compare against gsm8k_full_cache.yaml. Useful arms via --override:
+#   cache.method_kwargs.importance_ratio=1.0     control arm: full cache through
+#                                                MiKV's code (token-identical to
+#                                                DynamicCache; tests/test_mikv.py)
+#   cache.method_kwargs.lo_bits=0                H2O: drop instead of quantize
+#   cache.method_kwargs.importance_ratio=0.0     RTN: every token INT2
+#   cache.method_kwargs.channel_balancer=false   no outlier awareness (Table 2)
+#   cache.method_kwargs.hi_bits=8                INT8 importance cache (Table 3)
+#
+# GSM8K prompts are short (~150 tokens) and generations long, so most of each
+# answer is generated under the ratio -- unlike the windowed cache, MiKV's
+# budget binds from the first token (see modules/mikv/config.py).
+#
+# meta.json records `external_method` (config, resolved ratio, mean measured
+# kv_fraction) and read_gate=not-expected (no windowed Q tier exists).
+#
+# Produces: outputs/gsm8k/mikv_r20_int2/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: /home/ee/visitor/man_misn.visitor/llama-3.1-8b-instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: external
+  backend_package: null
+  cache_budget: null          # MiKV's budget is in method_kwargs
+  method_factory: "modules.mikv:make_mikv_method"
+  method_kwargs:
+    importance_ratio: 0.20
+    recent_ratio: 0.5
+    hi_bits: 16
+    lo_bits: 2
+    channel_balancer: true
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/mikv_r20_int2
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false
