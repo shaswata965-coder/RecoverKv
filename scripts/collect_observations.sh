@@ -19,10 +19,16 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 # step and per layer; SCHEMA.md lists them and which observation each feeds.
 #
 # --dataset: a LongBench name (reads $LONGBENCH_LOCAL_DIR/<name>.jsonl),
-# ruler:<task> (reads $RULER_DATA), wikitext-103, pg19, or a path.
+# ruler:<task> (reads $RULER_DATA), wikitext-103, pg19, or a path. Each sample
+# is one ARTICLE, and a .txt file is exactly one article -- a whole-corpus .txt
+# yields one sample however large it is. Pass a .jsonl (one article per line)
+# or a directory of .txt files for more.
 # Other flags: --sink 5 --local 128 --quant-budget-mode bytes --card-bits
 # --promotion bidir|oneway --promote-source dequant|original --token-heads
 # --backend flash_attn|eager --article-index --seed.
+#
+# Move a zip off this machine (split, checksummed, onto a throwaway branch):
+#   scripts/ship_observations.sh outputs/obs_data/<run>.zip
 #
 # Turn a zip into the parity pair the observation suite reads:
 #   python -m modules.evaluation.observation_collector export \
