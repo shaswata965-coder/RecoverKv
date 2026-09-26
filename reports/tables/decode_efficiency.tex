@@ -1,48 +1,77 @@
-% Decode throughput and peak memory: full KV (eager, flash), MiKV, ResQ, ours.
-% Needs \usepackage{booktabs}. table* spans both columns of a two-column
-% template and is the same as table in a one-column one.
+% Decode efficiency, one table per decode length (256/8192, 256/16384):
+% full KV (eager, flash), MiKV, ResQ, ours. Needs \usepackage{booktabs}.
 %
 % Transcribed from two perf-table printouts, both A100-80GB, one GPU, fp16:
 %   ours     cache_budget 0.20, q 0.70 (bytes), gate 0.25, local 128, sink 5,
 %            window 8
 %   full KV  outputs/efficiency_fullkv_2f06bc4 (runs=1, warmup=0, stat=median)
-% Throughput is the printed decode tok/s, i.e. B / steady-state TPOT.
-% Memory is the whole-run peak allocated, weights included. The printers say
-% "GB" but divide MiB by 1024, so it is GiB, 14.96 of it weights.
-% OOM at 16K, B = 32 is inferred, not printed: both full-KV arms printed "-"
-% there, and their measured peak grows 2.06 (flash) / 2.29 (eager) GiB per
+% TTFT and TPOT are in seconds exactly as printed; TPOT is steady state.
+% Decode is the printed decode tok/s, i.e. B / TPOT. Peak is the whole-run peak
+% allocated, weights included. The printers say "GB" but divide MiB by 1024, so
+% it is GiB, 14.96 of it weights.
+% The full-KV printout has no TTFT column, so those cells are "--" until it is
+% taken from that run. MiKV and ResQ are "--" until those baselines are run.
+% OOM at 256/16384, B = 32 is inferred, not printed: both full-KV arms printed
+% "-" there, and their measured peak grows 2.06 (flash) / 2.29 (eager) GiB per
 % sequence from B = 8 to 16 at that shape, i.e. ~81 / ~88 GiB at B = 32.
-% Bold is best per column among the rows that have numbers; recheck it once
-% MiKV and ResQ are filled in.
-\begin{table*}[t]
+% Bold is best within a batch size among rows with numbers; TTFT is unbolded
+% because only ours has one. Recheck bold once the "--" cells are filled in.
+
+\begin{table}[t]
 \centering
 \small
-\setlength{\tabcolsep}{5pt}
-\begin{tabular}{@{}l cccc cccc@{}}
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}cl cccc@{}}
 \toprule
- & \multicolumn{4}{c}{Throughput (tokens/s) $\uparrow$}
- & \multicolumn{4}{c}{Peak memory (GiB) $\downarrow$} \\
-\cmidrule(lr){2-5} \cmidrule(l){6-9}
- & \multicolumn{2}{c}{8K decode} & \multicolumn{2}{c}{16K decode}
- & \multicolumn{2}{c}{8K decode} & \multicolumn{2}{c}{16K decode} \\
-\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(l){8-9}
-Method & $B{=}1$ & $B{=}32$ & $B{=}1$ & $B{=}32$
-       & $B{=}1$ & $B{=}32$ & $B{=}1$ & $B{=}32$ \\
+ &        & TTFT & TPOT & Decode & Mem. \\
+$B$ & Method & (s)$\downarrow$ & (s)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$ \\
 \midrule
-Full KV (eager) &          20.5  &          108.0  &          20.7  &           OOM   &          16.15  &          52.19  &          17.28  &           OOM   \\
-Full KV (flash) & \textbf{22.2}  &          322.8  & \textbf{22.3}  &           OOM   &          16.04  &          48.51  &          17.05  &           OOM   \\
+ 1 & Full KV (eager) &    --  &          0.0489  &          20.5   &          16.15  \\ % TODO TTFT
+   & Full KV (flash) &    --  & \textbf{0.0451}  & \textbf{22.2}   &          16.04  \\ % TODO TTFT
+   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
+   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
+   & Ours            & 0.078  &          0.0678  &          14.8   & \textbf{15.61}  \\
 \midrule
-MiKV            &           --   &            --   &           --   &            --   &            --   &            --   &            --   &            --   \\ % TODO
-ResQ            &           --   &            --   &           --   &            --   &            --   &            --   &            --   &            --   \\ % TODO
-Ours            &          14.8  & \textbf{429.3}  &          14.8  & \textbf{214.3}  & \textbf{15.61}  & \textbf{34.70}  & \textbf{16.24}  & \textbf{54.78}  \\
+32 & Full KV (eager) &    --  &          0.2962  &         108.0   &          52.19  \\ % TODO TTFT
+   & Full KV (flash) &    --  &          0.0991  &         322.8   &          48.51  \\ % TODO TTFT
+   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
+   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
+   & Ours            & 1.106  & \textbf{0.0745}  & \textbf{429.3}  & \textbf{34.70}  \\
 \bottomrule
 \end{tabular}
-\caption{Decode throughput and peak GPU memory on one A100-80GB (fp16). Each
-run prefills a 256-token prompt, then generates 8K or 16K tokens at batch size
-$B$. Throughput is $B$ divided by the steady-state time per output token;
-memory includes ${\approx}15$\,GiB of model weights. Full KV keeps the
-uncompressed cache, with eager attention or FlashAttention. Ours keeps 20\% of
-the full cache by bytes (70\% of it int2) and reads 25\% of the int2 windows
-per step. OOM: exceeds the 80\,GiB device. Best per column in bold.}
-\label{tab:decode-efficiency}
-\end{table*}
+\caption{Decode efficiency at prefill/decode = 256/8192 on one A100-80GB
+(fp16). TTFT: time to first token. TPOT: steady-state time per output token.
+Decode: $B/\mathrm{TPOT}$. Mem.: peak allocated GPU memory, including
+${\approx}15$\,GiB of weights. Ours keeps 20\% of the full KV cache by bytes
+(70\% of it int2) and reads 25\% of the int2 windows per step. Best per batch
+size in bold.}
+\label{tab:decode-256-8192}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}cl cccc@{}}
+\toprule
+ &        & TTFT & TPOT & Decode & Mem. \\
+$B$ & Method & (s)$\downarrow$ & (s)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$ \\
+\midrule
+ 1 & Full KV (eager) &    --  &          0.0483  &          20.7   &          17.28  \\ % TODO TTFT
+   & Full KV (flash) &    --  & \textbf{0.0449}  & \textbf{22.3}   &          17.05  \\ % TODO TTFT
+   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
+   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
+   & Ours            & 0.079  &          0.0676  &          14.8   & \textbf{16.24}  \\
+\midrule
+32 & Full KV (eager) & \multicolumn{4}{c}{OOM} \\
+   & Full KV (flash) & \multicolumn{4}{c}{OOM} \\
+   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
+   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
+   & Ours            & 0.712  & \textbf{0.1493}  & \textbf{214.3}  & \textbf{54.78}  \\
+\bottomrule
+\end{tabular}
+\caption{Decode efficiency at prefill/decode = 256/16384, same setup as
+Table~\ref{tab:decode-256-8192}. OOM: exceeds the 80\,GiB device. Best per
+batch size in bold.}
+\label{tab:decode-256-16384}
+\end{table}
