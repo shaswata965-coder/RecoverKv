@@ -36,6 +36,12 @@ same held set in both arms):
 Without promotion the aim stays flat (q = 0.20: 64% → 66%). With it, the aim improves as the
 decode goes on (67% → 77%): the cache learns where attention has moved and follows it.
 
+*Random pick* (the dotted lines in panel b) is the score an fp tier would get if its `k_fp` slots
+went to `k_fp` of the held windows (fp + int2) chosen uniformly at random. That is
+`k_fp / (k_fp + N_q)`: 2 / 28 = 7% at q = 0.70 and 7 / 14 = 50% at q = 0.20. It is the floor that
+says whether a tier is aimed at all. At q = 0.70 both arms are 3–4× above it; at q = 0.20 only
+the promoting arm pulls clearly away from it over the decode.
+
 **3. Every promotion is a better pick than the window it replaces** (panel c). Over the next 32
 steps, a promoted window draws **2.0×** (q = 0.70) and **2.4×** (q = 0.20) the attention of the
 fp window it displaces (0.78% vs 0.39% and 0.77% vs 0.32% of a head's attention per step; 221

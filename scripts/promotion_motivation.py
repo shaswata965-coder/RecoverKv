@@ -20,9 +20,10 @@ policy's own ranking signal, int2 windows barred from fp), over the decode in
 * **staleness** -- the share of layer-evictions whose fp set differs between the
   two arms.
 
-The figure is three print-size panels: (a) staleness over the decode, (b)
-fp-tier aim over the decode, with vs without promotion, against chance, (c)
-what one promotion carries (from the ablation JSON).
+The figure is three print-size panels, captioned under their x axes, with the
+legend on the right: (a) staleness over the decode, (b) fp-tier aim over the
+decode, with vs without promotion, against a random pick of ``k_fp`` of the
+held windows, (c) what one promotion carries (from the ablation JSON).
 """
 
 from __future__ import annotations
@@ -99,8 +100,11 @@ def analyse(zip_path: str) -> Dict[str, object]:
 # the figure
 # ---------------------------------------------------------------------------
 
-INK, MUTED, GRID = "#1c2026", "#5b6878", "#d9dde3"
-WITH, WITHOUT, SOFT = "#6446a4", "#82aee3", "#c1b3f2"
+INK, MUTED = "#1c2026", "#5b6878"
+# Checked with the dataviz validator (light surface): lightness, chroma, CVD and
+# normal-vision separation, 3:1 contrast all pass for this pair.
+WITH, WITHOUT = "#6446a4", "#4a86d6"
+CAPTION_Y = -0.29            # panel captions sit under each x axis, all at one height
 
 
 def figure(res: Dict[str, dict], abl: Dict[str, dict], stem: str) -> List[str]:
@@ -114,18 +118,18 @@ def figure(res: Dict[str, dict], abl: Dict[str, dict], stem: str) -> List[str]:
                          "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
                          "svg.fonttype": "none", "pdf.fonttype": 42})
     labs = list(res)
-    ls = dict(zip(labs, ("-", "--", ":")))
-    fig, ax = plt.subplots(1, 3, figsize=(6.5, 2.3),
-                           gridspec_kw={"wspace": 0.45, "width_ratios": [1, 1, 0.82]})
+    ls = dict(zip(labs, ("-", "--", "-.")))
+    fig, ax = plt.subplots(1, 3, figsize=(8.4, 2.3),
+                           gridspec_kw={"wspace": 0.55, "width_ratios": [1, 1, 0.8]})
     x = np.arange(len(res[labs[0]]["bins"])) * BIN + BIN / 2
+    mk = dict(lw=1.5, marker="o", ms=3.2, markeredgewidth=0)
 
     # (a) how often the fp tier without promotion is not the one the cache would pick
     for lab in labs:
         y = 100 * np.asarray(res[lab]["stale"])
-        ax[0].plot(x, y, ls[lab], color=WITH, lw=1.5, marker="o", ms=2.6)
-        ax[0].annotate(lab.replace("q", "q = "), (x[-1], y[-1]), xytext=(-2, 5),
+        ax[0].plot(x, y, ls[lab], color=WITH, **mk)
+        ax[0].annotate(lab.replace("q", "q = "), (x[-1], y[-1]), xytext=(0, 6),
                        textcoords="offset points", ha="right", fontsize=7.2, color=INK)
-    ax[0].set_title("(a) Stale fp tier (no promotion)", loc="left")
     ax[0].set_ylabel("Layer-evictions stale (%)")
     ax[0].set_ylim(0, 100)
 
@@ -134,45 +138,50 @@ def figure(res: Dict[str, dict], abl: Dict[str, dict], stem: str) -> List[str]:
         n = int(np.sum(np.asarray(res[lab]["aim_bins_scored"]) > 0))
         for arm, col in (("with", WITH), ("without", WITHOUT)):
             ax[1].plot(x[:n], 100 * np.asarray(res[lab][f"aim_{arm}"][:n]), ls[lab],
-                       color=col, lw=1.5, marker="o", ms=2.6)
-        ax[1].axhline(100 * res[lab]["chance"], color=MUTED, lw=0.7, ls=ls[lab], alpha=0.6)
-    for lab in labs:
-        ax[1].text(6, 100 * res[lab]["chance"] + 1.5, "chance", fontsize=6.8, color=MUTED)
-    ax[1].set_title("(b) fp tier on top windows", loc="left")
-    ax[1].set_ylabel("fp tier in next-32 top-$k$ (%)")
+                       color=col, **mk)
+        c = 100 * res[lab]["chance"]
+        ax[1].axhline(c, color=MUTED, lw=0.8, ls=":")
+        ax[1].text(508, c + 1.8, f"random pick, {lab.replace('q', 'q = ')}: {c:.0f}%",
+                   ha="right", va="bottom", fontsize=6.8, color=MUTED)
+    ax[1].set_ylabel("fp windows in next-32 top-$k$ (%)")
     ax[1].set_ylim(0, 100)
     for a_ in ax[:2]:
         a_.set_xlabel("Decode step")
         a_.set_xlim(0, 512)
         a_.set_xticks([0, 128, 256, 384, 512])
-        a_.grid(axis="y", color=GRID, lw=0.6)
-        a_.spines[["top", "right"]].set_visible(False)
 
     # (c) what one promotion carries
     lab_ab = list(abl)
     pos = np.arange(len(lab_ab))
     dem = np.array([100 * abl[k]["swap"]["demoted_mass"] for k in lab_ab])
     pro = np.array([100 * abl[k]["swap"]["promoted_mass"] for k in lab_ab])
-    w = 0.38
-    ax[2].bar(pos - w / 2, dem, w, color=WITHOUT)
-    ax[2].bar(pos + w / 2, pro, w, color=WITH)
+    w = 0.36
+    ax[2].bar(pos - w / 2 - 0.01, dem, w, color=WITHOUT)
+    ax[2].bar(pos + w / 2 + 0.01, pro, w, color=WITH)
     for i in range(len(lab_ab)):
         ax[2].text(pos[i] + w / 2, pro[i] + 0.02, f"{pro[i] / dem[i]:.1f}\u00d7",
                    ha="center", va="bottom", fontsize=7.2, color=INK)
-    ax[2].set_xticks(pos, [k.replace("q", "q = ") for k in lab_ab])
-    ax[2].set_title("(c) One promotion", loc="left")
+    ax[2].set_xticks(pos, [k.lstrip("q") for k in lab_ab])
+    ax[2].set_xlabel("Quant ratio")
     ax[2].set_ylabel("Attention / step, next 32 (%)")
-    ax[2].set_ylim(0, pro.max() * 1.3)
-    ax[2].grid(axis="y", color=GRID, lw=0.6)
-    ax[2].spines[["top", "right"]].set_visible(False)
+    ax[2].set_ylim(0, pro.max() * 1.25)
 
-    handles = [Line2D([], [], color=WITH, lw=5, label="With promotion / promoted window"),
+    captions = ("(a) Stale fp tier, no promotion",
+                "(b) fp tier on windows read next",
+                "(c) One promotion")
+    for a_, cap in zip(ax, captions):
+        a_.spines[["top", "right"]].set_visible(False)
+        a_.text(0.5, CAPTION_Y, cap, transform=a_.transAxes, ha="center", va="top",
+                fontsize=8.5, color=INK)
+
+    handles = [Line2D([], [], color=WITH, lw=5, label="With promotion\n(promoted window)"),
                Line2D([], [], color=WITHOUT, lw=5,
-                      label="No promotion / window it displaces"),
-               *[Line2D([], [], color=MUTED, lw=1.2, ls=ls[lab],
-                        label=lab.replace("q", "q = ")) for lab in labs]]
-    fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False,
-               bbox_to_anchor=(0.5, -0.14), handlelength=2.2, columnspacing=1.4)
+                      label="No promotion\n(window it replaces)"),
+               *[Line2D([], [], color=MUTED, lw=1.3, ls=ls[lab],
+                        label=lab.replace("q", "q = ")) for lab in labs],
+               Line2D([], [], color=MUTED, lw=0.8, ls=":", label="Random pick")]
+    fig.legend(handles=handles, loc="center left", frameon=False,
+               bbox_to_anchor=(0.905, 0.55), handlelength=2.2, labelspacing=0.9)
     written = []
     for ext in ("pdf", "svg", "png"):
         p = f"{stem}.{ext}"
