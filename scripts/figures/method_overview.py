@@ -413,7 +413,9 @@ H1 = KEY_Y + 5
 # (a)'s cache: wide, with the dropped windows still visible as ghosts
 CA = Cache(x0=146, yb=93, sink_w=2.2, fp_w=21, q_w=14, loc_w=21, fp_h=20, n_drop=N_DROP,
            gap=7.5, wgap=2.2)
-TRACED = 3                               # the int2 window whose score update is shown
+TRACED = 6                               # the int2 window whose score update is shown:
+                                         # far right, so the row under it leaves room for
+                                         # the loop's arrow and its label
 A_ROW = 105                              # (a)'s alpha row
 A_SPAN = 224.5                           # its first cell -> the middle of "New score"
 # (b) and (c): the same cache, narrower, after the eviction. (c) draws it higher: its
@@ -433,7 +435,7 @@ def fig1_a(g):
     # ---- the attention map: columns are keys, each row one query token
     N, SINK, WSZ, cell = 18, 2, 8, 3.3
     N_PROMPT = 9
-    hx, hy = 38, 31
+    hx, hy = 50, 31
     rng = random.Random(3)
     P = []
     for i in range(N):
@@ -503,8 +505,8 @@ def fig1_a(g):
     g.text(c2 + 20, ly, "Earlier steps", size=FS, anchor="middle")
     g.text(c3 + 24, ly, "Ranks it", size=FS, anchor="middle")
     g.line(CA.qx(TRACED), ay - 1, CA.qx(TRACED), CA.yb + 1.5, stroke=Q_S, sw=0.9, arrow="violet")
-    # the loop from (c) comes in from the left at mid-row; its tag sits just above it
-    g.text(3, ay + ah / 2 - 4, "From (c)", size=FS, fill=FP_T)
+    # the loop from (c) comes in from the left at mid-row, labelled just above it
+    g.text(4, ay + ah / 2 - 4, "Fused attention score", size=FS, fill=FP_T)
 
     # ---- the ranked scores, standing on the windows they tier
     bb, bmax = CA.yb - CA.fp_h - 4, 24
@@ -655,7 +657,7 @@ def build_fig1():
     block_arrow(g, XB - 1.5, yb, XC + BW + 0.5, yb)
     # every window's attention this step, read or credited, goes back into its score (a):
     # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell. (a)'s own
-    # row says what happens to it; the tag where it enters says where it came from
+    # row says what happens to it; the label where it enters says what it carries
     yk = BY + (KY0 + KY1) / 2
     xa = LM + CA.qx(TRACED) - A_SPAN
     ya, r = A_ROW + 7, 4
