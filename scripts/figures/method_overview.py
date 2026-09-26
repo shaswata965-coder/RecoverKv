@@ -15,6 +15,8 @@ fails the build on anything below that, or on text that collides.
   (c) one fused pass per token: re-ranked at each window boundary, read in one
       kernel (fp16 and opened int2 in full, the rest through their cards), and
       the next token appended; every window's attention loops back to (a).
+  Layout: (c) sits left of (b), so the loop runs clockwise -- down from (a) into
+  (b), across into (c), and up the left margin back into (a)'s score update.
 
 ``method_details``  -- Figure 2, the mechanisms Figure 1 leaves out:
   (a) demoting a window: its keys as one cluster -> the card; the parts of an
@@ -28,6 +30,9 @@ int2 windows, 2 of 8 opened), but that is geometry, never text.
 
 Palette: fp16 blue, int2 violet, card green, sink slate, query / new token red,
 dropped a dashed outline; every label and mark one solid ink, no greys.
+
+Figure 1's labels are upright (no italics) and start with a capital; a dtype
+(fp16, int2) or a symbol (alpha) keeps its own case.
 
 Run:  python scripts/figures/method_overview.py && node scripts/figures/export_figure.mjs
 """
@@ -122,13 +127,12 @@ class G:
         self.add(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r}" fill="{fill}" stroke="{stroke}" '
                  f'stroke-width="{sw}"{extra}/>')
 
-    def text(self, x, y, s, size=FS, anchor="start", weight=None, fill=INK, italic=False,
-             rotate=None, extra=""):
+    def text(self, x, y, s, size=FS, anchor="start", weight=None, fill=INK, rotate=None,
+             extra=""):
         w = f' font-weight="{weight}"' if weight else ""
-        it = ' font-style="italic"' if italic else ""
         rot = f' transform="rotate({rotate} {x:.2f} {y:.2f})"' if rotate is not None else ""
         self.add(f'<text x="{x:.2f}" y="{y:.2f}" font-size="{size}" text-anchor="{anchor}" '
-                 f'fill="{fill}"{w}{it}{rot}{extra}>{html.escape(s)}</text>')
+                 f'fill="{fill}"{w}{rot}{extra}>{html.escape(s)}</text>')
 
     def text_parts(self, x, y, parts, size=9, anchor="start", weight=None, fill=INK):
         """Text with subscripts, ``parts = [(text, is_sub), ...]``. A subscript is a
@@ -175,9 +179,9 @@ def frame(g, w, h, tag, title, sub=None, sub_right=False):
     g.text(6, 11, f"{tag}  {title}", size=FT, weight="bold")
     if sub:
         if sub_right:
-            g.text(w - 6, 11, sub, size=FS, anchor="end", italic=True)
+            g.text(w - 6, 11, sub, size=FS, anchor="end")
         else:
-            g.text(6, 21, sub, size=FS, italic=True)
+            g.text(6, 21, sub, size=FS)
 
 
 # ---------------------------------------------------------------------------
@@ -373,13 +377,14 @@ def svg_doc(g, w, h):
 # Figure 1 -- the runtime loop
 # ===========================================================================
 W1 = 396
-LM = 9                                   # left margin: carries the loop back to (a)
+LM = 14                                  # left margin: carries the loop back to (a)
+XL = 6                                   # the loop's run up the margin, clear of the borders
 AW, AH = W1 - LM - 1, 131
 BW = (W1 - LM - 1 - 8) / 2
-BY = AH + 14
-BH = 198
-YL = BY + BH + 5                         # the loop's run under (b) and (c)
-H1 = YL + 14
+XC, XB = LM, LM + BW + 8                 # (c) left, (b) right: the loop runs clockwise
+BY = AH + 17                             # the gap under (a) carries the loop's label
+BH = 200
+H1 = BY + BH + 1
 
 # (a)'s cache: wide, with the dropped windows still visible as ghosts
 CA = Cache(x0=118, yb=93, sink_w=2, fp_w=17, q_w=12, loc_w=17, fp_h=20, n_drop=N_DROP)
@@ -387,13 +392,13 @@ TRACED = 3                               # the int2 window whose score update is
 A_ROW = 103                              # (a)'s alpha row
 # (b) and (c): the same cache, narrower, after the eviction
 CB = Cache(x0=8, yb=134, sink_w=1.6, fp_w=14, q_w=10, loc_w=14, fp_h=20, gap=3.2, wgap=1.4)
-KY0 = CB.yb + 10                         # (c)'s kernel box
+KY0 = CB.yb + 12                         # (c)'s kernel box; above it the new K, V come in
 KY1 = KY0 + 34
 
 
 def fig1_a(g):
     frame(g, AW, AH, "(a)", "Cumulative attention ranks the windows",
-          "re-tiered at every window boundary", sub_right=True)
+          "Re-tiered at every window boundary", sub_right=True)
 
     # ---- the attention map: columns are keys, each row one query token
     N, SINK, WSZ, cell = 18, 2, 8, 3.3
@@ -415,11 +420,11 @@ def fig1_a(g):
             g.rect(hx + j * cell, hy + i * cell, cell, cell, fill=col, stroke="#ffffff", sw=0.25)
     hw = N * cell
     g.rect(hx, hy, hw, hw, stroke=INK, sw=0.5)
-    g.text(hx, hy - 4, "keys (cached tokens)", size=FS)
-    g.line(hx + 78, hy - 6.5, hx + 92, hy - 6.5, stroke=INK, sw=0.7, arrow="dark")
-    g.text(hx - 23, hy + hw / 2, "query tokens", size=FS, anchor="middle", rotate=-90)
+    g.text(hx, hy - 4, "Keys (cached)", size=FS)
+    g.line(hx + 53.5, hy - 6.5, hx + hw, hy - 6.5, stroke=INK, sw=0.7, arrow="dark")
+    g.text(hx - 23, hy + hw / 2, "Query tokens", size=FS, anchor="middle", rotate=-90)
     yp = hy + N_PROMPT * cell
-    for (y0, y1, lab, col) in ((hy, yp, "prompt", INK), (yp, hy + hw, "decode", QRY_S)):
+    for (y0, y1, lab, col) in ((hy, yp, "Prompt", INK), (yp, hy + hw, "Decode", QRY_S)):
         g.path(f"M{hx - 1},{y0 + 0.6} L{hx - 3.5},{y0 + 0.6} L{hx - 3.5},{y1 - 0.6} "
                f"L{hx - 1},{y1 - 0.6}", stroke=col, sw=0.7)
         g.text(hx - 7, (y0 + y1) / 2, lab, size=FS, anchor="middle", fill=col, rotate=-90)
@@ -445,7 +450,7 @@ def fig1_a(g):
         x += cw + cg_
     x += 0.5
     g.line(x, ay + ah / 2, x + 12, ay + ah / 2, stroke=INK, sw=0.7, arrow="dark")
-    g.text(x + 6, ay - 2.5, "sum", size=FS, anchor="middle")
+    g.text(x + 6, ay - 2.5, "Sum", size=FS, anchor="middle")
     x += 14
 
     def chip(x0, wd, parts, fill, stroke, bold=False, sw=0.6, tcol=INK):
@@ -461,12 +466,12 @@ def fig1_a(g):
     x = chip(c2, 38, [("α", False), ("history", True)], Q_F, Q_S)
     g.text(x + 5, ay + 10.5, "=", size=10, anchor="middle", weight="bold")
     c3 = x + 10
-    chip(c3, 46, [("new score", False)], "#ffffff", Q_S, bold=True, sw=1.1)
+    chip(c3, 46, [("New score", False)], "#ffffff", Q_S, bold=True, sw=1.1)
     ly = ay + ah + 10
-    g.text(ax0 + (5 * cw + 4 * cg_) / 2, ly, "this step's row", size=FS, anchor="middle")
-    g.text(c1 + 18, ly, "summed", size=FS, anchor="middle")
-    g.text(c2 + 19, ly, "earlier steps", size=FS, anchor="middle")
-    g.text(c3 + 23, ly, "ranks it", size=FS, anchor="middle")
+    g.text(ax0 + (5 * cw + 4 * cg_) / 2, ly, "This step's row", size=FS, anchor="middle")
+    g.text(c1 + 18, ly, "Summed", size=FS, anchor="middle")
+    g.text(c2 + 19, ly, "Earlier steps", size=FS, anchor="middle")
+    g.text(c3 + 23, ly, "Ranks it", size=FS, anchor="middle")
     g.line(CA.qx(TRACED), ay - 1, CA.qx(TRACED), CA.yb + 1.5, stroke=Q_S, sw=0.9, arrow="violet")
 
     # ---- the ranked scores, standing on the windows they tier
@@ -492,9 +497,9 @@ def fig1_a(g):
         g.rect(x_, bb - hgt, wd, hgt, stroke=INK if tr else solid, sw=0.9 if tr else 0.5)
     g.line(CA.fp[0] - 2, bb, CA.drop[-1] + CA.q_w + 2, bb, stroke=INK, sw=0.5)
     # tier names, straight over their windows
-    for key, top, bot, col in (("sink", None, "sink", SINK_S), ("fp", "top-k", "fp16", FP_T),
-                               ("q", "next top-k", "int2 + card", Q_T),
-                               ("drop", "rest", "dropped", INK), ("loc", "newest", "local", FP_T)):
+    for key, top, bot, col in (("sink", None, "Sink", SINK_S), ("fp", "Top-k", "fp16", FP_T),
+                               ("q", "Next top-k", "int2 + card", Q_T),
+                               ("drop", "Rest", "Dropped", INK), ("loc", "Newest", "Local", FP_T)):
         if top:
             g.text(CA.cx(key), 32, top, size=FS, anchor="middle", fill=col, weight="bold")
         g.text(CA.cx(key), 41, bot, size=FS, anchor="middle", fill=col)
@@ -502,32 +507,32 @@ def fig1_a(g):
 
 
 def fig1_b(g):
-    frame(g, BW, BH, "(b)", "Cards choose what to read", "per KV head, every decode step")
+    frame(g, BW, BH, "(b)", "Cards choose what to read", "Per KV head, every decode step")
     top = CB.card_top()
 
     # the query heads of one GQA group score every card
     qx, qy, qw = CB.cx("q") - 13, 27, 26
     for h in range(4):
         g.rect(qx, qy + h * 3.6, qw, 2.8, fill=QRY_F, stroke=QRY_S, sw=0.5, rx=0.8)
-    g.text(qx - 4, qy + 10, "query heads", size=FS, anchor="end", fill=QRY_T, weight="bold")
+    g.text(qx - 4, qy + 10, "Query heads", size=FS, anchor="end", fill=QRY_T, weight="bold")
     gy, ch, pitch = qy + 24, 7, 9.4
     for c in range(N_Q):
         g.line(CB.cx("q"), qy + 14.5, CB.qx(c), gy - 1.5, stroke=INK, sw=0.4)
-    g.text(CB.span("q")[1] + 4, qy + 10, "score", size=FS)
+    g.text(CB.span("q")[1] + 4, qy + 10, "Score", size=FS)
     g.text(CB.span("q")[1] + 4, qy + 19, "every card", size=FS)
 
     # each head's share of the cards, then the union across the group
     for h in range(4):
-        g.text(CB.span("q")[0] - 3, gy + h * pitch + 6.2, f"head {h + 1}", size=FS, anchor="end")
+        g.text(CB.span("q")[0] - 3, gy + h * pitch + 6.2, f"Head {h + 1}", size=FS, anchor="end")
         for c, x in enumerate(CB.q):
             g.rect(x, gy + h * pitch, CB.q_w, ch, fill=ramp(PURPLES, SHARE[h][c] ** 0.6 * 1.05),
                    stroke="#ffffff", sw=0.4)
-    g.text(CB.span("q")[1] + 4, gy + 3 * pitch + 6.2, "retrieval", size=FS)
+    g.text(CB.span("q")[1] + 4, gy + 3 * pitch + 6.2, "Retrieval", size=FS)
     uy = gy + 4 * pitch + 3
     g.text(CB.span("q")[1] + 4, gy + 4 * pitch + 6.2, "head", size=FS)
     for c in SEL:
         g.rect(CB.q[c] - 1.5, uy - 1.5, CB.q_w + 3, top - 3 - (uy - 1.5), fill="#ebe4f7", rx=1.5)
-    g.text(CB.span("q")[0] - 3, uy + 6.2, "union", size=FS, anchor="end", weight="bold")
+    g.text(CB.span("q")[0] - 3, uy + 6.2, "Union", size=FS, anchor="end", weight="bold")
     for c, x in enumerate(CB.q):
         g.rect(x, uy, CB.q_w, ch, fill=ramp(PURPLES, UNION[c] ** 0.6 * 1.05), stroke="#ffffff",
                sw=0.4)
@@ -537,45 +542,47 @@ def fig1_b(g):
         g.line(CB.qx(c), uy + ch + 1.5, CB.qx(c), top - 2, stroke=Q_S, sw=0.9, arrow="violet")
     for x1, x2 in ((CB.sink[0], CB.span("fp")[1]), CB.span("loc")):
         bracket(g, x1, x2, CB.yb - CB.fp_h - 3, up=True)
-        g.text((x1 + x2) / 2, CB.yb - CB.fp_h - 6, "always read", size=FS, anchor="middle")
+        g.text((x1 + x2) / 2, CB.yb - CB.fp_h - 6, "Always read", size=FS, anchor="middle")
     CB.draw(g, mode="gated")
 
-    # the opened windows, and what the gate leaves
-    g.text(CB.cx("q"), CB.yb + 12, "top windows opened, at the gate ratio", size=FS,
+    # the opened windows, and what a step reads of each int2 window
+    g.text(CB.cx("q"), CB.yb + 12, "Top windows opened, at the gate ratio", size=FS,
            anchor="middle", weight="bold", fill=Q_T)
-    ky = CB.yb + 29
-    g.rect(10, ky - 7, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
-    g.text(23, ky, "opened", size=FS)
+    kx, ky, kp = 10, CB.yb + 28, 13
+    g.use("card", kx, ky - 7.5, 9, 9)
+    g.text(kx + 13, ky, "Card: read for every window", size=FS)
+    g.rect(kx, ky + kp - 7, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
+    g.text(kx + 13, ky + kp, "Opened: its int2 window is read too", size=FS)
     g.add('<g opacity="0.45">')
-    g.rect(64, ky - 7, 9, 8, fill=Q_F, stroke=Q_S, sw=0.6, dash="1.5 1")
+    g.rect(kx, ky + 2 * kp - 7, 9, 8, fill=Q_F, stroke=Q_S, sw=0.6, dash="1.5 1")
     g.add("</g>")
-    g.text(77, ky, "only its card is read", size=FS)
+    g.text(kx + 13, ky + 2 * kp, "Not opened: only its card is read", size=FS)
 
 
 def fig1_c(g):
-    frame(g, BW, BH, "(c)", "One fused pass per token", "every decode step, every layer")
+    frame(g, BW, BH, "(c)", "One fused pass per token", "Every decode step, every layer")
     top = CB.card_top()
     yfp = CB.yb - CB.fp_h
 
     # ---- when the newest window fills: re-rank, then promote / demote / drop
     chx, chy, chw, chh = 8, 30, 112, 12
     g.rect(chx, chy, chw, chh, fill="#ffffff", stroke=INK, sw=0.7, rx=3)
-    g.text(chx + chw / 2, chy + 8.6, "re-rank by cumulative score", size=FS, anchor="middle",
+    g.text(chx + chw / 2, chy + 8.6, "Re-rank by cumulative score", size=FS, anchor="middle",
            weight="bold")
-    xn, ym = CB.loc[-1] + 3.5, chy + chh / 2
+    xn, ym = CB.loc[-1] + CB.loc_w / 2, chy + chh / 2
     g.path(f"M{xn},{yfp - 1} L{xn},{ym} L{chx + chw + 1},{ym}", stroke=INK, sw=0.8, arrow="dark")
-    g.text(xn - 2, ym - 3, "window full", size=FS, anchor="end")
+    g.text(xn - 2, ym - 3, "Window full", size=FS, anchor="end")
     y0, yl = chy + chh + 0.5, chy + chh + 30.5
     g.line(CB.cx("fp"), y0, CB.cx("fp"), yfp - 1.5, stroke=FP_S, sw=0.9, arrow="blue")
-    g.text(CB.cx("fp") + 3, yl, "promote", size=FS, fill=FP_T)
+    g.text(CB.cx("fp") + 3, yl, "Promote", size=FS, fill=FP_T)
     xdm = CB.qx(3)
     g.line(xdm, y0, xdm, top - 1.5, stroke=Q_S, sw=0.9, arrow="violet")
-    g.text(xdm + 3, yl, "demote", size=FS, fill=Q_T)
+    g.text(xdm + 3, yl, "Demote", size=FS, fill=Q_T)
     g.text(xdm + 3, yl + 9, "(+ card)", size=FS, fill=Q_T)
     xdr = chx + chw - 8
     g.line(xdr, y0, xdr, y0 + 8, stroke=INK, sw=0.7)
     xmark(g, xdr, y0 + 11.5, r=2.4)
-    g.text(xdr + 4, y0 + 14.3, "drop", size=FS)
+    g.text(xdr + 4, y0 + 14.3, "Drop", size=FS)
 
     CB.draw(g, mode="gated", fill_newest=True)
 
@@ -587,7 +594,7 @@ def fig1_c(g):
                 None if c in SEL else "1.5 1.2", 0.9 if c in SEL else 0.6) for c in range(N_Q)]):
         g.line(x, CB.yb + 1, x, KY0 - 1, stroke=col, sw=sw, dash=dash, arrow=arrow)
     g.rect(4, KY0, BW - 12, KY1 - KY0, fill="#ffffff", stroke=INK, sw=0.6, rx=3)
-    g.text(8, KY0 + 8.8, "fused attention reads:", size=FS, weight="bold")
+    g.text(8, KY0 + 8.8, "Fused attention reads:", size=FS, weight="bold")
     mt, mh = KY0 + 11.5, 12
     g.rect(CB.sink[0], mt, CB.sink[1] - CB.sink[0], mh, fill=SINK_F, stroke=SINK_S, sw=0.4)
     for x in CB.fp:
@@ -600,20 +607,21 @@ def fig1_c(g):
     for x in CB.loc:
         g.rect(x, mt, CB.loc_w, mh, fill="hatch-blue", stroke=FP_S, sw=0.5)
     ly = mt + mh + 8.6
-    g.text(CB.qx(SEL[0]), ly, "decoded", size=FS, anchor="middle", fill=Q_T)
-    g.text((CB.qx(4) + CB.qx(5)) / 2, ly, "card only", size=FS, anchor="middle", fill=CARD_T)
+    g.text(CB.qx(SEL[0]), ly, "Decoded", size=FS, anchor="middle", fill=Q_T)
+    g.text((CB.qx(4) + CB.qx(5)) / 2, ly, "Card only", size=FS, anchor="middle", fill=CARD_T)
 
-    # ---- the token it produces: its K, V go into the newest window
+    # ---- the token it produces: its K, V go into the newest window, from below, which
+    # keeps (c)'s right edge clear at the cache for the arrow coming in from (b)
     oy, ox0, ox1 = KY1 + 7, 8, 98
     g.line((ox0 + ox1) / 2, KY1, (ox0 + ox1) / 2, oy - 0.5, stroke=INK, sw=0.8, arrow="dark")
     g.rect(ox0, oy, ox1 - ox0, 11, fill="#ffffff", stroke=QRY_S, sw=0.9, rx=2)
-    g.text((ox0 + ox1) / 2, oy + 8, "output → next token", size=FS, anchor="middle",
+    g.text((ox0 + ox1) / 2, oy + 8, "Output → next token", size=FS, anchor="middle",
            weight="bold", fill=QRY_T)
-    xr = BW - 4
+    xr, yr = BW - 4, KY0 - 3.5
     xt = CB.loc[-1] + CB.loc_w * 5.5 / 8                        # its slot in the newest window
-    g.path(f"M{ox1},{oy + 5.5} L{xr},{oy + 5.5} L{xr},{yfp - 5} L{xt},{yfp - 5} L{xt},{yfp - 1}",
+    g.path(f"M{ox1},{oy + 5.5} L{xr},{oy + 5.5} L{xr},{yr} L{xt},{yr} L{xt},{CB.yb + 1}",
            stroke=QRY_S, sw=0.9, arrow="red")
-    g.text((ox1 + xr) / 2, oy + 2.8, "its K, V appended", size=FS, anchor="middle", fill=QRY_T)
+    g.text((ox1 + xr) / 2, oy + 2.8, "Its K, V appended", size=FS, anchor="middle", fill=QRY_T)
 
 
 def build_fig1():
@@ -621,27 +629,28 @@ def build_fig1():
     g.open(LM, 0, extra=f' class="panel" data-w="{AW}" data-h="{AH}"')
     fig1_a(g)
     g.close()
-    g.open(LM, BY, extra=f' class="panel" data-w="{BW:.1f}" data-h="{BH}"')
+    g.open(XB, BY, extra=f' class="panel" data-w="{BW:.1f}" data-h="{BH}"')
     fig1_b(g)
     g.close()
-    cx0 = LM + BW + 8
-    g.open(cx0, BY, extra=f' class="panel" data-w="{BW:.1f}" data-h="{BH}"')
+    g.open(XC, BY, extra=f' class="panel" data-w="{BW:.1f}" data-h="{BH}"')
     fig1_c(g)
     g.close()
 
-    # between panels: the tiered cache feeds the gate; the gate's pick feeds the pass
-    g.line(LM + 60, AH + 1, LM + 60, BY - 1, stroke=INK, sw=1, arrow="dark")
+    # between panels: the tiered cache feeds the gate (b, right); the gate's pick feeds
+    # the pass (c, left), level with the cache both of them draw
+    xq = XB + CB.cx("q")
+    g.line(xq, AH + 1, xq, BY - 1, stroke=INK, sw=1, arrow="dark")
     yb = BY + CB.yb - CB.fp_h / 2
-    g.line(LM + BW + 0.5, yb, cx0 - 0.5, yb, stroke=INK, sw=1, arrow="dark")
-    # every window's attention this step, read or credited, goes back into its score (a)
-    xg = LM + BW + 4                                          # the gap between (b) and (c)
+    g.line(XB - 0.5, yb, XC + BW + 0.5, yb, stroke=INK, sw=1, arrow="dark")
+    # every window's attention this step, read or credited, goes back into its score (a):
+    # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell
     yk = BY + (KY0 + KY1) / 2
-    xa = LM + CA.qx(TRACED) - 204                             # (a)'s first alpha cell
+    xa = LM + CA.qx(TRACED) - 204
     ya = A_ROW + 7
-    g.path(f"M{cx0 + 4},{yk} L{xg},{yk} L{xg},{YL} L3.5,{YL} L3.5,{ya} L{xa - 0.8},{ya}",
-           stroke=FP_S, sw=1, arrow="blue")
-    g.text(W1 / 2, YL + 10, "every window's attention this step, read or credited, is added "
-           "to its score", size=FS, anchor="middle", fill=FP_T, weight="bold")
+    g.path(f"M{XC + 4},{yk} L{XL},{yk} L{XL},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1,
+           arrow="blue")
+    g.text(XL + 5, AH + 11.4, "Every window's attention this step, read or credited, is added "
+           "to its score", size=FS, fill=FP_T, weight="bold")
     return svg_doc(g, W1, H1), W1, H1
 
 
