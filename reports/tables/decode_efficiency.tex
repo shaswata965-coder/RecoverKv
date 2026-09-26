@@ -1,21 +1,26 @@
 % Decode efficiency, one table per decode length (256/8192, 256/16384):
 % full KV (eager, flash), MiKV, ResQ, ours. Needs \usepackage{booktabs}.
 %
-% Transcribed from two perf-table printouts, both A100-80GB, one GPU, fp16:
+% Transcribed from three perf-table printouts, one GPU, fp16:
 %   ours     cache_budget 0.20, q 0.70 (bytes), gate 0.25, local 128, sink 5,
-%            window 8
-%   full KV  outputs/efficiency_fullkv_2f06bc4 (runs=1, warmup=0, stat=median)
+%            window 8; A100-80GB
+%   full KV  outputs/efficiency_fullkv_2f06bc4 (runs=1, warmup=0, stat=median);
+%            A100-80GB
+%   MiKV     its own ttft / tpot / tok/s / peak table; the printout does not
+%            state the device, taken to be the same A100-80GB
 % TTFT and TPOT are in seconds exactly as printed; TPOT is steady state.
 % Decode is the printed decode tok/s, i.e. B / TPOT. Peak is the whole-run peak
-% allocated, weights included. The printers say "GB" but divide MiB by 1024, so
-% it is GiB, 14.96 of it weights.
+% allocated, weights included. Ours' printer says "GB" but divides MiB by 1024,
+% so it is GiB, 14.96 of it weights; the full-KV and MiKV B = 1 peaks sit on the
+% same weights + KV and read the same way.
 % The full-KV printout has no TTFT column, so those cells are "--" until it is
-% taken from that run. MiKV and ResQ are "--" until those baselines are run.
-% OOM at 256/16384, B = 32 is inferred, not printed: both full-KV arms printed
-% "-" there, and their measured peak grows 2.06 (flash) / 2.29 (eager) GiB per
-% sequence from B = 8 to 16 at that shape, i.e. ~81 / ~88 GiB at B = 32.
-% Bold is best within a batch size among rows with numbers; TTFT is unbolded
-% because only ours has one. Recheck bold once the "--" cells are filled in.
+% taken from that run. ResQ is "--" until it is run.
+% OOM at 256/16384, B = 32: MiKV's printout says OOM. Full KV's is inferred, not
+% printed: both full-KV arms printed "-" there, and their measured peak grows
+% 2.06 (flash) / 2.29 (eager) GiB per sequence from B = 8 to 16 at that shape,
+% i.e. ~81 / ~88 GiB at B = 32.
+% Bold is best within a batch size among rows with numbers; an OOM row loses.
+% Recheck bold once the "--" cells are filled in.
 
 \begin{table}[t]
 \centering
@@ -26,17 +31,17 @@
  &        & TTFT & TPOT & Decode & Mem. \\
 $B$ & Method & (s)$\downarrow$ & (s)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$ \\
 \midrule
- 1 & Full KV (eager) &    --  &          0.0489  &          20.5   &          16.15  \\ % TODO TTFT
-   & Full KV (flash) &    --  & \textbf{0.0451}  & \textbf{22.2}   &          16.04  \\ % TODO TTFT
-   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
-   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
-   & Ours            & 0.078  &          0.0678  &          14.8   & \textbf{15.61}  \\
+ 1 & Full KV (eager) &          --    &          0.0489  &          20.5   &          16.15  \\ % TODO TTFT
+   & Full KV (flash) &          --    & \textbf{0.0451}  & \textbf{22.2}   &          16.04  \\ % TODO TTFT
+   & MiKV            & \textbf{0.069} &          0.0581  &          17.2   &          16.14  \\
+   & ResQ            &          --    &            --    &            --   &            --   \\ % TODO
+   & Ours            &          0.078 &          0.0678  &          14.8   & \textbf{15.61}  \\
 \midrule
-32 & Full KV (eager) &    --  &          0.2962  &         108.0   &          52.19  \\ % TODO TTFT
-   & Full KV (flash) &    --  &          0.0991  &         322.8   &          48.51  \\ % TODO TTFT
-   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
-   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
-   & Ours            & 1.106  & \textbf{0.0745}  & \textbf{429.3}  & \textbf{34.70}  \\
+32 & Full KV (eager) &          --    &          0.2962  &         108.0   &          52.19  \\ % TODO TTFT
+   & Full KV (flash) &          --    &          0.0991  &         322.8   &          48.51  \\ % TODO TTFT
+   & MiKV            & \textbf{1.020} &          0.2956  &         108.2   &          52.41  \\
+   & ResQ            &          --    &            --    &            --   &            --   \\ % TODO
+   & Ours            &          1.106 & \textbf{0.0745}  & \textbf{429.3}  & \textbf{34.70}  \\
 \bottomrule
 \end{tabular}
 \caption{Decode efficiency at prefill/decode = 256/8192 on one A100-80GB
@@ -57,17 +62,17 @@ size in bold.}
  &        & TTFT & TPOT & Decode & Mem. \\
 $B$ & Method & (s)$\downarrow$ & (s)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$ \\
 \midrule
- 1 & Full KV (eager) &    --  &          0.0483  &          20.7   &          17.28  \\ % TODO TTFT
-   & Full KV (flash) &    --  & \textbf{0.0449}  & \textbf{22.3}   &          17.05  \\ % TODO TTFT
-   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
-   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
-   & Ours            & 0.079  &          0.0676  &          14.8   & \textbf{16.24}  \\
+ 1 & Full KV (eager) &          --    &          0.0483  &          20.7   &          17.28  \\ % TODO TTFT
+   & Full KV (flash) &          --    & \textbf{0.0449}  & \textbf{22.3}   &          17.05  \\ % TODO TTFT
+   & MiKV            &          0.084 &          0.0666  &          15.0   &          17.27  \\
+   & ResQ            &          --    &            --    &            --   &            --   \\ % TODO
+   & Ours            & \textbf{0.079} &          0.0676  &          14.8   & \textbf{16.24}  \\
 \midrule
 32 & Full KV (eager) & \multicolumn{4}{c}{OOM} \\
    & Full KV (flash) & \multicolumn{4}{c}{OOM} \\
-   & MiKV            &    --  &            --    &            --   &            --   \\ % TODO
-   & ResQ            &    --  &            --    &            --   &            --   \\ % TODO
-   & Ours            & 0.712  & \textbf{0.1493}  & \textbf{214.3}  & \textbf{54.78}  \\
+   & MiKV            & \multicolumn{4}{c}{OOM} \\
+   & ResQ            &          --    &            --    &            --   &            --   \\ % TODO
+   & Ours            & \textbf{0.712} & \textbf{0.1493}  & \textbf{214.3}  & \textbf{54.78}  \\
 \bottomrule
 \end{tabular}
 \caption{Decode efficiency at prefill/decode = 256/16384, same setup as
