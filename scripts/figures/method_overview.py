@@ -367,7 +367,7 @@ def panel_a(g):
     g.text(hx - 3, by - 4, "sink", size=10.5, anchor="end", fill=SINK_S, weight="bold")
 
     # ---- window scores, ranked: each bar is one window's tokens stacked, plus what decode added
-    sx, sbase, smax, bw, bgp = 208, by, 128, 8, 2
+    sx, sbase, smax, bw, bgp = 208, by, 104, 8, 2      # tallest bar stays under the tier labels
     n = N_FP + N_Q + N_DROP
     scores = [1.0 - 0.9 * (k / (n - 1)) ** 0.8 for k in range(n)]
     kinds = ["fp"] * N_FP + ["q"] * N_Q + ["drop"] * N_DROP
