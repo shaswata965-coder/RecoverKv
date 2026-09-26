@@ -89,7 +89,7 @@ Caveat
 ``(event, window)`` lookback pair (so one long inactive run contributes many
 eligible pairs), accepts a rescue arbitrarily far in the future, applies no
 censoring, and simulates Sticky-K on ground truth with ``m = 3`` hard-wired.
-They are different estimators of related quantities (``EVALUATION_GUIDE.md``,
+They are different estimators of related quantities (the design notes,
 Observation III).  Dropping the horizon closes *one* of those differences and
 none of the others: this is still an **episode** count (one long cold run
 contributes one eligible unit, not many pairs), still measured over the real
@@ -248,6 +248,7 @@ def compute(
     rows: List[Dict[str, Any]] = []
     sweep_rows: List[Dict[str, Any]] = []
     trans_rows: List[Dict[str, Any]] = []
+    chain_rows: List[Dict[str, Any]] = []
     arrays: Dict[str, np.ndarray] = {}
     n = 0
 
@@ -262,6 +263,33 @@ def compute(
             warn_vacuous(f"{cid}/oracle", METRIC_TITLE,
                          "the run declares top_k_fp=0, so the oracle selection "
                          "is empty at every event")
+
+        # ── the real moves: F / Q / E chain ─────────────────────────────
+        # `policy_fp`'s P01 below pools the int2 tier with evicted windows
+        # (an evicted window is a promotable 0 at every later event), so the
+        # promotion / demotion / eviction rates are counted here instead.
+        states = QM.tier_states(view.acc_fp, view.acc_q, view.band_mask())
+        arrays[f"tier_states__{cid}"] = states
+        for i, d in enumerate(ds):
+            tr = QM.tier_transitions(states, d)
+            counts = tr["counts_by_trace"]
+            arrays[f"tier_transition_counts__{cid}__d{d}"] = counts
+            if tr["resurrections"]:
+                log.warning("%s: %d E -> F/Q pairs; eviction is permanent, so "
+                            "survivor ids are mis-mapped", cid,
+                            tr["resurrections"])
+            for j, (move, (a, b)) in enumerate(QM.MOVES.items()):
+                num, den = counts[:, a, b], counts[:, a, :].sum(-1)
+                mu_c, lo_c, hi_c = QM.bootstrap_mean_ci(
+                    QM.group_ratio(num, den, matrix.trace_group),
+                    confidence, n_boot, seed + 7000 + 100 * i + j)
+                chain_rows.append({
+                    "condition": cid, "delta": d, "move": move,
+                    "from": QM.STATE_NAMES[a], "to": QM.STATE_NAMES[b],
+                    "rate_mean": mu_c, "ci_lower": lo_c, "ci_upper": hi_c,
+                    "pooled_rate": float(tr["pooled_probabilities"][a, b]),
+                    "count": int(num.sum()),
+                })
 
         for sel_name, sel in selection_matrices(matrix, cid):
             key = f"{cid}__{sel_name}"
@@ -397,6 +425,7 @@ def compute(
         "knobs": knobs, "summary_table": rows,
         "inactivity_sweep_table": sweep_rows,
         "transition_table": trans_rows,
+        "tier_chain_table": chain_rows,
         "diagnostics": {
             "horizon": None,
             "horizon_note": (
@@ -505,9 +534,13 @@ def render(matrix, result: Dict[str, Any]) -> str:
         "which are exactly the ones with the least room left to recover — and "
         "no `H` escapes it: raising `H` trades the first bias for the second "
         "until `H >= R - m + 1` censors every episode away.",
-        "> `P01` (cold -> hot at lag `delta`) is the promotion argument and "
-        "`P10` the demotion argument; both are fixed-lag flip probabilities, "
-        "not lookbacks, so neither is affected by the above.",
+        "> For `oracle`, `P01` (cold -> hot at lag `delta`) is the promotion "
+        "argument and `P10` the demotion argument. For `policy_fp` they are "
+        "fp-MEMBERSHIP flips: `0` pools the int2 tier with evicted windows, so "
+        "`P01` is diluted by windows that can never come back and `P10` mixes "
+        "demotion with eviction. The real moves are in the F / Q / E table "
+        "below. All are fixed-lag, not lookbacks, so the horizon note does not "
+        "touch them.",
         "> **Do not compare this to Suite B's `global_lir`.** Suite B counts "
         "every `(event, window)` lookback pair, applies no censoring, and "
         "hard-wires `m=3` on a Sticky-K simulation over ground truth — a "
@@ -516,6 +549,18 @@ def render(matrix, result: Dict[str, Any]) -> str:
         "heads, so there is no per-head resolution to report; "
         "`lir_uncapped_per_layer__*` is the finest axis that carries signal.",
     ]
+    chain = result.get("tier_chain_table") or []
+    if chain:
+        lines += ["", "**The moves — F / Q / E chain** (`P(to | from)` at lag "
+                  "`delta`; whether each move paid off is QEvict Observation V):",
+                  "", "| run | lag | move | rate | pooled | count |",
+                  "| --- | --- | --- | --- | --- | --- |"]
+        for r in chain:
+            lines.append(
+                f"| `{r['condition']}` | {r['delta']} | "
+                f"`{r['from']}→{r['to']}` {r['move']} | "
+                f"{_ci_pct(r['rate_mean'], r['ci_lower'], r['ci_upper'])} | "
+                f"{_pct(r['pooled_rate'])} | {r['count']} |")
     return "\n".join(lines)
 
 
@@ -527,11 +572,12 @@ def write(matrix, result: Dict[str, Any], out_dir: Path) -> Dict[str, Path]:
         out_dir, STEM,
         tables=(("summary", result["summary_table"]),
                 ("inactivity_sweep", result["inactivity_sweep_table"]),
-                ("transitions", result["transition_table"])),
+                ("transitions", result["transition_table"]),
+                ("tier_chain", result["tier_chain_table"])),
         payload={k: result[k] for k in
                  ("metric_id", "metric_name", "title", "question", "runs_used",
                   "knobs", "summary_table", "inactivity_sweep_table",
-                  "transition_table", "diagnostics")},
+                  "transition_table", "tier_chain_table", "diagnostics")},
         arrays=result["arrays"], meta=meta, report=result["report"])
 
 

@@ -11,6 +11,7 @@ import torch
 from modules.quant.quantizer import (
     dequantize_key_window,
     dequantize_value_window,
+    grid_group,
     pack_crumbs_last,
     quantize_key_window,
     quantize_value_window,
@@ -54,9 +55,14 @@ class TestKeyQuant:
         packed, scale, zero = quantize_key_window(k)
         assert packed.shape == (H, D, W // 4)
         assert packed.dtype == torch.uint8
-        assert scale.shape == (H, D)
-        assert zero.shape == (H, D)
-        assert scale.dtype == torch.float16
+        # The grid is one byte per (head, channel) over an fp16 scale shared by
+        # GRID_GROUP of them -- see QGrid.
+        assert scale.q.shape == (H, D) and scale.q.dtype == torch.uint8
+        assert zero.q.shape == (H, D) and zero.q.dtype == torch.int8
+        assert scale.s.shape == (H, D // grid_group(D))
+        assert scale.s.dtype == torch.float16 and zero.s.dtype == torch.float16
+        # A scale code is never 0: the fit divides by the decoded grid.
+        assert int(scale.q.min()) >= 1
 
         k_hat = dequantize_key_window(packed, scale, zero, W, out_dtype=torch.float32)
         assert k_hat.shape == (H, W, D)
@@ -70,8 +76,10 @@ class TestKeyQuant:
         # Per (head, channel) range along the token axis.
         rng = k.amax(dim=1, keepdim=True) - k.amin(dim=1, keepdim=True)  # [H,1,D]
         max_err = (k_hat - k).abs().amax(dim=1)  # [H, D]
-        # Allow a hair over R/6 for fp16 grid rounding.
-        bound = (rng.squeeze(1) / 6.0) * 1.05 + 1e-3
+        # Allow a hair over R/6 for the one-byte grid's rounding: the stored
+        # scale can exceed the true one by up to half a group quantum, which
+        # widens the four levels and so the worst-case error with them.
+        bound = (rng.squeeze(1) / 6.0) * 1.20 + 1e-3
         assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
@@ -80,8 +88,9 @@ class TestKeyQuant:
         const = torch.randn(H, 1, D).expand(H, W, D).contiguous()
         packed, scale, zero = quantize_key_window(const)
         k_hat = dequantize_key_window(packed, scale, zero, W, out_dtype=torch.float32)
-        # zero == mn == the constant (as fp16); dequant returns it exactly.
-        assert torch.allclose(k_hat, zero.unsqueeze(1).to(torch.float32).expand(H, W, D))
+        # Every code is 0, so the dequant returns the stored `zero` exactly --
+        # which is now the DECODED grid, not an fp16 copy of the constant.
+        assert torch.equal(k_hat, zero.decode().unsqueeze(1).expand(H, W, D))
 
     def test_fp16_grid_idempotence(self):
         # Dequantizing twice against the pinned fp16 grid is bit-identical, and
@@ -109,8 +118,10 @@ class TestValueQuant:
         v = torch.randn(H, W, D)
         packed, scale, zero = quantize_value_window(v)
         assert packed.shape == (H, W, D // 4)
-        assert scale.shape == (H, W)
-        assert zero.shape == (H, W)
+        assert scale.q.shape == (H, W) and scale.q.dtype == torch.uint8
+        assert zero.q.shape == (H, W) and zero.q.dtype == torch.int8
+        # ws < GRID_GROUP, so a value window's grid shares one scale per head.
+        assert scale.s.shape == (H, W // grid_group(W))
 
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
         assert v_hat.shape == (H, W, D)
@@ -130,7 +141,7 @@ class TestValueQuant:
         const = torch.randn(H, W, 1).expand(H, W, D).contiguous()
         packed, scale, zero = quantize_value_window(const)
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
-        assert torch.allclose(v_hat, zero.unsqueeze(2).to(torch.float32).expand(H, W, D))
+        assert torch.equal(v_hat, zero.decode().unsqueeze(2).expand(H, W, D))
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +384,148 @@ class TestMaterialize:
         order, q_token_len = score_meta
         assert q_token_len == 2 * ws
         assert order[0].tolist() == [0, 2, 1, 3]
+
+
+def test_affine_quantize_inplace_matches_the_out_of_place_form():
+    """The in-place chain must be BIT-identical to the expression it replaced.
+
+    `_affine_quantize` used to build `round((x32 - zero) / scale)` then clamp
+    out of place, holding three fp32 buffers of x's size live at its peak --
+    12 bytes per element to quantize a 2-byte one. At 2048/batch-32 the first
+    eviction asked for 7.25 GiB there and the allocator refused. Chaining in
+    place keeps one buffer.
+
+    That is only a legitimate change if nothing about the result moves, so this
+    re-implements the old expression here and compares codes, scale and zero
+    exactly -- across dtypes, group axes, and the degenerate mx == mn case the
+    scale guard exists for.
+    """
+    import torch
+    from modules.quant.quantizer import _affine_quantize, _quantize_grid, _LEVELS
+
+    def _reference(x, group_dim):
+        x32 = x.to(torch.float32)
+        mx = x32.amax(dim=group_dim, keepdim=True)
+        mn = x32.amin(dim=group_dim, keepdim=True)
+        scale = (mx - mn) / _LEVELS
+        scale = torch.where(mx == mn, torch.ones_like(scale), scale)
+        s_g = _quantize_grid(scale.squeeze(group_dim), signed=False)
+        z_g = _quantize_grid(mn.squeeze(group_dim), signed=True)
+        q = torch.round((x32 - z_g.decode().unsqueeze(group_dim))
+                        / s_g.decode().unsqueeze(group_dim))
+        q = torch.clamp(q, 0.0, _LEVELS)
+        return q.to(torch.uint8), s_g, z_g
+
+    g = torch.Generator().manual_seed(20260917)
+    cases = []
+    for dtype in (torch.float16, torch.float32, torch.bfloat16):
+        cases.append(torch.randn(3, 5, 32, generator=g).to(dtype))
+        cases.append((torch.randn(2, 4, 16, generator=g) * 1e3).to(dtype))
+    # Degenerate group: every element of the group axis identical => mx == mn.
+    cases.append(torch.full((2, 3, 8), 0.75, dtype=torch.float16))
+    # Mixed: one degenerate group beside live ones.
+    mixed = torch.randn(2, 3, 8, generator=g).to(torch.float16)
+    mixed[0, 1, :] = -1.25
+    cases.append(mixed)
+
+    for x in cases:
+        for group_dim in (-1, 1):
+            before = x.clone()
+            codes, scale_g, zero_g = _affine_quantize(x, group_dim)
+            r_codes, r_scale, r_zero = _reference(before, group_dim)
+            tag = f"dtype={x.dtype} group_dim={group_dim}"
+            assert torch.equal(x, before), f"{tag}: the input was mutated"
+            assert torch.equal(codes, r_codes), f"{tag}: codes moved"
+            assert torch.equal(scale_g.q, r_scale.q), f"{tag}: scale codes moved"
+            assert torch.equal(scale_g.s, r_scale.s), f"{tag}: scale group moved"
+            assert torch.equal(zero_g.q, r_zero.q), f"{tag}: zero codes moved"
+            assert torch.equal(zero_g.s, r_zero.s), f"{tag}: zero group moved"
+            assert codes.max() <= _LEVELS, f"{tag}: code above the top level"
+
+
+def test_affine_quantize_does_not_mutate_an_fp32_input():
+    """`.to(float32)` is a NO-OP on an fp32 tensor, so the in-place chain would
+    write through to the caller's tensor. The clone guard is the whole reason
+    this is safe; without it a caller that quantized an fp32 key window would
+    find its keys replaced by int2 codes, silently."""
+    import torch
+    from modules.quant.quantizer import _affine_quantize
+
+    x = torch.randn(2, 3, 16, dtype=torch.float32,
+                    generator=torch.Generator().manual_seed(4))
+    before = x.clone()
+    _affine_quantize(x, -1)
+    assert torch.equal(x, before), "an fp32 input was quantized in place"
+
+
+def test_affine_dequantize_inplace_matches_the_out_of_place_form():
+    """Same contract on the read side: one fp32 buffer, identical values."""
+    import torch
+    from modules.quant.quantizer import _affine_quantize, _affine_dequantize
+
+    g = torch.Generator().manual_seed(11)
+    for dtype in (torch.float16, torch.float32):
+        x = torch.randn(3, 4, 32, generator=g).to(dtype)
+        codes, scale_g, zero_g = _affine_quantize(x, -1)
+        scale = scale_g.decode().unsqueeze(-1)   # the reduced group axis
+        zero = zero_g.decode().unsqueeze(-1)
+        ref = ((codes.to(torch.float32) * scale) + zero).to(dtype)
+        codes_before = codes.clone()
+        got = _affine_dequantize(codes, scale, zero, dtype)
+        assert torch.equal(got, ref), f"dequant moved for {dtype}"
+        assert torch.equal(codes, codes_before), "the codes were mutated"
+
+
+def test_apply_rotary_one_matches_huggingface():
+    """Rotating ONE tensor must be bit-identical to HF rotating two.
+
+    `unrotate_key_window` / `rotate_key_window` used to call
+    `apply_rotary_pos_emb(k, k, cos, sin)` -- passing the key as both q and k,
+    so HF computed the identical result twice and one copy was discarded. That
+    is double the elementwise work and roughly five key-sized fp buffers live at
+    the peak to produce one. At 2048/batch-32 the demote path asked for 3.62 GiB
+    there and the allocator refused.
+
+    `_apply_rotary_one` computes HF's expression once, with `rotate_half`
+    imported from HF so the convention is still theirs. This asserts the two
+    agree exactly -- not `allclose`. If a transformers upgrade changes the RoPE
+    convention, this is the test that says so.
+    """
+    import torch
+    from modules.quant.effective import _apply_rotary, _apply_rotary_one
+
+    apply_rotary_pos_emb = _apply_rotary()
+    g = torch.Generator().manual_seed(913)
+    for dtype in (torch.float32, torch.float16):
+        for B, H, W, D in [(1, 2, 4, 8), (3, 4, 16, 32), (2, 1, 1, 64)]:
+            k = torch.randn(B, H, W, D, generator=g).to(dtype)
+            cos = torch.randn(B, W, D, generator=g).to(dtype)
+            sin = torch.randn(B, W, D, generator=g).to(dtype)
+            k_ref = k.clone()
+            _, expect = apply_rotary_pos_emb(k_ref, k_ref, cos, sin)
+            got = _apply_rotary_one(k, cos, sin)
+            tag = f"dtype={dtype} shape={(B, H, W, D)}"
+            assert torch.equal(got, expect), f"{tag}: rotation moved"
+            assert torch.equal(k, k_ref), f"{tag}: the input key was mutated"
+
+
+def test_rotate_and_unrotate_are_unchanged_by_the_single_tensor_path():
+    """The two public helpers must still agree with HF end to end."""
+    import torch
+    from modules.quant.effective import _apply_rotary
+
+    apply_rotary_pos_emb = _apply_rotary()
+    H, W, D = 3, 6, 16
+    rope = _RealRoPE(D)
+    pos = torch.arange(40, 40 + W, dtype=torch.long)
+    k_post = torch.randn(H, W, D, generator=torch.Generator().manual_seed(5))
+
+    k4 = k_post.unsqueeze(0)
+    cos, sin = rope(k4, pos.unsqueeze(0))
+    _, expect_un = apply_rotary_pos_emb(k4, k4, cos, -sin)
+    assert torch.equal(unrotate_key_window(k_post, pos, rope),
+                       expect_un.squeeze(0))
+
+    _, expect_rot = apply_rotary_pos_emb(k4, k4, cos, sin)
+    assert torch.equal(rotate_key_window(k_post, pos, rope),
+                       expect_rot.squeeze(0))

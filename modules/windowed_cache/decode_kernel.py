@@ -55,6 +55,9 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from modules.quant.quantizer import grid_group
+from modules.quant.sketch import card_field_layout
+
 try:  # pragma: no cover - import guard, exercised only where triton is present
     import triton
     import triton.language as tl
@@ -68,66 +71,38 @@ _LOG2E = 1.4426950408889634
 """``log2(e)``. Folded into ``scale`` so the kernel's softmax runs in base 2."""
 
 
-def decode_exp2_enabled() -> bool:
-    """Whether the decode kernel's softmax runs in base 2 (default ON).
-
-    ``tl.exp`` lowers to the accurate ``expf`` (~ten SFU ops); ``exp2`` lowers to
-    a single ``ex2.approx.f32``, which is why every FlashAttention implementation
-    uses it. The change is exact in real arithmetic — folding ``log2(e)`` into
-    ``scale`` makes every logit a base-2 exponent, so ``m``, ``wmax`` and ``lse``
-    are all in base-2 units and ``p``, ``l``, ``acc`` and ``out`` are unchanged
-    quantities. ``ex2.approx`` carries ~2 ulp against ``expf``'s ~1.
-
-    ``STICKYKV_DECODE_EXP2=0`` restores ``expf`` — a control arm for A/B'ing the
-    numerical difference, matching the prefill kernel's ``STICKYKV_SCORE_EXP2``.
-    Not a fallback: both settings are correct, one is faster.
-    """
-    v = os.environ.get("STICKYKV_DECODE_EXP2", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def rope_store_dtype_enabled() -> bool:
-    """Whether the RoPE tables are built at the KV store's dtype (default ON).
-
-    ``STICKYKV_ROPE_STORE_DTYPE=0`` restores the historical fp32 tables. This is
-    a **control arm for bisection, not a tuning knob**: fp32 is the convention
-    that made a token's key depend on which tier held it (see
-    :func:`rope_cos_sin_halves`), so turning it off reinstates a known defect.
-    It exists so a perf regression can be attributed to this change in one run
-    rather than by reverting code.
-    """
-    v = os.environ.get("STICKYKV_ROPE_STORE_DTYPE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-#: Latched at import so the launch path never touches ``os.environ``. Tests that
-#: flip the variable call :func:`refresh_exp2_latch`.
-_EXP2 = [decode_exp2_enabled()]
-_ROPE_STORE_DTYPE = [rope_store_dtype_enabled()]
-
-
-def refresh_exp2_latch() -> bool:
-    """Re-read ``STICKYKV_DECODE_EXP2``. For tests that set it after import."""
-    _EXP2[0] = decode_exp2_enabled()
-    return _EXP2[0]
-
-
-def refresh_rope_dtype_latch() -> bool:
-    """Re-read ``STICKYKV_ROPE_STORE_DTYPE``. For tests that set it after import."""
-    _ROPE_STORE_DTYPE[0] = rope_store_dtype_enabled()
-    return _ROPE_STORE_DTYPE[0]
+#: The kernel's two numeric conventions, both fixed. Base-2 softmax: log2(e) is
+#: folded into `scale`, so every logit is already a base-2 exponent and the base
+#: change costs nothing per element. RoPE tables at the KV STORE's dtype, not
+#: fp32: every other RoPE in this cache runs at the store dtype, and an fp32
+#: table here made a token's key depend on which tier held it (max round-trip
+#: error 4.5e-01 -> 6.9e-04). Both were environment knobs; neither had a correct
+#: "off", so neither is a knob.
+_EXP2 = [True]
+_ROPE_STORE_DTYPE = [True]
 
 
 def fused_decode_enabled() -> bool:
-    """Whether the fused two-tier decode path is active (default ON).
+    """Always ``True``. There is one decode on the flash backend.
 
-    Off only when ``STICKYKV_FUSED_DECODE`` is explicitly falsey. ON by default
-    because the fused kernel is the intended decode path for the flash backend;
-    the materialize path is kept for the eager backend and CPU tests (which never
-    install the flash monkeypatch, so they never reach this kernel).
+    quietly served by the materialize path instead — a second, slower, entirely
+    different implementation of the same method, selected by an environment
+    variable nobody reads back when quoting a number.
+
+    What decides the path now is the machine, not a setting: the score hook
+    computes ``fused_decode_enabled() and cuda``, so CUDA runs the fused gated
+    kernel and CPU runs :meth:`WindowedCache._materialize`. The materialize path
+    is kept for exactly that — it is the CPU oracle 13 test files check the
+    kernel against, and without it nothing here is verifiable off a GPU. It is
+    not reachable as a production alternative.
+
+    The varlen case (a padding ``attention_mask`` reaching
+    ``_flash_attention_forward``) is the one thing that used to justify the
+    switch. It still cannot be served fused, and it still fails loudly —
+    :class:`~modules.windowed_cache.flash_decode.FusedDecodeNotReached` — rather
+    than silently routing to different code. Use equal-length prompts.
     """
-    v = os.environ.get("STICKYKV_FUSED_DECODE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +266,45 @@ def window_tiling(window_size: int, target_keys: int = 64) -> Tuple[int, int]:
     return block_nw, _pow2_at_least(block_nw * window_size, floor=1)
 
 
+def check_gate_selection(
+    sel: Optional[Tensor], B: int, H_kv: int, n_active: int,
+) -> int:
+    """Validate the gate's pick; return ``n_sel``, or ``0`` when ungated.
+
+    Split out of :func:`_decode_triton` for the same reason :func:`window_tiling`
+    is a function: the launch path cannot run on a CPU-only box, so anything left
+    inside it ships untested. This is the contract that keeps a malformed
+    selection an **error** rather than silently wrong output — a ``sel`` of the
+    wrong shape, dtype or layout would not fail on a GPU, it would index the
+    wrong windows and emit scores that still look exactly like probabilities.
+
+    The kernel derives ``SEL``'s innermost stride as 1 and indexes it with
+    ``b * selb + kv * selh + slot``, so contiguity is a checked contract here,
+    not an assumption there.
+    """
+    if sel is None or n_active == 0:
+        return 0
+    if sel.dim() != 3 or sel.shape[0] != B or sel.shape[1] != H_kv:
+        raise RuntimeError(
+            f"fused decode gate expects sel [B, H_kv, n_sel] = [{B}, {H_kv}, *]; "
+            f"got {tuple(sel.shape)}.")
+    n_sel = int(sel.shape[-1])
+    if not 0 < n_sel <= n_active:
+        raise RuntimeError(
+            f"fused decode gate selected {n_sel} of {n_active} active windows; it "
+            "must pick at least one and no more than the tier holds. A larger "
+            "n_sel means sel was built against a different store version than "
+            "qtier, which would index past the gathered codes.")
+    if sel.dtype not in (torch.int32, torch.int64):
+        raise RuntimeError(
+            f"fused decode gate requires an int32 or int64 sel, got {sel.dtype}.")
+    if not sel.is_contiguous():
+        raise RuntimeError(
+            "fused decode requires a contiguous sel; its innermost stride is "
+            "assumed to be 1 inside the kernel.")
+    return n_sel
+
+
 def two_tier_window_reference(
     q: Tensor,
     k_eff: Tensor,
@@ -301,6 +315,9 @@ def two_tier_window_reference(
     n_body_win: int,
     Sfp: Optional[int] = None,
     exp2: bool = False,
+    sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
+    centroids: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
 
@@ -310,13 +327,32 @@ def two_tier_window_reference(
     and the epilogue that rescales each window by ``exp(m_tile - lse)`` — so that
     the parts of §5.1 that cannot be executed on a CPU-only box (the Triton
     lowering) are the *only* parts left unverified. The arithmetic, the tiling,
-    the masking and the rescale are all pinned by
     ``tests/test_window_scores.py`` against the plain
     ``softmax -> strip sink -> window-sum`` path.
 
     ``k_eff``/``v_eff`` are the effective ``[sink ‖ body ‖ Q]`` store, exactly
     what ``two_tier_decode_reference`` takes. ``Sfp`` is where the fp tier ends
     and the Q tier begins; it defaults to "all of it" (no Q tier).
+
+    ``sel`` is the **gate's** selection: ``[B, H_kv, n_sel]`` int, the active Q
+    columns this step actually reads, ascending. ``None`` means read the whole
+    tier, which is the ungated path and leaves every line below unchanged.
+
+    When ``sel`` is given, ``k_eff``/``v_eff`` still carry the **full** Q tier —
+    the gate skips *reads*, it does not shrink the store — so the Q region is
+    still ``n_active`` windows and ``W_phys`` is still ``n_body_win + n_active``.
+    The loop then runs over ``n_sel`` physical slots and dereferences each
+    through ``sel``, which is exactly the kernel's ``widx = tl.load(SEL + …)``.
+    Two consequences the kernel shares and this models:
+
+    * A window's score lands on column ``n_body_win + sel[b, kv, j]``, its own
+      column, not on the ``j``-th one. Getting this wrong would credit a read
+      window's mass to a skipped one — plausible-looking scores on the wrong
+      windows, which no shape check would catch.
+    * A skipped column is never written, so it must be *pre-set* rather than
+      left at whatever the buffer held: the epilogue rescales every column it
+      reads. Here they start at ``0``/``-inf``; the kernel stores the same
+      sentinel in a prologue (see its ``GATED`` block).
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` where ``W_phys`` is
     ``n_body_win + n_q_win`` in **physical** order — body windows then Q windows,
@@ -359,6 +395,7 @@ def two_tier_window_reference(
     _, BLOCK_T = window_tiling(ws)
     offs_t = torch.arange(BLOCK_T)
     t_win = offs_t // ws                                   # window index in tile
+    t_tok = offs_t % ws                                    # token index in window
     in_tile = offs_t < (block_nw * ws)                     # masks the pow2 padding
 
     def tile(key0: int, end: int, win_base: int, n_win_limit: int) -> None:
@@ -413,21 +450,127 @@ def two_tier_window_reference(
             wsum[:, :, w] = torch.where(sel, p, torch.zeros_like(p)).sum(dim=-1)
             wmax[:, :, w] = m_new
 
+    def q_tile_gated(w0: int, sel_q: Tensor, n_sel: int) -> None:
+        """One Q-tier tile **under SEL indirection** — the kernel's gated loop.
+
+        Same online softmax as :func:`tile`, but the lane -> key map goes through
+        ``sel`` instead of being ``key0 + offs_t``. Every lane of a tile is
+        resolved independently, per ``(row, KV head)``, because the gate selects
+        per KV head (see ``QuantizedStore.gated_q_tier`` for why the union or a
+        row-level top-k will not do).
+        """
+        nonlocal m, l, acc
+        slot = w0 + t_win                                  # physical slot in sel
+        live = in_tile & (slot < n_sel)                    # [BLOCK_T]
+        if not bool(live.any()):
+            return
+        # Clamp rather than mask the dereference: `live` already decides what
+        # counts, and a clamped index keeps every derived offset (the key, and in
+        # the kernel the RoPE row) inside the tier. The kernel clamps for the
+        # same reason.
+        col = sel_q[:, :, slot.clamp(0, n_sel - 1)]        # [B,H_q,BLOCK_T]
+        idx = body_end + col * ws + t_tok                  # key index per lane
+        nmask = live.expand_as(idx) & (idx < S) & (idx >= body_end)
+        safe = idx.clamp(0, S - 1)
+
+        lg = torch.gather(logits, -1, safe)                # [B,H_q,BLOCK_T]
+        lg = torch.where(nmask, lg, torch.full_like(lg, float("-inf")))
+        m_new = torch.maximum(m, lg.max(dim=-1).values)
+        corr = (torch.exp2 if exp2 else torch.exp)(m - m_new)
+        corr = torch.nan_to_num(corr, nan=0.0)
+        p = torch.where(nmask, (torch.exp2 if exp2 else torch.exp)(
+            lg - m_new.unsqueeze(-1)), torch.zeros_like(lg))
+        vg = torch.gather(v_flat, 2, safe.unsqueeze(-1).expand(*safe.shape, D))
+        acc = acc * corr.unsqueeze(-1) + torch.matmul(
+            p.unsqueeze(-2), vg).squeeze(-2)
+        l = l * corr + p.sum(dim=-1)
+        m = m_new
+
+        for j in range(block_nw):                          # mirrors tl.static_range
+            if w0 + j >= n_sel:
+                continue
+            selm = (t_win == j) & nmask
+            if not bool(selm.any()):
+                continue
+            # The j-th slot of THIS tile scores onto its own active column.
+            wcol = (n_body_win + sel_q[:, :, w0 + j]).unsqueeze(-1)   # [B,H_q,1]
+            wsum.scatter_(-1, wcol, torch.where(
+                selm, p, torch.zeros_like(p)).sum(dim=-1, keepdim=True))
+            wmax.scatter_(-1, wcol, m_new.unsqueeze(-1))
+
     # 1. sink prologue -- softmax only
     for s0 in range(0, max(num_sink, 0), BLOCK_T):
         tile(s0, num_sink, -1, 0)
     # 2. fp body -- whole-window tiles from num_sink
     for w0 in range(0, n_body_win, block_nw):
         tile(num_sink + w0 * ws, body_end, w0, n_body_win - w0)
-    # 3. Q tier -- whole-window tiles
-    for w0 in range(0, n_q_win, block_nw):
-        tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
+    # 3. Q tier -- whole-window tiles, through the gate's selection when given
+    if sel is None:
+        for w0 in range(0, n_q_win, block_nw):
+            tile(body_end + w0 * ws, S, n_body_win + w0, n_q_win - w0)
+    else:
+        if sel.shape[0] != B or sel.shape[1] != H_kv:
+            raise ValueError(
+                f"sel must be [B, H_kv, n_sel] = [{B}, {H_kv}, *], got "
+                f"{tuple(sel.shape)}")
+        n_sel = int(sel.shape[-1])
+        if n_sel > n_q_win:
+            raise ValueError(
+                f"sel picks {n_sel} windows but the Q tier holds only {n_q_win}. "
+                "The gate selects a subset of the tier it is handed; a larger "
+                "selection means sel was built against a different store.")
+        sel_q = sel.to(torch.long).repeat_interleave(H_q // H_kv, dim=1)
+        for w0 in range(0, n_sel, block_nw):
+            q_tile_gated(w0, sel_q, n_sel)
 
     out = acc / l.unsqueeze(-1)
     lse = m + (torch.log2 if exp2 else torch.log)(l)
     live = wmax > NEG
+    raw = wsum                                             # tile-relative, pre-rescale
     wsum = torch.where(live, wsum * (torch.exp2 if exp2 else torch.exp)(wmax - lse.unsqueeze(-1)),
                        torch.zeros_like(wsum))
+
+    # Skipped windows get their card's estimate, corrected by the card's TYPICAL
+    # error on the windows that were read -- mirroring the kernel's GATED
+    # epilogue. `live` over the Q columns IS the read set (a skipped column was
+    # never written, so its wmax is still the -inf sentinel), which is why
+    # neither this nor the kernel consults `sel` again.
+    #
+    # The correction is the mean LOG ratio, exact over estimate, and not the
+    # ratio of the sums: see `scorer.fill_skipped_window_scores` for why the sum
+    # form transfers a retrieval head's peak onto every window it did not read.
+    # The log of each read window's normalised mass is taken as
+    # log(raw) + (wmax - lse), never as log(exp(...)), so a read window far below
+    # the step's peak still has a finite log instead of underflowing to -inf.
+    if sel is not None and logmass is not None:
+        read = live[..., n_body_win:]                          # [B,H_q,n_active]
+        raw_q = raw[..., n_body_win:]
+        ok = read & (raw_q > 0)
+        log_scaled = (torch.log(torch.where(ok, raw_q, torch.ones_like(raw_q)))
+                      + (wmax[..., n_body_win:] - lse.unsqueeze(-1))
+                      * (math.log(2.0) if exp2 else 1.0))
+        cnt = ok.sum(-1, keepdim=True)
+        dsum = torch.where(ok, log_scaled - logmass,
+                           torch.zeros_like(logmass)).sum(-1, keepdim=True)
+        dmean = torch.where(cnt > 0, dsum / cnt.clamp_min(1),
+                            torch.full_like(dsum, NEG))
+        fill = (logmass + dmean).exp()                         # calibrated mass
+        wsum = torch.cat([
+            wsum[..., :n_body_win],
+            torch.where(read, wsum[..., n_body_win:], fill),
+        ], dim=-1)
+
+        # The skipped windows also ATTEND, through their value centroids, at the
+        # weight `fill` just measured. Mirrors the kernel's §5 block: a `tl.dot`
+        # of the same tile, then one renormalization of `out` and of every score.
+        if centroids is not None:
+            skipped = (~read).to(fill.dtype)
+            mhat = fill * skipped                              # [B,H_q,n_active]
+            out = out.float() + torch.einsum(
+                "bhw,bhwd->bhd", mhat, centroids.to(torch.float32))
+            den = 1.0 + mhat.sum(-1, keepdim=True)
+            out = out / den
+            wsum = wsum / den
     return out.to(v_eff.dtype), wsum
 
 
@@ -438,21 +581,35 @@ def two_tier_window_reference(
 
 if _HAS_TRITON:
 
+    # The card-field unpack the gate kernel reads mu/v/t with, reused for the
+    # value centroid so every card field has one lane map at every width.
+    from .gate_kernel import _card_codes
+
     @triton.jit
     def _two_tier_decode_kernel(
         Q, KFP, VFP,
-        KC, KS, KZ,                # Q keys: codes u8 [B,n,H_kv,D,ws//4]; scale/zero fp16 [B,n,H_kv,D]
-        VC, VS, VZ,                # Q vals: codes u8 [B,n,H_kv,ws,D//4]; scale/zero fp16 [B,n,H_kv,ws]
+        # Q keys: codes u8 [B,n,H_kv,D,ws//4]; grid = one byte per (head, channel)
+        # (u8 scale, i8 zero) over an fp16 scale per GROUP_K of them, [B,n,H_kv,D]
+        # and [B,n,H_kv,D//GROUP_K]. Values the same over (head, token) and WS.
+        KC, KS, KSS, KZ, KZS,
+        VC, VS, VSS, VZ, VZS,
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
+        SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
+        LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
+        VM, VMS, VANC,             # value centroids: [B,n,H_kv,D*VM_BITS//8] (int4-packed u8 by default), fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
-        H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
+        H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
         sqb, sqh, sqd,
         kfb, kfh, kfs, kfd,
         vfb, vfh, vfs, vfd,
+        selb, selh,
         HEAD_DIM: tl.constexpr, HALF: tl.constexpr, WS: tl.constexpr,
         BLOCK_R: tl.constexpr, BLOCK_NW: tl.constexpr, BLOCK_T: tl.constexpr,
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
+        GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
+        GATED: tl.constexpr, LOG2E: tl.constexpr,
+        VM_BITS: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -463,10 +620,35 @@ if _HAS_TRITON:
         ``window_size`` -- see :func:`window_tiling`.
 
         The exact algorithm, tile for tile, is mirrored on CPU by
-        :func:`two_tier_window_reference` and pinned by
         ``tests/test_window_scores.py``. **Keep the two in step**: that oracle is
         the only thing standing between this kernel and an unverified rewrite,
         because Triton cannot run on the CPU box this repo is developed on.
+
+        ``GATED`` — the read gate
+        ~~~~~~~~~~~~~~~~~~~~~~~~~
+        When ``GATED``, the Q-tier loop runs over ``n_sel`` **physical slots** and
+        dereferences each through ``SEL`` (``widx = tl.load(SEL + …)``) instead of
+        walking the tier in order. ``KC``/``KS``/``VC``/``COS``/… are still the
+        **whole** gathered tier, indexed by active column — the gate skips *reads*,
+        it does not shrink the store — so nothing is re-gathered per step and the
+        traffic saved is exactly the windows not named by ``SEL``. This is why the
+        selection is an indirection and not a host-side ``index_select``: the
+        latter would move the very bytes the gate exists not to move.
+
+        Two things follow, and both are load-bearing:
+
+        * A window's score is stored at ``n_body_win + widx``, its own column —
+          not at the slot's position in the tile. Crediting slot ``j``'s mass to
+          column ``j`` would put real scores on the wrong windows and still look
+          entirely plausible downstream.
+        * Skipped columns are never written by the Q loop, so the ``GATED``
+          prologue below seeds them (``WSUM = 0``, ``WMAX = -inf``) before it
+          runs. Without that, the epilogue would rescale whatever the buffer
+          happened to hold — ``wsum``/``wmax`` are ``torch.empty``.
+
+        ``GATED`` is a ``constexpr``, so the ungated kernel is a separate compile
+        with the indirection folded away — the gate costs the ungated path
+        nothing, not even a predicated load.
 
         Strides for the Q-tier tensors, ``COS``/``SIN``, ``OUT``, ``WSUM`` and
         ``WMAX`` are DERIVED from shapes rather than passed (§5.2); the dispatcher
@@ -501,6 +683,8 @@ if _HAS_TRITON:
         # Derived strides -- contiguous by contract (see the dispatcher's check).
         wsb = H_q * W_phys
         wsh = W_phys
+        lgb = H_q * n_active
+        lgh = n_active
         ob = H_q * HEAD_DIM
         kcb = n_active * H_kv * HEAD_DIM * PACK_K
         kcn = H_kv * HEAD_DIM * PACK_K
@@ -508,13 +692,31 @@ if _HAS_TRITON:
         ksb = n_active * H_kv * HEAD_DIM
         ksn = H_kv * HEAD_DIM
         ksh = HEAD_DIM
+        GK: tl.constexpr = HEAD_DIM // GROUP_K
+        ksgb = n_active * H_kv * GK
+        ksgn = H_kv * GK
+        ksgh = GK
         vcb = n_active * H_kv * WS * PACK_V
         vcn = H_kv * WS * PACK_V
         vch = WS * PACK_V
         vsb = n_active * H_kv * WS
         vsn = H_kv * WS
         vsh = WS
+        GV: tl.constexpr = WS // GROUP_V
+        vsgb = n_active * H_kv * GV
+        vsgn = H_kv * GV
+        vsgh = GV
         cob = n_active * WS * HALF
+        # VM is packed along D at VM_BITS (the `quant_card_bits` knob), so its
+        # row is D * VM_BITS / 8 bytes wide: HALF at the shipped int4, D at int8.
+        VMW: tl.constexpr = HEAD_DIM * VM_BITS // 8
+        vmb = n_active * H_kv * VMW
+        vmn = H_kv * VMW
+        vmh = VMW
+        vmsb = n_active * H_kv
+        vmsn = H_kv
+        vab = H_kv * HEAD_DIM
+        vah = HEAD_DIM
 
         # ---- 1. sink prologue: softmax only, emits no window score -----------
         # Sinks are not represented in window scores (the scorer strips them
@@ -567,25 +769,71 @@ if _HAS_TRITON:
                 tl.store(WMAX + b * wsb + hq * wsh + w, m_new, mask=keep)
 
         # ---- 3. Q tier: int2 dequant + RoPE in registers, whole-window tiles ---
+        # Under GATED, seed the Q columns this program owns: the loop below writes
+        # only the selected ones and the epilogue reads them all.
+        if GATED:
+            offs_wi = tl.arange(0, BLOCK_W)
+            for wi0 in range(n_body_win, W_phys, BLOCK_W):
+                icols = wi0 + offs_wi
+                imask = r_mask[:, None] & (icols < W_phys)[None, :]
+                iptr = b * wsb + hq[:, None] * wsh + icols[None, :]
+                tl.store(WSUM + iptr, tl.zeros([BLOCK_R, BLOCK_W], tl.float32),
+                         mask=imask)
+                tl.store(WMAX + iptr,
+                         tl.full([BLOCK_R, BLOCK_W], -float("inf"), tl.float32),
+                         mask=imask)
+
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
-        for w0 in range(0, n_active, BLOCK_NW):
-            widx = w0 + t_win                                # [BLOCK_T] window ids
-            qmask = in_tile & (widx < n_active)
-            ks_lo = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + offs_hl[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            kz_lo = tl.load(KZ + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + offs_hl[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            ks_hi = tl.load(KS + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + (offs_hl + HALF)[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
-            kz_hi = tl.load(KZ + b * ksb + widx[None, :] * ksn + kv * ksh
-                            + (offs_hl + HALF)[:, None],
-                            mask=qmask[None, :], other=0.0).to(tl.float32)
+        # A statement, not a ternary: `if` on a constexpr is the form Triton's
+        # frontend is guaranteed to fold, and only the taken branch is traced.
+        if GATED:
+            n_q_iter = n_sel
+        else:
+            n_q_iter = n_active
+        for w0 in range(0, n_q_iter, BLOCK_NW):
+            if GATED:
+                # Slot -> active column. Clamp the dereference rather than mask
+                # it: `qmask` already decides what counts, and a clamped widx
+                # keeps every offset derived from it (the codes, and `crow` into
+                # COS/SIN) inside the tier for the dead lanes too.
+                slot = w0 + t_win                            # [BLOCK_T] slots
+                qmask = in_tile & (slot < n_sel)
+                widx = tl.load(SEL + b * selb + kv * selh
+                               + tl.minimum(slot, n_sel - 1)).to(tl.int32)
+            else:
+                widx = w0 + t_win                            # [BLOCK_T] window ids
+                qmask = in_tile & (widx < n_active)
+            # The grid is one byte per entry times the fp16 scale its group of
+            # GROUP_K channels shares, in that order -- the same two ops the
+            # store's dequant does, so the kernel reads the exact grid the codes
+            # were fit to. The group scales are few (D // GROUP_K per window and
+            # head) and every lane of a group hits the same address, so the
+            # repeated load is an L1 hit, not traffic.
+            kg_lo = (offs_hl // GROUP_K)[:, None]
+            kg_hi = ((offs_hl + HALF) // GROUP_K)[:, None]
+            gptr = KSS + b * ksgb + widx[None, :] * ksgn + kv * ksgh
+            zptr = KZS + b * ksgb + widx[None, :] * ksgn + kv * ksgh
+            kptr = KS + b * ksb + widx[None, :] * ksn + kv * ksh
+            kzptr = KZ + b * ksb + widx[None, :] * ksn + kv * ksh
+            ks_lo = (tl.load(kptr + offs_hl[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(gptr + kg_lo,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            kz_lo = (tl.load(kzptr + offs_hl[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(zptr + kg_lo,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            ks_hi = (tl.load(kptr + (offs_hl + HALF)[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(gptr + kg_hi,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
+            kz_hi = (tl.load(kzptr + (offs_hl + HALF)[:, None],
+                             mask=qmask[None, :], other=0).to(tl.float32)
+                     * tl.load(zptr + kg_hi,
+                               mask=qmask[None, :], other=0.0).to(tl.float32))
             kb_lo = tl.load(KC + b * kcb + widx[None, :] * kcn + kv * kch
                             + offs_hl[:, None] * PACK_K + byte_t[None, :],
                             mask=qmask[None, :], other=0)
@@ -606,10 +854,15 @@ if _HAS_TRITON:
             m_new = tl.maximum(m, tl.max(logit, axis=1))
             corr = tl.exp2(m - m_new)
             p = tl.where(qmask[None, :], tl.exp2(logit - m_new[:, None]), 0.0)
-            vs = tl.load(VS + b * vsb + widx * vsn + kv * vsh + t_tok,
-                         mask=qmask, other=0.0).to(tl.float32)
-            vz = tl.load(VZ + b * vsb + widx * vsn + kv * vsh + t_tok,
-                         mask=qmask, other=0.0).to(tl.float32)
+            vg = t_tok // GROUP_V
+            vs = (tl.load(VS + b * vsb + widx * vsn + kv * vsh + t_tok,
+                          mask=qmask, other=0).to(tl.float32)
+                  * tl.load(VSS + b * vsgb + widx * vsgn + kv * vsgh + vg,
+                            mask=qmask, other=0.0).to(tl.float32))
+            vz = (tl.load(VZ + b * vsb + widx * vsn + kv * vsh + t_tok,
+                          mask=qmask, other=0).to(tl.float32)
+                  * tl.load(VZS + b * vsgb + widx * vsgn + kv * vsgh + vg,
+                            mask=qmask, other=0.0).to(tl.float32))
             vb = tl.load(VC + b * vcb + widx[:, None] * vcn + kv * vch
                          + t_tok[:, None] * PACK_V + cbyte[None, :],
                          mask=qmask[:, None], other=0)
@@ -618,22 +871,47 @@ if _HAS_TRITON:
             l = l * corr + tl.sum(p, axis=1)
             m = m_new
             for j in tl.static_range(BLOCK_NW):
-                w = w0 + j
-                sel = (t_win == j) & qmask
-                pj = tl.sum(tl.where(sel[None, :], p, 0.0), axis=1)
-                keep = r_mask & (w < n_active)
-                col = n_body_win + w
+                lane = (t_win == j) & qmask
+                pj = tl.sum(tl.where(lane[None, :], p, 0.0), axis=1)
+                if GATED:
+                    # Slot w0+j scores onto ITS OWN column, not onto column j.
+                    sj = w0 + j
+                    col = n_body_win + tl.load(
+                        SEL + b * selb + kv * selh
+                        + tl.minimum(sj, n_sel - 1)).to(tl.int32)
+                    keep = r_mask & (sj < n_sel)
+                else:
+                    w = w0 + j
+                    col = n_body_win + w
+                    keep = r_mask & (w < n_active)
                 tl.store(WSUM + b * wsb + hq * wsh + col, pj, mask=keep)
                 tl.store(WMAX + b * wsb + hq * wsh + col, m_new, mask=keep)
 
         out = acc / l[:, None]
         lse = m + tl.log2(l)
-        tl.store(OUT + b * ob + hq[:, None] * HEAD_DIM + offs_d[None, :],
-                 out.to(OUT.dtype.element_ty), mask=r_mask[:, None])
+        # OUT is NOT stored here. Under GATED the windows this step declined to
+        # read still contribute to the attention output, through their value
+        # centroids at the weight the epilogue is about to measure -- so the
+        # output is not final until §5 has run. The ungated kernel stores at the
+        # bottom unchanged; `GATED` is a constexpr, so it costs it nothing.
 
         # ---- 4. epilogue: rescale each window from its tile max to the LSE ----
         # Runs over W_phys values, not S. That is the whole of §5.1's traffic cut.
+        #
+        # Under GATED this pass also accumulates what the skipped windows need,
+        # so their scores never leave the kernel. Doing it on the host cost 22
+        # torch ops per layer per step -- 704 launches per token at L=32 -- to
+        # shuffle a [B, H_q, W] tensor, on a decode path that is bound by launch
+        # count. The two reductions ride along in a pass that already runs.
+        #
+        # `smax > -inf` IS the selected set: the GATED prologue seeded every Q
+        # column to -inf and only the visited ones were written, so no SEL lookup
+        # is needed here.
         offs_w = tl.arange(0, BLOCK_W)
+        # The card's typical error over the read windows, as a mean LOG ratio
+        # (exact over estimate) -- see §5 for why not a ratio of sums.
+        dsum = tl.zeros([BLOCK_R], tl.float32)         # sum ln(exact/estimate)
+        dcnt = tl.zeros([BLOCK_R], tl.float32)         # read windows measured
         for w0 in range(0, W_phys, BLOCK_W):
             cols = w0 + offs_w
             cmask = cols < W_phys
@@ -645,6 +923,166 @@ if _HAS_TRITON:
             scaled = tl.where(smax > -float("inf"),
                               ssum * tl.exp2(smax - lse[:, None]), 0.0)
             tl.store(ptr, scaled, mask=sm)
+            if GATED:
+                live = (sm & (smax > -float("inf")) & (ssum > 0.0)
+                        & (cols[None, :] >= n_body_win))
+                qc = tl.maximum(cols - n_body_win, 0)
+                lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
+                             mask=live, other=0.0)
+                # ln(scaled) taken as log2(ssum) + smax - lse, never as the log of
+                # `scaled` itself: a read window far below the step's peak would
+                # underflow to 0 there and drag the mean to -inf. Masked lanes are
+                # given a harmless ssum of 1 before the log and then selected away.
+                lsc = (tl.log2(tl.where(live, ssum, 1.0)) + smax
+                       - lse[:, None]) / LOG2E
+                dsum += tl.sum(tl.where(live, lsc - lg, 0.0), axis=1)
+                dcnt += tl.sum(tl.where(live, 1.0, 0.0), axis=1)
+
+        # ---- 5. GATED only: score the windows this step did not read ----------
+        # A skipped window credited with zero would rank last and be evicted, so
+        # the gate would destroy the tier it exists to read less often. It gets
+        # its card's estimate instead, corrected by the card's TYPICAL error on
+        # the windows that were read:
+        #
+        #     score_i = exp(logmass_i + mean_read(ln exact_j - logmass_j))
+        #
+        # The softmax normaliser cancels out of that expression, so `lse` is not
+        # needed; `LOG2E` keeps the base-e logmass exact while every exponential
+        # in this kernel stays base 2.
+        #
+        # It used to be the ratio of the SUMS, (sum exact) / (sum estimate). That
+        # is right only when the card is off by the same factor everywhere, and
+        # it is most wrong on the step that matters most: a retrieval head whose
+        # target token sits in a read int2 window puts nearly all its mass on
+        # that one token, which a rank-1 card does not model, so the sum ratio
+        # becomes that token's error and every skipped window was credited with a
+        # share of the needle's mass -- about 3x it at ratio 0.25. The output
+        # below then diluted the needle by that much and blended in centroids.
+        # The mean log ratio moves by 1/n_sel of such an outlier, not by all of it.
+        if GATED:
+            dmean = tl.where(dcnt > 0.0, dsum / tl.maximum(dcnt, 1.0),
+                             -float("inf"))
+            # The skipped windows also ATTEND, through their value centroids.
+            #
+            # Reading 25% of the tier and returning that softmax unchanged is not
+            # an approximation of attention over the cache -- it is exact
+            # attention over a DIFFERENT cache, one where the other 75% does not
+            # exist and the surviving weights have been inflated to cover for it.
+            # `fill` is already the calibrated mass those windows carry, so the
+            # honest output adds each one's representative at that weight and
+            # renormalizes.
+            #
+            # This rides in the pass that was already running. The only new
+            # traffic is the centroid tile (D int8 + one fp16 scale per skipped
+            # window, 130 B/head against the 6432 B/window not read), and the
+            # only new arithmetic is one `tl.dot` of a tile the loop already
+            # holds -- the same shape as the Q loop's `tl.dot(p, vv)`.
+            vacc = tl.zeros([BLOCK_R, HEAD_DIM], tl.float32)
+            msum = tl.zeros([BLOCK_R], tl.float32)
+            vanc = tl.load(VANC + b * vab + kv * vah + offs_d).to(tl.float32)
+            for w0 in range(n_body_win, W_phys, BLOCK_W):
+                cols = w0 + offs_w
+                cmask = cols < W_phys
+                ptr = WSUM + b * wsb + hq[:, None] * wsh + cols[None, :]
+                mptr = WMAX + b * wsb + hq[:, None] * wsh + cols[None, :]
+                sm = r_mask[:, None] & cmask[None, :]
+                smax = tl.load(mptr, mask=sm, other=0.0)
+                skipped = sm & (smax == -float("inf"))
+                qc = tl.maximum(cols - n_body_win, 0)
+                lg = tl.load(LOGM + b * lgb + hq[:, None] * lgh + qc[None, :],
+                             mask=skipped, other=-float("inf"))
+                # dmean is -inf when no read window could be measured, and lg is
+                # -inf off the skipped set; either way this is exp2(-inf) = 0,
+                # never NaN, because dmean is never +inf.
+                fill = tl.exp2((lg + dmean[:, None]) * LOG2E)
+                tl.store(ptr, fill, mask=skipped)
+
+                f = tl.where(skipped, fill, 0.0)           # [BLOCK_R, BLOCK_W]
+                msum += tl.sum(f, axis=1)
+                # Centroid tile: [BLOCK_W, HEAD_DIM]. Dequantized in registers,
+                # exactly as the Q loop dequantizes codes -- no fp16 centroid
+                # tensor is ever built.
+                qmask = cmask & (cols >= n_body_win)
+                # At VM_BITS (`_card_codes`). At the shipped int4 these are
+                # nibbles, +8 biased: element d is byte d//2, shift 4*(d%2) --
+                # the same unpack as the Q loop's int2 crumbs, one width up.
+                vq = _card_codes(VM + b * vmb + qc[:, None] * vmn + kv * vmh,
+                                 offs_d[None, :], qmask[:, None], VM_BITS)
+                vsc = tl.load(VMS + b * vmsb + qc * vmsn + kv,
+                              mask=qmask, other=0.0).to(tl.float32)
+                vbar = vq * vsc[:, None] + vanc[None, :]
+                vacc = vacc + tl.dot(f, vbar)
+
+            # Renormalize: `out` and every stored window score are on a softmax
+            # that summed to 1 over the read set, and `msum` of mass has just
+            # been added to it.
+            den = 1.0 + msum
+            out = (out + vacc) / den[:, None]
+            for w0 in range(0, W_phys, BLOCK_W):
+                cols = w0 + offs_w
+                sm = r_mask[:, None] & (cols < W_phys)[None, :]
+                ptr = WSUM + b * wsb + hq[:, None] * wsh + cols[None, :]
+                tl.store(ptr, tl.load(ptr, mask=sm, other=0.0) / den[:, None],
+                         mask=sm)
+
+        tl.store(OUT + b * ob + hq[:, None] * HEAD_DIM + offs_d[None, :],
+                 out.to(OUT.dtype.element_ty), mask=r_mask[:, None])
+
+
+#: Per-(shape, dtype, device) scratch, reused across layers within a step.
+#:
+#: the design notesD5 sized this against three allocations per layer per step
+#: and rated it the smallest item on its list. It counted the decode side only;
+#: the read gate brought two more (`est`, `logm`), and `topk`/`sort` two outputs
+#: each, so the fused path allocates ~11 per layer per step -- **352 per step at
+#: L=32**, on a path where the host gap is 37% of the step.
+#:
+#: Only tensors that are DEAD by the end of `_run_fused` live here. `out` does
+#: not: it is returned to the model as the attention output, so reusing it would
+#: let layer i+1 overwrite a tensor layer i's `o_proj` may still be reading. That
+#: is precisely the class of silent aliasing bug `CacheState.replace` guards
+#: against, and it is why this cache is opt-in per buffer rather than applied to
+#: everything allocated here.
+#:
+#: `bfbdb1f` -- *"revert the reusable ctx dict -- it caused the narrativeqa OOM"*
+#: -- is the standing precedent. A reused buffer holds memory the caching
+#: allocator would otherwise recycle, and the headline cell already peaks near
+#: 48 GB. Keying on the exact shape means a changed geometry allocates a new
+#: turns the whole thing off if `peak_GB` moves in the perf table.
+_SCRATCH: dict = {}
+
+_SCRATCH_ON = True
+
+
+def _scratch(name: str, shape, dtype, device):
+    """A reusable buffer for ``name`` at this exact geometry.
+
+    Contents are undefined on entry, exactly as ``torch.empty`` leaves them, so
+    every caller must fully write what it later reads. The two-tier kernel does:
+    the body loop writes the fp columns, the ``GATED`` prologue seeds every Q
+    column, and the epilogue reads only what those two wrote.
+    """
+    if not _SCRATCH_ON:
+        return torch.empty(shape, dtype=dtype, device=device)
+    key = (tuple(shape), dtype, str(device))
+    held = _SCRATCH.get(name)
+    if held is not None and held[0] == key:
+        return held[1]
+    # ONE buffer per name, replaced when the geometry moves -- never accumulated.
+    # `W_phys` tracks `n_active`, which moves at every eviction, so a cache keyed
+    # on shape would keep a buffer per distinct window count for the whole
+    # generation. That is the `bfbdb1f` narrativeqa OOM with extra steps. Holding
+    # one means a changed shape costs exactly the allocation it costs today, and
+    # the steady state -- where every step has the same geometry -- still reuses.
+    buf = torch.empty(shape, dtype=dtype, device=device)
+    _SCRATCH[name] = (key, buf)
+    return buf
+
+
+def release_decode_scratch() -> None:
+    """Drop every reused buffer. For tests and for a caller that has finished a
+    generation and wants the memory back before the next shape arrives."""
+    _SCRATCH.clear()
 
 
 def _pow2_at_least(x: int, floor: int = 16) -> int:
@@ -655,21 +1093,267 @@ def _pow2_at_least(x: int, floor: int = 16) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Shared-memory fit ladder
+# Tile search -- shared-memory fit AND measured time
 # ---------------------------------------------------------------------------
 
-#: ``(target_keys, num_stages)`` rungs, fastest first. Bigger tiles mean fewer
+#: ``(target_keys, num_stages, num_warps)`` rungs. Bigger tiles mean fewer
 #: serial iterations (§5.3's whole point) but more ``tl.dot`` operand staging in
-#: shared memory; more pipeline stages hide more latency at the same cost. An
-#: A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands before staging,
-#: so the top rung does not fit everywhere -- hence a ladder rather than a
-#: constant. Every rung is numerically identical; only speed differs.
-_FIT_LADDER = [(64, 2), (32, 2), (32, 1), (16, 2), (16, 1)]
+#: shared memory. An A100 has 163 KB/SM and BLOCK_T=64 needs ~128 KB of operands
+#: before staging, so the top rung does not fit everywhere -- hence a ladder
+#: rather than a constant.
+#:
+#: ``num_stages`` is not free: Triton's software pipeliner allocates that many
+#: copies of the loop's shared-memory operands, so dropping 2 -> 1 roughly halves
+#: the staging at the SAME tile. Without ``(64, 1)`` a kernel that just missed
+#: ``(64, 2)`` fell straight to ``target_keys=32`` and **doubled its serial
+#: Q-tier iterations** -- 23 -> 45 at ``ws=8`` -- to buy shared memory one fewer
+#: stage would also have bought.
+#:
+#: ``num_warps`` was never passed at all, so every launch ran at Triton's
+#: default of 4 regardless of tile. At ``BLOCK_T=64`` and ``HEAD_DIM=128`` that
+#: is a guess, not a choice, and it is the one launch parameter with no cost
+#: model here at all -- so it is searched rather than asserted.
+#:
+#: **The ladder is now TIMED, not first-fit.** It used to stop at the first rung
+#: that merely *launched*, which asserts that a full tile at one stage beats a
+#: half tile at two -- i.e. that serial iteration count dominates latency hiding.
+#: The 2026-09-19 profile says that assertion was wrong in the direction that
+#: matters: at ``target_keys=64`` the ~128 KB of staged operands leave room for
+#: **one block per SM**, so the Q-tier loop's ~14 dependent tiles run with
+#: nothing co-resident to cover their latency, and the kernel lands at ~190 GB/s
+#: on a 1555 GB/s part (97.2% GPU busy, so this is the kernel's own time, not a
+#: host gap). A smaller tile trades iteration count for occupancy, and which way
+#: that trade falls is a measurement, not a derivation.
+#:
+#: Ordering therefore no longer carries meaning -- every entry is timed and the
+#: fastest wins. It is kept tile-major only so the announcement reads in the
+#: order the shared-memory argument above discusses.
+_FIT_LADDER = [
+    (64, 2, 4), (64, 2, 8),
+    (64, 1, 4), (64, 1, 8),
+    (32, 2, 4), (32, 2, 8),
+    (32, 1, 4), (32, 1, 8),
+    (16, 2, 4), (16, 2, 8),
+    (16, 1, 4), (16, 1, 8),
+]
+
 
 #: Winning rung per geometry signature, so the search runs once per process.
 _FIT_CHOICE: dict = {}
 
+#: Every rung's measured milliseconds, per signature, kept so a profile can print
+#: the search rather than just its verdict. A rung that did not fit is absent --
+#: that absence IS the shared-memory result.
+_FIT_TIMINGS: dict = {}
+
 _FIT_ANNOUNCED: set = set()
+
+#: How many times each signature has been seen, so a geometry is only tuned once
+#: it has proved it will recur (:data:`_TUNE_AFTER`).
+_FIT_SEEN: dict = {}
+
+
+def fit_choice() -> dict:
+    """``{sig: rung}`` -- the tile rung chosen per geometry. A copy.
+
+    ``scripts/profile_decode.py`` prints this: the kernel announces its choice
+    once per geometry, in warmup, which scrolls away above whatever a profile is
+    being read for. It asked for this accessor before it existed, inside a bare
+    ``except Exception: pass``, so the one line the tuning step needs was the one
+    line a profile did not carry.
+    """
+    return dict(_FIT_CHOICE)
+
+
+def fit_timings() -> dict:
+    """``{sig: [(rung, ms), ...]}`` -- what the search measured. A copy.
+
+    The verdict without the margin is not reviewable: a rung that won by 30% and
+    a rung that won by 0.5% call for different next moves, and only this says
+    which happened.
+    """
+    return {k: list(v) for k, v in _FIT_TIMINGS.items()}
+
+
+#: Launches per timed sample, and samples per rung. Small on purpose: the whole
+#: search is ``len(_FIT_LADDER) * (_TUNE_WARMUP + _TUNE_ITERS)`` launches of a
+#: ~0.5 ms kernel, i.e. tens of milliseconds, and it runs ONCE per geometry.
+#:
+#: **The cost that is not small is Triton's JIT: one compile per rung, and at the
+#: shipped geometry that is all 12.** The rung dedup does not reduce it there
+#: (see :func:`_search_rungs`). This is why the harness's warmup exists --
+#: ``perf_shapes.py`` runs enough decode steps to cross the first eviction
+#: precisely so JIT and autotune land in warmup rather than in measurement run 0
+#: -- and why Triton's on-disk cache makes it a once-per-machine cost rather than
+#: a once-per-run one. If a cold-cache warmup of a few minutes is not acceptable
+#: somewhere, ``_FIT_LADDER`` is one list literal and trimming it is the knob;
+#: trim it by *measurement*, not by guessing which rungs matter.
+_TUNE_WARMUP = 1
+_TUNE_ITERS = 3
+
+#: How many times a geometry must RECUR before it is worth timing.
+#:
+#: The first version of this searched on a signature's first sight, and that was
+#: measured wrong on 2026-09-19: at 4096/B=1 it took TPOT to 0.1917. The cause is
+#: that a decode run does not hold one geometry. The Q tier fills at one window
+#: per ``ws`` steps, so ``n_sel`` climbs across the whole run, and the perf
+#: runner itself warns when a cell is shorter than the fill ("needs ~744 steps
+#: ... and this cell runs 512"). Every signature change was a fresh 12-rung
+#: search, i.e. up to 12 Triton JIT compiles, landing INSIDE the measured window.
+#: Before the search existed only one rung was ever compiled per geometry, so
+#: this was a pure regression of my own making.
+#:
+#: Requiring recurrence fixes both halves. A fill-phase geometry is seen once and
+#: never tuned -- it takes the first rung that fits, exactly the old cost. A
+#: steady-state geometry recurs every step, so it is tuned once and the winner
+#: serves the rest of the run. It also tunes at a REPRESENTATIVE point: tuning on
+#: first sight measured the rungs at ``n_sel = 1``, where every rung runs one
+#: Q-tier iteration and the comparison is dominated by the fp body -- a tuning
+#: point that says nothing about the loop being tuned.
+_TUNE_AFTER = 3
+
+
+def _time_launch(launch, warmup: int = _TUNE_WARMUP,
+                 iters: int = _TUNE_ITERS) -> float:
+    """Mean device milliseconds for ``launch()``, or raise what it raised.
+
+    One event pair around ``iters`` launches, not ``iters`` pairs: the kernel
+    under test is sub-millisecond and per-launch event overhead would be a
+    visible share of what is being compared. The warmup launch absorbs Triton's
+    JIT for a rung this process has not compiled yet, so the compile never lands
+    inside the timed region.
+
+    **The launches are performed on the caller's real tensors.** That is safe
+    because the kernel only ever ``tl.store``s to ``OUT`` / ``WSUM`` / ``WMAX``
+    and never loads them -- it accumulates in registers -- so running it n times
+    leaves exactly what running it once leaves. Timing against scratch copies
+    would need a full duplicate of the fp tier, which is the largest thing on the
+    step, to measure a kernel whose whole problem is memory.
+    """
+    for _ in range(warmup):
+        launch()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        launch()
+    end.record()
+    end.synchronize()
+    return float(start.elapsed_time(end)) / max(iters, 1)
+
+
+def _first_fit(ladder, launch, label: str, sig, key=None):
+    """Launch the first rung that fits, compiling nothing else. The old policy.
+
+    This is what a geometry gets until it has proved it will recur
+    (:data:`_TUNE_AFTER`). It is not a fallback -- it is the cheap arm of the
+    search, and it exists because compiling twelve rungs for a shape that is
+    about to change is strictly worse than compiling one.
+    """
+    seen_keys = set()
+    last: Optional[BaseException] = None
+    for rung in ladder:
+        k = rung if key is None else key(rung)
+        if k in seen_keys:
+            continue
+        seen_keys.add(k)
+        try:
+            launch(rung)
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            last = exc
+            continue
+        return rung
+    raise RuntimeError(
+        f"{label}: no tile fits in shared memory at any rung. Tried "
+        f"{ladder} for sig={sig}. Last error: {last}"
+    )
+
+
+def _search_rungs(choice: dict, timed: dict, announced: set, seen: dict, sig,
+                  ladder, launch, label: str, key=None):
+    """Time every rung that fits; cache and return the fastest. Once per ``sig``.
+
+    ``launch(rung)`` must run the kernel and return ``None``; it is called
+    repeatedly, so it must be idempotent (see :func:`_time_launch`).
+
+    ``key(rung)`` maps a rung to the launch it actually produces, and rungs that
+    collapse onto one are timed once. Distinct rungs are not always distinct
+    kernels: ``window_tiling`` floors ``target_keys // ws``, so at a large ``ws``
+    several ``target_keys`` yield the same ``(BLOCK_NW, BLOCK_T)``.
+
+    **At the shipped geometry this fires for nothing, and that was measured, not
+    assumed.** ``BLOCK_W`` is derived from ``target_keys`` too
+    (``_pow2_at_least(min(W_phys, target_keys), 16)``), so those rungs still
+    differ in a constexpr and are still separate compiles. The dedup only bites
+    where the tiling AND ``BLOCK_W`` both collapse -- a large ``ws`` with a short
+    window axis (``W_phys <= 16``). It is kept because that regime is real and
+    the check is free, NOT because it makes the common case cheaper: at
+    ``ws=8, W_phys=273`` the ladder is 12 rungs and 12 compiles.
+
+    A rung that raises ``OutOfResources`` is skipped -- that is the shared-memory
+    half of the search and it is unchanged. Any other exception propagates: a
+    tuner that swallowed a real error would silently tune around a bug.
+
+    **The winner is re-launched before returning**, so the values the caller goes
+    on to use come from the rung every subsequent step will use. Rungs differ in
+    tile order, which reassociates the online-softmax accumulation and moves the
+    output in its last bits; returning a losing rung's numbers would make the
+    step that happened to run the search numerically different from its
+    neighbours for no reason.
+
+    Kernel-or-error: if no rung fits, this raises with the whole ladder, because
+    a decode kernel that cannot launch must fail loudly (invariant 3).
+    """
+    known = choice.get(sig)
+    if known is not None:
+        launch(known)
+        return known
+
+    # Only time a geometry that has proved it will recur -- see _TUNE_AFTER.
+    n = seen.get(sig, 0) + 1
+    seen[sig] = n
+    if n < _TUNE_AFTER:
+        return _first_fit(ladder, launch, label, sig, key)
+
+    timings = []
+    seen = set()
+    last: Optional[BaseException] = None
+    for rung in ladder:
+        k = rung if key is None else key(rung)
+        if k in seen:
+            continue
+        seen.add(k)
+        try:
+            ms = _time_launch(lambda r=rung: launch(r))
+        except BaseException as exc:                     # noqa: BLE001
+            if not _is_out_of_resources(exc):
+                raise
+            last = exc
+            continue
+        timings.append((rung, ms))
+
+    if not timings:
+        raise RuntimeError(
+            f"{label}: no tile fits in shared memory at any rung. Tried "
+            f"{ladder} for sig={sig}. Last error: {last}"
+        )
+
+    best = min(timings, key=lambda t: t[1])[0]
+    choice[sig] = best
+    timed[sig] = sorted(timings, key=lambda t: t[1])
+    launch(best)
+    if sig not in announced:
+        announced.add(sig)
+        ranked = " ".join(
+            f"{r}={ms:.3f}ms" for r, ms in sorted(timings, key=lambda t: t[1])
+        )
+        print(f"[StickyKV] {label} tuned sig={sig} -> {best} "
+              f"(after {n} sightings; {len(timings)}/{len(ladder)} rungs timed, "
+              f"the rest did not fit or duplicate one that did) | {ranked}")
+    return best
 
 
 def _is_out_of_resources(exc: BaseException) -> bool:
@@ -695,20 +1379,6 @@ def _is_out_of_resources(exc: BaseException) -> bool:
     return False
 
 
-def _announce_fit(sig, target_keys: int, num_stages: int,
-                  block_nw: int, block_t: int) -> None:
-    """Say which rung won, once per geometry. Never silent: the tile size is a
-    performance fact a reader of a perf table needs, and a run that quietly
-    dropped to the smallest tile would otherwise look like the kernel simply
-    being slow."""
-    if sig in _FIT_ANNOUNCED:
-        return
-    _FIT_ANNOUNCED.add(sig)
-    print(f"[StickyKV] fused decode tiling: target_keys={target_keys} "
-          f"num_stages={num_stages} -> BLOCK_NW={block_nw} BLOCK_T={block_t} "
-          f"(ws={sig[0]}, head_dim={sig[1]})")
-
-
 def _decode_triton(
     q: Tensor,
     k_fp: Tensor,
@@ -717,6 +1387,10 @@ def _decode_triton(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
+    centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -731,6 +1405,11 @@ def _decode_triton(
     int2 fields shaped ``[B, n, H_kv, ...]`` plus RoPE halves ``cos``/``sin``
     ``[B, n*ws, D//2]`` and ``window_size`` — the int2 unpack + affine dequant +
     RoPE all happen inside the kernel, so no fp16 Q tensor is built.
+
+    ``sel`` is the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns
+    (ascending). ``None`` reads the whole tier. ``qtier`` is the **full** tier
+    either way — ``sel`` is an indirection inside the kernel, not a pre-gather,
+    which is what keeps the skipped windows' bytes off the wire.
     """
     if not _HAS_TRITON:
         raise RuntimeError("Triton not available; fused decode requires CUDA+triton.")
@@ -760,25 +1439,36 @@ def _decode_triton(
         )
     W_phys = n_body_win + n_active
 
+    # `out` is NOT scratch: it leaves this function as the model's attention
+    # output and stays live until that layer's o_proj has consumed it.
     out = torch.empty((B, H_q, D), device=q.device, dtype=q.dtype)
-    wsum = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
-    wmax = torch.empty((B, H_q, W_phys), device=q.device, dtype=torch.float32)
+    # `wsum` is consumed by the score gather inside `_run_fused` and `wmax` is
+    # never read outside the kernel, so both are dead before the next layer runs.
+    wsum = _scratch("wsum", (B, H_q, W_phys), torch.float32, q.device)
+    wmax = _scratch("wmax", (B, H_q, W_phys), torch.float32, q.device)
 
     # Dummies for the empty-Q case: valid tensors so the pointers exist; never
     # indexed (the Q loop runs only while w0 < n_active == 0).
     dev = q.device
+    gk, gv = grid_group(D), grid_group(ws)
     if qtier is None:
         kc = torch.zeros((B, 1, H_kv, D, max(ws // 4, 1)), dtype=torch.uint8, device=dev)
-        ksz = torch.zeros((B, 1, H_kv, D), dtype=torch.float16, device=dev)
+        kq = torch.zeros((B, 1, H_kv, D), dtype=torch.uint8, device=dev)
+        kgs = torch.zeros((B, 1, H_kv, D // gk), dtype=torch.float16, device=dev)
         vc = torch.zeros((B, 1, H_kv, ws, max(D // 4, 1)), dtype=torch.uint8, device=dev)
-        vsz = torch.zeros((B, 1, H_kv, ws), dtype=torch.float16, device=dev)
+        vq = torch.zeros((B, 1, H_kv, ws), dtype=torch.uint8, device=dev)
+        vgs = torch.zeros((B, 1, H_kv, ws // gv), dtype=torch.float16, device=dev)
         cs = torch.zeros((B, 1, half), dtype=q.dtype, device=dev)
-        KC, KS, KZ = kc, ksz, ksz
-        VC, VS, VZ = vc, vsz, vsz
+        KC, VC = kc, vc
+        KS, KSS, KZ, KZS = kq, kgs, kq, kgs
+        VS, VSS, VZ, VZS = vq, vgs, vq, vgs
         COS, SIN = cs, cs
     else:
-        KC, KS, KZ = qtier["k_codes"], qtier["k_scale"], qtier["k_zero"]
-        VC, VS, VZ = qtier["v_codes"], qtier["v_scale"], qtier["v_zero"]
+        KC, VC = qtier["k_codes"], qtier["v_codes"]
+        KS, KSS = qtier["k_scale"]
+        KZ, KZS = qtier["k_zero"]
+        VS, VSS = qtier["v_scale"]
+        VZ, VZS = qtier["v_zero"]
         COS, SIN = qtier["cos"], qtier["sin"]
 
     # §5.2 passes shapes instead of strides for these, so contiguity stops being
@@ -787,8 +1477,10 @@ def _decode_triton(
     # from `rope_cos_sin_halves`, which calls `.contiguous()` -- so this never
     # fires in practice and costs one flag read per launch. It is here because a
     # silently non-contiguous tensor would read garbage rather than fail.
-    for name, t in (("k_codes", KC), ("k_scale", KS), ("k_zero", KZ),
-                    ("v_codes", VC), ("v_scale", VS), ("v_zero", VZ),
+    for name, t in (("k_codes", KC), ("k_scale", KS), ("k_scale_s", KSS),
+                    ("k_zero", KZ), ("k_zero_s", KZS),
+                    ("v_codes", VC), ("v_scale", VS), ("v_scale_s", VSS),
+                    ("v_zero", VZ), ("v_zero_s", VZS),
                     ("cos", COS), ("sin", SIN)):
         if not t.is_contiguous():
             raise RuntimeError(
@@ -796,6 +1488,67 @@ def _decode_triton(
                 f"derived from its shape inside the kernel (DECODE_SPEED_PLAN "
                 f"§5.2). Got shape {tuple(t.shape)} strides {tuple(t.stride())}."
             )
+
+    n_sel = check_gate_selection(sel, B, H_kv, n_active)
+    gated = n_sel > 0
+    if gated:
+        SEL, selb, selh = sel, sel.stride(0), sel.stride(1)
+        if logmass is None:
+            raise RuntimeError(
+                "a gated fused decode needs the gate's logmass: the kernel scores "
+                "the windows it skipped from their cards, and without it they "
+                "would leave as zeros, rank last, and be evicted.")
+        if logmass.shape != (B, H_q, n_active) or logmass.dtype != torch.float32:
+            raise RuntimeError(
+                f"logmass must be fp32 [B, H_q, n_active] = [{B}, {H_q}, "
+                f"{n_active}]; got {tuple(logmass.shape)} {logmass.dtype}.")
+        if not logmass.is_contiguous():
+            raise RuntimeError(
+                "fused decode requires a contiguous logmass; its strides are "
+                "derived from its shape inside the kernel.")
+        LOGM = logmass
+        if centroids is None:
+            raise RuntimeError(
+                "a gated fused decode needs the value centroids: the windows it "
+                "skips attend through them, and without them 75% of the tier "
+                "would be silently absent from the attention output.")
+        VM, VMS, VANC = centroids
+        # At `vm_bits` (modules/quant/sketch._q_symb): int4 by default, packed
+        # two per byte along D, so the stored row is D//2 wide. Checked rather
+        # than inferred: a centroid at the wrong width would read the right
+        # number of BYTES and the wrong VALUES, which is the failure mode a
+        # shape check exists to catch.
+        vm_width, vm_dtype = card_field_layout(D, vm_bits)
+        if VM.shape != (B, n_active, H_kv, vm_width):
+            raise RuntimeError(
+                f"centroid codes at {vm_bits} bits must be [B, n_active, H_kv, "
+                f"{vm_width}] = [{B}, {n_active}, {H_kv}, {vm_width}]; got "
+                f"{tuple(VM.shape)}.")
+        if VM.dtype != vm_dtype:
+            raise RuntimeError(
+                f"centroid codes at {vm_bits} bits must be {vm_dtype}; got "
+                f"{VM.dtype}.")
+        if VMS.shape != (B, n_active, H_kv):
+            raise RuntimeError(
+                f"centroid scales must be [B, n_active, H_kv]; got {tuple(VMS.shape)}.")
+        if VANC.shape != (B, H_kv, D):
+            raise RuntimeError(
+                f"the value anchor must be [B, H_kv, D] = [{B}, {H_kv}, {D}]; "
+                f"got {tuple(VANC.shape)}.")
+        for name, t in (("vm", VM), ("vms", VMS), ("vanc", VANC)):
+            if not t.is_contiguous():
+                raise RuntimeError(
+                    f"fused decode requires a contiguous {name}; its strides are "
+                    "derived from its shape inside the kernel.")
+    else:
+        # Valid pointers the kernel never dereferences: the Q loop runs while
+        # w0 < n_sel == 0, and the GATED blocks are compiled out entirely.
+        SEL = torch.zeros((1,), dtype=torch.int32, device=dev)
+        LOGM = torch.zeros((1,), dtype=torch.float32, device=dev)
+        VM = torch.zeros((1,), dtype=torch.uint8, device=dev)
+        VMS = torch.zeros((1,), dtype=torch.float16, device=dev)
+        VANC = torch.zeros((1,), dtype=torch.float32, device=dev)
+        selb = selh = 0
 
     BLOCK_R = _pow2_at_least(rep)
     grid = (B * H_kv,)
@@ -813,55 +1566,71 @@ def _decode_triton(
     if _EXP2[0]:
         scaling = scaling * _LOG2E
 
-    # Shared-memory fit ladder (see _FIT_LADDER). §5.3 widened the Q-tier tile
-    # from one window (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows,
-    # which quadrupled the `tl.dot` operand staging -- k_rlo/k_rhi go from
-    # [64,16] to [64,64] and vv from [16,128] to [64,128]. At BLOCK_T=64 that is
-    # ~128 KB of dot operands before Triton's pipelining multiplies it, and an
-    # A100 has 163 KB of shared memory per SM. The first GPU run of this kernel
-    # hit exactly that: "Required: 176128, Hardware limit: 166912".
+    # Tile search (see _FIT_LADDER). §5.3 widened the Q-tier tile from one window
+    # (BLOCK_WS=16 in the pre-§5.3 kernel) to BLOCK_NW windows, which quadrupled
+    # the `tl.dot` operand staging -- k_rlo/k_rhi go from [64,16] to [64,64] and
+    # vv from [16,128] to [64,128]. At BLOCK_T=64 that is ~128 KB of dot operands
+    # before Triton's pipelining multiplies it, and an A100 has 163 KB of shared
+    # memory per SM. The first GPU run of this kernel hit exactly that:
+    # "Required: 176128, Hardware limit: 166912".
     #
-    # So the tile size is CHOSEN, not assumed: try the fastest rung, and step
-    # down on OutOfResources. This is a tuning search, not a correctness
-    # fallback -- every rung computes bit-identical results, only the tiling and
-    # the pipeline depth differ -- and the winner is cached per geometry so the
-    # search runs once. If no rung fits, it raises with the whole ladder, because
-    # a decode kernel that cannot launch must fail loudly (invariant 3).
-    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0))
-    rungs = _FIT_LADDER if _FIT_CHOICE.get(sig) is None else [_FIT_CHOICE[sig]]
-    last: Optional[BaseException] = None
-    for target_keys, num_stages in rungs:
+    # That arithmetic says which rungs FIT. It does not say which is FASTEST, and
+    # until 2026-09-19 this loop conflated the two: it took the first rung that
+    # launched. The profile settles it -- at ~128 KB of operands only one block is
+    # resident per SM, so the Q-tier loop runs with nothing to hide its latency,
+    # and the kernel sits at ~12% of memory bandwidth at 97.2% GPU busy. Whether
+    # a smaller tile's extra iterations cost less than its extra occupancy buys
+    # is not derivable from the staging arithmetic, so it is measured.
+    #
+    # `_search_rungs` owns the whole policy: it times every rung that fits, caches
+    # the winner per signature, re-launches the winner so the caller's values come
+    # from the rung the steady state will use, and raises if nothing fits. At
+    # steady state this is one dict hit and one launch -- the same work the
+    # first-fit path did.
+    #
+    # `gated` joins the signature: GATED is a constexpr, so the two variants are
+    # separate compiles with different register and staging pressure, and a rung
+    # that fit one is not evidence about the other. `B`, `Sfp` and `n_sel` join it
+    # too, and they did not have to under first-fit: a FIT is shape-independent
+    # (staging is a function of the tile), but a TIME is not -- the grid is
+    # `B * H_kv` and the serial chain is `Sfp` and `n_sel` long. `Sfp` and `n_sel`
+    # are bucketed by bit length so the fp store's one-token-per-step growth
+    # between evictions does not re-trigger the search every step; `B` is exact
+    # because it moves the grid.
+    sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(vm_bits))
+
+    def _launch(rung):
+        target_keys, num_stages, num_warps = rung
         BLOCK_NW, BLOCK_T = window_tiling(ws, target_keys)
         BLOCK_W = _pow2_at_least(min(W_phys, target_keys), floor=16)
-        try:
-            _two_tier_decode_kernel[grid](
-                q, k_fp, v_fp, KC, KS, KZ, VC, VS, VZ, COS, SIN, out, wsum, wmax,
-                scaling,
-                H_q, H_kv, n_active, Sfp, rep, num_sink, n_body_win, W_phys,
-                q.stride(0), q.stride(1), q.stride(2),
-                k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
-                v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
-                HEAD_DIM=D, HALF=half, WS=ws,
-                BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
-                BLOCK_W=BLOCK_W,
-                PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
-                num_stages=num_stages,
-            )
-        except BaseException as exc:                     # noqa: BLE001
-            if not _is_out_of_resources(exc):
-                raise
-            last = exc
-            continue
-        if _FIT_CHOICE.get(sig) != (target_keys, num_stages):
-            _FIT_CHOICE[sig] = (target_keys, num_stages)
-            _announce_fit(sig, target_keys, num_stages, BLOCK_NW, BLOCK_T)
-        return out, wsum
+        _two_tier_decode_kernel[grid](
+            q, k_fp, v_fp, KC, KS, KSS, KZ, KZS, VC, VS, VSS, VZ, VZS,
+            COS, SIN, SEL, LOGM,
+            VM, VMS, VANC,
+            out, wsum, wmax,
+            scaling,
+            H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
+            q.stride(0), q.stride(1), q.stride(2),
+            k_fp.stride(0), k_fp.stride(1), k_fp.stride(2), k_fp.stride(3),
+            v_fp.stride(0), v_fp.stride(1), v_fp.stride(2), v_fp.stride(3),
+            selb, selh,
+            HEAD_DIM=D, HALF=half, WS=ws,
+            BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
+            BLOCK_W=BLOCK_W,
+            PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+            GROUP_K=gk, GROUP_V=gv,
+            GATED=gated, LOG2E=_LOG2E, VM_BITS=vm_bits,
+            num_stages=num_stages, num_warps=num_warps,
+        )
 
-    raise RuntimeError(
-        "fused decode could not fit in shared memory at any tile size. Tried "
-        f"(target_keys, num_stages) = {_FIT_LADDER} for ws={ws}, head_dim={D}, "
-        f"BLOCK_R={BLOCK_R}. Last error: {last}"
+    _search_rungs(
+        _FIT_CHOICE, _FIT_TIMINGS, _FIT_ANNOUNCED, _FIT_SEEN, sig, _FIT_LADDER,
+        _launch, "fused decode tiling",
+        key=lambda r: (window_tiling(ws, r[0]),
+                       _pow2_at_least(min(W_phys, r[0]), floor=16), r[1], r[2]),
     )
+    return out, wsum
 
 
 
@@ -878,6 +1647,10 @@ def fused_two_tier_decode(
     scaling: float,
     num_sink: int = 0,
     n_body_win: Optional[int] = None,
+    sel: Optional[Tensor] = None,
+    logmass: Optional[Tensor] = None,
+    centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -888,9 +1661,17 @@ def fused_two_tier_decode(
     n_body_win : scored windows the fp body spans. Defaults to
         ``ceil((S_fp - num_sink) / ws)``; pass it when the caller already knows
         it, so the kernel's window axis matches the caller's score axis exactly.
+    sel : the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns, or None
+        to read the whole tier.
+    vm_bits : the width the value centroids were built at (``CardBits.vm``,
+        the ``quant_card_bits`` knob); 4 is the shipped card.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
-    physical order (body windows, then Q windows).
+    physical order (body windows, then Q windows). ``W_phys`` counts the **whole**
+    Q tier whether or not ``sel`` gated it; a skipped window's column comes back
+    ``0`` for the caller to fill from its card (see
+    :func:`scorer.fill_skipped_window_scores`, and why leaving it at zero would
+    evict the tier the gate exists to preserve).
     """
     if not (_HAS_TRITON and q.is_cuda):
         reason = "triton not installed" if not _HAS_TRITON else "not on CUDA"
@@ -899,4 +1680,5 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
-    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win)
+    return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
+                          sel, logmass, centroids, vm_bits)

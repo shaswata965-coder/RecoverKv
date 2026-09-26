@@ -20,6 +20,8 @@ __all__ = [
     "ConfigValidationError",
     "get_cache_classes",
     "quant_budget_mode_kwargs",
+    "quant_tier_policy_kwargs",
+    "quant_tier_policy_record",
     "validate_backend_attn_pairing",
     "assert_transformers_version_supported",
     "is_transformers_version_supported",
@@ -132,38 +134,23 @@ def get_cache_classes(backend: str) -> Tuple[Type, Type, Callable]:
     Imports are lazy: ``flash_attn`` is **never** imported on the eager
     path, so the eager backend runs without flash-attn installed.
     """
-    if backend == "flash_attn":
-        try:
-            from modules.windowed_cache import (  # type: ignore[attr-defined]
-                WindowedCache,
-                WindowedCacheConfig,
-                install_score_hooks,
-            )
-        except ImportError as e:
-            raise ConfigValidationError(
-                "flash_attn backend requested but modules.windowed_cache is not "
-                "available.  Ensure Prompt 02 has been implemented."
-            ) from e
-        return WindowedCache, WindowedCacheConfig, install_score_hooks
-
-    elif backend == "eager":
-        try:
-            from modules.windowed_eager_cache import (  # type: ignore[attr-defined]
-                WindowedCache,
-                WindowedCacheConfig,
-                install_score_hooks,
-            )
-        except ImportError as e:
-            raise ConfigValidationError(
-                "eager backend requested but modules.windowed_eager_cache is not "
-                "available.  Ensure Prompt 02 has been implemented."
-            ) from e
-        return WindowedCache, WindowedCacheConfig, install_score_hooks
-
-    else:
+    if backend not in ("flash_attn", "eager"):
         raise ConfigValidationError(
             f"Unknown cache backend: {backend!r}.  Must be 'flash_attn' or 'eager'."
         )
+    # ONE cache. The two backends differ only in where the eviction scores come
+    # from -- flash recomputes the post-RoPE query and runs the fused kernel,
+    # eager reads `attn_weights` off the module output -- and `install_score_hooks`
+    # picks that from the attention implementation. They used to be two packages,
+    # and the eager one drifted into a stale fork: 736 lines against 2494, with no
+    # read gate, no fused decode, no layer-major eviction and no byte-split mode.
+    # A backend that quietly runs a different cache is a different method.
+    from modules.windowed_cache import (  # type: ignore[attr-defined]
+        WindowedCache,
+        WindowedCacheConfig,
+        install_score_hooks,
+    )
+    return WindowedCache, WindowedCacheConfig, install_score_hooks
 
 
 def quant_budget_mode_kwargs(cache_config_cls: Type, requested: str) -> dict:
@@ -228,3 +215,75 @@ def validate_backend_attn_pairing(
             f"attn_implementation in {allowed!r}, but got "
             f"{attn_implementation!r}.  Fix your config."
         )
+
+
+def quant_card_bits_record(cache_cfg: Any) -> dict:
+    """``{"mu": 4, "v": 8, "t": 8, "vm": 4}`` -- the gate-card widths a run used.
+
+    For metadata sidecars, next to ``read_gate``: the widths move the card's
+    price, and under ``quant_budget_mode: bytes`` which windows the cache
+    keeps, so a quality number without them does not say which card it ran.
+    Parsed from the config exactly as ``WindowedCacheConfig`` parses it, so a
+    ``null`` records the shipped default rather than ``None``.
+    """
+    from modules.quant.sketch import parse_card_bits
+    return parse_card_bits(getattr(cache_cfg, "quant_card_bits", None))._asdict()
+
+
+def quant_tier_policy_kwargs(cache_cfg: Any) -> dict:
+    """``quant_promotion`` / ``quant_promote_source`` for a WindowedCacheConfig.
+
+    Passed only when they differ from the shipped method, so a default run
+    constructs its cache exactly as before these knobs existed. Every runner
+    that builds a cache goes through here -- a knob threaded by hand into some
+    runners and not others is how ``quant_budget_mode`` came to be inert in
+    three of them (ACCURACY_RECOVERY_PLAN.md §2).
+    """
+    out = {}
+    promo = getattr(cache_cfg, "quant_promotion", "bidir") or "bidir"
+    src = getattr(cache_cfg, "quant_promote_source", "dequant") or "dequant"
+    if promo != "bidir":
+        out["quant_promotion"] = promo
+    if src != "dequant":
+        out["quant_promote_source"] = src
+    return out
+
+
+def quant_tier_policy_record(cache_cfg: Any) -> dict:
+    """``{"quant_promotion": ..., "quant_promote_source": ...}`` for sidecars.
+
+    Next to ``read_gate`` and ``quant_card_bits``: either knob changes which
+    windows the cache keeps or what a promoted one holds, so a quality number
+    without them does not say which method produced it.
+    """
+    return {
+        "quant_promotion": getattr(cache_cfg, "quant_promotion", "bidir") or "bidir",
+        "quant_promote_source": (getattr(cache_cfg, "quant_promote_source",
+                                         "dequant") or "dequant"),
+    }
+
+
+def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:
+    """``{"quant_gate_ratio": requested}``, or ``{}`` if the backend lacks it.
+
+    The read gate lives on the fused flash decode path only: the eager package
+    dequantizes every active int2 window every step and has no gate to configure.
+    So the kwarg is omitted there rather than passed and rejected.
+
+    Unlike :func:`quant_budget_mode_kwargs`, dropping it does not silently change
+    the operating point — it changes how much of the tier is *read*, not what the
+    cache *keeps*, and eager's answer ("all of it") is the same at every ratio.
+    So this omits rather than raising: an eager run is correct at any ratio, just
+    ungated, and raising would break every existing eager config for a knob that
+    could never have applied to it.
+
+    What it does prevent is the reverse failure — the flash backend quietly
+    ignoring a configured ratio because the caller forgot to thread it through,
+    which is exactly how ``quant_budget_mode`` came to be inert in three runners
+    at once (ACCURACY_RECOVERY_PLAN.md §2).
+    """
+    if "quant_gate_ratio" in getattr(cache_config_cls, "__dataclass_fields__", {}):
+        return {"quant_gate_ratio": requested}
+    return {}
+
+

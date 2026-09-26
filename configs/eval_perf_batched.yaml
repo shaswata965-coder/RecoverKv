@@ -46,8 +46,14 @@
 #   Every config runs at every grid cell and `skip_if_oom: true` makes the ladder
 #   a max-B search: a config's max-B is the largest batch_size it did NOT skip.
 #   Headline = (max-B that fits) x (decode tok/s per row).
-#   CAVEAT: reported `throughput_tokps` includes prefill (perf_runner.py:252
-#   says so). For the decode claim use  batch_size / (tpot_ms / 1000).
+#   CAVEAT: do NOT quote `throughput_tokps` — it includes prefill AND its
+#   denominator omits `prefill_to_decode_gap_ms`, so it disagrees with
+#   `e2e_latency_ms`. For the decode claim use `throughput_decode_tokps`
+#   (= batch_size / (tpot_steady_ms / 1000)); for an end-to-end claim use
+#   `throughput_e2e_tokps`. NOT `tpot_ms`: it averages in decode step 0, which
+#   is where this design compacts the prompt, so a rate built on it charges a
+#   one-off O(prefill) cost into every token and the bias decays as 1/gen_len.
+#   print_perf_batched.py does all of this for you.
 #
 # SWEEP
 #   cache_budget  0.20 / 0.10  — per-row memory; the 1:1 lever on max-B.
@@ -94,7 +100,7 @@ cache:
   # The repo default is 'bytes' (the mode a memory-vs-quality claim is stated
   # in — see ACCURACY_RECOVERY_PLAN.md §2); 'tokens' is correct only here.
   # eval_perf_smoke.yaml inherits this file, so it inherits this too.
-  quant_budget_mode: tokens
+  quant_budget_mode: bytes
 
 perf:
   # Real long-context text, chunked to exactly prefill_len and sampled per row,
@@ -187,12 +193,31 @@ perf:
     - { prefill_len: 4096, gen_len: 128, batch_size: 32 }
     - { prefill_len: 4096, gen_len: 128, batch_size: 64 }
 
+  # WHY last_only. At prefill=4096 the full [B, L, V] prefill logits tensor is
+  # ~1.05 GB PER ROW in fp16 (~67 GB at B=64). It is identical for every method,
+  # it lands in peak_prefill_mb, and it is large enough on its own to OOM the
+  # high-B rungs — so with `full` the ladder stops for a reason that has nothing
+  # to do with the KV cache, and max-B is understated for every config. Any
+  # max-B recorded before this line was added is understated and NOT comparable
+  # to one recorded after it.
+  prefill_logits: last_only
+
   num_warmup_runs: 1
-  num_measurement_runs: 2
-  allow_shared_gpu: true
+  warmup_decode_steps: null            # auto: cross the first eviction so the
+                                       # Triton eviction kernel JITs in WARMUP
+  # The printer takes a MEDIAN; at n=2 a median is a mean of two, so one
+  # thermally-throttled run moves the figure by half its excess.
+  num_measurement_runs: 5
+  # 14 cells x 6 configs runs the part hot. Without cooldown and clock locking
+  # later cells are measured on a slower GPU and the drift — which is monotonic
+  # in ladder position — reads as method variance.
+  cooldown_s: 3.0
+  enable_clock_locking: true           # needs elevated perms; warns and continues
+  clock_settle_s: 5.0
+  # A co-tenant process is indistinguishable from a slow method in these numbers.
+  allow_shared_gpu: false
   skip_if_oom: true                    # REQUIRED: this is what makes the ladder a max-B search
   skip_if_flash_attn_unavailable: true
-  enable_clock_locking: false
 
 telemetry:
   track_scores: false                  # scoring telemetry would distort the timings

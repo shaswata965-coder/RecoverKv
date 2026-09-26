@@ -43,6 +43,65 @@ class ConfigValidationError(ValueError):
 FIRST_EVICTION_STEP_DEFAULT = 0
 
 
+#: **The shipped operating point — one definition, for speed AND for quality.**
+#:
+#: Every headline number should describe the same method. Before this existed
+#: they did not: ``configs/longbench_ours_flash_attn.yaml`` and
+#: ``configs/gsm8k_budget20.yaml`` scored the method at ``quant_ratio = 0.0``
+#: (no int2 tier, no read gate, pure fp16) while ``scripts/run_perf_table.sh``
+#: timed it at ``quant_ratio = 0.70`` in ``tokens`` mode. Those are two
+#: different caches. A table saying "1.37x faster than FullKV" and a table
+#: saying "42.4 on qasper" then describe methods that were never the same
+#: method, and no reader can tell.
+#:
+#: This is the reference the checker compares every shipped config against
+#: (``scripts/check_operating_point.py``). It does NOT override a config: a
+#: run is free to be somewhere else on purpose. What it removes is the case
+#: where nobody noticed.
+#:
+#: ``quant_budget_mode: bytes`` is the mode a memory-vs-quality claim can be
+#: stated in -- ``q`` splits the BYTE budget, so the retained cache costs
+#: ``cache_budget`` of the full cache at every ``q``. Under ``tokens`` the
+#: window COUNT is held fixed while the keys get cheaper, so a run reported at
+#: ``cache_budget 0.20`` is really holding ~11% of the full cache
+#: (``ResolvedConfig.budget_utilisation``: 0.57 at q=0.70).
+OPERATING_POINT = {
+    "cache_budget": 0.20,
+    "window_size": 8,
+    "num_sink_tokens": 5,
+    "local_window_size": 128,
+    "quant_ratio": 0.70,
+    "quant_budget_mode": "bytes",
+    "quant_gate_ratio": 0.25,
+    "first_eviction_step": FIRST_EVICTION_STEP_DEFAULT,
+}
+
+#: Configs that are deliberately NOT at the operating point, with the reason.
+#: Anything not listed here and not matching is a divergence the checker flags.
+OPERATING_POINT_EXEMPT = {
+    "base.yaml": "the schema's defaults, not a run",
+    "longbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "gsm8k_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "eval_parity_base.yaml": "parity harness; budget 0.25 is its own control",
+    "eval_parity_ours_eager.yaml": "parity harness; matched to the base arm",
+    "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",
+    "gsm8k_budget80.yaml": "the 0.80 arm of the budget sweep",
+    "eval_perf_smoke.yaml": "smoke test, not a reported number",
+    "eval_faithfulness.yaml": "no cache block",
+    "eval_qevict.yaml": "no cache block",
+    "eval_tier_study.yaml": "sweeps the tier on purpose",
+    "eval_visualize.yaml": "no cache block",
+    "longbench_ours_step0.yaml": "budget sweep arm at q=0.5, an ablation",
+    # window_size=16 ONLY -- the file is the omega=16 arm and says so in its
+    # name. It sat exempt for "RULER uses int4, a different tier", which was not
+    # true of anything in the repo and hid the fact that it was also running
+    # quant_ratio=0.0: a pure fp16 cache with no Q tier and therefore no read
+    # gate, scored under the same branch's name as LongBench at 0.70. It is now
+    # at the operating point on every axis but the one it exists to vary.
+    "ruler_niah_mk3_omega16.yaml": "the omega=16 arm; window_size is the ablation",
+}
+
+
 def log_operating_point(config, is_windowed: bool) -> None:
     """Log the full cache operating point at the start of a generation run.
 
@@ -85,6 +144,15 @@ def log_operating_point(config, is_windowed: bool) -> None:
         getattr(cache, "backend_package", None),
         getattr(getattr(config, "model", None), "attn_implementation", None),
     )
+    promo = getattr(cache, "quant_promotion", "bidir")
+    src = getattr(cache, "quant_promote_source", "dequant")
+    if q > 0 and (promo != "bidir" or src != "dequant"):
+        log.warning(
+            "operating point: ABLATION -- quant_promotion=%s, "
+            "quant_promote_source=%s (shipped: bidir / dequant)%s",
+            promo, src,
+            "; 'original' is an oracle holding fp copies OUTSIDE the budget"
+            if src == "original" else "")
 
 
 # ---------------------------------------------------------------------------
@@ -110,29 +178,50 @@ class CacheConfig:
     num_sink_tokens: int = 4
     local_window_size: Union[int, float] = 0.25  # int (multiple of window_size) or ratio
     rerotate_on_evict: bool = False  # StreamingLLM-style key re-rotation on eviction (default off)
-    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1] (design.md §7); 0 disables the Q tier
+    quant_ratio: float = 0.0  # two-tier int2 split q in [0,1]; 0 disables the Q tier
     # What quant_ratio divides between the fp16 and int2 tiers. "bytes"
     # (default) splits the byte budget, so the retained cache costs exactly
     # cache_budget of the full cache at every q and cheaper int2 keys buy more
-    # context — the mode a memory-vs-quality claim is stated in. "tokens" splits
+    # context -- the mode a memory-vs-quality claim is stated in. "tokens" splits
     # the window count instead, holding the retained KEY count q-invariant; that
     # is what a latency table needs (equal work per row) and what the perf suite
-    # pins explicitly, but it under-spends the budget it was granted (63% at
-    # q=0.5) and costs accuracy for memory nobody asked to save. See
-    # modules/windowed_cache/config.py and ACCURACY_RECOVERY_PLAN.md §2.
+    # pins explicitly, but it under-spends the budget it was granted (69% at
+    # q=0.5) and costs accuracy for memory nobody asked to save.
     quant_budget_mode: str = "bytes"
     # Decode step of the FIRST eviction, independent of window_size. 0 (default)
-    # compresses the prompt on decode step 0 — before that step's query attends —
+    # compresses the prompt on decode step 0 -- before that step's query attends --
     # so every generated token comes from the budgeted cache. A positive value
     # delays it and leaves any answer finishing inside that window measured at
     # FULL cache whatever cache_budget says. See modules/windowed_cache/policy.py.
     first_eviction_step: int = FIRST_EVICTION_STEP_DEFAULT
-    # None = auto (memoize the dequantized Q tier at B=1, not above). The memo
-    # costs ~149 MB/row vs ~131 MB/row of actual KV, so it halves max-B; it buys
-    # ~8x fewer Q-tier dequants per step. Set explicitly to measure both sides.
-    quant_memoize_read: Optional[bool] = None
+    # Fraction of each step's ACTIVE int2 windows the read gate dequantizes.
+    # There is no on/off knob: the gate IS the read path wherever there is a Q
+    # tier. 1.0 selects every window, which makes the gate a provable no-op and
+    # is the control arm for pricing it.
+    quant_gate_ratio: float = 0.25
+    # Bits per element of each read-gate card field, (mu, v, t, vm), each 8, 4
+    # or 2 (modules/quant/sketch.CardBits). null = the shipped card, mu4/v8/t8/vm4.
+    # `4` / `2` set every field; {"v": 4} or "mu=4,v=4,t=2,vm=2" set some.
+    # Under quant_budget_mode "bytes" a narrower card buys more int2 windows,
+    # so this moves what the cache keeps, not only what it reads.
+    quant_card_bits: Any = None
+    # Tier-movement ablation and promotion-payload oracle
+    # (modules/windowed_cache/config.py). "bidir" / "dequant" are the shipped
+    # method; "oneway" forbids int2 -> fp promotion at matched bytes, and
+    # "original" promotes the exact fp window from a shadow OUTSIDE the budget
+    # (evaluation-only). Both are quality changes; sidecars record them.
+    quant_promotion: str = "bidir"
+    quant_promote_source: str = "dequant"
 
     def __post_init__(self) -> None:
+        if self.quant_promotion not in ("bidir", "oneway"):
+            raise ConfigValidationError(
+                f"quant_promotion must be 'bidir' or 'oneway', got "
+                f"{self.quant_promotion!r}")
+        if self.quant_promote_source not in ("dequant", "original"):
+            raise ConfigValidationError(
+                f"quant_promote_source must be 'dequant' or 'original', got "
+                f"{self.quant_promote_source!r}")
         if self.cache_budget is not None:
             # Type guards mirror WindowedCacheConfig.__post_init__: reject
             # bool before int (bool subclasses int) and reject non-float
@@ -188,11 +277,32 @@ class CacheConfig:
             raise ConfigValidationError(
                 f"quant_ratio must be a float in [0, 1], got {self.quant_ratio!r}"
             )
+        # Mirrors WindowedCacheConfig.__post_init__ so a bad value is rejected at
+        # load, not at the first decode step inside a benchmarked run.
+        if isinstance(self.quant_gate_ratio, bool):
+            raise ConfigValidationError(
+                "quant_gate_ratio must be a float in (0, 1], got bool")
+        if isinstance(self.quant_gate_ratio, int):
+            self.quant_gate_ratio = float(self.quant_gate_ratio)
+        if (not isinstance(self.quant_gate_ratio, float)
+                or not (0.0 < self.quant_gate_ratio <= 1.0)):
+            raise ConfigValidationError(
+                "quant_gate_ratio must be a float in (0, 1], got "
+                f"{self.quant_gate_ratio!r}. 1.0 reads every window (the gate's "
+                "no-op control arm); 0 would read none and is not a gate.")
         if self.quant_budget_mode not in ("tokens", "bytes"):
             raise ConfigValidationError(
                 f"quant_budget_mode must be 'tokens' or 'bytes', got "
                 f"{self.quant_budget_mode!r}"
             )
+        # Rejected at load, not at the first eviction. Imported only when set,
+        # so the default config stays torch-free to load.
+        if self.quant_card_bits is not None:
+            from modules.quant.sketch import parse_card_bits
+            try:
+                parse_card_bits(self.quant_card_bits)
+            except ValueError as exc:
+                raise ConfigValidationError(str(exc)) from None
 
     def resolve_local_window_size(self, budget_tokens: int) -> int:
         """Resolve local_window_size to a concrete token count.
@@ -293,6 +403,22 @@ class ParityConfig:
     decoding: str = "greedy"
     record_full_attention: bool = False
     full_attention_sample_rate: int = 10
+    # Which field of a local jsonl / save_to_disk record is the article, and an
+    # optional "key=value" record filter (data/corpus_loader.py). A LongBench
+    # jsonl needs text_field "context": auto-detection reaches the short
+    # "input" question first. RULER needs record_filter "task=<name>".
+    text_field: Optional[str] = None
+    record_filter: Optional[str] = None
+    # Base run: also record the PER-QUERY-HEAD per-step window mass
+    # ([S, T, L, H_q, W] fp16, the size of `window_scores` again). The read gate
+    # selects per KV head, and anything that adds attention across query heads
+    # must normalise per head first (CLAUDE.md), so the observation suite's gate
+    # recall and read ledger need it; without it they fall back to differencing
+    # the fp16 cumulative array, which is noise past a few hundred steps.
+    record_head_step_mass: bool = False
+    # Ours run: record which int2 windows the read gate opened, per step, layer
+    # and KV head (flash backend with a Q tier only -- elsewhere nothing gates).
+    record_gate: bool = True
 
 
 @dataclass

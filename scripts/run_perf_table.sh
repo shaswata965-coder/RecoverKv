@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run_perf_table.sh — reproduce the 7-column decode table
-#   shape | batch | TTFT(s) | TPOT_steady(s) | throughput(tok/s) | peak_GB | steadyKV_GB
+# run_perf_table.sh — reproduce the decode table
+#   shape | batch | TTFT(s) | TPOT_steady(s) | dec tok/s | e2e tok/s | peak_GB | steadyKV_GB
+#
+# The two throughput columns are the two claims: dec tok/s = batch/TPOT_steady
+# (steady state, excludes the step-0 prompt compaction), e2e tok/s =
+# batch*gen_len/e2e_latency (includes prefill and the prefill->decode gap). This
+# table used to print ONE column, the npz's legacy throughput_tokps, which is
+# neither -- see THROUGHPUT below.
 #
 # One method, swept over the shapes and batch sizes you give it, printed in the
 # exact format of that table. Everything is configurable: model path, output
@@ -23,23 +29,51 @@
 #                     2wikimqa, qasper, ...       a LongBench dataset
 #                     longbench:NAME / corpus:NAME  force a loader
 #   QUANT_RATIO     two-tier int2 split q in [0,1]              (default: 0.70)
-#   QUANT_MODE      tokens | bytes  (see config.py)             (default: tokens)
-#   CACHE_BUDGET    fraction of the context kept                (default: 0.50)
+#
+#   The defaults above ARE utils.config.OPERATING_POINT -- the one point the
+#   quality configs are pinned to as well. Run scripts/check_operating_point.py
+#   before quoting a speed row and an accuracy row together.
+#   QUANT_MODE      tokens | bytes  (see config.py)             (default: bytes)
+#                   `bytes` is utils.config.OPERATING_POINT and is the mode a
+#                   memory-vs-quality claim can be stated in: q splits the BYTE
+#                   budget, so the cache costs cache_budget at every q. Under
+#                   `tokens` a run reported at 0.20 really holds ~11%.
+#   GATE_RATIO      read-gate SELECTIVITY (default: 0.25). 1.0 selects every
+#                   window -- a control for selectivity ONLY. It still runs the
+#                   gate kernel, its topk+sort, the SEL indirection, the GATED
+#                   prologue and fill pass, and builds a card every eviction, so
+#                   it prices the SELECTION and not the machinery. There is no
+#                   arm that removes the machinery: the gate is the read path.
+#   CACHE_BUDGET    fraction of the context kept                (default: 0.20)
 #   SHAPES          space list of prefill/decode pairs          (default: "4096/256 2048/512 1048/1048")
 #   BATCHES         space list of batch sizes                   (default: "1 32")
 #   BACKEND         flash_attn | eager                          (default: flash_attn)
 #   WINDOW_SIZE     eviction window (mult. of 4 for q>0)        (default: 8)
 #   NUM_SINK        sink tokens kept whole                      (default: 5)
-#   LOCAL_WINDOW    local region: int (mult of window) or float (default: 64)
+#   LOCAL_WINDOW    local region: int (mult of window) or float (default: 128)
 #   RUNS            measurement runs per cell (median reported)  (default: 3)
 #   WARMUP          warmup runs per cell                        (default: 1)
 #   DTYPE           float16 | bfloat16                          (default: float16)
 #   STAT            median | mean  (across runs, for the table) (default: median)
-#   COMPILE_EVICT   1 | 0  torch.compile the eviction step      (default: 1)
-#   LSE_STRICT      1 | 0  hard-fail on an L-reuse miss         (default: 1)
-#                   1 raises AT the miss, naming the layer and the cause.
-#                   0 degrades to recompute: a second O(N^2) pass per layer
-#                   AND the fp32 block that OOMs 4096/batch-32.
+#   COOLDOWN        seconds idled between runs                  (default: 0)
+#   CLOCK_LOCK      true | false  lock GPU clocks               (default: false)
+#                   THE DEFAULTS ARE THE HISTORIC TABLE'S, NOT THE REPO'S. Every
+#                   other perf config here sets 3.0 / true, and perf_runner warns
+#                   that without them back-to-back cells heat the GPU and later
+#                   rows are measured on a slower part. They are 0 / false here
+#                   so a fresh run stays comparable to the tables already
+#                   recorded. Pass --cooldown 3 --clock-lock true for hygiene,
+#                   and then do not compare the result cell-by-cell against a
+#                   table taken without them.
+#   THROUGHPUT      which throughput column(s) to print         (default: both)
+#                     both | decode | e2e | all | legacy
+#                     legacy = the old single throughput_tokps column, for
+#                     reproducing a table printed before this change. It is
+#                     prefill-inclusive AND omits the prefill->decode gap, so it
+#                     is neither claim; do not quote it.
+#   (No COMPILE_EVICT / LSE_STRICT. Both are unconditional now -- the eviction
+#   is compiled-or-raise and an L-reuse miss raises -- so the flags were parsed
+#   and then never read, which is worse than not having them.)
 #
 # ------------------------------------------------------------------- examples
 #   # the shipped table (q=0.70, the two default batch sizes)
@@ -55,6 +89,10 @@
 #
 #   # the historic byte-budget behaviour (cache grows with q), for comparison
 #   scripts/run_perf_table.sh --model /models/llama --quant-mode bytes --quant-ratio 0.70
+#
+#   # reprint an existing run's npz -- no GPU, no re-measurement. The three
+#   # rates side by side, to reconcile an old table against the corrected ones:
+#   python scripts/print_perf_table.py --npz-dir outputs/perf_table --throughput all
 # ============================================================================
 set -euo pipefail
 
@@ -90,20 +128,27 @@ MODEL_PATH="${MODEL_PATH:-}"
 OUT_DIR="${OUT_DIR:-$PROJECT_ROOT/outputs/perf_table}"
 DATA_SOURCE="${DATA_SOURCE:-wikitext-103}"
 QUANT_RATIO="${QUANT_RATIO:-0.70}"
-QUANT_MODE="${QUANT_MODE:-tokens}"
-CACHE_BUDGET="${CACHE_BUDGET:-0.50}"
+QUANT_MODE="${QUANT_MODE:-bytes}"
+# The read gate's selectivity: the fraction of each step's active int2 windows
+# the decode kernel dequantizes. 1.0 selects every window -- the no-op proof on
+# the one read path, and the control for what the SELECTION is worth.
+GATE_RATIO="${GATE_RATIO:-0.25}"
+CACHE_BUDGET="${CACHE_BUDGET:-0.20}"
 SHAPES="${SHAPES:-4096/256 2048/512 1048/1048}"
 BATCHES="${BATCHES:-1 32}"
 BACKEND="${BACKEND:-flash_attn}"
 WINDOW_SIZE="${WINDOW_SIZE:-8}"
 NUM_SINK="${NUM_SINK:-5}"
-LOCAL_WINDOW="${LOCAL_WINDOW:-64}"
+LOCAL_WINDOW="${LOCAL_WINDOW:-128}"
 RUNS="${RUNS:-3}"
 WARMUP="${WARMUP:-1}"
 DTYPE="${DTYPE:-float16}"
 STAT="${STAT:-median}"
-COMPILE_EVICT="${COMPILE_EVICT:-1}"
-LSE_STRICT="${LSE_STRICT:-1}"
+# See the header: these two default to what the recorded tables were taken with,
+# not to what the rest of the repo's perf configs use.
+COOLDOWN="${COOLDOWN:-0}"
+CLOCK_LOCK="${CLOCK_LOCK:-false}"
+THROUGHPUT="${THROUGHPUT:-both}"
 
 # ---- flags (win over env) --------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -113,6 +158,7 @@ while [[ $# -gt 0 ]]; do
     --data-source|--dataset) DATA_SOURCE="$2"; shift 2;;
     --quant-ratio)          QUANT_RATIO="$2"; shift 2;;
     --quant-mode)           QUANT_MODE="$2"; shift 2;;
+    --gate-ratio)           GATE_RATIO="$2"; shift 2;;
     --cache-budget|--budget) CACHE_BUDGET="$2"; shift 2;;
     --shapes)               SHAPES="$2"; shift 2;;
     --batches)              BATCHES="$2"; shift 2;;
@@ -124,9 +170,12 @@ while [[ $# -gt 0 ]]; do
     --warmup)               WARMUP="$2"; shift 2;;
     --dtype)                DTYPE="$2"; shift 2;;
     --stat)                 STAT="$2"; shift 2;;
-    --compile-evict)        COMPILE_EVICT="$2"; shift 2;;
-    --lse-strict)           LSE_STRICT="$2"; shift 2;;
-    -h|--help)              sed -n '2,57p' "$0"; exit 0;;
+    --cooldown)             COOLDOWN="$2"; shift 2;;
+    --clock-lock)           CLOCK_LOCK="$2"; shift 2;;
+    --throughput)           THROUGHPUT="$2"; shift 2;;
+    # 2..96 is the whole banner; a hard-coded end line silently truncated the
+    # help every time the header grew.
+    -h|--help)              sed -n '2,96p' "$0"; exit 0;;
     *) echo "unknown option: $1" >&2; echo "run with --help" >&2; exit 2;;
   esac
 done
@@ -146,7 +195,6 @@ fi
 # (`((I)//ws)` guard, `aten.amin` StarDep) are fixed at the source in cache.py,
 # so a supported build compiles. If yours still cannot, the error names the op
 # and the fix; rerun with --compile-evict 0 for eager (launch-bound) numbers.
-export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 
 # L-reuse (a PREFILL optimization) hands the softmax normaliser L from the flash
 # forward to the score kernel instead of recomputing it. DEFAULT IS STRICT: a
@@ -160,7 +208,6 @@ export STICKYKV_COMPILE_EVICT="$COMPILE_EVICT"
 # [B, H_q, chunk, S] fp32 block that is 32 GB at 4096/batch-32 -- larger than the
 # model weights, and the reason that cell OOMs. Pass --lse-strict 0 only when you
 # knowingly want the recompute path.
-export STICKYKV_LSE_STRICT="$LSE_STRICT"
 
 case "$BACKEND" in
   flash_attn) ATTN_IMPL="flash_attention_2";;
@@ -187,6 +234,7 @@ for shape in $SHAPES; do
   done
 done
 
+
 # ---- write the self-contained config ---------------------------------------
 cat > "$CONFIG_FILE" <<YAML
 # GENERATED by scripts/run_perf_table.sh -- safe to delete.
@@ -207,6 +255,13 @@ window:
 cache:
   quant_ratio: ${QUANT_RATIO}
   quant_budget_mode: ${QUANT_MODE}
+  # Written here, not only announced below: a knob this script prints into
+  # run_perf_table.env and checks against the operating point, but does not put
+  # in the config, is a knob whose two arms measure the same thing. That is the
+  # 6b8a188 bug (quant_gate_ratio inert in every runner) recurring in the
+  # runner that prices the gate. NB this heredoc is unquoted, so backticks here
+  # would be command substitution, not quotes.
+  quant_gate_ratio: ${GATE_RATIO}
   first_eviction_step: 0
 
 perf:
@@ -234,7 +289,8 @@ ${GRID_LINES}
   allow_shared_gpu: true
   skip_if_oom: true              # an OOM cell prints OOM rather than aborting
   skip_if_flash_attn_unavailable: true
-  enable_clock_locking: false
+  cooldown_s: ${COOLDOWN}
+  enable_clock_locking: ${CLOCK_LOCK}
 
 telemetry:
   track_scores: false            # scoring telemetry would distort the timings
@@ -247,14 +303,49 @@ YAML
   echo "model: $MODEL_PATH"
   echo "data_source: $DATA_SOURCE"
   echo "quant_ratio: $QUANT_RATIO  quant_budget_mode: $QUANT_MODE  cache_budget: $CACHE_BUDGET"
+  echo "quant_gate_ratio: $GATE_RATIO"
   echo "shapes: $SHAPES  batches: $BATCHES  backend: $BACKEND"
-  echo "STICKYKV_COMPILE_EVICT: $STICKYKV_COMPILE_EVICT"
-  echo "STICKYKV_LSE_STRICT: $STICKYKV_LSE_STRICT"
   echo "window_size: $WINDOW_SIZE  num_sink: $NUM_SINK  local_window: $LOCAL_WINDOW"
-  echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE"
+  echo "runs: $RUNS  warmup: $WARMUP  dtype: $DTYPE  stat: $STAT"
+  echo "cooldown_s: $COOLDOWN  clock_locking: $CLOCK_LOCK"
+  echo "throughput_columns: $THROUGHPUT"
 } > "$OUT_DIR/run_perf_table.env"
 
 echo "=== run_perf_table: q=$QUANT_RATIO ($QUANT_MODE), budget=$CACHE_BUDGET, backend=$BACKEND ==="
+
+# Say it out loud when a flag moves this run off the pinned operating point.
+# `--gate-ratio 1.0` is the case that matters: it is a legitimate ablation, and
+# it is NOT the configuration LongBench and GSM8K are pinned to, so its rows
+# cannot be quoted beside an accuracy number. A run that silently sits somewhere
+# else is how the perf table came to time quant_ratio 0.70 while LongBench
+# scored 0.0.
+python - "$CACHE_BUDGET" "$WINDOW_SIZE" "$NUM_SINK" "$LOCAL_WINDOW" \
+         "$QUANT_RATIO" "$QUANT_MODE" "$GATE_RATIO" <<'PYEOF' || true
+import sys
+sys.path.insert(0, ".")
+try:
+    from utils.config import OPERATING_POINT as OP
+except Exception:
+    raise SystemExit(0)
+got = dict(zip(("cache_budget", "window_size", "num_sink_tokens",
+                "local_window_size", "quant_ratio", "quant_budget_mode",
+                "quant_gate_ratio"), sys.argv[1:8]))
+def norm(v):
+    try:
+        return round(float(v), 6)
+    except (TypeError, ValueError):
+        return str(v).strip()
+off = [(k, v, OP[k]) for k, v in got.items() if norm(v) != norm(OP[k])]
+if off:
+    print("")
+    print("  !! THIS RUN IS NOT AT THE PINNED OPERATING POINT")
+    for k, v, want in off:
+        print(f"       {k}: {v}   (operating point: {want})")
+    print("     These rows are an ABLATION. They cannot be quoted beside a")
+    print("     LongBench or GSM8K number, which are pinned to the point above.")
+    print("     scripts/check_operating_point.py prints the full comparison.")
+    print("")
+PYEOF
 echo "data: $DATA_SOURCE"
 echo "shapes: $SHAPES   batches: $BATCHES"
 echo "config: $CONFIG_FILE"
@@ -267,4 +358,5 @@ echo "=== decode table ==="
 python "$PROJECT_ROOT/scripts/print_perf_table.py" \
     --npz-dir "$OUT_DIR" \
     --stat "$STAT" \
+    --throughput "$THROUGHPUT" \
     --out "$OUT_DIR/table.txt"

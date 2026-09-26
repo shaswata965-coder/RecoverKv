@@ -176,11 +176,14 @@ window:
 
 cache:
   first_eviction_step: 0     # compact the prompt on decode step 0
-  # Pinned, not inherited. This is a LATENCY suite: rows must do equal work to
-  # be comparable, so the retained key count has to stay quant_ratio-invariant.
-  # The repo default is 'bytes' (the mode a memory-vs-quality claim is stated
-  # in — see ACCURACY_RECOVERY_PLAN.md §2); 'tokens' is correct only here.
-  quant_budget_mode: tokens
+  # Pinned, not inherited, and pinned to the mode the whole repo now runs in.
+  # This suite reports MEMORY beside latency, and a memory claim is only
+  # meaningful under 'bytes': q splits the byte allowance, so every row costs
+  # the cache_budget it says it does and cheaper keys buy more context. Under
+  # 'tokens' the window count is pinned instead and a row labelled 0.50 really
+  # holds ~0.34 of the full cache -- which would flatter the latency and
+  # misstate the memory in the same table.
+  quant_budget_mode: bytes
 
 perf:
   protocol: standard         # provenance label only; selects no third-party code
@@ -235,17 +238,29 @@ perf:
       quant_ratio: 0.5
       requires_flash_attn: true
 
-    - name: ours_b50_q50_nomemo
-      # Same method with the dequantized-Q-tier memo OFF. At B=1 the memo
-      # defaults ON, and it trades ~149 MB/row of extra memory for ~8x fewer
-      # Q-tier dequants per step. Only this suite can price that trade, so both
-      # sides have to be in the table. BATCHING_PLAN.md §5.
+    - name: ours_b50_q50_ungated
+      # The read gate's control arm, which is what this slot is for now.
+      #
+      # It used to hold `quant_memoize_read: false`, pricing the dequantized-Q
+      # memo against the default. That memo is unreachable: the gate became the
+      # read path, the fused decode never calls `effective_q_tier`, and
+      # `resolve` refuses an explicit True wherever there is a Q tier. So the
+      # arm resolved to the same cache as `ours_b50_q50` and spent a quarter of
+      # the suite's GPU time printing a duplicate row.
+      #
+      # `quant_gate_ratio: 1.0` reads every int2 window instead of a quarter of
+      # them. It is the no-op proof on the one read path, so the row prices what
+      # the SELECTION is worth -- the machinery (the gate launch, its pick, the
+      # SEL indirection, the epilogue) runs in both arms and is not what this
+      # measures. NOT score-neutral: an ungated step scores every window truly
+      # where a gated one credits the skipped ones from their cards, so this row
+      # is an ablation and cannot be quoted beside an accuracy number.
       cache_backend: windowed
       cache_package: flash_attn
       attn_implementation: flash_attention_2
       cache_budget: 0.50
       quant_ratio: 0.5
-      quant_memoize_read: false
+      quant_gate_ratio: 1.0
       requires_flash_attn: true
 
   # 24k / 32k / 40k at gen_len 101 = exactly 100 decode forwards, matching the

@@ -478,7 +478,9 @@ class LongBenchRunner:
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
-        from utils.cache_factory import quant_budget_mode_kwargs
+        from utils.cache_factory import (quant_budget_mode_kwargs,
+                                         quant_gate_ratio_kwargs,
+                                         quant_tier_policy_kwargs)
 
         cfg = self.config
         model = self.model
@@ -508,6 +510,15 @@ class LongBenchRunner:
             # time, so the auto rule (memo on at B == 1) hides it — a config
             # asking for it OFF got it ON anyway.
             quant_memoize_read=getattr(cfg.cache, "quant_memoize_read", None),
+            **quant_gate_ratio_kwargs(
+                self.WindowedCacheConfig,
+                getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Gate-card field widths (sketch.CardBits); None means the shipped card.
+            quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+            **quant_tier_policy_kwargs(cfg.cache),
+            # The gate itself. LongBench must be able to take the same arm the
+            # throughput table takes, or the two describe different methods --
+            # which is the exact defect 8ef579a fixed for quant_ratio.
             # Without this the knob was inert here: LongBench fell through to
             # WindowedCacheConfig's default whatever the YAML said, while the
             # GSM8K/RULER/parity/perf runners all honoured it. At the default 0
@@ -559,6 +570,8 @@ class LongBenchRunner:
                 "top_k_windows": int(r.top_k_windows),
                 "top_k_fp": int(r.top_k_fp),
                 "N_q": int(r.N_q),
+                "quant_card_bits": dict(r.quant_card_bits._asdict()),
+                "bytes_per_gate_card": int(r.bytes_per_gate_card),
                 "retained_windows": int(r.retained_windows),
                 "retained_tokens": int(r.retained_tokens),
                 "retained_bytes": int(r.retained_bytes),
@@ -669,6 +682,27 @@ class LongBenchRunner:
         # All others: return as-is (metric functions handle normalization)
         return pred
 
+
+    def _read_gate_report(self, label: str) -> dict:
+        """Did the read gate actually run? Recorded into every metadata sidecar.
+
+        A run that did NOT gate reads the whole int2 tier, generates correct
+        text, and scores normally — invisible in an accuracy number exactly as
+        it was invisible in a latency number, and harder to catch, because
+        quality moves for a hundred reasons and nobody re-derives them. So the
+        sidecar carries the verdict rather than leaving it to be inferred from
+        the config.
+        """
+        from modules.windowed_cache import flash_decode
+        import torch as _t
+        cache_cfg = getattr(self.config, "cache", None)
+        expect = flash_decode.expect_gated(
+            getattr(cache_cfg, "backend_package", None),
+            getattr(cache_cfg, "quant_ratio", 0.0),
+            _t.cuda.is_available(),
+        )
+        return flash_decode.log_gate_report(log, label, expect)
+
     def _cleanup_memory(self, cache=None) -> None:
         """Memory hygiene between examples."""
         if cache is not None:
@@ -691,6 +725,7 @@ class LongBenchRunner:
         """Write per-dataset metadata sidecar JSON."""
         cfg = self.config
         env = capture_environment()
+        read_gate = self._read_gate_report(dataset_name)
 
         budget = cfg.cache.cache_budget
         compression_ratio = round(1.0 - budget, 2) if budget else None
@@ -725,7 +760,12 @@ class LongBenchRunner:
         else:
             lws_resolved = None
 
+        from utils.cache_factory import (quant_card_bits_record,
+                                         quant_tier_policy_record)
         meta = {
+            "read_gate": read_gate,
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "dataset": dataset_name,
             "num_examples": num_examples,
             "model_name": cfg.model.name,

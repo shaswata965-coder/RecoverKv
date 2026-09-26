@@ -138,16 +138,23 @@ class TestOursParityRunner:
         # The code checks backend_package == "eager" before setting output_attentions
         assert found_conditional or True  # structural check
 
-    def test_ours_routes_to_correct_package_per_backend(self):
-        """Factory routing returns correct package per backend."""
-        # Test eager routes to windowed_eager_cache
+    def test_ours_routes_both_backends_to_the_one_cache(self):
+        """One cache since ``0974687``: the eager package was a stale fork (no
+        read gate, no fused decode), so both backends resolve to the same class
+        and differ only in where the scores come from and whether the gate runs.
+        """
         from utils.cache_factory import get_cache_classes
         WC_eager, _, _ = get_cache_classes("eager")
-        assert "windowed_eager_cache" in WC_eager.__module__
-
         WC_flash, _, _ = get_cache_classes("flash_attn")
-        assert "windowed_cache" in WC_flash.__module__
-        assert "eager" not in WC_flash.__module__
+        assert WC_eager is WC_flash
+        assert WC_flash.__module__ == "modules.windowed_cache.cache"
+
+    def test_ours_threads_the_budget_mode_through(self):
+        """The parity run used to drop quant_budget_mode, so a 'tokens' request
+        silently ran the 'bytes' default. It must reach the cache config the
+        way every quality runner passes it."""
+        src = Path("modules/evaluation/ours_parity_runner.py").read_text()
+        assert "quant_budget_mode_kwargs(" in src
 
     def test_ours_loads_and_teacher_forces_base_npz(self, tmp_path):
         """Feed a base npz, assert ours' generated_tokens would equal base's."""

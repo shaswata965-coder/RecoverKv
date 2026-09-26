@@ -219,16 +219,16 @@ if _HAS_TRITON:
         by the causal fast-path) stay NaN and are excluded from comparison. P_full
         is zero-initialised: a skipped (m,n) is all-future, whose true P is 0.
         """
-        from modules.windowed_cache.score_kernel import (
-            LOG2E, _score_exp2_enabled)
+        from modules.windowed_cache.score_kernel import LOG2E
 
         B, H_q, T, D = q.shape
         H_kv, S = k.shape[1], k.shape[2]
         num_groups = H_q // H_kv
         lse = lse.contiguous().float()
         # Default to whatever production would do, so the mirror tracks it.
+        # Production is exp2, unconditionally, since STICKYKV_SCORE_EXP2 went.
         if use_exp2 is None:
-            use_exp2 = _score_exp2_enabled()
+            use_exp2 = True
         scaling = scaling * LOG2E if use_exp2 else scaling
 
         out = torch.empty(B, H_q, S, device=q.device, dtype=torch.float32)
@@ -341,7 +341,7 @@ def test_C_step_localization():
 
     S_ref, P_ref, future, out_ref = torch_stages(q, k, scaling, lse)
     out_dbg, S_dbg, P_dbg = run_debug_kernel(q, k, scaling, lse, block_m=block_m, block_n=block_n)
-    out_prod = _token_scores_triton(q, k, scaling, lse, block_m=block_m, block_n=block_n).float()
+    out_prod = _token_scores_triton(q, k, scaling, lse).float()
 
     inrange = ~future  # [T,S]; compare S only on non-future (always-visited) cells
     inrange4 = inrange[None, None].expand_as(S_ref)
@@ -388,7 +388,7 @@ def test_D_tile_size_invariance(block_m, block_n):
     scaling = D ** -0.5
     lse = compute_lse(q, k, scaling)
     ref = token_scores_from_lse(q, k, scaling, lse)
-    got = _token_scores_triton(q, k, scaling, lse, block_m=block_m, block_n=block_n).float()
+    got = _token_scores_triton(q, k, scaling, lse).float()
     torch.testing.assert_close(got, ref, atol=5e-2, rtol=5e-2, msg=f"blk=({block_m},{block_n})")
 
 
@@ -556,7 +556,7 @@ def _report():
 
     S_ref, P_ref, future, out_ref = torch_stages(q, k, scaling, lse)
     out_dbg, S_dbg, P_dbg = run_debug_kernel(q, k, scaling, lse, block_m=bn, block_n=bn)
-    out_prod = _token_scores_triton(q, k, scaling, lse, block_m=bn, block_n=bn).float()
+    out_prod = _token_scores_triton(q, k, scaling, lse).float()
     inrange4 = (~future)[None, None].expand_as(S_ref)
 
     stages = [

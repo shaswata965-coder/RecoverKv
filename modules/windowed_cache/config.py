@@ -14,7 +14,14 @@ from typing import Any, Optional, Union
 
 import torch
 
+from modules.quant.sketch import CARD_BITS_DEFAULT, CardBits, parse_card_bits
+
 from .policy import FIRST_EVICTION_STEP
+
+#: Floor on `ResolvedConfig.budget_utilisation`. A budget that is granted and
+#: not spent is a quality result reported at the wrong operating point, so under
+#: 'bytes' this is enforced rather than reported.
+MIN_BUDGET_UTILISATION = 0.99
 
 
 # ---------------------------------------------------------------------------
@@ -60,9 +67,29 @@ class ResolvedConfig:
     # actually achieved under either.
     bytes_per_fp_window: int = 0
     bytes_per_q_window: int = 0
+    # The card's share of `bytes_per_q_window`, carried so a memory report can
+    # say what the gate costs without re-deriving it. Zero when there is no gate.
+    bytes_per_gate_card: int = 0
     # None → decide from the batch size at the first forward (on at B=1, off
     # above). See WindowedCacheConfig.quant_memoize_read.
     quant_memoize_read: Optional[bool] = None
+    # Rank-1 read gate (modules/quant/sketch.py). This field is already RESOLVED
+    # -- `resolve()` has turned the tri-state knob into a bool, so readers here
+    # never re-derive it. `quant_gate_ratio` is the fraction of each step's
+    # active Q windows that get dequantized; the per-step cap is derived from it
+    # against the live `n_active`, not pinned to an integer, because `N_q` moves
+    # with the shape and a fixed count would not be the same fraction anywhere.
+    quant_sketch_enabled: bool = False
+    quant_gate_ratio: float = 0.25
+    quant_gate_margin: float = float("inf")
+    quant_gate_max_windows: Optional[int] = None
+    # Each gate-card field's width, already parsed (WindowedCacheConfig's
+    # `quant_card_bits`). `bytes_per_gate_card` above is priced from it.
+    quant_card_bits: CardBits = CARD_BITS_DEFAULT
+    # Tier-movement policy and promotion payload (WindowedCacheConfig), carried
+    # verbatim. Defaults are the shipped method.
+    quant_promotion: str = "bidir"
+    quant_promote_source: str = "dequant"
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -106,7 +133,7 @@ class ResolvedConfig:
         reported at ``cache_budget=0.20`` is really holding 13.8% / 11.4% of the
         full cache. That gap is a silent accuracy cost, so it is a property
         rather than something each reader recomputes. Report it with every
-        quality row; ``ACCURACY_RECOVERY_PLAN.md`` §2 is why.
+        quality row; the design notes is why.
         """
         if self.total_budget_bytes <= 0:
             return 0.0
@@ -219,9 +246,9 @@ class WindowedCacheConfig:
     # What `quant_ratio` divides between the fp16 and int2 tiers.
     #
     # "bytes" (default) — q splits the BYTE budget; each tier then buys windows
-    #     at its own price. An int2 window costs ~3.9x less than an fp16 one
-    #     (b_fp/b_q = 32768/8448 at ws=8, D=128, H_kv=8), so the retained window
-    #     count grows with q:
+    #     at its own price. An int2 window costs ~2.8x less than an fp16 one
+    #     with its gate card (b_fp/b_q = 32768/9632 at ws=8, D=128, H_kv=8; 5.1x
+    #     without the card), so the retained window count grows with q:
     #
     #       retained_windows = top_k_windows * (1 + (b_fp/b_q - 1) * q)
     #
@@ -253,6 +280,51 @@ class WindowedCacheConfig:
     # first-eviction drop count so that case is visible rather than implied.
     quant_budget_mode: str = "bytes"
     quant_memoize_read: Optional[bool] = None
+    # -- rank-1 read gate (modules/quant/sketch.py) -------------------------
+    # Each int2 window carries a card written once at demotion; the decode step
+    # scans the cards and dequantizes only the windows whose UPPER BOUND clears
+    # the bar. Because the bound is a bound, a skipped window provably carries no
+    # logit above it: the gate can over-select, it cannot miss.
+    #
+    #
+    # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
+    # operating point the efficiency arithmetic is costed on: the card is a
+    # third of a window, so break-even sits at ~0.67 and 0.25 leaves headroom.
+    # 1.0 dequantizes everything and makes the gate a provable no-op.
+    quant_gate_ratio: float = 0.25
+    # Delta, in log space. A window also survives when its bound is within Delta
+    # of its head's best bound -- a top-p, so a peaked head keeps few windows and
+    # a flat head keeps many, with no calibration and no sort. The default `inf`
+    # makes the RATIO the only selector (a deterministic top-k by bound); set a
+    # finite Delta to get the adaptive rule capped by the ratio.
+    quant_gate_margin: float = float("inf")
+    # Absolute cap, overriding the ratio when set. Diagnostics; prefer the ratio.
+    quant_gate_max_windows: Optional[int] = None
+    # Bits per element of each gate-card field, (mu, v, t, vm), each 8, 4 or 2
+    # (modules/quant/sketch.CardBits). None is the shipped card, mu4/v8/t8/vm4,
+    # and is byte- and kernel-identical to the build before this knob existed.
+    # One width sets every field (`4`, `"int2"`); a mapping or a
+    # "mu=4,v=4,t=2,vm=2" string sets some. Parsed to a CardBits here.
+    #
+    # It moves the card's PRICE, and the budget follows it: under
+    # quant_budget_mode="bytes" a narrower card buys more int2 windows, so which
+    # windows the cache keeps moves with it -- a quality change, not only a
+    # read-traffic one. Under "tokens" the window count is unchanged and only
+    # the bytes move.
+    quant_card_bits: Any = None
+    # How windows may move between tiers at an eviction. "bidir" (shipped):
+    # F <-> Q -> E, an int2 window whose score recovers is promoted back to fp.
+    # "oneway": F -> Q -> E, an int2 window can be kept or evicted but never
+    # promoted -- the ablation that prices promotion at exactly matched bytes
+    # (the tier sizes come from the budget resolver either way, so both arms
+    # hold the same fp and int2 window counts). A quality change.
+    quant_promotion: str = "bidir"
+    # What a promoted window is made of. "dequant" (shipped): its int2
+    # reconstruction, re-rotated -- no extra memory. "original": the exact fp
+    # K/V it was demoted from, kept in an fp shadow beside the codes. That
+    # shadow is NOT in the byte budget, so "original" is an evaluation-only
+    # ORACLE for the promotion-payload experiment, never a method.
+    quant_promote_source: str = "dequant"
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -326,6 +398,46 @@ class WindowedCacheConfig:
                 f"local_window_size must be int or float, "
                 f"got {type(self.local_window_size).__name__}"
             )
+
+        # -- rank-1 read gate --
+        gate_live = self.quant_ratio > 0.0
+        if gate_live and self.quant_memoize_read is True:
+            raise ValueError(
+                "quant_memoize_read=True cannot be combined with a LIVE read "
+                "gate: the memo caches the WHOLE dequantized tier keyed on "
+                "store.version -- which only moves at eviction, while the "
+                "gate's selected set moves every step. It would serve a set the "
+                "gate did not choose. Leave it None, or set "
+                ""
+                "per-step selected set and memoizes legitimately."
+            )
+        if not (0.0 < self.quant_gate_ratio <= 1.0):
+            raise ValueError(
+                f"quant_gate_ratio must be in (0, 1], got {self.quant_gate_ratio}. "
+                "1.0 dequantizes every window, i.e. a no-op gate."
+            )
+        if self.quant_gate_margin != float("inf") and self.quant_gate_margin < 0:
+            raise ValueError(
+                f"quant_gate_margin must be >= 0 or inf, got {self.quant_gate_margin}"
+            )
+        if (self.quant_gate_max_windows is not None
+                and self.quant_gate_max_windows < 1):
+            raise ValueError("quant_gate_max_windows must be >= 1 or None")
+        self.quant_card_bits = parse_card_bits(self.quant_card_bits)
+        if self.quant_promotion not in ("bidir", "oneway"):
+            raise ValueError(
+                f"quant_promotion must be 'bidir' or 'oneway', got "
+                f"{self.quant_promotion!r}")
+        if self.quant_promote_source not in ("dequant", "original"):
+            raise ValueError(
+                f"quant_promote_source must be 'dequant' or 'original', got "
+                f"{self.quant_promote_source!r}")
+        if self.quant_promote_source == "original":
+            warnings.warn(
+                "quant_promote_source='original' keeps an fp copy of every int2 "
+                "window OUTSIDE the byte budget. It is the evaluation-only "
+                "oracle of the promotion-payload experiment; its memory and "
+                "quality are not the method's.", stacklevel=2)
 
         # -- quant_budget_mode (what quant_ratio divides) --
         if self.quant_budget_mode not in ("tokens", "bytes"):
@@ -511,18 +623,56 @@ class WindowedCacheConfig:
         # that now dominates the Q window (design.md §2, §7). window_size % 4 == 0
         # is validated, so the // 2 below is exact.
         b_fp = bytes_per_token * self.window_size                       # K+V fp16
-        b_q = (
-            (num_kv_heads * head_dim * self.window_size) // 2           # int2 codes, K+V
-            + 4 * num_kv_heads * head_dim                               # key scale+zero fp16
-            + 4 * num_kv_heads * self.window_size                       # value scale+zero fp16
-        )
+        # The GATE CARD IS PART OF THE WINDOW. It is resident for the life of the
+        # window, it is allocated unconditionally wherever there is a Q tier, and
+        # leaving it out of `b_q` is not a rounding error: at D=128, ws=8, H_kv=8
+        # the card is 3200 B against the codes-plus-grid's 6432, so an unbudgeted
+        # card is a 50% overrun on the exact tier the memory claim is made about.
+        # It was missing here, which meant every reported `cache_budget`
+        # understated the bytes actually held.
+        #
+        # Both halves are priced by the modules that define the formats, not
+        # re-derived here: a window whose layout changes and whose budget does
+        # not is the same bug in a new place.
+        from modules.quant.quantizer import bytes_per_q_window
+        from modules.quant.sketch import sketch_bytes_per_head
+
+        gate_live = q > 0.0
+        b_card = (num_kv_heads * sketch_bytes_per_head(
+                      head_dim, self.window_size, self.quant_card_bits)
+                  if gate_live else 0)
+        b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size) + b_card
         m_evict = remaining * bytes_per_token                           # evictable bytes
         if self.quant_budget_mode == "bytes":
-            # Historic split: q divides the BYTES. An int2 window is ~3.9x
+            # Historic split: q divides the BYTES. An int2 window is ~2.8x
             # cheaper, so the retained WINDOW COUNT grows with q and the cache
             # can end up holding more keys than the prompt (see the field docs).
             top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
             N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+            # SPEND THE REMAINDER. Two independent floor divisions leave up to
+            # one window of each tier unbought -- and because the leftover is
+            # never spent, the cache quietly runs under budget while the report
+            # says otherwise. Top up one window at a time, each time taking the
+            # tier that keeps the realised byte split closest to `q`, so filling
+            # the budget does not drift the operating point it was resolved at.
+            spent = top_k_fp * b_fp + N_q * b_q
+            while True:
+                room_fp = (spent + b_fp) <= m_evict
+                room_q = q > 0.0 and (spent + b_q) <= m_evict
+                if not (room_fp or room_q):
+                    break
+
+                def _err(dfp: int, dq: int) -> float:
+                    fp_b = (top_k_fp + dfp) * b_fp
+                    q_b = (N_q + dq) * b_q
+                    return abs(q_b / max(fp_b + q_b, 1) - q)
+
+                if room_q and (not room_fp or _err(0, 1) <= _err(1, 0)):
+                    N_q += 1
+                    spent += b_q
+                else:
+                    top_k_fp += 1
+                    spent += b_fp
         else:
             # Token split (default): q divides the retained WINDOW COUNT, so
             # top_k_fp + N_q == top_k_windows for every q. The keys a decode step
@@ -540,7 +690,7 @@ class WindowedCacheConfig:
         if q == 0.0:
             top_k_fp = top_k_windows
 
-        return ResolvedConfig(
+        resolved = ResolvedConfig(
             window_size=self.window_size,
             num_sink_tokens=self.num_sink_tokens,
             local_tokens=local_tokens,
@@ -555,6 +705,76 @@ class WindowedCacheConfig:
             quant_budget_mode=self.quant_budget_mode,
             bytes_per_fp_window=b_fp,
             bytes_per_q_window=b_q,
+            bytes_per_gate_card=b_card,
             quant_memoize_read=self.quant_memoize_read,
+            # The gate IS the read path wherever there is a Q tier. There is no
+            # knob: an ungated arm is a second method with different eviction
+            # decisions and a different kernel compile, and keeping one meant
+            # every downstream number had to say which arm it came from.
+            quant_sketch_enabled=q > 0.0,
+            quant_gate_ratio=self.quant_gate_ratio,
+            quant_gate_margin=self.quant_gate_margin,
+            quant_gate_max_windows=self.quant_gate_max_windows,
+            quant_card_bits=self.quant_card_bits,
+            quant_promotion=self.quant_promotion,
+            quant_promote_source=self.quant_promote_source,
             first_eviction_step=self.first_eviction_step,
         )
+
+        # --- ENFORCE the budget, do not merely compute it --------------------
+        # `budget_utilisation` has always been reported; nothing has ever
+        # refused a configuration that failed to spend what it was granted. A
+        # cache that holds 70% of its allowance is a quality result taken at a
+        # budget nobody asked for, and it reads as a memory win in the table.
+        #
+        # Under 'bytes' the remainder is spent above, so this is reachable only
+        # if the allowance cannot buy a single window of either tier -- a
+        # genuinely unusable budget, worth refusing loudly.
+        #
+        # Under 'tokens' the window COUNT is pinned and the bytes are whatever
+        # the cheaper keys cost, so under-spend is the mode's definition, not a
+        # fault. It is still not allowed to be silent: 'tokens' is a latency
+        # mode, and a quality number taken under it is stated at a budget the
+        # config did not ask for.
+        util = resolved.budget_utilisation
+        if self.quant_budget_mode == "bytes":
+            # The invariant is GRANULARITY-EXACT, not a percentage: the leftover
+            # must be too small to buy another window of any tier. A flat 99%
+            # floor is the wrong shape -- it is unreachable when the allowance
+            # buys only a handful of windows (one fp window is 15% of a 6-window
+            # budget) and it is far too loose when it buys hundreds. At the
+            # shipped shapes this implies >= 99.6%.
+            cheapest = b_q if q > 0.0 else b_fp
+            leftover = m_evict - resolved.retained_evictable_bytes
+            if leftover >= cheapest:
+                raise ValueError(
+                    f"cache_budget={self.cache_budget} leaves {leftover} B of its "
+                    f"{m_evict} B evictable allowance unspent, enough for another "
+                    f"{'int2' if q > 0.0 else 'fp'} window ({cheapest} B"
+                    f"{f', incl. {b_card} B of gate card' if b_card else ''}). "
+                    "The remainder loop should have bought it; this is a bug in "
+                    "resolve(), not a bad configuration."
+                )
+            if util < MIN_BUDGET_UTILISATION:
+                warnings.warn(
+                    f"cache_budget={self.cache_budget} spends {util:.1%} of its "
+                    f"byte allowance ({resolved.retained_bytes} of "
+                    f"{resolved.total_budget_bytes} B). The allowance is fully "
+                    f"spent to within one window ({leftover} B left, cheapest "
+                    f"window {cheapest} B) -- the shortfall is granularity, not "
+                    "waste. It matters anyway: this run holds "
+                    f"{util * self.cache_budget:.1%} of the full cache, not "
+                    f"{self.cache_budget:.1%}. Quote quality numbers against that.",
+                    stacklevel=2,
+                )
+        elif util < MIN_BUDGET_UTILISATION:
+            warnings.warn(
+                f"quant_budget_mode='tokens' at quant_ratio={q} spends "
+                f"{util:.1%} of the byte budget: the window count is pinned, so "
+                f"cheaper int2 keys buy fewer bytes rather than more windows. "
+                f"This run holds {util * self.cache_budget:.1%} of the full "
+                "cache, not cache_budget. Quote quality numbers against that, "
+                "or resolve in 'bytes'.",
+                stacklevel=2,
+            )
+        return resolved

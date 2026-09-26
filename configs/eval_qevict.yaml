@@ -1,8 +1,12 @@
 # ============================================================================
-# StickyKV — QEvict observation suite (skew / window-level / revival)
+# StickyKV — QEvict observation suite (skew / window-level / revival /
+#            decode read ledger / tier dynamics)
 # ----------------------------------------------------------------------------
 # Post-processing only: reads the same parity_base + parity_ours pair as the
-# faithfulness suite, no model load.  Analysis knobs (FMM horizon, LIR
+# faithfulness suite, no model load. Observation IV (the read ledger) needs the
+# ours run on the FLASH backend at schema >= 1.3 (it records the read gate's
+# pick) and a base run with parity.record_head_step_mass=true;
+# scripts/run_qevict_observations.sh produces exactly that pair.  Analysis knobs (FMM horizon, LIR
 # inactivity/horizon, transition lags, pool factor) use the module defaults —
 # to tune them, call the module CLI directly:
 #

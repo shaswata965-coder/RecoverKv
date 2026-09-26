@@ -18,13 +18,13 @@ kernel. **The two still produce identical caches**, which is not an assumption:
 ``tests/test_quant_cache.py::test_flash_eager_two_tier_parity`` runs both and
 compares K/V, active window ids and effective length every step, and
 ``tests/test_layer_major_evict.py`` pins the same equivalence within this twin
-against ``STICKYKV_LAYER_MAJOR_DECODE=0``.
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import os
 import traceback
 import warnings
@@ -49,15 +49,19 @@ from modules.quant import (
     unrotate_key_window,
 )
 from modules.quant.effective import rotate_key_window
-from modules.quant.slots import QuantSlotTable, n_slots_for
+from modules.quant.compact import join, stable_partition
+from modules.quant.quantizer import QGrid
+from modules.quant.slots import GRID_FIELDS, QuantSlotTable, n_slots_for
 
 
 # ---------------------------------------------------------------------------
-# Optional torch.compile of the eviction step (STICKYKV_COMPILE_EVICT).
-# Off by default: the eager _evict_two_tier_impl is the reference path and ships
-# GPU-unvalidated compilation OFF, mirroring the decode read path's convention
-# (modules/quant/effective.py). The compiled callable is process-global and
-# built lazily on first use so a run that never evicts never pays for it.
+# torch.compile of the eviction step. ALWAYS -- there is no knob and no device
+# test: `_evict_two_tier` calls the compiled body on every backend and raises if
+# it cannot be lowered. `_evict_two_tier_impl` is still the reference the
+# compiled body must equal (tests call it directly), and
+# _emulating_precision_casts is what keeps them equal. The compiled callable is
+# process-global and built lazily on first use so a run that never evicts never
+# pays for it.
 # ---------------------------------------------------------------------------
 
 _COMPILED_EVICT_FN = None
@@ -68,10 +72,18 @@ _EVICT_COMPILE_TRIED_STATIC = False
 #: Proof-of-execution counters for the eviction path, same contract as
 #: :data:`modules.windowed_cache.flash_decode._STATS`: being *able* to compile is
 #: not the same as the compiled body actually running. ``compiled`` counts
-#: evictions that went through ``_COMPILED_EVICT_FN``, ``eager`` the ones that
-#: took the reference body. A benchmark that believes it enabled the compiled
-#: eviction and reports ``eager > 0`` measured the path it was trying to replace.
+#: evictions that went through ``_COMPILED_EVICT_FN``. ``eager`` is kept at zero
+#: and is now a TRIPWIRE rather than a measurement: since the compiled path
+#: became unconditional nothing increments it, so a nonzero value means an eager
+#: fallback was reintroduced somewhere and the run's numbers are not the
+#: compiled path's.
 _EVICT_STATS = {"eager": 0, "compiled": 0}
+
+#: One-shot flag for the reset-and-retry on a Dynamo bail. Not sticky like
+#: :data:`_EVICT_COMPILE_FAILED`: a bail is a run property, so it gets exactly
+#: one rescue per process and then becomes a real error rather than an infinite
+#: reset loop that would recompile the world on every eviction.
+_EVICT_BAIL_RETRIED = {"done": False}
 
 #: Sticky record of a torch.compile failure on the eviction, process-global and
 #: NOT cleared by :func:`reset_evict_path_stats` — a build that cannot lower the
@@ -97,6 +109,125 @@ def evict_path_stats() -> dict:
     return dict(_EVICT_STATS)
 
 
+#: Widths the demote / reactivate compacts may take. A count that varies per
+#: eviction gives ``torch.compile`` a new shape every time, so the measured
+#: count is rounded UP to one of these rungs. The first eviction, where
+#: everything genuinely is fresh, still lands on the top one.
+_EVICT_WIDTH_LADDER = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+
+
+def _evict_widths(masks, bounds):
+    """Smallest ladder rung covering each mask's widest row. **One sync, total.**
+
+    ``bounds`` is one cap for every mask, or one per mask. They differ: the
+    demote and reactivate widths are capped by ``n_q`` (the Q tier's window
+    count) and the promote width by ``min(N_q, n_fp)`` (what the fp side can
+    take back). Passing them together is what keeps this to a single host read.
+
+    ``_compact`` allocates by RANK into a worst-case width, because the counts
+    are ragged per row. That width is ``n_q`` -- every window the Q tier can
+    hold -- and at steady state only a handful of lanes are really fresh: one
+    window is sealed per ``window_size`` steps, plus whatever crosses the tier
+    boundary on re-ranking. Everything else is gathered, un-rotated, quantized
+    and sketched, then masked away.
+
+    It did not matter much under ``quant_budget_mode: tokens``, where ``n_q`` is
+    64. Under ``bytes`` -- the mode the budget is honestly spent in -- ``n_q`` is
+    **250**. Fitting DECODE_SPEED_PLAN.md §3's measured eviction cost against
+    the 2026-09-17 table reproduces every cell to within 2-13% only if the
+    eviction scales with ``n_q``, and it puts the eviction at **~60 ms of a
+    124 ms step** at 4096/B=32. About half. This width is now the largest single
+    item in the decode step, not a tidy-up.
+
+    **The bound has to come from the data.** ``_compact`` routes overflow lanes
+    to a dump column, so a width that is ever too small silently drops work. A
+    max over rows is a true upper bound by construction; config arithmetic is
+    not, which is why this pays a ``.item()`` rather than estimating one.
+
+    That ``.item()`` costs one graph break in the compiled eviction -- two
+    Inductor graphs instead of one. The trade is explicit and it is not close:
+    one break against a payload up to 31x smaller. All the demote work sits
+    AFTER the width is known, so it stays inside one fused region either way.
+    """
+    masks = tuple(masks)
+    if isinstance(bounds, int):
+        bounds = (bounds,) * len(masks)
+    else:
+        bounds = tuple(int(b) for b in bounds)
+        if len(bounds) != len(masks):
+            raise ValueError(
+                f"{len(masks)} masks but {len(bounds)} bounds")
+    if all(b <= 0 for b in bounds):
+        return [0] * len(masks)
+    # ONE `.item()` for every width this eviction needs. Two separate reads
+    # would be two host syncs and two graph breaks per eviction, for the same
+    # information; stacking them first makes it one of each.
+    #
+    # Per mask, NOT one reduction over a stack of them: the masks are different
+    # widths -- fresh/react span the merged window axis, promote spans the fp
+    # picks -- so stacking raises. (Tried; the compiled eviction refused it on
+    # the first call, which is the kernel-or-error contract working.)
+    needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
+    out = []
+    for need, bound in zip(needs, bounds):
+        need = int(need)
+        if need <= 0 or bound <= 0:
+            out.append(0)
+            continue
+        for rung in _EVICT_WIDTH_LADDER:
+            if rung >= need:
+                out.append(min(rung, bound))
+                break
+        else:
+            out.append(bound)
+    return out
+
+
+def evict_width_stats(cache) -> Optional[dict]:
+    """What ``_compact``'s worst-case width bought, per eviction. Syncs once.
+
+    ``None`` until an eviction has run. Otherwise::
+
+        {"evictions", "n_q", "W_retained",
+         "fresh_max", "fresh_mean", "promote_max", "promote_mean", "react_max",
+         "fresh_fill", "promote_fill"}
+
+    ``fresh_fill`` is ``fresh_max / n_q`` and ``promote_fill`` is
+    ``promote_max / n_q`` -- **the numbers that size D1.** Sized by their caps,
+    the demote path un-rotates, quantizes and sketches
+    ``[L*B, n_q, H_kv, ws, D]`` every eviction and the promote path dequantizes,
+    RoPEs and splices ``[L*B, min(N_q, n_fp), H_kv, ws, D]``, with everything
+    beyond a row's real count masked away. A fill of 0.05 says 95% of that
+    payload is discarded; a fill near 1.0 says the cap is about right and
+    measuring the width buys nothing.
+
+    Both paths are now sized by the measured max, so these read as *what the cap
+    would have cost*, not as waste still being paid.
+
+    the design notes records this as the risk the D1 estimate rests on --
+    *"If the real count is routinely close to n_q, D1 is worth little"* -- and it
+    has never been printed. Read it AFTER a timed window, never inside one: the
+    single ``.item()`` here is the host sync the counters exist to avoid on the
+    eviction path itself.
+    """
+    buf = getattr(cache, "_evict_widths", None)
+    bound = getattr(cache, "_evict_width_bound", None)
+    if buf is None or bound is None:
+        return None
+    ev, fmax, pmax, rmax, fsum, psum = (int(x) for x in buf.tolist())
+    if ev == 0:
+        return None
+    n_q, W = bound
+    return {
+        "evictions": ev, "n_q": n_q, "W_retained": W,
+        "fresh_max": fmax, "fresh_mean": fsum / ev,
+        "promote_max": pmax, "promote_mean": psum / ev,
+        "react_max": rmax,
+        "fresh_fill": (fmax / n_q) if n_q else None,
+        "promote_fill": (pmax / n_q) if n_q else None,
+    }
+
+
 def evict_compile_failed() -> Optional[str]:
     """The eviction's torch.compile failure (``"Type: msg"``), or ``None``.
 
@@ -120,66 +251,17 @@ def evict_compile_traceback() -> Optional[str]:
 
 def reset_evict_path_stats() -> None:
     """Zero the per-path counters. Does NOT clear the sticky compile-failure flag
-    (that is a property of the build, not of one measured run)."""
+    (that is a property of the build, not of one measured run).
+
+    It DOES clear the one-shot bail rescue, and that is the right granularity:
+    the recompile budget is process-wide, so a cell can arrive with it already
+    spent by the cell before. One rescue per measured run means each cell can
+    recover once from someone else's spending, while a cell that bails twice on
+    its own still fails loudly instead of resetting the world every eviction.
+    """
     _EVICT_STATS["eager"] = 0
     _EVICT_STATS["compiled"] = 0
-
-
-def _compile_evict_enabled() -> bool:
-    """Whether to run the eviction through ``torch.compile`` (default OFF)."""
-    v = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _compile_evict_backend() -> Optional[str]:
-    """Optional ``torch.compile`` backend override for the eviction.
-
-    ``None`` (unset) uses the default (Inductor), which is what fuses the
-    launches on GPU. Set ``STICKYKV_COMPILE_EVICT_BACKEND`` to pick another —
-    ``aot_eager`` traces + runs eager (no C++/Triton codegen, so it validates the
-    tracing and semantics on a box without a compiler), ``cudagraphs`` for the
-    graph backend, etc.
-    """
-    v = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND", "").strip()
-    return v or None
-
-
-def _layer_major_decode() -> bool:
-    """Whether decode uses the layer-major store (default **ON**).
-
-    This is DECODE_SPEED_PLAN §4.1 and it is the shipped path, not an experiment:
-    one eviction for all ``L`` layers instead of ``L`` of them, which is a 32x cut
-    on ~64% of the per-token launch budget.
-
-    ``STICKYKV_LAYER_MAJOR_DECODE=0`` restores the per-layer eviction. It exists
-    for two reasons and no others: it is the control arm of
-    ``tests/test_layer_major_evict.py``, which asserts the two paths produce
-    byte-identical caches, and it is how the same A/B is run on a GPU. It is not
-    a fallback — nothing selects it automatically, and no failure degrades into
-    it; a layer-major path that cannot run raises.
-    """
-    v = os.environ.get("STICKYKV_LAYER_MAJOR_DECODE", "1").strip().lower()
-    return v in ("1", "true", "yes", "on")
-
-
-def _prefill_layer_major() -> bool:
-    """Whether PREFILL also allocates layer-major (default OFF).
-
-    Decode is layer-major unconditionally — that is DECODE_SPEED_PLAN §4.1 and
-    it is the default path, not a flag. Prefill is not, and the reason is memory
-    rather than taste: a layer-major prompt buffer means the first compaction has
-    to hold the whole ``L*B``-row prompt AND the whole ``L*B``-row steady store at
-    once, where per-layer buffers compact one at a time and only ever hold a
-    single layer's steady store alongside the prompt. At 4096/batch-32 that is
-    about +4 GB of peak — roughly 8% of the cell, taken straight out of max
-    batch, which is the number the whole method exists to raise.
-
-    So prefill stays per-layer and this knob exists to MEASURE the other side on
-    a box where the peak has headroom. It changes allocation only; the eviction,
-    the retained set and the cache contents are identical either way.
-    """
-    v = os.environ.get("STICKYKV_PREFILL_LAYER_MAJOR", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    _EVICT_BAIL_RETRIED["done"] = False
 
 
 class _LayerStateView:
@@ -252,8 +334,7 @@ class _ReadOnlySlotTableView(QuantSlotTable):
         self.window_size = parent.window_size
         self.head_dim = parent.head_dim
         self.num_kv_heads = parent.num_kv_heads
-        for field in ("key_codes", "key_scale", "key_zero",
-                      "val_codes", "val_scale", "val_zero",
+        for field in ("key_codes", "val_codes", *GRID_FIELDS,
                       "slot_wid", "slot_active", "slot_pos"):
             setattr(self, field, getattr(parent, field)[r0:r0 + rows])
         self._row_base = (
@@ -352,40 +433,443 @@ def _clamp_index(x: Tensor, hi) -> Tensor:
     return hi - (hi - x).clamp_min(0)
 
 
+def _emulating_precision_casts(fn):
+    """Wrap ``fn`` so Inductor keeps every narrowing cast in the eviction graph.
+
+    Inductor does not emulate intermediate precision casts by default: it drops
+    an ``fp32 -> fp16 -> fp32`` round trip and keeps the wider value in a
+    register. For most code that is a free accuracy win. In the eviction it is a
+    correctness bug, because three quantisers in that graph use the round trip
+    deliberately — they fit codes to the **fp16-stored** grid so the grid the
+    codes were fit to is bit-identical to the grid every later dequant reads
+    (``quant/quantizer.py`` module docstring, design §2):
+
+    - ``_affine_quantize`` (the int2 Q tier). Measured on 2.14 CPU Inductor over
+      24 seeds: without this flag the packed codes differ from eager on 11/24
+      seeds for keys and 14/24 for values — one int2 level, on elements whose
+      pre-round quantity straddles .5 because the two grids differ by an fp16
+      ulp. With it: 0/24.
+    - ``sketch._q_sym`` and ``sketch._q_up`` (the gate cards). Worse: 24/24 seeds
+      diverge, and ``_q_up``'s ``dequant >= x`` guarantee — which is what makes
+      the gate's Cauchy–Schwarz bound an upper bound at all — is violated 115
+      times in that sample. Its ``(1 + 2**-9)`` scale nudge is sized for the fp16
+      grid; against an un-narrowed one it is sized for the wrong grid. With this
+      flag: 0 divergences, 0 violations.
+
+    The sketch half is not new — those helpers were never behind a graph break,
+    so every compiled eviction since the cards landed has been building them on
+    the wrong grid. Tracing the int2 quantiser (removing its ``@_compile_disable``)
+    is what makes the flag load-bearing for the Q tier too.
+
+    Scoped, not global: ``config.patch`` is entered per call and restores the
+    process default on exit, so nothing else the host compiles is affected.
+    Inductor keys its code cache on config, so the wrapped callable compiles once
+    and the patch is a dict swap on every later call. A no-op when the backend is
+    not Inductor (``aot_eager`` runs eager kernels, which narrow by definition).
+    """
+    try:
+        from torch._inductor import config as inductor_config
+    except Exception:  # pragma: no cover - no Inductor on this build
+        return fn
+    if not hasattr(inductor_config, "emulate_precision_casts"):
+        # Then _quant_may_be_traced() is False and the int2 quantiser keeps its
+        # graph break, so the Q tier is safe. The sketch cards are NOT — they
+        # were never behind one — and on such a build there is no knob here that
+        # would protect them. That is the pre-existing behaviour, unchanged.
+        return fn  # pragma: no cover - torch-version dependent
+    return inductor_config.patch("emulate_precision_casts", True)(fn)
+
+
+class EvictionRanEager(RuntimeError):
+    """The compiled eviction body executed in Python instead of being traced.
+
+    A distinct type because it is a **run** property, not a **build** property,
+    and the two must not share a fate. A lowering failure says "this build
+    cannot lower this graph" -- true for every later cell, which is why
+    :data:`_EVICT_COMPILE_FAILED` is sticky. A Dynamo bail says "Dynamo declined
+    this frame right now", and the commonest reason is that the process-wide
+    recompile budget is already spent by an EARLIER cell. Filing that as a build
+    failure is what turned one failing cell into five untried ones on the
+    2026-09-19 sweep.
+    """
+
+
+def _scalar_outputs_off(fn):
+    """Wrap ``fn`` so ``.item()`` / ``.tolist()`` GRAPH-BREAK instead of going symbolic.
+
+    **This is the fix for the 2026-09-19 total outage, and it is a torch default
+    that flipped under code written for the other one.**
+
+    :func:`_evict_widths` reads three widths with one ``.tolist()`` and then
+    branches on them::
+
+        needs = torch.stack([m.sum(1).max() for m in masks]).tolist()
+        ...
+        if need <= 0 or bound <= 0:
+
+    Its docstring states the intended cost out loud -- *"that .item() costs one
+    graph break in the compiled eviction -- two Inductor graphs instead of one"*
+    -- and ``tests/test_evict_graph_breaks.py`` was written against exactly that,
+    down to the recorded message ``Unsupported Tensor.item() call with
+    capture_scalar_outputs=False``.
+
+    Under ``capture_scalar_outputs=True`` -- **the default since torch 2.6** --
+    ``.tolist()`` stops breaking and returns an *unbacked* symint instead. The
+    branch above then becomes a guard on ``u0 <= 0`` that Dynamo cannot resolve,
+    and its response is not a graph break: it abandons the frame and runs the
+    whole eviction EAGER. Measured on the 2026-09-19 run::
+
+        frames: {'total': 10, 'ok': 9}
+        9x  Could not guard on data-dependent expression u0 <= 0
+        Caused by: if need <= 0 or bound <= 0:   # cache.py:168 in _evict_widths
+
+    **Capturing this scalar symbolically is not merely unhelpful, it is
+    incompatible with the design.** The width is what ``_compact`` allocates
+    with, and ``_evict_widths`` exists precisely to pay one host sync for a real
+    integer, because a width that is ever too small routes overflow to a dump
+    column and silently drops work. A symbolic width cannot size that allocation
+    without a guard, and the guard is the thing that cannot be resolved. So the
+    sync is the point, and the break that comes with it is the designed
+    structure -- not a wart to be optimised away by a config default.
+
+    Scoped, not global, mirroring :func:`_emulating_precision_casts`:
+    ``config.patch`` is entered per call and restores the process default on
+    exit, so nothing else the host compiles is affected.
+    """
+    try:
+        from torch._dynamo import config as dynamo_config
+    except Exception:  # pragma: no cover - no Dynamo on this build
+        return fn
+    if not hasattr(dynamo_config, "capture_scalar_outputs"):
+        return fn  # pragma: no cover - torch-version dependent
+    return dynamo_config.patch("capture_scalar_outputs", False)(fn)
+
+
+#: Dynamo graphs this one code object may hold before the recompile limit fires.
+#:
+#: The default is 8, and the eviction blew it: the body used to take ``layer_idx``
+#: and index a Python list with it, so the 32 per-layer calls of the FIRST
+#: eviction minted 32 specialisations and the joint evictions -- the 39 that
+#: matter -- never got a slot. That is fixed at the source (see
+#: :meth:`WindowedCache._evict_two_tier`), so the specialisations left are the
+#: shape ones the body asks for ON PURPOSE: it makes its control ints concrete
+#: with ``int()`` so Inductor gets real integers instead of symbols, which costs a
+#: graph per distinct geometry during the fill phase and one at steady state.
+#:
+#: A limit is not a budget to spend -- it is the point at which Dynamo silently
+#: STOPS compiling. So it is set well clear of the handful expected, and the body
+#: raises outright if it ever runs eager anyway. The eviction is the only
+#: ``torch.compile`` in this repo, so nothing else competes for this.
+_EVICT_CACHE_SIZE_LIMIT = 64
+
+
+#: The recompile-limit config names Dynamo has used across versions. Both the
+#: per-code-object limit and the process-wide accumulated one matter, and both
+#: have been renamed, so every spelling is tried and the ones that exist are read
+#: back into the diagnosis.
+_DYNAMO_LIMIT_NAMES = (
+    "cache_size_limit", "accumulated_cache_size_limit",
+    "recompile_limit", "accumulated_recompile_limit",
+)
+
+
+def _raise_dynamo_cache_limit() -> None:
+    """Give the eviction's code object room for its shape specialisations.
+
+    Idempotent and cheap; called before every compiled eviction rather than once
+    at build, because a `torch._dynamo.reset()` or another library's
+    `config.patch` can put a limit back between evictions and the cost of
+    re-checking is four attribute reads.
+
+    **Only ever raised, never lowered** -- a caller that deliberately set a
+    higher limit keeps it, and Dynamo's `accumulated_*` limits default to 256,
+    well above ours.
+    """
+    import torch._dynamo as _td
+
+    # `hasattr` first: `torch._dynamo.config` is a ConfigModule that rejects
+    # unknown names.
+    for name in _DYNAMO_LIMIT_NAMES:
+        if not hasattr(_td.config, name):
+            continue
+        if getattr(_td.config, name) < _EVICT_CACHE_SIZE_LIMIT:
+            setattr(_td.config, name, _EVICT_CACHE_SIZE_LIMIT)
+
+
+def _dynamo_diagnosis() -> str:
+    """Dynamo's own state, read at the moment an eviction ran eager.
+
+    This exists because the first version of the eager check named three
+    possible causes and gave the reader no way to tell which. That cost a whole
+    GPU run: the failure said "one of these three" and the evidence needed to
+    choose was sitting in `torch._dynamo` the entire time. A diagnostic that
+    names a suspect list is not a diagnostic.
+
+    Everything here is read defensively -- this runs on a path that is already
+    failing, and a diagnosis that raises while diagnosing is worse than none.
+    """
+    lines = []
+    try:
+        import torch._dynamo as _td
+
+        limits = {n: getattr(_td.config, n, None) for n in _DYNAMO_LIMIT_NAMES}
+        lines.append(
+            "  limits now: "
+            + ", ".join(f"{n}={v}" for n, v in limits.items() if v is not None)
+            + f"   (this module raises them to {_EVICT_CACHE_SIZE_LIMIT})"
+        )
+        # If a limit reads BELOW ours, `_raise_dynamo_cache_limit` did not take
+        # -- a different config object, a ConfigModule that ignored the write, or
+        # something lowered it afterwards. That is cause 1 and it is now provable
+        # rather than inferred.
+        low = [n for n, v in limits.items()
+               if v is not None and v < _EVICT_CACHE_SIZE_LIMIT]
+        if low:
+            lines.append(
+                f"  !! {low} read BELOW {_EVICT_CACHE_SIZE_LIMIT}: the raise did "
+                "not take. THIS IS CAUSE 1 and it is a bug in "
+                "_raise_dynamo_cache_limit, not in your run."
+            )
+        for flag in ("disable", "suppress_errors"):
+            v = getattr(_td.config, flag, None)
+            if v:
+                lines.append(f"  !! torch._dynamo.config.{flag}={v}  <- CAUSE 2")
+    except Exception as exc:  # pragma: no cover - diagnosis must not raise
+        lines.append(f"  (dynamo config unreadable: {type(exc).__name__}: {exc})")
+
+    try:
+        import os as _os
+        for env in ("TORCHDYNAMO_DISABLE", "TORCH_COMPILE_DISABLE"):
+            if _os.environ.get(env):
+                lines.append(f"  !! {env}={_os.environ[env]}  <- CAUSE 2")
+    except Exception:  # pragma: no cover
+        pass
+
+    try:
+        from torch._dynamo.utils import counters as _counters
+
+        frames = dict(_counters.get("frames", {}))
+        if frames:
+            lines.append(f"  frames: {frames}   (ok << total means Dynamo bailed)")
+        # THE NUMBER THAT SETTLES THE TPOT REGRESSION, and it is free: Dynamo
+        # publishes it. `_EVICT_STATS["compiled"]` counts CALLS through the
+        # compiled callable and says nothing about how many graphs were built.
+        # If this reads ~2x the eviction count, the body is minting a graph per
+        # eviction -- `T_fp` and `W` are int()-forced and both move while the Q
+        # tier fills -- and the compile time IS the regression. A wrapper around
+        # the backend was tried to get this and broke the sweep; see
+        # `_build_compiled_evict`.
+        stats = dict(_counters.get("stats", {}))
+        if stats:
+            lines.append(f"  GRAPHS BUILT: {stats}   <- ~2x the eviction count "
+                         "means a graph per eviction")
+        breaks = _counters.get("graph_break", {})
+        if breaks:
+            top = sorted(breaks.items(), key=lambda kv: -kv[1])[:5]
+            lines.append("  top graph breaks (CAUSE 3 if one of these is new):")
+            lines.extend(f"      {n}x  {r}" for r, n in top)
+            # The one we have already diagnosed and fixed. If it is back, the
+            # scoped patch in `_scalar_outputs_off` is not reaching the trace.
+            if any("data-dependent" in r or "u0" in r for r, _ in top):
+                lines.append(
+                    "  !! a data-dependent guard is back. That is the KNOWN "
+                    "2026-09-19 outage: `_evict_widths` branches on a "
+                    "`.tolist()` width, which must GRAPH-BREAK. Check that "
+                    "`_scalar_outputs_off` is still wrapping the compiled "
+                    "callable and that capture_scalar_outputs reads False "
+                    "during the trace."
+                )
+    except Exception as exc:  # pragma: no cover
+        lines.append(f"  (dynamo counters unreadable: {type(exc).__name__}: {exc})")
+
+    lines.append(
+        f"  evictions compiled before this one: {_EVICT_STATS['compiled']}. "
+        "If that is large and this is the first failure, the graph count grew "
+        "with the SHAPES -- the body forces int() on W and T_fp, which move at "
+        "every eviction until the Q tier stops filling, so a run that never "
+        "reaches steady state mints a graph per eviction."
+    )
+    return "\n".join(lines)
+
+
 def _build_compiled_evict(dynamic: bool):
     """``torch.compile`` the eviction body. Lazy — never raises here; a lowering
     failure surfaces on the first CALL, not at construction."""
+    _raise_dynamo_cache_limit()
+    # NO custom backend -- but NOT for the reason first recorded here. A counting
+    # wrapper around `compile_fx` was tried on 2026-09-19 and the sweep failed
+    # with `IndexError: list assignment index out of range`; that was blamed on
+    # the wrapper. **It was not the wrapper.** The next run, with the wrapper
+    # removed, raised the identical error under stock `backend='inductor'`. The
+    # cause is `merge_view_inputs` (see `_EVICT_COMPILE_HELP`).
+    #
+    # The wrapper is still gone, on its own merits: the graph count it existed
+    # to collect is already published read-only in `torch._dynamo.utils.counters`
+    # (see `_dynamo_diagnosis`), so it bought a free number and added a moving
+    # part to the one path in this repo that cannot afford one.
     kw: Dict[str, Any] = {"dynamic": dynamic}
-    backend = _compile_evict_backend()
-    if backend is not None:
-        kw["backend"] = backend
-    return torch.compile(WindowedCache._evict_two_tier_impl, **kw)
+    # Both wrappers are scoped `config.patch`es entered per call. `_scalar_
+    # outputs_off` is outermost because it governs DYNAMO (whether `.tolist()`
+    # breaks the graph at all) while `_emulating_precision_casts` governs
+    # INDUCTOR (how the resulting graphs lower), so the former has to be in
+    # effect while the latter's graphs are being traced.
+    return _scalar_outputs_off(
+        _emulating_precision_casts(
+            torch.compile(WindowedCache._evict_two_tier_impl, **kw)))
 
 
 _EVICT_COMPILE_HELP = """The compiled eviction is KERNEL-OR-ERROR: it never silently runs the eager
-body under a compiled label -- the whole point of the flag is to MEASURE the
-compiled path, and a quiet eager run would report eager numbers as if compiled.
-So this raises rather than falling back.
+body under a compiled label -- the point is to MEASURE the compiled path, and a
+quiet eager run would report eager numbers as if compiled. So this raises rather
+than falling back.
+  THERE IS NO WAY TO TURN IT OFF. Compilation is unconditional (see the banner
+at the top of this module): `_evict_two_tier` always calls the compiled body, on
+every backend and every device. `STICKYKV_COMPILE_EVICT`, `--compile-evict` and
+`STICKYKV_COMPILE_EVICT_BACKEND` were deleted in 0974687 ("one production path,
+no fallbacks") and this text used to still advertise all three -- so a failure
+here sent you after knobs that no longer exist. This module reads NO environment
+variable. `perf_runner` still SETS `STICKYKV_COMPILE_EVICT=1`, which nothing
+reads; it records intent, it does not control anything. A lowering failure is
+therefore a total outage until it is fixed, which is why the diagnosis below is
+the only path forward.
   What this is: torch.compile / Inductor could not lower
-WindowedCache._evict_two_tier_impl on this build. The known torch<=2.6 causes --
-a symbolic `((I)//ws)` guard and an `aten.amin` StarDep from a single-sided
-clamp -- are addressed in the body (concrete shape ints + a two-sided clamp). If
-it still fails, the traceback names the op that did not lower.
-  To get numbers now: rerun with STICKYKV_COMPILE_EVICT=0 (or --compile-evict 0).
-That runs the EAGER eviction -- correct, just launch-bound -- so the ~81%
-eviction launch budget is not cut and TPOT stays high.
-  To diagnose the lowering: the FULL Inductor traceback (which names the exact
-aten op / source line) is in evict_compile_traceback() and is written by the perf
-runner to <output_dir>/evict_compile_error_*.txt -- read that first. Also
-TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape,
-and try STICKYKV_COMPILE_EVICT_BACKEND=aot_eager (traces + runs without codegen --
-if THAT works the failure is Inductor codegen, not the traced graph)."""
+WindowedCache._evict_two_tier_impl on this build. Both attempts are reported --
+`dynamic=True` first, then `dynamic=False` after a `torch._dynamo.reset()` (the
+reset is load-bearing: without it Dynamo reuses the code object's frame state and
+the "static" retry gets automatic-dynamic promoted straight back, so it re-raises
+the identical symbolic error). The message recorded below is the SECOND attempt's.
+  The known causes are addressed at the source, and each has a named home:
+    * `The argument '((I)//8)' is not comparable` -- a `torch.cat` in this graph.
+      READ THIS BEFORE TOUCHING A `.shape` READ: it is NOT a symbolic-shape bug,
+      and two rounds of forcing `int()` on shape reads (`d44baba`, `014c40b`)
+      changed nothing because of that. `I` is not the imaginary unit and not a
+      shape symbol -- it is `torch.utils._sympy.functions.Identity`, Inductor's
+      "do not expand this" wrapper, which prints as `I` only because sympy's
+      StrPrinter defines `_print_Identity` for the identity MATRIX and dispatches
+      on the class name. So `((I)//8)` is `FloorDiv(Identity(<expr>), ws)`.
+      Inductor builds that wrapper in exactly one place --
+      `_inductor/lowering.py::pointwise_cat` -- so a cat lowered pointwise is the
+      only way to get one. It then blows up in `_simplify_loops` -> `stride_vars`,
+      which substitutes every index var with 0: `Identity(i - h)` becomes
+      `Identity(-h)`, which has no free symbols, and sympy's `Min`/`Max` rejects
+      any arg that `is_number` but is not `is_comparable`. That `is_number` is
+      the proof the value was already CONCRETE -- and why the `dynamic=False`
+      retry failed with the byte-identical message instead of a different one.
+      The fix is never `int()`; it is to build the tensor without a cat:
+      `compact.join` for a plain join, `effective._rotate_half_no_cat` for RoPE's
+      rotation. `test_the_compiled_eviction_contains_no_cat` asserts zero cats in
+      this graph, which is what makes the failure impossible rather than
+      unlikely; it asserts ZERO because removing one cat changes the fusion
+      heuristics and can expose another (it did, twice).
+    * `IndexError: list assignment index out of range` in
+      `_functorch/_aot_autograd/runtime_wrappers.py::merge_view_inputs` --
+      **FIXED 2026-09-19 by moving the store write out of the graph; read this
+      before putting one back.** It is an UPSTREAM bug, not a lowering failure
+      in the usual sense. AOTAutograd builds "synthetic
+      bases" when graph inputs are VIEWS ALIASING A COMMON BASE and at least one
+      is mutated, and it mis-sizes `post_processed_calling_convention_meta`.
+      This body is made of exactly that shape: `_LayerStateView` ->
+      `joint.key_states` -> `_key_buf`, plus the `body_k` / `body_v` /
+      `body_pos` slices of the same buffer.
+      It fires in the RESUMED region (`torch_dynamo_resume_in_..._at_2701`, at
+      `store.demote_many`), i.e. the half created by `_evict_widths`' `.tolist()`
+      break -- so it is reachable only when that break exists, which is to say
+      only when `capture_scalar_outputs` is False. With it True (the torch 2.6
+      default) there is no break and Dynamo abandons the whole frame to eager
+      instead. Both roads ended at "not compiled", by two independent
+      mechanisms.
+      **The fix was (B), and the aliasing pair is named exactly:**
+      `replace_body` does `_key_buf[:, :, num_sink:n] = body_key`, mutating the
+      BASE that `state.key_states` is a VIEW of -- and the region reads that
+      view, as `body_k`. Three such pairs (key / value / positions); the
+      `replace` branch is worse, reading `state.key_states` and reallocating in
+      one expression. Both now run in `_evict_two_tier`, outside the graph, and
+      the compiled body returns the compacted body instead of installing it.
+      **The invariant to keep: the compiled eviction may mutate the slot table
+      (separate allocations) but must never write a buffer it reads a view of.**
+      Putting such a write back re-breaks the build.
+    * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
+    * a symbolic scalar reaching `torch.arange`, a `torch.where` sentinel, a
+      slice bound or a reshape extent. Still a real hazard class, just NOT the
+      one above: every shape-derived scalar in the region is forced with `int()`
+      and `test_scalar_shape_reads_in_the_compiled_region_are_int_forced` keeps
+      it that way. `B` (and the flattened `B * n`) is the one axis deliberately
+      left symbolic.
+  If it still fails, the traceback names the op that did not lower.
+  To diagnose: the FULL Inductor traceback (which names the exact aten op /
+source line) is in evict_compile_traceback() and is written by the perf runner to
+<output_dir>/evict_compile_error_*.txt -- read that first. Then
+TORCH_LOGS='+inductor,graph_breaks' TORCHDYNAMO_VERBOSE=1 on the failing shape.
+  To reproduce on a CPU box, with no GPU: `pytest
+tests/test_evict_graph_breaks.py -k no_cat`. It needs
+`force_pointwise_cat=True`, and that is not a detail -- `lowering.py::cat`
+returns a `ConcatKernel` UNCONDITIONALLY for CPU devices ("negative performance
+impact of pointwise_cat optimization on CPU"), so a CPU box never takes the
+pointwise path and never builds an `Identity` at all. That branch, not anything
+about the C++ backend tolerating symbolic ints, is why this class of failure is
+invisible on CPU by default. The test also disables `fx_graph_cache`, because a
+cache hit lowers nothing and passes vacuously."""
 
 
-def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
+def _cuda_oom_cause(exc: BaseException) -> Optional[BaseException]:
+    """The out-of-memory exception inside ``exc``'s cause chain, or ``None``.
+
+    Kept separate from the lowering-failure path because the two mean opposite
+    things. A lowering failure is a property of the BUILD -- it will fail the
+    same way on every later cell, so recording it once and failing fast is
+    right. An OOM is a property of THIS CELL's shape and the allocator's
+    fragmentation right now; the next cell may be half the size and fine.
+
+    Returns the exception rather than a bool so the caller can re-raise the OOM
+    *itself*. That matters: ``perf_runner`` catches ``torch.cuda.OutOfMemoryError``
+    by type to mark a cell ``oom`` (skipped, and legitimate max-B evidence) and
+    everything else to mark it ``errored`` (a code/config bug, explicitly NOT
+    max-B evidence). torch.compile may deliver the OOM wrapped in a Dynamo
+    ``BackendCompilerFailed``, and re-raising the wrapper would file a genuine
+    OOM under "errored". Unwrapping keeps the two categories meaning what the
+    runner's own log message says they mean.
+    """
+    chain: List[BaseException] = []
+    seen: set = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+
+    # Typed first, and over the WHOLE chain before falling back to the message.
+    # Order matters: Dynamo's `BackendCompilerFailed` repeats the inner error's
+    # text, so a message test applied depth-first returns the wrapper -- which
+    # is precisely the type the perf runner does not catch.
+    for c in chain:
+        if isinstance(c, torch.cuda.OutOfMemoryError):
+            return c
+    for c in chain:
+        if type(c).__name__ in ("OutOfMemoryError", "CudaOutOfMemoryError"):
+            return c
+    # Last resort: the phrase, but normalised to the type the runner catches.
+    # A wrapper that only *says* "out of memory" is still an OOM as far as the
+    # sweep is concerned, and filing it as a build failure is the bug this
+    # function exists to stop. The original is attached, so the autopsy and the
+    # traceback still show what actually happened.
+    for c in chain:
+        if "out of memory" in str(c).lower():
+            normalised = torch.cuda.OutOfMemoryError(str(c))
+            normalised.__cause__ = exc
+            return normalised
+    return None
+
+
+def _run_compiled_evict(cache, state, store, policy, step: int):
     """Run one eviction through ``torch.compile``, or RAISE. Kernel-or-error: no
     eager fallback (a silent eager run under a compiled label defeats the whole
-    measurement -- the design intent). On success ``cache`` is mutated in place.
+    measurement -- the design intent). On success ``cache`` is mutated in place
+    and the body's ``(pre-eviction scores, retained indices)`` pair is returned
+    for the caller to record as telemetry.
+
+    ``step`` is taken for the failure message only and is NOT forwarded: an int
+    that increments every eviction is an int Dynamo specialises on, and the graph
+    this function exists to build must not carry one.
 
     Tries ``dynamic=True`` first (one graph across the varying window count),
     then once with ``dynamic=False`` (concrete shapes are the belt to the body's
@@ -402,28 +886,89 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
         # A prior eviction already proved this build cannot lower it; fail fast
         # with the recorded reason rather than re-attempting the compile per cell.
         raise RuntimeError(
-            "STICKYKV_COMPILE_EVICT is set but torch.compile of the two-tier "
-            "eviction already failed on this build "
-            f"({_EVICT_COMPILE_FAILED}).\n" + _EVICT_COMPILE_HELP
+            "torch.compile of the two-tier eviction already failed on this "
+            f"build ({_EVICT_COMPILE_FAILED}); refusing the eviction at decode "
+            f"step {step}.\n" + _EVICT_COMPILE_HELP
         )
+    # Before EVERY call, not only at build: a `torch._dynamo.reset()` (this
+    # function performs one on the static retry) or another library's
+    # `config.patch` can put a limit back between evictions, and re-checking is
+    # four attribute reads against a body that runs once per `ws` steps.
+    _raise_dynamo_cache_limit()
     if _COMPILED_EVICT_FN is None:
         _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
     try:
-        _COMPILED_EVICT_FN(cache, layer_idx, step)
+        out = _COMPILED_EVICT_FN(cache, state, store, policy)
         _announce_evict_path_once(compiled=True)
         _EVICT_STATS["compiled"] += 1
-        return
+        return out
+    except EvictionRanEager:
+        # A Dynamo BAIL, not a lowering failure -- see EvictionRanEager. The
+        # dominant cause is a spent recompile budget, and the budget is
+        # process-wide: the 2026-09-19 sweep spent it in its FIRST cell (~32
+        # evictions x 2 regions while the Q tier filled) and every later cell
+        # bailed on its first eviction.
+        #
+        # So clear the caches and try once more. `reset()` is the only thing
+        # that gives this code object a fresh budget, it is process-global (safe
+        # here -- the eviction is the only torch.compile in this repo), and the
+        # retry is cheap relative to the sweep it rescues. Safe to retry on the
+        # same step: the check that raised sits at the TOP of the body, before
+        # any mutation, so `cache` is untouched.
+        if _EVICT_BAIL_RETRIED["done"]:
+            raise
+        _EVICT_BAIL_RETRIED["done"] = True
+        import torch._dynamo as _td
+        _td.reset()
+        _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=True)
+        out = _COMPILED_EVICT_FN(cache, state, store, policy)
+        _announce_evict_path_once(compiled=True)
+        _EVICT_STATS["compiled"] += 1
+        return out
     except Exception as e_dyn:  # pragma: no cover - GPU/Inductor-build dependent
+        # An OOM is a RESOURCE condition, not a lowering failure, and the two
+        # must not be confused. `_EVICT_COMPILE_FAILED` is sticky by design --
+        # it means "this build cannot lower the body", so no later cell wastes
+        # a compile on it. Recording an OOM there poisons every remaining cell
+        # in the sweep: one 4096/batch-32 row that ran out of memory turned all
+        # six rows of a table into "already failed on this build", which is not
+        # what happened and is not max-B evidence either. Re-raise it as itself
+        # so the perf runner's own OOM handling (skip_if_oom, the max-B ladder)
+        # sees the exception it is written to catch.
+        oom = _cuda_oom_cause(e_dyn)
+        if oom is not None:
+            raise oom
         terminal = e_dyn
         if not _EVICT_COMPILE_TRIED_STATIC:
             _EVICT_COMPILE_TRIED_STATIC = True
             try:
+                # RESET FIRST, or the retry is not a retry. `torch.compile` keys
+                # its caches on the code object, and `_evict_two_tier_impl` is
+                # the same one we just failed on: Dynamo's per-code-object frame
+                # state still records those dims as having varied, so
+                # `dynamic=False` gets automatic-dynamic promoted right back and
+                # the "static" attempt re-raises the identical symbolic error.
+                # That is why a `((I)//8)` lowering failure was reported twice
+                # and read as one — the message the runner prints is the STATIC
+                # attempt's, recorded only after this branch has run.
+                #
+                # `reset()` is process-global, and that is acceptable here only
+                # because the eviction is the ONLY `torch.compile` in this repo
+                # (it also clears Dynamo's counters, which `perf_runner` reads —
+                # but this path has already failed, and the failure's own
+                # traceback is what gets recorded). Imported locally: `torch`
+                # alone does not bring `torch._dynamo` in on every build.
+                import torch._dynamo as _td
+                _td.reset()
                 _COMPILED_EVICT_FN = _build_compiled_evict(dynamic=False)
-                _COMPILED_EVICT_FN(cache, layer_idx, step)
+                out = _COMPILED_EVICT_FN(cache, state, store, policy)
                 _announce_evict_path_once(compiled=True)
                 _EVICT_STATS["compiled"] += 1
-                return
+                return out
             except Exception as e_static:
+                oom = _cuda_oom_cause(e_static)
+                if oom is not None:
+                    raise oom
                 terminal = e_static
         _EVICT_COMPILE_FAILED = f"{type(terminal).__name__}: {terminal}"[:400]
         # Capture the WHOLE Inductor stack before we lose it — it names the aten
@@ -435,8 +980,8 @@ def _run_compiled_evict(cache, layer_idx: int, step: int) -> None:
         )
         _COMPILED_EVICT_FN = None
         raise RuntimeError(
-            "STICKYKV_COMPILE_EVICT is set but torch.compile of the two-tier "
-            f"eviction failed ({_EVICT_COMPILE_FAILED}).\n" + _EVICT_COMPILE_HELP
+            "torch.compile of the two-tier eviction failed at decode step "
+            f"{step} ({_EVICT_COMPILE_FAILED}).\n" + _EVICT_COMPILE_HELP
         ) from terminal
 
 
@@ -448,7 +993,7 @@ def _announce_evict_path_once(compiled: bool) -> None:
     if compiled:
         print(
             "[StickyKV] eviction path: COMPILED two-tier eviction ACTIVE [OK] "
-            "(STICKYKV_COMPILE_EVICT=1)",
+            "(unconditional; no env var selects this)",
             flush=True,
         )
     else:
@@ -552,6 +1097,12 @@ class WindowedCache(_HFCacheBase):
                     # Provisional: `None` means auto, resolved from the real batch
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
+                    sketch_enabled=self.resolved.quant_sketch_enabled,
+                    card_bits=self.resolved.quant_card_bits,
+                    # The promotion-payload oracle keeps each window's original
+                    # fp K/V beside its codes; off unless asked for.
+                    shadow_dtype=(kv_dtype if self.resolved.quant_promote_source
+                                  == "original" else None),
                 )
                 for _ in range(num_layers)
             ]
@@ -668,7 +1219,7 @@ class WindowedCache(_HFCacheBase):
         # cache at the END of each step is identical; only "append then compact"
         # becomes "compact then append". tests/test_layer_major_evict.py pins
         # that byte-for-byte against the per-layer path.
-        self._layer_major: bool = _layer_major_decode()
+        self._layer_major: bool = True
         self._joint: Optional[CacheState] = None
         self._joint_store: Optional[QuantizedStore] = None
         self._joint_step: int = 0
@@ -727,6 +1278,23 @@ class WindowedCache(_HFCacheBase):
         self._memoization_resolved = True
         pref = self.resolved.quant_memoize_read
         memo = (batch_size == 1) if pref is None else pref
+        # A LIVE gate means no memo, full stop; config rejects an explicit True.
+        # The memo is keyed on store.version -- which only moves at eviction --
+        # while the gate's selected set moves every step, so it would serve a
+        # set the gate did not choose.
+        #
+        # `quant_read_gate=False` makes the memo legitimate again -- ungated
+        # there is no per-step selected set -- so the auto rule above turns it
+        # back on at B=1, saving 7 of every 8 steps' whole-tier dequant.
+        #
+        # Scope, because this is easy to over-read: the memo covers
+        # `effective_q_tier`, which is reached only through `_joint_qtier_read`
+        # -> `_materialize_joint`. On CUDA the fused two-tier kernel takes raw
+        # int2 and dequantizes inside, so that path is not taken and this line
+        # changes nothing about a GPU decode step. It is the eager/materialize
+        # path -- CPU, and the eager backend -- that gets the 8x back.
+        if self.resolved.quant_sketch_enabled:
+            memo = False
         for store in self._stores:
             if store is not None:
                 store.memoize_read = memo
@@ -1064,6 +1632,9 @@ class WindowedCache(_HFCacheBase):
                     "layer_idx": layer_idx,
                     "qtier": qtier,
                     "score_meta": score_meta,
+                    # The gate needs `q`, which update() never sees; the patch
+                    # selects with it in hand. See flash_decode._run_fused.
+                    "gate": self._fused_ctx[layer_idx]["gate"],
                     "num_sink": self.resolved.num_sink_tokens,
                     "window_size": ws,
                     "scaling": self._attn_scaling,
@@ -1464,6 +2035,7 @@ class WindowedCache(_HFCacheBase):
                 "layer_idx": layer_idx,
                 "qtier": qtier,
                 "score_meta": score_meta,
+                "gate": self._fused_ctx[layer_idx]["gate"],
                 "num_sink": self.resolved.num_sink_tokens,
                 "window_size": ws,
                 "scaling": self._attn_scaling,
@@ -1497,7 +2069,12 @@ class WindowedCache(_HFCacheBase):
         L = self.num_layers
         idx = store.table.active_order(n)                       # [R, n] slots
         kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)  # [R*n, …]
-        fields = [t.reshape(L, B, n, *t.shape[1:]) for t in (kc, ks, kz, vc, vs, vz)]
+
+        def by_layer(t: Tensor) -> Tensor:
+            return t.reshape(L, B, n, *t.shape[1:])
+
+        kc, vc = by_layer(kc), by_layer(vc)
+        ks, kz, vs, vz = (g.map(by_layer) for g in (ks, kz, vs, vz))
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -1507,20 +2084,40 @@ class WindowedCache(_HFCacheBase):
             self.rope_module, qpos_flat, self._kv_dtype)
         self._joint_qpos = qpos_flat
 
+        # The gate's cards ride the same one-gather-for-all-L trick as the codes:
+        # `gather_sketch` keeps the [R, n] leading pair, and R is layer-major, so
+        # layer i's rows are the same [r0, r0+B) slice everything else here uses.
+        joint_gate = self._gate_ctx(store, idx, n)
+
         key = (store.version, n, B)
-        kc, ks, kz, vc, vs, vz = fields
         for i in range(L):
             r0 = i * B
+            # `.map` and not `[i]`: a QGrid is a NamedTuple, so indexing it with
+            # an int takes its first FIELD, not its first layer.
             self._fused_ctx[i] = {
                 "qkey": key,
                 "qtier": {
-                    "k_codes": kc[i], "k_scale": ks[i], "k_zero": kz[i],
-                    "v_codes": vc[i], "v_scale": vs[i], "v_zero": vz[i],
+                    "k_codes": kc[i], "k_scale": ks.map(lambda t: t[i]),
+                    "k_zero": kz.map(lambda t: t[i]),
+                    "v_codes": vc[i], "v_scale": vs.map(lambda t: t[i]),
+                    "v_zero": vz.map(lambda t: t[i]),
                     "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
                     "window_size": ws,
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
+                # `**joint_gate` first, then override only the row-sliced
+                # tensors: every non-tensor key (`n_sel`, `bits`, and whatever
+                # _gate_ctx grows next) passes through. Listing keys by hand
+                # dropped `bits` here while the per-layer path carried it, and
+                # _run_fused died on every layer-major decode.
+                "gate": None if joint_gate is None else {
+                    **joint_gate,
+                    "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
+                    "anchor": joint_gate["anchor"][r0:r0 + B],
+                    "centroid": tuple(t[r0:r0 + B]
+                                      for t in joint_gate["centroid"]),
+                },
             }
 
     def _fused_qtier_joint(self, layer_idx: int, store, B: int, n: int, ws: int):
@@ -1635,12 +2232,12 @@ class WindowedCache(_HFCacheBase):
         # (position-only) the kernel applies in registers.
         idx = store.table.active_order(n)                     # [B, n] slots
         kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
-        kc = kc.reshape(B, n, *kc.shape[1:])
-        ks = ks.reshape(B, n, *ks.shape[1:])
-        kz = kz.reshape(B, n, *kz.shape[1:])
-        vc = vc.reshape(B, n, *vc.shape[1:])
-        vs = vs.reshape(B, n, *vs.shape[1:])
-        vz = vz.reshape(B, n, *vz.shape[1:])
+
+        def by_row(t: Tensor) -> Tensor:
+            return t.reshape(B, n, *t.shape[1:])
+
+        kc, vc = by_row(kc), by_row(vc)
+        ks, kz, vs, vz = (g.map(by_row) for g in (ks, kz, vs, vz))
         qpos_flat = qpos.reshape(B, n * ws)
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -1657,8 +2254,50 @@ class WindowedCache(_HFCacheBase):
         self._fused_ctx[layer_idx] = {
             "qkey": key, "qtier": qtier, "qpos": qpos_flat,
             "mkey": None, "score_meta": None,
+            "gate": self._gate_ctx(store, idx, n),
         }
         return qtier
+
+    def _gate_ctx(self, store, idx: Tensor, n: int) -> Optional[Dict]:
+        """The read gate's hand-off — the cards, the anchor, and how many to keep.
+
+        ``None`` only when the store has **no cards** — ``quant_sketch_enabled``
+        off, or nothing demoted yet. That is a capability fact, not a setting:
+        there is nothing to select on.
+
+        The ratio does **not** get its own path. ``1.0`` used to return ``None``
+        and skip the gate entirely, which meant the shipped config and the
+        control arm ran different code and a reader had to know which. Now every
+        ratio takes the same route and ``1.0`` simply selects every window — the
+        no-op proof, on the one implementation, rather than a second one.
+
+        Memoized with the tier for the same reason the tier is (design §10): cards
+        are written once when a window is sealed and reactivated unchanged on
+        re-demotion, so between evictions this gather is pure repeat work.
+
+        ``n_sel`` is resolved against the **live** ``n_active`` rather than pinned,
+        because ``N_q`` moves with the shape and a fixed count would not be the
+        same fraction anywhere.
+        """
+        ratio = self.resolved.quant_gate_ratio
+        if not (store.sketch_enabled and store._anchor is not None
+                and getattr(store.table, "sketch", False)):
+            return None
+        card = store.table.gather_sketch(idx)
+        # The centroid columns ride the same gather, so the windows this step
+        # skips cost no second pass over the tier to attend through. `vm_q` /
+        # `vm_s` are SKETCH_FIELDS[-2:]; the kernel wants them contiguous and
+        # separate from the scan fields, which the gather already gives.
+        # `bits` travels with the card because the card cannot say how it was
+        # encoded: a packed field's shape does not determine its width once `D`
+        # is not known, and both kernels take the widths as constexprs.
+        return {
+            "card": card,
+            "anchor": store._anchor,
+            "centroid": (card[-2], card[-1], store._v_anchor),
+            "bits": store.card_bits,
+            "n_sel": max(1, math.ceil(ratio * n)),
+        }
 
     def _fused_meta(self, layer_idx: int, state, ws: int):
         """The ``(order, q_token_len)`` scatter map — memoized per window epoch.
@@ -1728,6 +2367,52 @@ class WindowedCache(_HFCacheBase):
             out_dtype=state.key_states.dtype,
         )
 
+    def _record_evict_widths(self, fresh: Tensor, promote: Tensor,
+                             react: Tensor, n_q: int, W: int) -> None:
+        """How many lanes each eviction actually used, against the width it got.
+
+        ``_compact`` allocates by **rank into a worst-case width**, not by count:
+        the counts are ragged per row (*"row 0 may demote 4 windows while row 1
+        demotes none"*), so allocating by count would need the max, and the max
+        needs a host sync. the design notesD1 proposes paying that sync -- one
+        per eviction -- to stop un-rotating, quantizing and sketching a
+        ``[L*B, n_q, H_kv, ws, D]`` tensor of which most lanes are masked away.
+
+        **D1's size is entirely this ratio, and nothing has ever printed it.**
+        DECODE_NEXT.md §7 lists it as the risk the estimate rests on: *"If the
+        real count is routinely close to n_q, D1 is worth little."* So measure
+        before rewriting, especially now that the eviction actually fuses (the
+        waste is pointwise work inside a fused kernel, not sixteen launches of
+        it, which is a different and un-sized quantity).
+
+        **This costs no sync and no graph break**, which is the whole reason it
+        is a running max in device memory rather than the ``.item()`` D1 wants.
+        A ``.item()`` here reintroduces exactly the break
+        ``tests/test_evict_graph_breaks.py`` pins at zero -- measured:
+        ``Unsupported Tensor.item() call with capture_scalar_outputs=False``.
+        The buffer hangs off ``self``, which is argument 0 of the compiled body,
+        so Inductor functionalizes the mutation like any other input mutation.
+
+        Read it with :func:`evict_width_stats`, which syncs once, on demand,
+        outside whatever window was being timed.
+        """
+        buf = getattr(self, "_evict_widths", None)
+        if buf is None or buf.device != fresh.device:
+            buf = torch.zeros(6, dtype=torch.long, device=fresh.device)
+            self._evict_widths = buf
+        f = fresh.sum(1).max()
+        p = promote.sum(1).max()
+        r = react.sum(1).max()
+        buf[0] += 1
+        buf[1] = torch.maximum(buf[1], f)
+        buf[2] = torch.maximum(buf[2], p)
+        buf[3] = torch.maximum(buf[3], r)
+        buf[4] += f                      # running sums -> a mean, not just a max
+        buf[5] += p
+        # n_q and W are Python ints (tier_counts is config arithmetic), so they
+        # are trace-time constants -- recorded on the host, never in the graph.
+        self._evict_width_bound = (int(n_q), int(W))
+
     @staticmethod
     def _compact(src: Tensor, mask: Tensor, width: int) -> Tuple[Tensor, Tensor]:
         """Gather ``src``'s masked lanes to the front of a ``[B, width]`` tensor.
@@ -1749,8 +2434,12 @@ class WindowedCache(_HFCacheBase):
         """
         B = mask.shape[0]
         rank = mask.cumsum(1) - 1                                   # [B, W]
-        dump = torch.full_like(rank, width)
-        idx = torch.where(mask & (rank < width), rank.clamp_min(0), dump)
+        # `width` as a SCALAR other, not a full_like tensor of it: the tensor was
+        # a [B, W] int64 allocation and fill per call, three times an eviction,
+        # to be read by one `where`. And no `clamp_min(0)` on the true branch --
+        # a lane the condition selects has `mask` true, so its `rank` is already
+        # >= 0; the -1 lanes it was guarding take `width` regardless.
+        idx = torch.where(mask & (rank < width), rank, width)
         out = torch.full((B, width + 1), -1, dtype=src.dtype, device=src.device)
         out.scatter_(1, idx, src)
         valid = torch.zeros((B, width + 1), dtype=torch.bool, device=src.device)
@@ -1780,9 +2469,7 @@ class WindowedCache(_HFCacheBase):
         rows instead of ``B``, so all ``L`` layers' 273 launching ops collapse
         into one set of 273 (§4.1).
 
-        Default (``STICKYKV_COMPILE_EVICT`` off) calls the eager implementation
-        below — byte-for-byte the historic path, one extra function-pointer hop.
-        With it ON, the body is run through a lazily-built, process-global
+        The body always runs through a lazily-built, process-global
         ``torch.compile`` (``dynamic=True`` for the varying window count), which
         fuses the eviction step's ~360 pointwise / gather / scatter / quantize
         launches into a handful of kernels. That step is ~89% of the fused-decode
@@ -1793,11 +2480,10 @@ class WindowedCache(_HFCacheBase):
         are identical to the eager path. It fires once per ``ws`` steps, so a
         compile / recompile amortizes.
 
-        **Kernel-or-error when enabled — it never falls back to eager.** A silent
-        (or even loud) eager run under a "compiled" label defeats the flag's
-        entire purpose, which is to MEASURE the compiled path; an eager run would
-        report eager numbers, and the ~81%-of-budget eviction step would look
-        cut when it was not. So if ``torch.compile`` cannot lower the body,
+        **Kernel-or-error — it never falls back to eager.** A silent (or even
+        loud) eager run under a "compiled" label would report eager numbers, and
+        the ~81%-of-budget eviction step would look cut when it was not. So if
+        ``torch.compile`` cannot lower the body,
         :func:`_run_compiled_evict` raises (:data:`_EVICT_COMPILE_FAILED` records
         the reason for provenance) rather than running eager — the perf runner
         then marks that cell ``errored``, loudly, instead of quietly mislabelling
@@ -1809,18 +2495,127 @@ class WindowedCache(_HFCacheBase):
         (the shape-derived control ints are made concrete, and the clamp is
         two-sided), so on a supported build it now compiles rather than raising.
         If a build still cannot lower it, the raised error names the failing op
-        and the steps to get numbers (``STICKYKV_COMPILE_EVICT=0`` runs eager).
+
+        **``layer_idx`` never crosses into the compiled body, and that is
+        load-bearing** (2026-09-19). It used to: the body opened with
+        ``self._evict_targets(layer_idx)``, which indexes ``self._states`` --  a
+        PYTHON LIST -- so Dynamo specialised on the integer's value and built one
+        graph per layer. The first eviction runs per layer, 32 times, so it blew
+        ``cache_size_limit`` at layer 8, and Dynamo's response to that limit is to
+        run the frame EAGER. Every eviction after it, including all 39 joint ones
+        that actually matter, ran eager under a "compiled" label:
+
+            torch._dynamo hit config.cache_size_limit (8)
+              function: '_evict_two_tier_impl'
+              last reason: 0/0: L['layer_idx'] == 0   # self._states[layer_idx]
+
+        ``_EVICT_STATS`` could not see it -- it counts calls to the compiled
+        CALLABLE, and the callable was called; it was Dynamo underneath that
+        declined. A profile caught it as "3 compiled / 0 eager runs, Inductor
+        kernels 0.000 ms/step", i.e. the eviction's ~360 pointwise / gather /
+        scatter / quantize launches were never fused at all.
+
+        So everything that needs the layer's identity happens HERE, outside the
+        graph: resolving the targets, dropping the stale fused hand-offs,
+        installing the compacted body, and recording telemetry. What the body
+        gets is the three objects and nothing else.
+
+        **The ``joint`` bool went the same way, on 2026-09-19.** It selected
+        ``replace_body`` versus ``replace``, and both of those are now the
+        caller's -- so the body no longer branches on it at all, and dropping it
+        removes a specialisation axis: one graph per shape instead of two.
         """
-        if not _compile_evict_enabled():
-            _announce_evict_path_once(compiled=False)
-            _EVICT_STATS["eager"] += 1
-            return WindowedCache._evict_two_tier_impl(self, layer_idx, step)
-        # Compile requested: compiled-or-raise. No eager fallback by design.
-        _run_compiled_evict(self, layer_idx, step)
+        state, store, policy = self._evict_targets(layer_idx)
+
+        # Eviction rewrites the Q tier AND compacts the fp store's positions, so
+        # every memoized fused hand-off for this layer is stale. `store.version`
+        # already covers the Q half (`retain_only` inside the body bumps it); this
+        # covers the fp half without relying on that ordering. A layer-major
+        # eviction rewrites every layer, so it drops every entry. Hoisted out of
+        # the body because indexing `self._fused_ctx` by `layer_idx` specialises
+        # the graph exactly as `_evict_targets` did.
+        if layer_idx is None:
+            self._fused_ctx = [None] * self.num_layers
+        else:
+            self._fused_ctx[layer_idx] = None
+
+        # Compiled-or-raise. No eager fallback by design.
+        joint = layer_idx is None
+        (scores_before, retained_idx,
+         new_k, new_v, new_pos, n_q) = _run_compiled_evict(
+            self, state, store, policy, step)
+
+        # --- install the compacted body, OUTSIDE the graph -------------------
+        # This is deliberately not in the compiled body: writing a buffer that
+        # the same graph reads a view of is what made it uncompilable (the
+        # `merge_view_inputs` IndexError -- see `_evict_two_tier_impl` step 4b
+        # and `_EVICT_COMPILE_HELP`). Three slice-assignments gain nothing from
+        # being traced.
+        num_sink = self.resolved.num_sink_tokens
+        if joint:
+            # Layer-major: the buffer is already at its steady capacity (the
+            # per-layer first eviction is what sized it), so the compacted body
+            # goes straight in behind the sink prefix, which the rebuild carried
+            # through byte-identically at the same offsets. That skips the three
+            # full-store `cat`s below — ~2.9 GB of transient at 4096/batch-32
+            # once the row axis carries all 32 layers — and the reallocation
+            # `replace` performs whenever the target size moves.
+            state.replace_body(num_sink, new_k, new_v, new_pos)
+        else:
+            # Per-layer: this IS the first eviction, where `replace`
+            # reallocating from the prompt capacity down to the budget is the
+            # point — it is what releases the prompt-sized buffer.
+            # `join`, not `torch.cat`: same tensor, but a cat is lowered through
+            # Inductor's `pointwise_cat` on CUDA, the single source of the
+            # `Identity` node behind the `((I)//8)` failure. Kept here even out
+            # of the graph so the two branches stay the same operation.
+            state.replace(
+                join(state.key_states[:, :, :num_sink, :], new_k, 2),
+                join(state.value_states[:, :, :num_sink, :], new_v, 2),
+                join(state.position_ids[:, :num_sink], new_pos, 1),
+            )
+
+        # Only now is `state.seq_length` the compacted length.
+        store.commit_active_count(n_q)
+        policy.set_total_after_compaction(
+            state.seq_length + store.num_active_tokens
+        )
+
+        # Telemetry is per layer by contract and lives outside the graph for the
+        # same reason as the rest of this method. It is also the one consumer of
+        # the PRE-eviction score axis, which step 5 of the body overwrites -- so
+        # the body hands the tensor back rather than recording it.
+        if not isinstance(self.telemetry, NullTelemetry):
+            if joint:
+                self._record_joint_scores(step, scores_before, retained_idx)
+            else:
+                self.telemetry.record_scores(
+                    layer_idx, step, scores_before, retained_idx
+                )
         return None
 
-    def _evict_two_tier_impl(self, layer_idx: Optional[int], step: int) -> None:
+    def _evict_two_tier_impl(
+        self, state, store, policy
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int]:
         """One two-tier eviction (design §5), per row, entirely on device.
+
+        **This is the compiled body, and its whole parameter list is chosen so
+        Dynamo builds ONE graph for it.** It takes the resolved
+        ``(state, store, policy)`` and nothing else: no ``layer_idx`` (it would
+        index a Python list), no ``step`` (an integer that increments every
+        eviction is one Dynamo specialises on), and since 2026-09-19 no ``joint``
+        bool either, because the branch it selected now runs in the caller.
+
+        **It is also pure with respect to the fp buffers**, which is what makes
+        it compilable at all -- see step 4b. It may mutate the slot table, whose
+        fields are separate allocations, but it never writes a buffer it has read
+        a view of.
+
+        Returns ``(scores_before, retained_idx, new_k, new_v, new_pos, n_q)``.
+        The first two are the caller's telemetry input, returned rather than
+        recorded here because step 5 overwrites ``state.window_scores``. The next
+        three are the compacted body for the caller to install. ``n_q`` is the
+        active-window count to commit once it has.
 
         **The row axis is opaque here**, which is what makes the layer-major
         decode path (§4.1) a change of caller rather than of body: every
@@ -1846,7 +2641,43 @@ class WindowedCache(_HFCacheBase):
         :meth:`EvictionPolicy.tier_counts` — host ints that are identical across
         rows (BATCHING_PLAN.md §3), so nothing has to be measured off a tensor.
         """
-        state, store, policy = self._evict_targets(layer_idx)
+        # KERNEL-OR-ERROR, enforced where it can actually be seen. The eviction
+        # is "compiled unconditionally", but being CALLED through a compiled
+        # callable is not the same as being COMPILED: when Dynamo gives up on a
+        # frame -- recompile limit, an unsupported construct, a disabled cache --
+        # it runs the Python eagerly and says so only in a warning log. That is
+        # precisely what happened between 2026-09-18 and 2026-09-19 (see
+        # `_evict_two_tier`), and `_EVICT_STATS` reported "compiled" throughout.
+        #
+        # `torch.compiler.is_compiling()` is the one check that cannot be fooled,
+        # because it is answered by whoever is executing this line. Under Dynamo
+        # it is a trace-time constant, so the branch folds away and NOTHING of
+        # this reaches the graph; under an eager fallback it is False and the run
+        # stops. One bool test per eviction, i.e. one per `ws` steps.
+        if not torch.compiler.is_compiling():
+            raise EvictionRanEager(
+                "the two-tier eviction ran EAGER. It is compiled-or-error by "
+                "design: the compiled body exists to fuse ~360 pointwise / "
+                "gather / scatter / quantize launches into a handful of kernels, "
+                "and an eager run reports eager numbers under a compiled label.\n"
+                "\nWHAT DYNAMO SAYS, RIGHT NOW:\n" + _dynamo_diagnosis() + "\n"
+                "\nDynamo fell back without raising, which it does for exactly "
+                "three reasons:\n"
+                "  1. the recompile limit -- look for 'torch._dynamo hit "
+                "config.cache_size_limit' in the log, then find what is "
+                "specialising the graph (a Python-list index or a changing int "
+                "argument in this signature is the usual cause) and raise "
+                "_EVICT_CACHE_SIZE_LIMIT only after that;\n"
+                "  2. compilation disabled process-wide -- TORCHDYNAMO_DISABLE, "
+                "torch._dynamo.config.disable, or a torch._dynamo.disable() "
+                "decorator somewhere up the stack;\n"
+                "  3. an unsupported construct Dynamo declined to trace -- look "
+                "for a graph-break warning naming it.\n"
+                "There is no knob that makes an eager eviction acceptable: it "
+                "reports eager numbers under a compiled label, which is the one "
+                "failure this path exists to refuse."
+            )
+
         rope = self.rope_module
 
         ws = self.resolved.window_size
@@ -1854,7 +2685,6 @@ class WindowedCache(_HFCacheBase):
         dtype = state.key_states.dtype
         device = state.key_states.device
 
-        B, H_kv, T_fp, D = state.key_states.shape
         # CONCRETE ints for the integer index arithmetic below — arange sizes,
         # window ranks, clamp bounds, and the ``//ws`` token→window map. Off a
         # tensor ``.shape`` these are Python ints in eager but SymInts under
@@ -1867,22 +2697,37 @@ class WindowedCache(_HFCacheBase):
         # compacts to the budget every ``ws`` steps, so this specializes to a
         # handful of shapes during the fill phase and is stable at steady state
         # (which is why the compiled body is worth its recompiles — design §5).
-        T_body = int(T_fp) - num_sink
+        #
+        # Read one dim at a time, NOT as ``B, H_kv, T_fp, D = ...shape``. An
+        # unpack of the whole shape is the same symbolic read wearing a different
+        # AST, and it is where the guard used to have a blind spot: the four
+        # ``int()``s ``014c40b`` added all went on ``x = t.shape[i]`` forms while
+        # the live offender — ``B, _, W = window_scores.shape`` in
+        # ``policy.compute_two_tier_retain`` — was an unpack and sailed through.
+        B = state.key_states.shape[0]
+        H_kv = int(state.key_states.shape[1])
+        T_fp = int(state.key_states.shape[2])
+        D = int(state.key_states.shape[3])
+        T_body = T_fp - num_sink
         W = int(state.window_scores.shape[2])
-        # Eviction rewrites the Q tier AND compacts the fp store's positions, so
-        # every memoized fused hand-off for this layer is stale. store.version
-        # already covers the Q half (retain_only below bumps it); this also covers
-        # the fp half without relying on that ordering. A layer-major eviction
-        # (layer_idx is None) rewrites every layer, so it drops every entry.
-        if layer_idx is None:
-            self._fused_ctx = [None] * self.num_layers
-        else:
-            self._fused_ctx[layer_idx] = None
-
+        # The memoized fused hand-offs this eviction invalidates are dropped by
+        # `_evict_two_tier` before it calls here, because indexing `_fused_ctx`
+        # by layer is exactly the kind of Python-list access that specialises the
+        # graph.
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
-        retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # `quant_promotion="oneway"` (an ablation; the shipped policy is
+        # "bidir"): a window already in the int2 tier may not take an fp slot,
+        # so the chain is F -> Q -> E. That needs the CURRENT tier over the whole
+        # merged axis before ranking -- one extra lookup, only on this arm. The
+        # branch is a config string, a trace-time constant.
+        no_promote = None
+        if self.resolved.quant_promotion == "oneway":
+            store.ensure(B, device)
+            no_promote = store.lookup(state.original_window_ids)[1]
+        retained_idx, new_tier = policy.compute_two_tier_retain(
+            state.window_scores, no_promote)
         # W is a concrete int (above), so these are Python ints even under
         # torch.compile; the int() is belt-and-suspenders against a future
         # tier_counts that returns a tensor scalar.
@@ -1890,47 +2735,69 @@ class WindowedCache(_HFCacheBase):
         k_fp, n_q, local_w = int(k_fp), int(n_q), int(local_w)
         n_fp = k_fp + local_w
 
-        # Telemetry: snapshot the merged-axis scores. For the two-tier path the
-        # retained indices are merged-WINDOW indices (not token indices — the fp
-        # and Q survivors live in different stores).
-        if layer_idx is None:
-            self._record_joint_scores(step, state.window_scores, retained_idx)
-        else:
-            self.telemetry.record_scores(
-                layer_idx, step, state.window_scores, retained_idx
-            )
+        # Telemetry's input, captured before step 5 rebinds `state.window_scores`
+        # to the gathered axis. The recording itself is the caller's, which is
+        # also what keeps `layer_idx` and `step` out of this graph. For the
+        # two-tier path the retained indices are merged-WINDOW indices (not token
+        # indices — the fp and Q survivors live in different stores).
+        scores_before = state.window_scores
 
         wids = torch.gather(state.original_window_ids, 1, retained_idx)   # [B, W_ret]
         is_q_new = new_tier == 1
 
         # --- Resolve window ids → slots ONCE, then decide with masks --------
         store.ensure(B, device)
-        has_entry, is_q_cur, slot_of, match = store.lookup(wids)
+        has_entry, is_q_cur, slot_of, keep_slots = store.lookup(wids)
 
         demote = is_q_new & ~is_q_cur      # currently fp, wants Q
         fresh = demote & ~has_entry        # never quantized → quantize now
         react = demote & has_entry         # dormant → reactivate, NO requant (§10)
         promote = ~is_q_new & is_q_cur     # currently Q, wants fp
 
+        self._record_evict_widths(fresh, promote, react, n_q, W)
+
         # --- 3a. Free dropped entries FIRST (§6) ----------------------------
         # Before allocating, not after: it is what makes n_slots_for's
         # top_k_fp + N_q bound exact rather than merely likely. Safe in either
         # order — retain_only only touches windows that are NOT retained, and
         # every demote/promote/reactivate target is retained by construction.
-        store.retain_only(match)
+        store.retain_only(keep_slots)
 
         # --- fp window order: retained-fp windows, ascending id -------------
         # `wids` is already ascending (the merged axis is chronological), so
-        # pushing the Q-tier picks to a sentinel and sorting compacts the fp
-        # picks to the front, still ascending. Everything the fp rebuild needs
-        # is then gathered onto that same axis.
-        sentinel = torch.iinfo(torch.long).max
-        fp_key = torch.where(is_q_new, torch.full_like(wids, sentinel), wids)
-        take = torch.argsort(fp_key, dim=1)[:, :n_fp]                  # [B, n_fp]
+        # compacting the non-Q picks to the front keeps them ascending, and
+        # everything the fp rebuild needs is gathered onto that same axis. This
+        # used to push the Q picks to a sentinel and sort; the sentinel existed
+        # only to express "these go last", which is what a partition says
+        # directly, and the sort was the eviction's widest unfusable op.
+        take = stable_partition(~is_q_new)[:, :n_fp]                   # [B, n_fp]
         fp_wids = torch.gather(wids, 1, take)
         fp_prom = torch.gather(promote, 1, take)
         fp_slot = torch.gather(slot_of, 1, take)
         prom_rank = fp_prom.cumsum(1) - 1                              # [B, n_fp]
+
+        # --- D1, all three widths, ONE host read -----------------------------
+        # `_compact` allocates by RANK into a worst-case width because the counts
+        # are ragged per row, and everything past a row's real count is computed
+        # and then masked away. Promote was still sized by its BOUND
+        # (`min(N_q, n_fp)`), which under `quant_budget_mode: bytes` is ~250
+        # windows -- so `promote_many` dequantized, RoPE'd and spliced ~250
+        # windows per layer per eviction to use the handful that were really
+        # promoted. That is the same waste D1 removed from demote, on a payload
+        # that is larger, and it was the 7.25 GiB / 3.62 GiB the allocator
+        # refused at 2048/batch-32.
+        #
+        # Read here rather than in two places: the three masks are stacked into
+        # one `.item()`, so this is ONE host sync and ONE graph break for the
+        # whole eviction, exactly as before -- and now the promote block sits
+        # after the break with the demote block, in the same fused region.
+        # The measured max over rows is a true upper bound by construction,
+        # which is what `_compact` requires: a width that is ever too small
+        # routes overflow to a dump column and silently drops work.
+        n_p, n_r, n_d = _evict_widths(
+            (fp_prom, react, fresh),
+            (min(self.resolved.N_q, n_fp), n_q, n_q),
+        )
 
         body_k = state.key_states[:, :, num_sink:, :]
         body_v = state.value_states[:, :, num_sink:, :]
@@ -1942,20 +2809,30 @@ class WindowedCache(_HFCacheBase):
         body_wid = ((body_pos - num_sink) // ws).contiguous()          # [B, T_body]
 
         # --- 3b. Promote (Q→fp): ONE batched dequant + ONE RoPE -------------
-        # Width is the BOUND, not the count: promotions are ragged per row. The
-        # invalid lanes dequantize garbage from free slots and are dropped by the
-        # mask below — bit-identical for the valid ones, since every op here is
-        # per-window or per-token pointwise.
-        p_max = min(self.resolved.N_q, n_fp)
+        # Width is the measured MAX over rows (n_p above), not the bound:
+        # promotions are ragged per row, so lanes past a row's own count still
+        # dequantize garbage from free slots and are dropped by the mask below —
+        # bit-identical for the valid ones, since every op here is per-window or
+        # per-token pointwise. What changed is how many such lanes there are.
+        p_max = n_p              # D1: the MEASURED count, not min(N_q, n_fp)
         prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
         prom_k = prom_v = prom_pos = None
         if p_max > 0:
-            k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
-            prom_k = rotate_key_window(
-                k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
-                pos_pre.reshape(B, p_max * ws),
-                rope,
-            ).to(dtype)                                                # [B,H,p*ws,D]
+            if store.shadow_enabled:
+                # Evaluation-only oracle (`quant_promote_source="original"`):
+                # the window comes back exactly as it was demoted, keys already
+                # rotated, so there is no dequant and no RoPE here.
+                k_orig, v_pre, pos_pre = store.promote_many_original(
+                    prom_slot, prom_valid, dtype)
+                prom_k = k_orig.permute(0, 2, 1, 3, 4).reshape(
+                    B, H_kv, p_max * ws, D).to(dtype)                  # [B,H,p*ws,D]
+            else:
+                k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
+                prom_k = rotate_key_window(
+                    k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
+                    pos_pre.reshape(B, p_max * ws),
+                    rope,
+                ).to(dtype)                                            # [B,H,p*ws,D]
             prom_v = v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
                 B, H_kv, p_max * ws, D)
             prom_pos = pos_pre.reshape(B, p_max * ws).to(body_pos.dtype)
@@ -1964,27 +2841,37 @@ class WindowedCache(_HFCacheBase):
         # Must read the OLD fp store, so it runs before the rebuild below.
         # Reactivations are free — codes/grid/positions are frozen (§10) — so
         # they are a bit flip and never touch this path.
-        react_slot, react_valid = self._compact(slot_of, react, n_q)
+        # Widths (n_r, n_d) were measured with n_p above -- one read for all
+        # three, so the demote path costs no extra sync for its own bound.
+        react_slot, react_valid = self._compact(slot_of, react, n_r)
         store.reactivate_many(react_slot, react_valid)
 
-        fresh_wid, fresh_valid = self._compact(wids, fresh, n_q)
-        if n_q > 0 and T_body > 0:
-            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_q]
+        fresh_wid, fresh_valid = self._compact(wids, fresh, n_d)
+        if n_d > 0 and T_body > 0:
+            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_d]
             tok_f = _clamp_index(
                 (start_f.unsqueeze(-1) + torch.arange(ws, device=device))
-                .reshape(B, n_q * ws),
+                .reshape(B, n_d * ws),
                 T_body - 1,
             )
-            idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_q * ws, D)
+            idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_d * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
             v_tok = torch.gather(body_v, 2, idx_d)
             prange = torch.gather(body_pos, 1, tok_f)
             k_pre_d = unrotate_key_window(k_post, prange, rope)
             store.demote_many(
-                store.table.free_slots(n_q), fresh_valid, fresh_wid,
-                k_pre_d.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
-                v_tok.reshape(B, H_kv, n_q, ws, D).permute(0, 2, 1, 3, 4),
-                prange.reshape(B, n_q, ws),
+                store.table.free_slots(n_d), fresh_valid, fresh_wid,
+                k_pre_d.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4),
+                v_tok.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4),
+                prange.reshape(B, n_d, ws),
+                # The gate card is built from the ROTATED keys -- the tensor we
+                # already hold, one line above un-rotating it -- so it costs no
+                # extra RoPE, and positions are never rebased so it stays valid
+                # for the window's whole life (§5, §10).
+                keys_post_rope=(
+                    k_post.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4)
+                    if (store.sketch_enabled or store.shadow_enabled) else None
+                ),
             )
 
         # --- 4. Rebuild the fp store: [sink ‖ fp windows by id] -------------
@@ -2043,27 +2930,42 @@ class WindowedCache(_HFCacheBase):
                 tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
             )
 
-        if layer_idx is None:
-            # Layer-major: the buffer is already at its steady capacity (the
-            # per-layer first eviction is what sized it), so the compacted body
-            # goes straight in behind the sink prefix, which this rebuild carries
-            # through byte-identically at the same offsets. That skips the three
-            # full-store `cat`s below — ~2.9 GB of transient at 4096/batch-32 once
-            # the row axis carries all 32 layers — and the reallocation `replace`
-            # performs whenever the target size moves.
-            state.replace_body(num_sink, new_k, new_v, new_pos)
-        else:
-            # Per-layer: this IS the first eviction, where `replace` reallocating
-            # from the prompt capacity down to the budget is the point — it is
-            # what releases the prompt-sized buffer.
-            state.replace(
-                torch.cat([state.key_states[:, :, :num_sink, :], new_k], dim=2),
-                torch.cat([state.value_states[:, :, :num_sink, :], new_v], dim=2),
-                torch.cat([state.position_ids[:, :num_sink], new_pos], dim=1),
-            )
-
+        # --- 4b. The store write is the CALLER's, and that is the 2026-09-19
+        # fix. It used to happen right here, and it is what made this graph
+        # uncompilable:
+        #
+        #   `replace_body` does `self._key_buf[:, :, num_sink:n] = body_key`,
+        #   mutating the BASE that `state.key_states` is a VIEW of -- and this
+        #   region reads that view, as `body_k`. So Inductor lifted both the
+        #   base and the view as graph inputs with the base mutated, which is
+        #   exactly the shape AOTAutograd builds "synthetic bases" for, and
+        #   `merge_view_inputs` mis-sizes its metadata list on it:
+        #
+        #       _aot_autograd/runtime_wrappers.py:1442 in merge_view_inputs
+        #           post_processed_calling_convention_meta[k] = v
+        #       IndexError: list assignment index out of range
+        #
+        # Three aliasing pairs, all mutated: key/value/positions. The `replace`
+        # branch is worse -- it reads `state.key_states` AND reallocates the
+        # buffer in the same expression.
+        #
+        # So the compiled region now ends as pure compute: it RETURNS the
+        # compacted body and touches no buffer it has read a view of. Three
+        # slice-assignments have nothing to gain from being in a graph anyway,
+        # and `replace_body`'s own aliasing assertion is a host check that only
+        # really runs out here.
+        #
+        # **The invariant this establishes, and the one to keep:** the compiled
+        # eviction may mutate the slot table (separate allocations, no aliasing)
+        # but must never write a buffer it reads a view of. Adding such a write
+        # back into this region re-breaks the build.
         # --- 5. Gather scores + ids to the retained merged axis -------------
-        H_q = state.window_scores.shape[1]
+        # Only an `expand` size below, which tolerates a SymInt -- but `H_q` is
+        # the model's query-head count and never varies within a run, so making
+        # it concrete costs zero recompiles and keeps the "no raw scalar shape
+        # read in this region" rule absolute rather than case-by-case. `B` is the
+        # sole exception, and it is the one that would actually cost recompiles.
+        H_q = int(state.window_scores.shape[1])
         idx_w = retained_idx.unsqueeze(1).expand(B, H_q, -1)
         state.window_scores = torch.gather(
             state.window_scores, dim=-1, index=idx_w
@@ -2073,10 +2975,10 @@ class WindowedCache(_HFCacheBase):
         ).contiguous()
 
         # --- 6. Commit counts; policy total tracks T_fp + T_q ---------------
-        store.commit_active_count(n_q)
-        policy.set_total_after_compaction(
-            state.seq_length + store.num_active_tokens
-        )
+        # `commit_active_count` and `set_total_after_compaction` move out with
+        # the write: the latter reads `state.seq_length`, which only becomes
+        # correct once the caller has installed the compacted body.
+        return scores_before, retained_idx, new_k, new_v, new_pos, n_q
 
     def reorder_cache(self, beam_idx: Tensor) -> None:
         """Beam search is out of scope (v1)."""
