@@ -155,6 +155,18 @@ function svgToDrawio(svg) {
     return out;
   };
 
+  // A text's label: plain text, or HTML with <sub> where the figure set a subscript
+  // (<tspan class="sub">). draw.io renders html=1 labels as HTML.
+  const htmlEsc = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const labelOf = (el) => {
+    if (!el.querySelector('tspan.sub')) return el.textContent;
+    return [...el.childNodes].map((n) => {
+      if (n.nodeType === 3) return htmlEsc(n.textContent);
+      const t = htmlEsc(n.textContent);
+      return n.classList && n.classList.contains('sub') ? `<sub>${t}</sub>` : t;
+    }).join('');
+  };
+
   // ---- walk the figure in paint order ----------------------------------------
   const els = svg.querySelectorAll('rect, circle, line, path, text, use');
   for (const el of els) {
@@ -212,7 +224,7 @@ function svgToDrawio(svg) {
         `text;html=1;fillColor=none;strokeColor=none;whiteSpace=nowrap;align=${align};verticalAlign=middle;spacing=0;` +
         `spacingLeft=0;spacingRight=0;spacingTop=0;spacingBottom=0;fontFamily=Arial;` +
         `fontSize=${size};fontColor=${attr(el, 'fill', '#000000')};fontStyle=${fontStyle};` +
-        (rot ? `rotation=${rot};` : '') + opacityStyle(el), el.textContent);
+        (rot ? `rotation=${rot};` : '') + opacityStyle(el), labelOf(el));
     } else if (tag === 'use') {
       const ref = (el.getAttribute('href') || el.getAttribute('xlink:href') || '').slice(1);
       const sym = svg.querySelector(`symbol[id="${ref}"]`);

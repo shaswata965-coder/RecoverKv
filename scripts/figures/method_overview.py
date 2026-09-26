@@ -11,11 +11,14 @@ reader learns the cache once and then watches it being scored, gated and read:
   (a) the attention map (keys across, queries down) is summed per token, each
       window's tokens stack into its score, the ranked scores split into
       top-k fp16 / next top-k int2 / dropped, and the cache sections are mapped
-      onto the byte budget they share. A zoom shows the card as a cluster
-      summary of the window, and an int2 window's parts in one row, to scale
-      against the same window in fp16.
-  (b) the query scores every card; each head's preferences are unioned and the
-      top windows are opened at the gate ratio -- and every window's
+      onto the byte budget they share. "Scoring one window" shows one step's
+      update: the window's token attentions alpha_1..alpha_n (light and dark)
+      summed into alpha_window, added to alpha_history, giving the new score.
+      A zoom shows the card as a cluster summary of the window, and an int2
+      window's parts in one row, to scale against the same window in fp16.
+  (b) the query fans briefly onto a per-head score grid whose columns sit over
+      the cards; the union of the heads' shares opens the top windows at the
+      gate ratio, straight down into the cache bar -- and every window's
       cumulative score still grows, exactly if read, from its card if not
   (c) a generated token fills the newest window; the last closes it and the
       cache re-ranks (promote / demote / drop). One fused pass reads fp16 and
@@ -146,6 +149,28 @@ class G:
         self.add(f'<text x="{x:.2f}" y="{y:.2f}" font-size="{size}" text-anchor="{anchor}" '
                  f'fill="{fill}"{w}{it}{rot}{extra}>{html.escape(s)}</text>')
 
+    def text_parts(self, x, y, parts, size=13, anchor="start", weight=None, fill=INK):
+        """Text with subscripts: ``parts`` is ``[(text, is_sub), ...]``.
+
+        Subscripts are ``<tspan class="sub">`` shifted down and shrunk, so they do
+        not depend on a font carrying Unicode subscript glyphs; the draw.io export
+        turns the same class into ``<sub>``.
+        """
+        w = f' font-weight="{weight}"' if weight else ""
+        out, low = [], False
+        for txt, sub in parts:
+            if sub:
+                dy = "" if low else f' dy="{size * 0.3:.1f}"'
+                out.append(f'<tspan class="sub" font-size="{size * 0.72:.1f}"{dy}>'
+                           f"{html.escape(txt)}</tspan>")
+                low = True
+            else:
+                dy = f' dy="{-size * 0.3:.1f}"' if low else ""
+                out.append(f"<tspan{dy}>{html.escape(txt)}</tspan>")
+                low = False
+        self.add(f'<text x="{x:.2f}" y="{y:.2f}" font-size="{size}" text-anchor="{anchor}" '
+                 f'fill="{fill}"{w}>{"".join(out)}</text>')
+
     def use(self, sym, x, y, w, h, extra=""):
         self.add(f'<use href="#{sym}" xlink:href="#{sym}" x="{x:.2f}" y="{y:.2f}" width="{w}" height="{h}"{extra}/>')
 
@@ -253,7 +278,7 @@ def card_top(yb):
 # ---------------------------------------------------------------------------
 # canvas
 # ---------------------------------------------------------------------------
-PW, PH = 440, 684
+PW, PH = 440, 710
 GAP = 30
 LM = 34                                     # left margin carries the feedback arrow
 PX = [LM, LM + PW + GAP, LM + 2 * (PW + GAP)]
@@ -432,12 +457,46 @@ def panel_a(g):
     g.text((bx0 + bx1) / 2, ly + 19, "all four together make up the cache budget",
            size=11.5, anchor="middle", fill=INK, weight="bold")
 
+    # ---- scoring one window: its tokens' attention summed, added to its history
+    sx0, sy0, sw0, sh0 = 16, YB + 110, PW - 32, 74
+    g.rect(sx0, sy0, sw0, sh0, fill="#ffffff", stroke=RULE, sw=1, rx=6)
+    g.text(sx0 + 12, sy0 + 18, "scoring one window, every decode step", size=12.5, weight="bold",
+           fill=INK)
+    cw_, cg_, cy0, chh = 22, 2, sy0 + 30, 24
+    shades = [0.30, 0.85, 0.45, None, 0.18, 0.70]            # light and dark tokens
+    labels = [("1", 0), ("2", 0), ("3", 0), None, ("n−1", 0), ("n", 0)]
+    x = sx0 + 12
+    for v, lab in zip(shades, labels):
+        if v is None:                                         # the tokens not drawn
+            g.text(x + cw_ / 2, cy0 + 16, "…", size=13, anchor="middle", fill=INK)
+        else:
+            g.rect(x, cy0, cw_, chh, fill=ramp(BLUES, v), stroke=FP_S, sw=0.8)
+            g.text_parts(x + cw_ / 2, cy0 + 15, [("α", False), (lab[0], True)], size=11.5,
+                         anchor="middle", fill="#ffffff" if v > 0.6 else INK)
+        x += cw_ + cg_
+    xa = x + 2
+    g.line(xa, cy0 + chh / 2, xa + 16, cy0 + chh / 2, stroke=INK, sw=1.3, arrow="dark")
+    g.text(xa + 8, cy0 + chh + 12, "sum", size=11, anchor="middle", fill=INK)
+
+    def chip_(x0, wd, parts, fill, stroke, bold=False, sw=0.9):
+        g.rect(x0, cy0, wd, chh, fill=fill, stroke=stroke, sw=sw, rx=4)
+        g.text_parts(x0 + wd / 2, cy0 + 16, parts, size=12, anchor="middle", fill=INK,
+                     weight="bold" if bold else None)
+        return x0 + wd
+
+    x = chip_(xa + 22, 54, [("α", False), ("window", True)], ramp(BLUES, 0.35), FP_S)
+    g.text(x + 10, cy0 + 17, "+", size=15, anchor="middle", fill=INK, weight="bold")
+    x = chip_(x + 20, 54, [("α", False), ("history", True)], "#ffffff", FP_S)
+    g.text(x + 10, cy0 + 17, "=", size=15, anchor="middle", fill=INK, weight="bold")
+    chip_(x + 20, sx0 + sw0 - 12 - (x + 20), [("new score", False)], FP_F, FP_S, bold=True,
+          sw=1.4)
+
     # ---- demotion, magnified: the card clusters the window, and what an int2 window holds
-    zh = 176
-    zx, zy, zw = 16, YB + 128, PW - 32
+    zh = 152
+    zx, zy, zw = 16, sy0 + sh0 + 10, PW - 32
     g.rect(zx, zy, zw, zh, fill="#ffffff", stroke=RULE, sw=1, rx=6)
     g.text(zx + 12, zy + 19, "demoting a window to int2", size=12.5, weight="bold", fill=INK)
-    cx, cy = zx + 98, zy + 62
+    cx, cy = zx + 98, zy + 58
     vd = (0.83, -0.56)
     pts = [(-15, 6), (-8, -10), (6, 11), (13, -3), (-19, -3), (2, -13), (9, 4)]
     hot = (52, -30)
@@ -463,7 +522,7 @@ def panel_a(g):
     # one int2 window, to scale against the same window in fp16, in one row
     L0, L1 = zx + 12, zx + zw - 12
     rw, rh = L1 - L0, 12
-    r1, r2 = zy + 108, zy + 128
+    r1, r2 = zy + 98, zy + 116
     g.rect(L0, r1, rw, rh, fill=FP_F, stroke=FP_S, sw=0.8)
     g.text(L1 - 6, r1 + 9.5, "the same window in fp16", size=10.5, anchor="end", fill=FP_T)
     # relative sizes of the parts (their ratio, not a byte count, is what is drawn)
@@ -494,85 +553,87 @@ def panel_a(g):
 # ---------------------------------------------------------------------------
 def panel_b(g):
     frame(g, "(b)", "Cards choose what to read", "every decode step, per KV head")
+    top = card_top(YB)
 
-    # the query: 4 heads sharing one KV head
-    qx, qy = C["q"] - 22, 70
+    # the query: the heads of one GQA group, fanning briefly onto every card's column
+    qx, qy = C["q"] - 22, 62
     for h in range(4):
         g.rect(qx, qy + h * 8, 44, 6, fill=QRY_F, stroke=QRY_S, sw=0.8, rx=1.5)
-    g.text(qx - 8, qy + 14, "query", size=12.5, anchor="end", weight="bold", fill=QRY_T)
-    g.text(qx - 8, qy + 29, "heads of one group", size=12, anchor="end", fill=QRY_T)
-
-    # every card is scored against it
-    top = card_top(YB)
+    g.text(qx - 8, qy + 12, "query", size=12.5, anchor="end", weight="bold", fill=QRY_T)
+    g.text(qx - 8, qy + 27, "heads of one group", size=12, anchor="end", fill=QRY_T)
+    gy, ch = qy + 76, 12                        # per-head score grid, one column per card
     umax = max(UNION)
     for c in range(N_Q):
         v = UNION[c] / umax
-        g.line(C["q"], qy + 34, QX[c], top - 2, stroke=Q_S if c in SEL else INK,
-               sw=0.8 + 2.4 * v if c in SEL else 0.5)
-    g.text(C["q"] + 34, qy + 62, "score every card", size=12, fill=INK2)
-    for key in ("fp", "loc"):
-        x1, x2 = SPAN[key]
-        bracket(g, x1, x2, YB - FP_H - 8, up=True)
-        g.text((x1 + x2) / 2, YB - FP_H - 14, "always read", size=11.5, anchor="middle", fill=INK3)
+        g.line(C["q"], qy + 33, QX[c], gy - 3, stroke=Q_S if c in SEL else INK,
+               sw=0.8 + 2.2 * v if c in SEL else 0.5)
+    g.text(SPAN["q"][1] - 30, qy + 22, "score every card", size=12, fill=INK)
 
-    # each head's own preference, then the union across the group
-    gy, ch = YB + 30, 11
-    uy = gy + 4 * (ch + 2) + 12
-    for c in SEL:
-        g.rect(LAY["q"][c] - 2.5, top - 6, Q_W + 5, uy + ch + 4 - (top - 6), fill="#ebe4f7", rx=3)
-    cache_bar(g, YB, mode="gated")
+    # each head's share of the cards, then the union across the group
     for h in range(4):
-        g.text(SPAN["q"][0] - 8, gy + h * (ch + 2) + 9, f"head {h + 1}", size=11, anchor="end",
-               fill=INK2)
+        g.text(SPAN["q"][0] - 8, gy + h * (ch + 2) + 10, f"head {h + 1}", size=11, anchor="end",
+               fill=INK)
         for c, x in enumerate(LAY["q"]):
             g.rect(x, gy + h * (ch + 2), Q_W, ch, fill=ramp(PURPLES, SHARE[h][c] ** 0.6 * 1.05),
                    stroke="#ffffff", sw=0.6)
-    g.text(SPAN["q"][1] + 8, gy + 3 * (ch + 2) + 9, "retrieval head", size=11, fill=INK3)
-    g.text(SPAN["q"][0] - 8, uy + 9, "union", size=11, anchor="end", weight="bold", fill=INK)
+    g.text(SPAN["q"][1] + 8, gy + 3 * (ch + 2) + 10, "retrieval head", size=11, fill=INK)
+    uy = gy + 4 * (ch + 2) + 10
+    # the opened columns, carried straight down from the vote to the cards
+    for c in SEL:
+        g.rect(LAY["q"][c] - 2.5, uy - 3, Q_W + 5, top - 6 - (uy - 3), fill="#ebe4f7", rx=3)
+    g.text(SPAN["q"][0] - 8, uy + 10, "union", size=11, anchor="end", weight="bold", fill=INK)
     for c, x in enumerate(LAY["q"]):
         g.rect(x, uy, Q_W, ch, fill=ramp(PURPLES, UNION[c] ** 0.6 * 1.05), stroke="#ffffff", sw=0.6)
         if c in SEL:
             g.rect(x - 1, uy - 1, Q_W + 2, ch + 2, stroke=INK, sw=1.5)
     g.text(C["q"], uy + 30, "top windows opened, at the gate ratio", size=12.5, anchor="middle",
            weight="bold", fill=Q_T)
+    for c in SEL:
+        g.line(QX[c], uy + 38, QX[c], top - 5, stroke=Q_S, sw=1.6, arrow="violet")
+    for key in ("fp", "loc"):
+        x1, x2 = SPAN[key]
+        bracket(g, x1, x2, YB - FP_H - 8, up=True)
+        g.text((x1 + x2) / 2, YB - FP_H - 14, "always read", size=11.5, anchor="middle", fill=INK)
+    cache_bar(g, YB, mode="gated")
 
     # the cumulative score keeps rolling, read or not
-    ry = uy + 58
+    ry = YB + 44
     g.line(16, ry - 18, PW - 16, ry - 18, stroke=RULE, sw=1, dash="3 3")
     g.text(16, ry, "cumulative score keeps rolling, read or not", size=12.5, weight="bold",
            fill=INK)
-    base = ry + 96
+    base = ry + 170
     rr = random.Random(21)
     cols = ([(x, FP_W, "fp") for x in LAY["fp"]]
             + [(x, Q_W, "sel" if c in SEL else "skip") for c, x in enumerate(LAY["q"])]
             + [(x, FP_W, "fp") for x in LAY["loc"]])
+    k = 2.0
     for x, wd, kd in cols:
-        before = {"fp": rr.uniform(38, 52), "sel": rr.uniform(26, 36),
-                  "skip": rr.uniform(12, 26)}[kd]
-        add = {"fp": rr.uniform(10, 16), "sel": rr.uniform(10, 18), "skip": rr.uniform(3, 7)}[kd]
+        before = k * {"fp": rr.uniform(38, 52), "sel": rr.uniform(26, 36),
+                      "skip": rr.uniform(12, 26)}[kd]
+        add = k * {"fp": rr.uniform(10, 16), "sel": rr.uniform(10, 18), "skip": rr.uniform(3, 7)}[kd]
         pale = {"fp": "#e3edf8", "sel": "#ece6f7", "skip": "#ece6f7"}[kd]
         g.rect(x, base - before, wd, before, fill=pale, stroke="none")
         if kd == "skip":
             g.rect(x, base - before - add, wd, add, fill="hatch-violet", stroke=Q_S, sw=0.8)
         else:
             g.rect(x, base - before - add, wd, add, fill=FP_S if kd == "fp" else Q_S)
-    g.line(BX0 - 4, base, LAY["new"] + 8, base, stroke=INK3, sw=0.8)
-    ky = base + 20
+    g.line(BX0 - 4, base, LAY["new"] + 8, base, stroke=INK, sw=0.8)
+    ky = base + 22
     g.rect(24, ky - 10, 12, 11, fill="#ece6f7")
-    g.text(41, ky, "score so far", size=11.5, fill=INK2)
+    g.text(41, ky, "score so far", size=11.5, fill=INK)
     g.rect(122, ky - 10, 12, 11, fill=Q_S)
-    g.text(139, ky, "+ exact mass (read)", size=11.5, fill=INK2)
+    g.text(139, ky, "+ exact mass (read)", size=11.5, fill=INK)
     g.rect(262, ky - 10, 12, 11, fill="hatch-violet", stroke=Q_S, sw=0.8)
-    g.text(279, ky, "+ its card's credit", size=11.5, fill=INK2)
+    g.text(279, ky, "+ its card's credit", size=11.5, fill=INK)
 
     # key
-    ky2 = PH - 18
+    ky2 = ky + 30
     g.rect(24, ky2 - 11, 14, 13, fill=Q_F, stroke=INK, sw=1.4)
-    g.text(44, ky2, "opened", size=12, fill=INK2)
+    g.text(44, ky2, "opened", size=12, fill=INK)
     g.add('<g opacity="0.42">')
     g.rect(112, ky2 - 11, 14, 13, fill=Q_F, stroke=Q_S, sw=0.9, dash="2 1.5")
     g.add("</g>")
-    g.text(132, ky2, "only its card is read", size=12, fill=INK2)
+    g.text(132, ky2, "only its card is read", size=12, fill=INK)
 
 
 # ---------------------------------------------------------------------------
@@ -604,8 +665,8 @@ def panel_c(g):
     # ---- at the window boundary: re-rank, promote / demote / drop
     chx, chy, chw, chh = 40, 136, 196, 24
     ym = chy + chh / 2
-    g.path(f"M{xb},{ny0 + 26} L{xb},{ym - 6} Q{xb},{ym} {xb - 6},{ym} L{chx + chw + 3},{ym}",
-           stroke=QRY_S, sw=1.4, arrow="dark")
+    g.path(f"M{xb},{ny0 + 26} L{xb},{ym} L{chx + chw + 3},{ym}", stroke=QRY_S, sw=1.4,
+           arrow="dark")
     g.text(nx0 - 8, ny0 + 9, "last token closes it:", size=11.5, anchor="end", fill=QRY_T,
            weight="bold")
     g.text(nx0 - 8, ny0 + 24, "window boundary", size=11.5, anchor="end", fill=QRY_T)
@@ -613,14 +674,12 @@ def panel_c(g):
     g.text(chx + chw / 2, chy + 16, "re-rank by cumulative score", size=12, anchor="middle",
            weight="bold")
     # promote into fp16
-    g.path(f"M{chx + 30},{chy + chh + 2} C{chx + 30},{chy + 80} {C['fp']},{chy + 70} "
-           f"{C['fp']},{YB - FP_H - 5}", stroke=FP_S, sw=1.5, arrow="blue")
+    g.line(C["fp"], chy + chh + 1, C["fp"], YB - FP_H - 3, stroke=FP_S, sw=1.5, arrow="blue")
     g.text(C["fp"] + 8, chy + chh + 92, "promote:", size=11.5, fill=FP_T, weight="bold")
     g.text(C["fp"] + 8, chy + chh + 106, "rose → fp16", size=11.5, fill=FP_T)
     # demote into int2
     xdm = QX[5]
-    g.path(f"M{chx + chw / 2 + 10},{chy + chh + 2} C{chx + chw / 2 + 10},{chy + 80} {xdm},{chy + 90} "
-           f"{xdm},{top - 5}", stroke=Q_S, sw=1.5, arrow="violet")
+    g.line(xdm, chy + chh + 1, xdm, top - 3, stroke=Q_S, sw=1.5, arrow="violet")
     g.text(xdm + 8, chy + chh + 60, "demote: fell → 2-bit", size=11.5, fill=Q_T, weight="bold")
     g.text(xdm + 8, chy + chh + 74, "+ card, written once", size=11.5, fill=Q_T)
     # drop
