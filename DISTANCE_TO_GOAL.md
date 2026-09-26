@@ -1940,38 +1940,60 @@ cache and gate; zip -> export -> Observations I-V); never run on a GPU.
 
 ### 13.3 Promotion, priced in attention mass: Table 18 on one run — 2026-09-26
 
-`modules/evaluation/promotion_ablation.py` builds the paper's Table 18 (no promotion
-vs with promotion) from **one** bidirectional collector run, paired on the same
-prompts and queries. The paper's pilot compares runs on different articles. The
-no-promotion column replays the one-way policy on the run's own `rank_signal`, and
-the read gate is re-run by its own rule on the recorded cards. Windows the run had
-promoted get no card, so the gate is bracketed: `open` (always read, favours no
-promotion, the primary arm) and `closed`. Write-up:
-`reports/promotion_mass_q0.7_wikitext.md`; paper table:
-`reports/tables/promotion_ablation.tex`.
+`modules/evaluation/promotion_ablation.py` builds the paper's Table 18 from **one**
+bidirectional collector run. It uses the paper's row labels and three columns, all on
+the same prompts and queries. The paper's pilot compares runs on different articles.
 
-| q = 0.70 (2 fp + 26 int2) | no promotion | with | Δ (`open` … `closed`) |
-|---|---|---|---|
-| R3 FMM (fp + int2) | 28.89% | 28.89% | 0 (kept set identical at every eviction) |
-| FullKV mass on the fp tier | 1.00% | 1.07% | +0.064 pp |
-| mass reached only through the card fill | 2.90% | 2.87% | −0.03 … −0.10 pp |
-| R_Q (int2 mass in opened windows) | 59.07% | 59.24% | +0.17 … +0.84 pp |
-| Global LIR (fp) / Q→F transitions | 0 / 0 | 0.69% / 233 | |
-| promoted vs demoted window, mass per step | 0.39% | 0.78% | 2.0× |
+* **With gated promotion:** the measured run.
+* **With promotion (gate off):** the same tiers and scores with every int2 window read.
+* **No promotion:** the one-way policy replayed on the run's own `rank_signal`, with the
+  gate re-run by its own rule on the recorded cards. Windows the run had promoted get no
+  card, so the gate is bracketed: `open` (always read, favours no promotion, the primary
+  arm) and `closed`.
 
-Every mass row favours promotion, and every CI excludes zero, even under the bracket
-that favours no promotion. **At q = 0.70 the aggregate effect is small**, for three
-reasons: promotion reorders the kept set rather than changing it; the fp tier is two
-windows; and the gate already reads the window promotion would pin 92% of the time.
-At q = 0.20 the same table moves R_Q +3.4 … +9.4 pp and fill-only mass −17 … −34%.
-The pilot's magnitudes (R_Q +6.8 pp, FMM −0.7 pp, QSA +0.038) do not reproduce at
-q = 0.70. QSA cannot show them in a replay, because both arms carry the same scores.
+R_Q ("FullKV attention mass preserved") is int2 fidelity. Per query head and step,
+each int2 window's FullKV attention is set against the attention the decode step gives
+it (its 2-bit read, or its card fill); R_Q is the sum of the smaller of the two over
+the int2 tier's FullKV attention. Write-up: `reports/promotion_mass_q0.7_wikitext.md`;
+paper table: `reports/tables/promotion_ablation.tex`.
 
-Checks, both runs: replaying `bidir` reproduces the recorded tiers at 16,384 / 16,384
-layer-evictions; the gate rule reproduces 99.6% / 99.9% of the recorded picks (fp16
-card rounding); no replayed window lacked a score. `tests/test_promotion_ablation.py`
-(17) pins the replay against `EvictionPolicy.compute_two_tier_retain` for both
-arms, and the gate against `sketch.group_share` + `select_windows`. **Not done:** a
-measured `--promotion oneway` collector run (the command is in the write-up). The
-export was split into `parity_base` / `parity_ours` for this; output is
+| q = 0.70 (2 fp + 26 int2) | no promotion | with (gate off) | with gated | Δ gated − no |
+|---|---|---|---|---|
+| R3 FMM | 28.89% | 28.89% | 28.89% | 0 (kept set identical at every eviction) |
+| Quantized-Score Agreement | 0.9830 | 0.9830 | 0.9830 | −0.0000 |
+| R_Q | 88.52% | — (not recorded) | 88.54% | +0.025 pp [+0.010, +0.040] |
+| Global LIR / Q→F transitions | 0 / 0 | 0.69% / 233 | 0.69% / 233 | |
+| FullKV mass on the fp tier | 1.00% | 1.07% | 1.07% | +0.064 pp |
+| mass reached only through the card fill | 2.90% | 0.00% | 2.87% | −0.03 … −0.10 pp (`open` … `closed`) |
+| promoted vs demoted window, mass per step | 0.39% | | 0.78% | 2.0× |
+
+**Promotion changes which kept windows are read every step. It does not change what is
+kept, or how well int2 preserves attention.** R_Q is flat at both settings: q = 0.20
+gives 88.11% → 87.99%, which is not significant. A promoted window carries its int2
+payload into fp (`dequant`), so promotion does not restore precision. What promotion
+moves is what is read, and at q = 0.70 that is small: the fp tier is two windows, and
+the gate already reads the window promotion would pin 92% of the time. The gate itself
+costs far more read mass (2.87 pp left to the card fill) than promotion recovers
+(0.03 pp).
+
+At q = 0.20, promotion moves read mass about 6× more, gate recall 11–20× more, and
+card-fill-only mass 17–34% lower. The pilot's magnitudes (R_Q +6.8 pp, FMM −0.7 pp,
+QSA +0.038) do not reproduce. QSA cannot show them in a replay, because both arms
+carry the same scores.
+
+Checks, both runs:
+- replaying `bidir` reproduces the recorded tiers at 16,384 / 16,384 layer-evictions;
+- the gate rule reproduces 99.6% / 99.9% of the recorded picks (fp16 card rounding);
+- the kernel's fill formula reproduces 99.998% of the recorded fills within 1%;
+- no replayed window lacked a score;
+- R_Q is scored on the head-steps both arms can credit (99.9% / 95.4%).
+
+`tests/test_promotion_ablation.py` (24 tests) pins:
+- the replay against `EvictionPolicy.compute_two_tier_retain`, for both arms;
+- the gate against `sketch.group_share` + `select_windows`;
+- the fill against `scorer.fill_skipped_window_scores`.
+
+**Not done:** measured `--promotion oneway` and `--gate-ratio 1.0` collector runs. The
+module takes them as `--oneway-zip` / `--gate-off-zip`; the commands are in the
+write-up. The export was split into `parity_base` / `parity_ours` for this; output is
 byte-identical to before, checked on a 2-prompt zip cut from the real run.
