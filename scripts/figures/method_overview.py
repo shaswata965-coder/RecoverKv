@@ -1,12 +1,12 @@
-"""Build the method figures at print size: Figure 1 is 6.5 in (468 pt) wide, for
-white space between its panels; Figure 2 is 5.5 in (396 pt).
+"""Build the method figures at print size: Figure 1 is 6.75 in (486 pt) wide, the
+full width of a two-column page (a figure*); Figure 2 is 5.5 in (396 pt).
 
 Two figures, one unit = one printed point at that width, so a font size here IS
 its size on the page. Labels are >= 8 pt, panel titles 9 pt; the only smaller
 text is a subscript (>= 7 pt, LaTeX scriptsize at a 10 pt body).
 ``export_figure.mjs`` fails the build on anything below that, or on text that
-collides. Scaled into a narrower column, Figure 1's labels print smaller (at
-5.5 in: 8 pt -> 6.8 pt).
+collides. Scaled into a narrower text width, Figure 1's labels print smaller
+(at 6.3 in: 8 pt -> 7.5 pt).
 
 ``method_overview``  -- Figure 1, the runtime loop, nothing else:
   (a) cumulative attention ranks the windows: the attention map (keys across,
@@ -19,7 +19,12 @@ collides. Scaled into a narrower column, Figure 1's labels print smaller (at
       kernel (fp16 and opened int2 in full, the rest through their cards), and
       the next token appended; every window's attention loops back to (a).
   Layout: (c) sits left of (b), so the loop runs clockwise -- down from (a) into
-  (b), across into (c), and up the left margin back into (a)'s score update.
+  (b), across into (c), and up the left margin back into (a)'s score update. One
+  key under (c) and (b) explains the marks both use.
+  Lines: the flow between panels is block arrows, so it never reads as a
+  connector. Inside (c) every line is a short straight drop: the re-rank's
+  trigger is written in its box, the kernel's row sits under the windows it
+  reads (no arrow per window), and the new K, V go straight up to their slot.
 
 ``method_details``  -- Figure 2, the mechanisms Figure 1 leaves out:
   (a) demoting a window: its keys as one cluster -> the card; the parts of an
@@ -170,6 +175,20 @@ class G:
 def xmark(g, x, y, r=2.4, stroke=INK, sw=0.9):
     g.path(f"M{x - r},{y - r} L{x + r},{y + r} M{x - r},{y + r} L{x + r},{y - r}",
            stroke=stroke, sw=sw)
+
+
+def block_arrow(g, x0, y0, x1, y1, shaft=4.5, head=12, hl=9, fill=INK):
+    """A filled arrow from (x0, y0) to its tip at (x1, y1): the flow between panels, a
+    shape rather than a line, so it never reads as one of a panel's connectors."""
+    ln = math.hypot(x1 - x0, y1 - y0)
+    dx, dy = (x1 - x0) / ln, (y1 - y0) / ln
+    nx, ny = -dy, dx
+    bx, by = x1 - dx * hl, y1 - dy * hl
+    pts = [(x0 + nx * shaft / 2, y0 + ny * shaft / 2), (bx + nx * shaft / 2, by + ny * shaft / 2),
+           (bx + nx * head / 2, by + ny * head / 2), (x1, y1),
+           (bx - nx * head / 2, by - ny * head / 2), (bx - nx * shaft / 2, by - ny * shaft / 2),
+           (x0 - nx * shaft / 2, y0 - ny * shaft / 2)]
+    g.path("M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in pts) + " Z", stroke="none", fill=fill)
 
 
 def bracket(g, x1, x2, y, up=True, stroke=INK, sw=0.6, tick=2.5):
@@ -379,7 +398,7 @@ def svg_doc(g, w, h):
 # ===========================================================================
 # Figure 1 -- the runtime loop
 # ===========================================================================
-W1 = 468                                 # 6.5 in: wider than Figure 2, for white space
+W1 = 486                                 # 6.75 in: the full width of a two-column page
 LM = 22                                  # left margin: the loop back to (a), and its label
 XL = 14                                  # the loop's run up the margin, 8 pt clear of the borders
 GX = GY = 28                             # gaps between panels, where the flow arrows run
@@ -387,19 +406,24 @@ AW, AH = W1 - LM - 1, 135
 BW = (AW - GX) / 2
 XC, XB = LM, LM + BW + GX                # (c) left, (b) right: the loop runs clockwise
 BY = AH + GY
-BH = 212
-H1 = BY + BH + 1
+BH = 166
+KEY_Y = BY + BH + 15                     # one key under (c) and (b): its marks are in both
+H1 = KEY_Y + 5
 
 # (a)'s cache: wide, with the dropped windows still visible as ghosts
-CA = Cache(x0=140, yb=93, sink_w=2.2, fp_w=20, q_w=13.5, loc_w=20, fp_h=20, n_drop=N_DROP,
-           gap=7, wgap=2)
+CA = Cache(x0=146, yb=93, sink_w=2.2, fp_w=21, q_w=14, loc_w=21, fp_h=20, n_drop=N_DROP,
+           gap=7.5, wgap=2.2)
 TRACED = 3                               # the int2 window whose score update is shown
 A_ROW = 105                              # (a)'s alpha row
 A_SPAN = 224.5                           # its first cell -> the middle of "New score"
-# (b) and (c): the same cache, narrower, after the eviction
-CB = Cache(x0=9, yb=138, sink_w=1.8, fp_w=15, q_w=11, loc_w=15, fp_h=20, gap=4.5, wgap=1.6)
-KY0 = CB.yb + 13                         # (c)'s kernel box; above it the new K, V come in
-KY1 = KY0 + 38
+# (b) and (c): the same cache, narrower, after the eviction. (c) draws it higher: its
+# re-rank box above is short, its kernel box below is level with (b)'s cache, where the
+# gate's pick comes in
+_CB = dict(x0=9, sink_w=1.8, fp_w=16, q_w=11.5, loc_w=16, fp_h=20, gap=5, wgap=1.8)
+CB = Cache(yb=138, **_CB)
+CC = Cache(yb=100, **_CB)
+KY0 = CC.yb + 18                         # (c)'s kernel box; above it the new K, V go up
+KY1 = KY0 + 42
 
 
 def fig1_a(g):
@@ -551,83 +575,62 @@ def fig1_b(g):
         g.text((x1 + x2) / 2, CB.yb - CB.fp_h - 6, "Always read", size=FS, anchor="middle")
     CB.draw(g, mode="gated")
 
-    # the opened windows, and what a step reads of each int2 window
-    g.text(CB.cx("q"), CB.yb + 13, "Top windows opened, at the gate ratio", size=FS,
+    # the opened windows (what a step reads of each is in the key under the panels)
+    g.text(CB.cx("q"), CB.yb + 14, "Top windows opened, at the gate ratio", size=FS,
            anchor="middle", weight="bold", fill=Q_T)
-    kx, ky, kp = 11, CB.yb + 32, 14.5
-    g.use("card", kx, ky - 7.5, 9, 9)
-    g.text(kx + 13, ky, "Card: read for every window", size=FS)
-    g.rect(kx, ky + kp - 7, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
-    g.text(kx + 13, ky + kp, "Opened: its int2 window is read too", size=FS)
-    g.add('<g opacity="0.45">')
-    g.rect(kx, ky + 2 * kp - 7, 9, 8, fill=Q_F, stroke=Q_S, sw=0.6, dash="1.5 1")
-    g.add("</g>")
-    g.text(kx + 13, ky + 2 * kp, "Not opened: only its card is read", size=FS)
 
 
 def fig1_c(g):
     frame(g, BW, BH, "(c)", "One fused pass per token", "Every decode step, every layer")
-    top = CB.card_top()
-    yfp = CB.yb - CB.fp_h
+    top = CC.card_top()
+    yfp = CC.yb - CC.fp_h
 
-    # ---- when the newest window fills: re-rank, then promote / demote / drop
-    chx, chy, chw, chh = 9, 31, 114, 12.5
-    g.rect(chx, chy, chw, chh, fill="#ffffff", stroke=INK, sw=0.7, rx=3)
-    g.text(chx + chw / 2, chy + 8.8, "Re-rank by cumulative score", size=FS, anchor="middle",
-           weight="bold")
-    xn, ym = CB.loc[-1] + CB.loc_w / 2, chy + chh / 2
-    g.path(f"M{xn},{yfp - 1} L{xn},{ym} L{chx + chw + 1},{ym}", stroke=INK, sw=0.8, arrow="dark")
-    g.text(xn - 2, ym - 3, "Window full", size=FS, anchor="end")
-    y0, yl = chy + chh + 0.5, chy + chh + 32.5
-    g.line(CB.cx("fp"), y0, CB.cx("fp"), yfp - 1.5, stroke=FP_S, sw=0.9, arrow="blue")
-    g.text(CB.cx("fp") + 3, yl, "Promote", size=FS, fill=FP_T)
-    xdm = CB.qx(3)
+    # ---- when the newest window fills: re-rank, then promote / demote / drop. The
+    # trigger is written in the box, not drawn, so every line here is a short drop
+    rx0, ry0, rx1, ry1 = 14, 31, 170, 53
+    g.rect(rx0, ry0, rx1 - rx0, ry1 - ry0, fill="#ffffff", stroke=INK, sw=0.7, rx=3)
+    g.text((rx0 + rx1) / 2, ry0 + 9.4, "Re-rank by cumulative score", size=FS,
+           anchor="middle", weight="bold")
+    g.text((rx0 + rx1) / 2, ry0 + 18.4, "when the newest window fills", size=FS,
+           anchor="middle")
+    y0, yl = ry1 + 0.5, (ry1 + yfp) / 2 + 3
+    g.line(CC.cx("fp"), y0, CC.cx("fp"), yfp - 1.5, stroke=FP_S, sw=0.9, arrow="blue")
+    g.text(CC.cx("fp") + 3, yl, "Promote", size=FS, fill=FP_T)
+    xdm = CC.qx(3)
     g.line(xdm, y0, xdm, top - 1.5, stroke=Q_S, sw=0.9, arrow="violet")
-    g.text(xdm + 3, yl, "Demote", size=FS, fill=Q_T)
-    g.text(xdm + 3, yl + 9, "(+ card)", size=FS, fill=Q_T)
-    xdr = chx + chw - 8
-    g.line(xdr, y0, xdr, y0 + 8, stroke=INK, sw=0.7)
-    xmark(g, xdr, y0 + 11.5, r=2.4)
-    g.text(xdr + 4, y0 + 14.3, "Drop", size=FS)
+    g.text(xdm + 3, yl - 4.5, "Demote", size=FS, fill=Q_T)
+    g.text(xdm + 3, yl + 4.5, "(+ card)", size=FS, fill=Q_T)
+    xdr = rx1 - 12
+    g.line(xdr, y0, xdr, y0 + 6, stroke=INK, sw=0.7)
+    xmark(g, xdr, y0 + 9.5, r=2.4)
+    g.text(xdr + 4, y0 + 12.3, "Drop", size=FS)
 
-    CB.draw(g, mode="gated", fill_newest=True)
+    CC.draw(g, mode="gated", fill_newest=True)
 
-    # ---- one kernel reads the whole cache: fp16 and opened int2 in full, the rest by card
-    for x, col, arrow, dash, sw in (
-            [(CB.cx("sink"), SINK_S, "slate", None, 0.7), (CB.cx("fp"), FP_S, "blue", None, 0.9),
-             (CB.cx("loc"), FP_S, "blue", None, 0.9)]
-            + [(CB.qx(c), Q_S if c in SEL else CARD_S, "violet" if c in SEL else "green",
-                None if c in SEL else "1.5 1.2", 0.9 if c in SEL else 0.6) for c in range(N_Q)]):
-        g.line(x, CB.yb + 1, x, KY0 - 1, stroke=col, sw=sw, dash=dash, arrow=arrow)
-    g.rect(4.5, KY0, BW - 14, KY1 - KY0, fill="#ffffff", stroke=INK, sw=0.6, rx=3)
+    # ---- one kernel reads the whole cache: fp16 and opened int2 in full, the rest by
+    # card. Its row sits straight under the windows it reads, so no arrow per window
+    g.rect(4.5, KY0, BW - 12, KY1 - KY0, fill="#ffffff", stroke=INK, sw=0.6, rx=3)
     g.text(9, KY0 + 9.5, "Fused attention reads:", size=FS, weight="bold")
     mt, mh = KY0 + 13, 12.5
-    g.rect(CB.sink[0], mt, CB.sink[1] - CB.sink[0], mh, fill=SINK_F, stroke=SINK_S, sw=0.4)
-    for x in CB.fp:
-        g.rect(x, mt, CB.fp_w, mh, fill=FP_F, stroke=FP_S, sw=0.5)
-    for c, x in enumerate(CB.q):
+    g.rect(CC.sink[0], mt, CC.sink[1] - CC.sink[0], mh, fill=SINK_F, stroke=SINK_S, sw=0.4)
+    for x in CC.fp:
+        g.rect(x, mt, CC.fp_w, mh, fill=FP_F, stroke=FP_S, sw=0.5)
+    for c, x in enumerate(CC.q):
         if c in SEL:                                       # opened: dequantized on chip
-            g.rect(x, mt, CB.q_w, mh, fill=FP_F, stroke=Q_S, sw=0.9)
+            g.rect(x, mt, CC.q_w, mh, fill=FP_F, stroke=Q_S, sw=0.9)
         else:                                              # unread: its card only
-            g.use("card", x + (CB.q_w - CB.card) / 2, mt + mh - CB.card, CB.card, CB.card)
-    for x in CB.loc:
-        g.rect(x, mt, CB.loc_w, mh, fill="hatch-blue", stroke=FP_S, sw=0.5)
+            g.use("card", x + (CC.q_w - CC.card) / 2, mt + mh - CC.card, CC.card, CC.card)
+    for x in CC.loc:
+        g.rect(x, mt, CC.loc_w, mh, fill="hatch-blue", stroke=FP_S, sw=0.5)
     ly = mt + mh + 8.8
-    g.text(CB.qx(SEL[0]), ly, "Decoded", size=FS, anchor="middle", fill=Q_T)
-    g.text((CB.qx(4) + CB.qx(5)) / 2, ly, "Card only", size=FS, anchor="middle", fill=CARD_T)
+    g.text(CC.qx(SEL[0]), ly, "Decoded", size=FS, anchor="middle", fill=Q_T)
+    g.text((CC.qx(4) + CC.qx(5)) / 2, ly, "Card only", size=FS, anchor="middle", fill=CARD_T)
 
-    # ---- the token it produces: its K, V go into the newest window, from below, which
-    # keeps (c)'s right edge clear at the cache for the arrow coming in from (b)
-    oy, ox0, ox1 = KY1 + 8, 9, 100
-    g.line((ox0 + ox1) / 2, KY1, (ox0 + ox1) / 2, oy - 0.5, stroke=INK, sw=0.8, arrow="dark")
-    g.rect(ox0, oy, ox1 - ox0, 11, fill="#ffffff", stroke=QRY_S, sw=0.9, rx=2)
-    g.text((ox0 + ox1) / 2, oy + 8, "Output → next token", size=FS, anchor="middle",
-           weight="bold", fill=QRY_T)
-    xr, yr = BW - 5, KY0 - 4
-    xt = CB.loc[-1] + CB.loc_w * 5.5 / 8                        # its slot in the newest window
-    g.path(f"M{ox1},{oy + 5.5} L{xr},{oy + 5.5} L{xr},{yr} L{xt},{yr} L{xt},{CB.yb + 1}",
-           stroke=QRY_S, sw=0.9, arrow="red")
-    g.text((ox1 + xr) / 2, oy + 2.8, "Its K, V appended", size=FS, anchor="middle", fill=QRY_T)
+    # ---- the token it produces: its K, V go straight up into the newest window's slot
+    xt = CC.loc[-1] + CC.loc_w * 5.5 / 8
+    g.line(xt, KY0 - 0.5, xt, CC.yb + 1, stroke=QRY_S, sw=0.9, arrow="red")
+    g.text(xt - 3.5, (CC.yb + KY0) / 2 + 3, "Next token's K, V", size=FS, anchor="end",
+           fill=QRY_T)
 
 
 def build_fig1():
@@ -642,22 +645,35 @@ def build_fig1():
     fig1_c(g)
     g.close()
 
-    # between panels, across the full gaps: the tiered cache feeds the gate (b, right); the
-    # gate's pick feeds the pass (c, left), level with the cache both of them draw
+    # between panels, across the full gaps, as block arrows: the tiered cache feeds the
+    # gate (b, right); the gate's pick, level with (b)'s cache, feeds (c)'s kernel
     xq = XB + CB.cx("q")
-    g.line(xq, AH + 1.5, xq, BY - 1.5, stroke=INK, sw=1.6, arrow="dark")
+    block_arrow(g, xq, AH + 1.5, xq, BY - 0.5)
     yb = BY + CB.yb - CB.fp_h / 2
-    g.line(XB - 1.5, yb, XC + BW + 1.5, yb, stroke=INK, sw=1.6, arrow="dark")
+    block_arrow(g, XB - 1.5, yb, XC + BW + 0.5, yb)
     # every window's attention this step, read or credited, goes back into its score (a):
     # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell; the label
     # runs up the outside of the line
     yk = BY + (KY0 + KY1) / 2
     xa = LM + CA.qx(TRACED) - A_SPAN
-    ya = A_ROW + 7
-    g.path(f"M{XC + 4.5},{yk} L{XL},{yk} L{XL},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1,
-           arrow="blue")
+    ya, r = A_ROW + 7, 4
+    g.path(f"M{XC + 4.5},{yk} L{XL + r},{yk} Q{XL},{yk} {XL},{yk - r} L{XL},{ya + r} "
+           f"Q{XL},{ya} {XL + r},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1, arrow="blue")
     g.text(XL - 3.5, (ya + yk) / 2, "Each window's attention → its score", size=FS,
            anchor="middle", fill=FP_T, rotate=-90)
+
+    # the key: what a step reads of each int2 window, for the marks in (b) and (c)
+    g.open(LM, KEY_Y - 9, extra=f' class="panel" data-w="{AW}" data-h="13"')
+    col = AW / 3
+    g.use("card", 4, 1.5, 9, 9)
+    g.text(17, 9, "Card: read for every window", size=FS)
+    g.rect(col + 4, 2, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
+    g.text(col + 17, 9, "Opened: its int2 window is read too", size=FS)
+    g.add('<g opacity="0.45">')
+    g.rect(2 * col + 4, 2, 9, 8, fill=Q_F, stroke=Q_S, sw=0.6, dash="1.5 1")
+    g.add("</g>")
+    g.text(2 * col + 17, 9, "Not opened: only its card is read", size=FS)
+    g.close()
     return svg_doc(g, W1, H1), W1, H1
 
 
