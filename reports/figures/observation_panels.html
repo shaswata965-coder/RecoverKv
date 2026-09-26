@@ -211,7 +211,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-a"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="a" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="a" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="a" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">Importance is broad. The top 10% of historical windows hold 22.4% of the attention mass, half of it needs 32.2% of the windows, and 90% needs 79.4%.</p>
-      <p class="prov"><b>Measured</b>A.I. The curve runs through the seven reported points and is interpolated between them (concave, quadratic). The dashed diagonal is uniform importance.</p>
+      <p class="prov"><b>Measured</b>A.I. The dots are the seven reported points; the curve between them is interpolated (concave, quadratic). The dashed diagonal is uniform importance. The four reported CIs are within ±0.5 points and sit inside the dots, so none is drawn.</p>
       <div class="curve-src"><span id="curve-status">Curve: interpolated through 7 reported points</span>
         <span class="btn small file">Load measured curve (CSV)<input type="file" id="curve-file" accept=".csv,.txt,text/csv,text/plain" aria-label="Load measured curve CSV"></span>
         <button class="btn small" type="button" id="curve-reset" hidden>Use reported points</button></div>
@@ -243,7 +243,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-b"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="b" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="b" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="b" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">Storage moves track future use. Promoted windows draw 2.34× the candidate-set average over the next 32 steps; evicted windows draw 0.66×.</p>
-      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on. Whiskers are 95% CIs.</p>
+      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Count</th><th class="num">Lift</th><th class="num">95% CI</th></tr></thead>
@@ -269,12 +269,12 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-c"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="c" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="c" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="c" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">A few windows carry most of a query's low-bit attention. Reading the 7 of 26 its query ranks highest captures 59.2%, which is 93.9% of a hindsight pick of the same size.</p>
-      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. Uniform is the expected share 7/26 (arithmetic). 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
+      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. The dashed line is a uniform pick, the expected share 7/26 = 26.9% (arithmetic): a reference like (a)'s diagonal, not a measurement, so it has no interval. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Captured</th><th class="num">95% CI</th></tr></thead>
           <tbody>
-            <tr><td>Uniform</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
+            <tr><td>Uniform (dashed)</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
             <tr><td>Query-conditioned</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
             <tr><td>Hindsight</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
             <tr><td>Ratio</td><td>gate efficiency</td><td class="num">93.9%</td><td class="num">93.7–94.1</td></tr>
@@ -305,43 +305,55 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
 'use strict';
 
 // ---------------------------------------------------------------- print colours
-// Fixed in both page themes: these land on white paper.
+// Fixed in both page themes: these land on white paper. One blue for what the run measured
+// (the curve in (a), every bar in (b), the query-conditioned bar in (c)), gray for references.
+// The blue is the method figures' fp16 hue (#3c6ea8, scripts/figures/method_overview.py); the
+// bar step is light enough for a dark whisker to read on it (4.5:1) and still holds 3.6:1
+// against the paper. The old darkest bar gave its whisker 2.0:1, which is why it vanished.
+// Bars are not coloured by tier: that blue and the int2 violet fail the colour-blind check
+// (ΔE 0.8 deutan at matched lightness), and the axis already names each bar.
 const C = {
-  ink: '#1c2026', ink2: '#454c56', spine: '#30353c', guide: '#a2a8b1', ref: '#4d545e',
-  curve: '#1f5fae', wash: '#1f5fae',
-  promoted: '#184f95', stayHigh: '#2a78d6', demoted: '#86b6ef', stayLow: '#eea49d', evicted: '#cf4b43',
-  uniform: '#b4b9c0', query: '#1f5fae', hindFill: '#d5e3f6', hindHatch: '#1f5fae', whisker: '#1c2026'
+  ink: '#1c2026', ink2: '#555c66', spine: '#4a5059', ref: '#7a818b',
+  curve: '#3c6ea8', wash: '#3c6ea8', bar: '#5489c7', oracle: '#a6abb2',
+  whisker: '#1c2026', paper: '#ffffff'
 };
 
 // ---------------------------------------------------------------- data (report Part A)
+// Every number the figures used to print is here and in the LaTeX caption; the panels carry
+// only axes, category names and one word per dashed reference.
 const DATA = {
   a: {
     // A.I, mass held by the top share of windows (mean over traces at a fixed share)
     topShare: [[5, 13.6], [10, 22.4], [20, 36.8], [40, 59.2]],
     // A.I, share of windows needed to cover a mass level (mean over traces at a fixed mass)
     toCover: [[32.2, 50], [64.9, 80], [79.4, 90]],
-    anchors: [
+    // the seven reported points, drawn as dots: the curve between them is interpolated
+    points: [
+      { x: 5, y: 13.6, tip: '<b>Top 5%</b> of windows hold <b>13.6%</b> of attention mass' },
       { x: 10, y: 22.4, tip: '<b>Top 10%</b> of windows hold <b>22.4%</b> of attention mass (CI 22.1–22.7)' },
+      { x: 20, y: 36.8, tip: '<b>Top 20%</b> of windows hold <b>36.8%</b> of attention mass' },
       { x: 32.2, y: 50, tip: '<b>50%</b> of mass needs <b>32.2%</b> of windows (CI 31.7–32.6)' },
+      { x: 40, y: 59.2, tip: '<b>Top 40%</b> of windows hold <b>59.2%</b> of attention mass' },
       { x: 64.9, y: 80, tip: '<b>80%</b> of mass needs <b>64.9%</b> of windows (CI 64.5–65.3)' },
       { x: 79.4, y: 90, tip: '<b>90%</b> of mass needs <b>79.4%</b> of windows (CI 79.1–79.7)' }
     ]
   },
   b: [ // A.V, lift over the next 32 steps
-    { label: 'Promoted', v: 2.34, lo: 2.10, hi: 2.59, n: '221', fill: C.promoted },
-    { label: 'Stay high', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', fill: C.stayHigh },
-    { label: 'Demoted', v: 1.19, lo: 1.09, hi: 1.29, n: '221', fill: C.demoted },
-    { label: 'Stay low', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', fill: C.stayLow },
-    { label: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', fill: C.evicted }
+    { label: 'Promoted', v: 2.34, lo: 2.10, hi: 2.59, n: '221' },
+    { label: 'Stay high', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987' },
+    { label: 'Demoted', v: 1.19, lo: 1.09, hi: 1.29, n: '221' },
+    // 391,147 windows, 92% of all candidates (arithmetic); the interval is 0.01 wide, thinner
+    // at every panel size than the whisker's own stroke, so it draws as one tick
+    { label: 'Stay low', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147' },
+    { label: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336' }
   ],
   c: [ // A.IV, share of low-bit attention captured reading 7 of 26 windows
-    { label: 'Uniform', v: 26.9, fill: C.uniform, tip: '<b>Uniform:</b> 26.9% expected (7 / 26, arithmetic)' },
-    { label: 'Query-conditioned', v: 59.2, lo: 58.6, hi: 59.9, fill: C.query, tip: '<b>Query-conditioned:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
-    { label: 'Hindsight', v: 63.1, lo: 62.4, hi: 63.7, fill: C.hindFill, hatch: C.hindHatch, tip: '<b>Hindsight:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
+    { label: 'Query-conditioned', v: 59.2, lo: 58.6, hi: 59.9, fill: C.bar, tip: '<b>Query-conditioned:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
+    { label: 'Hindsight', v: 63.1, lo: 62.4, hi: 63.7, fill: C.oracle, tip: '<b>Hindsight:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
   ],
-  ofHindsight: '93.9% of hindsight',
-  readNote: '7 / 26 windows read',
-  horizonNote: 'next 32 steps'
+  // A.IV, a uniform pick of 7 of 26 windows: an expectation (arithmetic), so a reference line
+  // like (a)'s diagonal rather than a bar that would have no interval to draw
+  uniform: 100 * 7 / 26
 };
 
 const FIGS = {
@@ -350,11 +362,12 @@ const FIGS = {
   c: { file: 'obs_gate_recall', tag: '(c)', title: 'Query-time concentration' }
 };
 
-// Default axis titles: the first candidate that fits its axis on one line wins.
+// Default axis titles: the first candidate that fits its axis on one line wins. (b) and (c)
+// name their categories on the axis, so they have no x title unless one is typed in the page.
 const TITLES = {
   a: { x: ['Historical windows retained (%)', 'Windows retained (%)'], y: ['Cumulative attention mass (%)', 'Cumulative attention (%)', 'Cumulative mass (%)'] },
-  b: { x: ['Storage-priority transition', 'Transition'], y: ['Future-attention lift (×)', 'Attention lift (×)', 'Lift (×)'] },
-  c: { x: ['Window selection rule', 'Selection rule'], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
+  b: { x: [], y: ['Future-attention lift (×)', 'Attention lift (×)', 'Lift (×)'] },
+  c: { x: [], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
 };
 
 const WIDTHS = {
@@ -468,6 +481,7 @@ function pickTitle(key, axis, maxW, fs) {
   const custom = state.custom[key][axis];
   if (custom != null && custom !== '') return wrapWords(custom, maxW, fs);
   const cands = TITLES[key][axis];
+  if (!cands.length) return [];
   for (const c of cands) if (tw(c, fs) <= maxW) return [c];
   return wrapWords(cands[cands.length - 1], maxW, fs);
 }
@@ -491,8 +505,8 @@ function spread(c, h, gap, lo, hi) {
 // ---------------------------------------------------------------- layout (shared by the three panels)
 const fmtTick = v => (Math.round(v * 10) / 10).toString();
 const TICKS = {
-  a: { x: [0, 10, 32.2, 64.9, 79.4, 100], y: [0, 22.4, 50, 80, 90, 100], yMax: 100 },
-  b: { y: [0, 0.5, 1, 1.5, 2, 2.5, 3], yMax: 3, fmt: v => v === 0 ? '0' : v.toFixed(1) },
+  a: { x: [0, 25, 50, 75, 100], y: [0, 25, 50, 75, 100], yMax: 100 },
+  b: { y: [0, 1, 2, 3], yMax: 3, fmt: v => String(v) },
   c: { y: [0, 25, 50, 75, 100], yMax: 100 }
 };
 function layout() {
@@ -517,8 +531,8 @@ function layout() {
     const xr = {}, plotW = {};
     for (const k of K) { xr[k] = W - right[k]; plotW[k] = xr[k] - left; }
     const cats = {
-      b: catLayout(DATA.b.map(d => d.label), plotW.b / 5, tfs, right.b),
-      c: catLayout(DATA.c.map(d => d.label), plotW.c / 3, tfs, right.c)
+      b: catLayout(DATA.b.map(d => d.label), plotW.b / DATA.b.length, tfs, right.b),
+      c: catLayout(DATA.c.map(d => d.label), plotW.c / DATA.c.length, tfs, right.c)
     };
     const catH = k => {
       const cl = cats[k];
@@ -528,13 +542,15 @@ function layout() {
     const block = { a: tick + pad + capH + tfs * 0.22, b: catH('b'), c: catH('c') };
     const xTitles = {};
     for (const k of K) xTitles[k] = pickTitle(k, 'x', plotW[k], fs);
-    const need = k => block[k] + fs * 0.3 + fs * 0.8 + (xTitles[k].length - 1) * lh + fs * 0.24;
+    const need = k => block[k] + (xTitles[k].length ? fs * 0.3 + fs * 0.8 + (xTitles[k].length - 1) * lh : 0) + fs * 0.24;
     const bottom = Math.max(...K.map(need));
     const plotH = H - top - bottom;
     const yTitles = {};
     for (const k of K) yTitles[k] = pickTitle(k, 'y', plotH, fs);
+    // one bar width for (b) and (c), set by (b)'s five slots, so the pair reads as one set
+    const bw = Math.min(plotW.b / DATA.b.length * 0.62, fs * 2.4);
     L = { fs, tfs, W, H, lh, tlh, capH, tick, pad, annoFs: tfs, top, left, bottom, x0: left, xr, y0: top, y1: H - bottom,
-      plotW, plotH, cats, block, xTitles, yTitles, titleH };
+      plotW, plotH, cats, block, xTitles, yTitles, titleH, bw };
     if (K.every(k => yTitles[k].length === yLines[k])) break;
     for (const k of K) yLines[k] = yTitles[k].length;
   }
@@ -561,7 +577,11 @@ function chrome(key, L, yTicks, yFmt, sy, opts) {
   // x title, directly under this panel's tick labels
   const xt = L.xTitles[key], cx = (x0 + x1) / 2;
   xt.forEach((line, i) => { s += T(cx, y1 + L.block[key] + fs * 0.3 + fs * 0.8 + i * lh, line, { size: fs, anchor: 'middle', fill: C.ink }); });
-  if (state.titles) s += T(1, fs * 1.05, `${FIGS[key].tag} ${FIGS[key].title}`, { size: fs * 1.05, style: 'bold', fill: C.ink });
+  if (state.titles) {
+    // shrunk to the panel's width when it would run off it (1.75 in at 9 pt)
+    const str = `${FIGS[key].tag} ${FIGS[key].title}`, size = fs * 1.05;
+    s += T(1, fs * 1.05, str, { size: Math.min(size, size * (L.W - 2) / tw(str, size, 'bold')), style: 'bold', fill: C.ink });
+  }
   return s;
 }
 function catLabels(key, L, centers) {
@@ -576,20 +596,15 @@ function catLabels(key, L, centers) {
   });
   return s;
 }
+// A 95% CI at its true extent: ink over a paper-white casing, so it stays readable where it
+// crosses a bar's fill. Every interval is drawn. One narrower than the stroke (Stay low's
+// 0.94-0.95) closes up into a single cased tick at the bar's top; it used to be skipped.
 function whisker(cx, yLo, yHi, capW) {
-  if (!state.ci || Math.abs(yLo - yHi) < 1.2) return '';
-  return Ln(cx, yLo, cx, yHi, { stroke: C.whisker, w: 0.55 }) +
-    Ln(cx - capW / 2, yLo, cx + capW / 2, yLo, { stroke: C.whisker, w: 0.55 }) +
-    Ln(cx - capW / 2, yHi, cx + capW / 2, yHi, { stroke: C.whisker, w: 0.55 });
-}
-function hatch(x, y, w, h, stroke, step) {
-  let s = '';
-  const d = step * Math.SQRT2;
-  for (let c = x + y + d / 2; c < x + w + y + h; c += d) {
-    const lo = Math.max(x, c - (y + h)), hi = Math.min(x + w, c - y);
-    if (hi - lo > 0.2) s += Ln(lo, c - lo, hi, c - hi, { stroke, w: 0.45 });
-  }
-  return s;
+  if (!state.ci) return '';
+  const w = 0.65, casing = 0.45;
+  const beam = o => Ln(cx, yLo, cx, yHi, o) +
+    Ln(cx - capW / 2, yLo, cx + capW / 2, yLo, o) + Ln(cx - capW / 2, yHi, cx + capW / 2, yHi, o);
+  return beam({ stroke: C.paper, w: w + 2 * casing, cap: 'square' }) + beam({ stroke: C.whisker, w });
 }
 
 // ---------------------------------------------------------------- (a) cumulative importance
@@ -635,21 +650,19 @@ function drawA(L, screen) {
   const path = curvePath(sx, sy);
   s += `<path d="${path}Z" fill="${C.wash}" fill-opacity="0.08" stroke="none"/>`;
   s += Ln(sx(0), sy(0), sx(100), sy(100), { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  for (const a of DATA.a.anchors) {
-    s += `<polyline points="${f2(x0)},${f2(sy(a.y))} ${f2(sx(a.x))},${f2(sy(a.y))} ${f2(sx(a.x))},${f2(y1)}" fill="none" stroke="${C.guide}" stroke-width="0.5" stroke-dasharray="0.9 1.3"/>`;
-  }
   s += `<path d="${path}" fill="none" stroke="${C.curve}" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round"/>`;
-  const r = Math.max(1.7, fs * 0.25);
-  for (const a of DATA.a.anchors) {
-    s += `<circle cx="${f2(sx(a.x))}" cy="${f2(sy(a.y))}" r="${f2(r)}" fill="${C.curve}" stroke="#ffffff" stroke-width="0.8"/>`;
+  // the reported points; the line between them is interpolated
+  const r = Math.max(1.5, fs * 0.21);
+  for (const p of DATA.a.points) {
+    s += `<circle cx="${f2(sx(p.x))}" cy="${f2(sy(p.y))}" r="${f2(r)}" fill="${C.curve}" stroke="${C.paper}" stroke-width="0.7"/>`;
   }
-  // "uniform" along the diagonal, below it, clear of the guides
+  // "Uniform" along the diagonal, below it
   const ang = -Math.atan2(y1 - y0, x1 - x0) * 180 / Math.PI;
   const len = Math.hypot(x1 - x0, y1 - y0), nx = (y1 - y0) / len, ny = (x1 - x0) / len;
   const off = fs * 0.35 + capH;
-  const ux = sx(49) + nx * off, uy = sy(49) + ny * off;
-  s += T(ux, uy, 'uniform', { size: L.annoFs, anchor: 'middle', style: 'italic', rotate: ang, fill: C.ink2 });
-  // axes: ticks sit on the reported values
+  const ux = sx(55) + nx * off, uy = sy(55) + ny * off;
+  s += T(ux, uy, 'Uniform', { size: L.annoFs, anchor: 'middle', rotate: ang, fill: C.ink2 });
+  // axes: round ticks; the reported values are in the caption
   s += chrome('a', L, TICKS.a.y, fmtTick, sy, { xTicks: true });
   const xs = TICKS.a.x;
   const cx = spread(xs.map(sx), xs.map(v => tw(fmtTick(v), tfs) / 2), fs * 0.3, -Infinity, L.W - 1);
@@ -658,34 +671,25 @@ function drawA(L, screen) {
     s += T(cx[i], y1 + tick + pad + capH, fmtTick(v), { size: tfs, anchor: 'middle', fill: C.ink });
   });
   if (screen) {
-    for (const a of DATA.a.anchors) s += `<circle class="hit" data-tip="${esc(a.tip)}" cx="${f2(sx(a.x))}" cy="${f2(sy(a.y))}" r="${f2(fs * 0.9)}" fill="#000" fill-opacity="0"/>`;
+    for (const p of DATA.a.points) s += `<circle class="hit" data-tip="${esc(p.tip)}" cx="${f2(sx(p.x))}" cy="${f2(sy(p.y))}" r="${f2(fs * 0.7)}" fill="#000" fill-opacity="0"/>`;
   }
   return s;
 }
 
 // ---------------------------------------------------------------- (b) tier dynamics
 function drawB(L, screen) {
-  const { fs, x0, y0, y1, capH, lh, annoFs } = L, x1 = L.xr.b;
+  const { fs, x0, y0, y1, annoFs, bw } = L, x1 = L.xr.b;
   const yMax = TICKS.b.yMax, sy = v => y1 - v / yMax * (y1 - y0);
-  const n = DATA.b.length, slot = (x1 - x0) / n, bw = Math.min(slot * 0.6, fs * 2.6);
+  const n = DATA.b.length, slot = (x1 - x0) / n;
   const centers = DATA.b.map((_, i) => x0 + slot * (i + 0.5));
   const refY = sy(1);
   let s = '';
-  DATA.b.forEach((d, i) => { s += Rect(centers[i] - bw / 2, sy(d.v), bw, y1 - sy(d.v), d.fill); });
-  DATA.b.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.34); });
+  // the candidate-set average (1×), behind the bars like a gridline
   s += Ln(x0, refY, x1, refY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  DATA.b.forEach((d, i) => {
-    const topV = state.ci ? Math.max(d.v, d.hi) : d.v;
-    let base = sy(topV) - fs * 0.3;
-    if (base - capH - 0.8 < refY && base + 0.8 > refY) base = refY - fs * 0.3;
-    s += T(centers[i], base, `${d.v.toFixed(2)}×`, { size: annoFs, anchor: 'middle', fill: C.ink });
-  });
-  // legend for the dashed line, top right
-  const lgText = 'candidate-set average', lgW = tw(lgText, annoFs), sw = fs * 1.5;
-  const lgY = y0 + capH * 0.5 + 1;
-  s += Ln(x1 - lgW - fs * 0.45 - sw, lgY, x1 - lgW - fs * 0.45, lgY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  s += T(x1, lgY + capH * 0.45, lgText, { size: annoFs, anchor: 'end', fill: C.ink });
-  s += T(x1, lgY + capH * 0.45 + lh * 0.95, DATA.horizonNote, { size: annoFs, anchor: 'end', style: 'italic', fill: C.ink2 });
+  DATA.b.forEach((d, i) => { s += Rect(centers[i] - bw / 2, sy(d.v), bw, y1 - sy(d.v), C.bar); });
+  DATA.b.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
+  // one word names the line: at its right end, over the two bars that stay under 1×
+  s += T(x1, refY - fs * 0.3, 'Average', { size: annoFs, anchor: 'end', fill: C.ink2 });
   s += chrome('b', L, TICKS.b.y, TICKS.b.fmt, sy, {});
   s += catLabels('b', L, centers);
   if (screen) {
@@ -699,54 +703,33 @@ function drawB(L, screen) {
 
 // ---------------------------------------------------------------- (c) gate recall
 function drawC(L, screen) {
-  const { fs, x0, y0, y1, capH, lh, annoFs } = L, x1 = L.xr.c;
+  const { fs, x0, y0, y1, annoFs, bw } = L, x1 = L.xr.c;
   const sy = v => y1 - v / 100 * (y1 - y0);
-  const n = DATA.c.length, slot = (x1 - x0) / n, bw = Math.min(slot * 0.5, fs * 2.9);
+  const n = DATA.c.length, slot = (x1 - x0) / n;
   const centers = DATA.c.map((_, i) => x0 + slot * (i + 0.5));
+  const uY = sy(DATA.uniform);
   let s = '';
-  DATA.c.forEach((d, i) => {
-    const x = centers[i] - bw / 2, y = sy(d.v), h = y1 - y;
-    s += Rect(x, y, bw, h, d.fill);
-    if (d.hatch) {
-      s += hatch(x, y, bw, h, d.hatch, fs * 0.3);
-      s += Rect(x + 0.25, y + 0.25, bw - 0.5, h - 0.25, 'none', ` stroke="${d.hatch}" stroke-width="0.5"`);
-    }
-  });
-  DATA.c.forEach((d, i) => { if (d.lo != null) s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.3); });
-  const vlab = DATA.c.map((d, i) => {
-    const topV = state.ci && d.hi != null ? Math.max(d.v, d.hi) : d.v;
-    const base = sy(topV) - fs * 0.3, txt = `${d.v.toFixed(1)}%`, w = tw(txt, annoFs);
-    s += T(centers[i], base, txt, { size: annoFs, anchor: 'middle', fill: C.ink });
-    return { base, top: base - capH, l: centers[i] - w / 2, r: centers[i] + w / 2 };
-  });
-  // the top note, then "93.9% of hindsight" over the query bar, kept clear of both neighbours
-  const noteX = x0 + fs * 0.45, noteBase = y0 + capH + 1, noteR = noteX + tw(DATA.readNote, annoFs);
-  s += T(noteX, noteBase, DATA.readNote, { size: annoFs, anchor: 'start', fill: C.ink });
-  const q = vlab[1], h = vlab[2], cq = centers[1], gap = fs * 0.3;
-  const oneW = tw(DATA.ofHindsight, annoFs, 'italic');
-  let base = q.base - L.tlh;
-  if (cq + oneW / 2 + gap > h.l && base > h.top - 1.2 - annoFs * 0.24) base = h.top - 1.2 - annoFs * 0.24;
-  const hitsNote = b => b - capH < noteBase + fs * 0.25 && cq - oneW / 2 < noteR + gap;
-  if (!hitsNote(base)) {
-    s += T(cq, base, DATA.ofHindsight, { size: annoFs, anchor: 'middle', style: 'italic', fill: C.ink2 });
-  } else {
-    const [l1, l2] = bestSplit(DATA.ofHindsight, annoFs).lines;
-    s += T(cq, q.base - 2 * L.tlh, l1, { size: annoFs, anchor: 'middle', style: 'italic', fill: C.ink2 });
-    s += T(cq, q.base - L.tlh, l2, { size: annoFs, anchor: 'middle', style: 'italic', fill: C.ink2 });
-  }
+  // a uniform pick of the same 7 of 26 windows, behind the bars like (b)'s average
+  s += Ln(x0, uY, x1, uY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
+  DATA.c.forEach((d, i) => { s += Rect(centers[i] - bw / 2, sy(d.v), bw, y1 - sy(d.v), d.fill); });
+  DATA.c.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
+  // named once, above the line in the open space between the two bars
+  s += T((x0 + x1) / 2, uY - fs * 0.3, 'Uniform', { size: annoFs, anchor: 'middle', fill: C.ink2 });
   s += chrome('c', L, TICKS.c.y, fmtTick, sy, {});
   s += catLabels('c', L, centers);
   if (screen) {
     DATA.c.forEach((d, i) => { s += Rect(centers[i] - slot / 2, y0, slot, y1 - y0, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(d.tip)}"`); });
+    const tip = `<b>Uniform:</b> ${DATA.uniform.toFixed(1)}% expected from any 7 of 26 windows (arithmetic, no interval)`;
+    s += Rect(x0, uY - fs * 0.5, x1 - x0, fs, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(tip)}"`);
   }
   return s;
 }
 
 // ---------------------------------------------------------------- build
 const ARIA = {
-  a: 'Cumulative attention mass against the share of historical windows retained, highest importance first. Top 10% hold 22.4%; 50% of mass needs 32.2% of windows, 80% needs 64.9%, 90% needs 79.4%.',
+  a: 'Cumulative attention mass against the share of historical windows retained, highest importance first, through seven reported points. Top 10% hold 22.4%; 50% of mass needs 32.2% of windows, 80% needs 64.9%, 90% needs 79.4%. Dashed diagonal: uniform importance.',
   b: 'Future-attention lift over the next 32 steps by storage transition: Promoted 2.34, Stay high 1.63, Demoted 1.19, Stay low 0.94, Evicted 0.66; dashed line at the candidate-set average 1.0.',
-  c: 'Share of low-bit attention captured reading 7 of 26 windows: Uniform 26.9%, Query-conditioned 59.2% (93.9% of hindsight), Hindsight 63.1%.'
+  c: 'Share of low-bit attention captured reading 7 of 26 windows: Query-conditioned 59.2% (93.9% of hindsight), Hindsight 63.1%; dashed line at a uniform pick, 26.9%.'
 };
 function buildSVG(key, mode) {
   const L = layout();
@@ -826,11 +809,17 @@ ${sub('a', 'Broad utility', 'fig:obs-breadth')}${sep}
 ${sub('b', 'Gradual evolution', 'fig:obs-dynamics')}${sep}
 ${sub('c', 'Query-time concentration', 'fig:obs-gate')}
   \\caption{Observations on one decode run (Llama-3.1-8B-Instruct, 8 wikitext-103 prompts, 512 steps).
-    (a) Cumulative attention mass of historical windows sorted by the attention they received; the dashed
-    diagonal is uniform importance. The top 10\\% hold 22.4\\% of the mass and 90\\% of it needs 79.4\\% of the windows.
-    (b) Future-attention lift over the next 32 steps, relative to the average candidate (dashed), for each
-    storage-priority transition. (c) Share of low-bit attention captured when reading the same 7 of 26 windows.
-    Whiskers are 95\\% bootstrap CIs over (prompt, layer) traces.}
+    (a) Cumulative attention mass of historical windows sorted by the attention they received; dots are the
+    seven measured points and the dashed diagonal is uniform importance. The top 10\\% hold 22.4\\% of the
+    mass, half of it needs 32.2\\% of the windows and 90\\% needs 79.4\\%.
+    (b) Future-attention lift over the next 32 steps for each storage-priority transition, relative to the
+    candidate-set average (dashed): promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
+    stay low 0.94$\\times$, evicted 0.66$\\times$.
+    (c) Share of low-bit attention captured reading the same 7 of 26 windows: 59.2\\% when the query picks
+    them, 93.9\\% of the 63.1\\% a hindsight pick captures; dashed is a uniform pick, $7/26 = 26.9\\%$.
+    Whiskers are 95\\% bootstrap CIs over 256 (prompt, layer) traces. Stay low's (0.94--0.95, 391,147
+    windows) is narrower than its stroke and draws as a single tick; the intervals in (a) are within
+    $\\pm$0.5 points and sit inside the dots.}
   \\label{fig:observations}
 \\end{${env}}`;
 }
