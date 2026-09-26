@@ -243,7 +243,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-b"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="b" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="b" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="b" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">Storage moves track future use. Promoted windows draw 2.34× the candidate-set average over the next 32 steps; evicted windows draw 0.66×.</p>
-      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. Bars take the tier the window ends in, in the method figures' notation: fp16 blue, int2 violet, evicted a dashed empty box. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
+      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. The legend names each bar and the tier the window ends in, in the method figures' notation: fp16 blue, int2 violet, light for a window that moved into the tier and dark for one that stayed; evicted is a dashed empty box. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Count</th><th class="num">Lift</th><th class="num">95% CI</th></tr></thead>
@@ -269,12 +269,12 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-c"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="c" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="c" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="c" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">A few windows carry most of a query's low-bit attention. Reading the 7 of 26 its query ranks highest captures 59.2%, which is 93.9% of a hindsight pick of the same size.</p>
-      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. The dashed line is a uniform pick, the expected share 7/26 = 26.9% (arithmetic): a reference like (a)'s diagonal, not a measurement, so it has no interval. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
+      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. Uniform pick is the expected share of any 7 of 26 windows, 7/26 = 26.9% (arithmetic), so its bar has no interval; hindsight is the best 7 windows known after the fact. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Captured</th><th class="num">95% CI</th></tr></thead>
           <tbody>
-            <tr><td>Uniform (dashed)</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
+            <tr><td>Uniform pick</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
             <tr><td>Query-conditioned</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
             <tr><td>Hindsight</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
             <tr><td>Ratio</td><td>gate efficiency</td><td class="num">93.9%</td><td class="num">93.7–94.1</td></tr>
@@ -307,23 +307,25 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
 // ---------------------------------------------------------------- print colours
 // Fixed in both page themes: these land on white paper. Bars wear the tier they are about, in
 // the method figures' notation (scripts/figures/method_overview.py): fp16 blue, int2 violet,
-// each a fill outlined in its tier's ink, and a dropped window as a dashed white box. The two
-// fills sit far apart in lightness, which is what keeps them apart for colour-blind readers
-// (ΔE 14.5 protan, 19.0 normal; at matched lightness they collapse to 0.8). Both fills are
-// light enough for a dark whisker to read on them (4.2:1 and 8.5:1); the old darkest bar gave
-// its whisker 2.0:1, which is why it vanished.
+// each a fill outlined in its tier's ink, and a dropped window as a dashed white box. Each tier
+// has two shades so its two bars can be told apart: light for a window that moved into the tier
+// at this eviction, dark for one that stayed. Neighbouring bars differ most in lightness, which
+// is what keeps them apart for colour-blind readers (worst adjacent pair ΔE 18.7 protan, 19.0
+// normal; blue and violet at matched lightness collapse to 0.8). The light shades sit under 3:1
+// on white by design; the tier-ink outline carries their edge and the legend names every bar.
+// Whiskers read on every fill (3.4:1 on the dark shades, plus a paper-white casing).
 const C = {
   ink: '#1c2026', ink2: '#555c66', spine: '#4a5059', ref: '#7a818b',
   curve: '#3c6ea8', wash: '#3c6ea8',
-  fp: { fill: '#4e83c0', stroke: '#3c6ea8' }, q: { fill: '#bca9e8', stroke: '#6446a4' },
-  drop: { fill: '#ffffff', stroke: '#5b6878', dash: '1.6 1.1' }, oracle: { fill: '#c9cdd3', stroke: '#8b929c' },
+  fpMoved: { fill: '#82aee3', stroke: '#3c6ea8' }, fpStay: { fill: '#4074b0', stroke: '#2c5a8f' },
+  qMoved: { fill: '#c1b3f2', stroke: '#6446a4' }, qStay: { fill: '#7e65bb', stroke: '#51368a' },
+  drop: { fill: '#ffffff', stroke: '#5b6878', dash: '1.6 1.1' }, chance: { fill: '#d4d8dd', stroke: '#8b929c' },
   whisker: '#1c2026', paper: '#ffffff'
 };
-const TIER_KEY = [['fp', 'fp16'], ['q', 'int2'], ['drop', 'Evicted']];
 
 // ---------------------------------------------------------------- data (report Part A)
-// Every number the figures used to print is here and in the LaTeX caption; the panels carry
-// axes, category names, (b)'s tier key and one word per dashed reference.
+// Every number is here and in the LaTeX caption. (b) and (c) name their bars in a legend, not
+// under the axis; `key` is the legend text, and every legend entry starts with a capital.
 const DATA = {
   a: {
     // A.I, mass held by the top share of windows (mean over traces at a fixed share)
@@ -341,22 +343,22 @@ const DATA = {
       { x: 79.4, y: 90, tip: '<b>90%</b> of mass needs <b>79.4%</b> of windows (CI 79.1–79.7)' }
     ]
   },
-  b: [ // A.V, lift over the next 32 steps; `tier` is where the window ends up
-    { label: 'Promoted', v: 2.34, lo: 2.10, hi: 2.59, n: '221', tier: 'fp' },
-    { label: 'Stay high', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', tier: 'fp' },
-    { label: 'Demoted', v: 1.19, lo: 1.09, hi: 1.29, n: '221', tier: 'q' },
+  b: [ // A.V, lift over the next 32 steps; the shade is the tier the window ends up in
+    { label: 'Promoted', key: 'Promoted (fp16)', v: 2.34, lo: 2.10, hi: 2.59, n: '221', style: C.fpMoved },
+    { label: 'Stay high', key: 'Stay high (fp16)', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', style: C.fpStay },
+    { label: 'Demoted', key: 'Demoted (int2)', v: 1.19, lo: 1.09, hi: 1.29, n: '221', style: C.qMoved },
     // 391,147 windows, 92% of all candidates (arithmetic); the interval is 0.01 wide, thinner
     // at every panel size than the whisker's own stroke, so it draws as one tick
-    { label: 'Stay low', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', tier: 'q' },
-    { label: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', tier: 'drop' }
+    { label: 'Stay low', key: 'Stay low (int2)', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', style: C.qStay },
+    { label: 'Evicted', key: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', style: C.drop }
   ],
-  c: [ // A.IV, share of low-bit attention captured reading 7 of 26 windows (int2 violet: the gate reads int2)
-    { label: 'Query-conditioned', v: 59.2, lo: 58.6, hi: 59.9, style: C.q, tip: '<b>Query-conditioned:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
-    { label: 'Hindsight', v: 63.1, lo: 62.4, hi: 63.7, style: C.oracle, tip: '<b>Hindsight:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
-  ],
-  // A.IV, a uniform pick of 7 of 26 windows: an expectation (arithmetic), so a reference line
-  // like (a)'s diagonal rather than a bar that would have no interval to draw
-  uniform: 100 * 7 / 26
+  // A.IV, share of low-bit attention captured reading 7 of 26 windows. Uniform is the expected
+  // share of any 7 of 26 (arithmetic), so it has no interval to draw.
+  c: [
+    { label: 'Uniform', key: 'Uniform pick', v: 100 * 7 / 26, style: C.chance, tip: '<b>Uniform pick:</b> 26.9% expected from any 7 of 26 windows (arithmetic, no interval)' },
+    { label: 'Query-conditioned', key: 'Query-conditioned gate', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Query-conditioned gate:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
+    { label: 'Hindsight', key: 'Hindsight oracle', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Hindsight oracle:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
+  ]
 };
 
 const FIGS = {
@@ -412,10 +414,14 @@ function fontFaceCSS() {
 
 // ---------------------------------------------------------------- text metrics
 const mctx = document.createElement('canvas').getContext('2d');
-function tw(str, size, style) {
-  mctx.font = `${style === 'italic' ? 'italic ' : ''}${style === 'bold' ? '700 ' : ''}1000px ${FONT_ID[state.family]}`;
+function tw(str, size, style, family) {
+  mctx.font = `${style === 'italic' ? 'italic ' : ''}${style === 'bold' ? '700 ' : ''}1000px ${FONT_ID[family || state.family]}`;
   return mctx.measureText(str).width * size / 1000;
 }
+// Axis and panel titles: bold, in the other embedded face (sans titles on a serif figure, and
+// the reverse), so a title never reads as one more tick label.
+const titleFamily = () => (state.family === 'serif' ? 'sans' : 'serif');
+const twTitle = (str, size) => tw(str, size, 'bold', titleFamily());
 const f2 = n => Math.round(n * 100) / 100;
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -426,9 +432,9 @@ const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(
 // words by up to 4pt in the PDF.
 function T(x, y, str, o) {
   o = o || {};
-  const w = o.anchor === 'end' || o.anchor === 'middle' ? tw(str, o.size, o.style) : 0;
+  const w = o.anchor === 'end' || o.anchor === 'middle' ? tw(str, o.size, o.style, o.family) : 0;
   const xs = o.anchor === 'end' ? x - w : o.anchor === 'middle' ? x - w / 2 : x;
-  const a = [`x="${f2(xs)}"`, `y="${f2(y)}"`, `font-family="${FONT_ID[state.family]}"`, `font-size="${f2(o.size)}"`,
+  const a = [`x="${f2(xs)}"`, `y="${f2(y)}"`, `font-family="${FONT_ID[o.family || state.family]}"`, `font-size="${f2(o.size)}"`,
     `fill="${o.fill || C.ink}"`];
   if (o.style === 'italic') a.push('font-style="italic"');
   if (o.style === 'bold') a.push('font-weight="bold"');
@@ -446,35 +452,13 @@ function Rect(x, y, w, h, fill, extra) {
 }
 
 // ---------------------------------------------------------------- label helpers
-function bestSplit(label, fs) {
-  let best = [label], bestW = tw(label, fs);
-  for (let i = 1; i < label.length; i++) {
-    let parts = null;
-    if (label[i] === ' ') parts = [label.slice(0, i), label.slice(i + 1)];
-    else if (label[i - 1] === '-') parts = [label.slice(0, i), label.slice(i)];
-    if (!parts) continue;
-    const w = Math.max(tw(parts[0], fs), tw(parts[1], fs));
-    if (w < bestW) { best = parts; bestW = w; }
-  }
-  return { lines: best, w: bestW };
-}
-function catLayout(labels, slotW, fs, roomRight) {
-  const gap = fs * 0.32;
-  const fits = ws => ws.every((w, i) => i === 0 || ws[i - 1] / 2 + w / 2 + gap <= slotW) &&
-    ws[ws.length - 1] / 2 - slotW / 2 <= roomRight;
-  const one = labels.map(l => ({ lines: [l], w: tw(l, fs) }));
-  if (fits(one.map(o => o.w))) return { mode: 'flat', items: one, lines: 1 };
-  const two = labels.map(l => bestSplit(l, fs));
-  if (fits(two.map(o => o.w))) return { mode: 'flat', items: two, lines: Math.max(...two.map(o => o.lines.length)) };
-  return { mode: 'rot', items: one, lines: 1, maxW: Math.max(...one.map(o => o.w)) };
-}
 function wrapWords(str, maxW, fs) {
-  if (tw(str, fs) <= maxW) return [str];
+  if (twTitle(str, fs) <= maxW) return [str];
   const words = str.split(' ');
   let best = [str], bestW = Infinity;
   for (let i = 1; i < words.length; i++) {
     const l = [words.slice(0, i).join(' '), words.slice(i).join(' ')];
-    const w = Math.max(tw(l[0], fs), tw(l[1], fs));
+    const w = Math.max(twTitle(l[0], fs), twTitle(l[1], fs));
     if (w < bestW) { best = l; bestW = w; }
   }
   return best;
@@ -484,8 +468,65 @@ function pickTitle(key, axis, maxW, fs) {
   if (custom != null && custom !== '') return wrapWords(custom, maxW, fs);
   const cands = TITLES[key][axis];
   if (!cands.length) return [];
-  for (const c of cands) if (tw(c, fs) <= maxW) return [c];
+  for (const c of cands) if (twTitle(c, fs) <= maxW) return [c];
   return wrapWords(cands[cands.length - 1], maxW, fs);
+}
+// A legend for (b) and (c), which name their bars here rather than under the axis. Entries run
+// in bar order, top to bottom. It takes the first spot that keeps clear of every mark and label
+// in `avoid` (rects in figure units): top right, then top left, then two columns, each tried at
+// full label size and then a little smaller; with no room for the full names (`key`, which say
+// the tier), the short ones (`label`) are tried the same way. The swatch is a small copy of the bar.
+function legend(items, L, x0, x1, avoid) {
+  const { y0, annoFs } = L;
+  const hits = (r) => avoid.some(o => r.x0 < o.x1 && o.x0 < r.x1 && r.y0 < o.y1 && o.y0 < r.y1);
+  for (const lab of ['key', 'label']) for (const f of [annoFs, annoFs * 0.9, annoFs * 0.82]) {
+    const sw = f * 0.82, gap = f * 0.42, row = f * 1.3, colGap = f * 0.9;
+    const ws = items.map(it => sw + gap + tw(it[lab], f));
+    const place = (cols, right) => {
+      const per = Math.ceil(items.length / cols), colW = [];
+      for (let c = 0; c < cols; c++) colW.push(Math.max(...ws.slice(c * per, (c + 1) * per)));
+      const boxW = colW.reduce((a, b) => a + b, 0) + colGap * (cols - 1), boxH = (per - 1) * row + sw;
+      const bx = right ? x1 - boxW - f * 0.25 : x0 + f * 0.7, by = y0 + 1;
+      const box = { x0: bx - f * 0.3, y0: by - 0.5, x1: bx + boxW + f * 0.25, y1: by + boxH + f * 0.45 };
+      if (box.x0 < x0 + 1 || box.x1 > x1 + 0.01 || hits(box)) return null;
+      return items.map((it, i) => {
+        const c = Math.floor(i / per), r = i % per;
+        return { it, text: it[lab], x: bx + colW.slice(0, c).reduce((a, b) => a + b + colGap, 0), y: by + r * row };
+      });
+    };
+    const spots = place(1, true) || place(1, false) || place(2, true) || place(2, false);
+    if (spots) return legendMarks({ f, sw, gap, spots });
+  }
+  return null;
+}
+function legendMarks(pick) {
+  let s = '';
+  for (const { it, text, x, y } of pick.spots) {
+    s += bar(x, y, pick.sw, y + pick.sw, it.style);
+    s += T(x + pick.sw + pick.gap, y + pick.sw * 0.88, text, { size: pick.f, fill: C.ink });
+  }
+  return s;
+}
+// When nothing clears inside the plot (a narrow panel, large text), the legend takes a band above
+// it, in as many equal columns as fit the plot's width: whichever of the full or short names and
+// the two sizes gives the shallowest band (full names on a tie). The plot starts under the band.
+function legendBand(items, L, x0, x1) {
+  let best = null;
+  for (const lab of ['key', 'label']) for (const k of [0.9, 0.82]) {
+    // a column wider than the plot is set smaller rather than run off the edge
+    const widest = g => Math.max(...items.map(it => g * 1.24 + tw(it[lab], g)));
+    const f0 = L.annoFs * k, f = Math.min(f0, f0 * (x1 - x0) / widest(f0));
+    const sw = f * 0.82, gap = f * 0.42, row = f * 1.3, colGap = f * 1.1, colW = widest(f);
+    const cols = Math.max(1, Math.min(items.length, Math.floor((x1 - x0 + colGap) / (colW + colGap))));
+    const h = (Math.ceil(items.length / cols) - 1) * row + sw + L.capH + f * 0.6;
+    if (!best || h < best.h - 0.5) best = { lab, f, sw, gap, row, colGap, colW, cols, h };
+  }
+  const b = best;
+  return {
+    h: b.h,
+    marks: yTop => legendMarks({ f: b.f, sw: b.sw, gap: b.gap, spots: items.map((it, i) =>
+      ({ it, text: it[b.lab], x: x0 + (i % b.cols) * (b.colW + b.colGap), y: yTop + Math.floor(i / b.cols) * b.row })) })
+  };
 }
 // push overlapping 1-D labels apart (centres c, half-sizes h), keep inside [lo, hi]
 function spread(c, h, gap, lo, hi) {
@@ -532,16 +573,9 @@ function layout() {
     const left = 1 + Math.max(...K.map(k => yLines[k] * lh + fs * 0.3 + yTickW[k])) + pad + tick;
     const xr = {}, plotW = {};
     for (const k of K) { xr[k] = W - right[k]; plotW[k] = xr[k] - left; }
-    const cats = {
-      b: catLayout(DATA.b.map(d => d.label), plotW.b / DATA.b.length, tfs, right.b),
-      c: catLayout(DATA.c.map(d => d.label), plotW.c / DATA.c.length, tfs, right.c)
-    };
-    const catH = k => {
-      const cl = cats[k];
-      if (cl.mode === 'rot') return pad + 2 + cl.maxW * Math.sin(Math.PI / 5) + tfs * Math.cos(Math.PI / 5);
-      return pad + 1.5 + capH + (cl.lines - 1) * tlh + tfs * 0.22;
-    };
-    const block = { a: tick + pad + capH + tfs * 0.22, b: catH('b'), c: catH('c') };
+    // what sits between each x axis and its title: (a)'s tick labels; (b) and (c) name their
+    // bars in a legend, so their titles sit right under the axis
+    const block = { a: tick + pad + capH + tfs * 0.22, b: pad, c: pad };
     const xTitles = {};
     for (const k of K) xTitles[k] = pickTitle(k, 'x', plotW[k], fs);
     const need = k => block[k] + (xTitles[k].length ? fs * 0.3 + fs * 0.8 + (xTitles[k].length - 1) * lh : 0) + fs * 0.24;
@@ -552,7 +586,7 @@ function layout() {
     // one bar width for (b) and (c), set by (b)'s five slots, so the pair reads as one set
     const bw = Math.min(plotW.b / DATA.b.length * 0.62, fs * 2.4);
     L = { fs, tfs, W, H, lh, tlh, capH, tick, pad, annoFs: tfs, top, left, bottom, x0: left, xr, y0: top, y1: H - bottom,
-      plotW, plotH, cats, block, xTitles, yTitles, titleH, bw };
+      plotW, plotH, block, xTitles, yTitles, titleH, bw };
     if (K.every(k => yTitles[k].length === yLines[k])) break;
     for (const k of K) yLines[k] = yTitles[k].length;
   }
@@ -573,29 +607,17 @@ function chrome(key, L, yTicks, yFmt, sy, opts) {
   });
   // x axis
   s += Ln(x0, y1, x1, y1, { stroke: C.spine, w: 0.6, cap: 'square' });
-  // y title, rotated, centred on the plot
+  // y title, rotated, centred on the plot; x title under this panel's axis (or its tick labels)
+  const tf = { size: fs, anchor: 'middle', fill: C.ink, style: 'bold', family: titleFamily() };
   const yt = L.yTitles[key], cy = (y0 + y1) / 2;
-  yt.forEach((line, i) => { s += T(1 + fs * 0.8 + i * lh, cy, line, { size: fs, anchor: 'middle', rotate: -90, fill: C.ink }); });
-  // x title, directly under this panel's tick labels
+  yt.forEach((line, i) => { s += T(1 + fs * 0.8 + i * lh, cy, line, Object.assign({ rotate: -90 }, tf)); });
   const xt = L.xTitles[key], cx = (x0 + x1) / 2;
-  xt.forEach((line, i) => { s += T(cx, y1 + L.block[key] + fs * 0.3 + fs * 0.8 + i * lh, line, { size: fs, anchor: 'middle', fill: C.ink }); });
+  xt.forEach((line, i) => { s += T(cx, y1 + L.block[key] + fs * 0.3 + fs * 0.8 + i * lh, line, tf); });
   if (state.titles) {
     // shrunk to the panel's width when it would run off it (1.75 in at 9 pt)
     const str = `${FIGS[key].tag} ${FIGS[key].title}`, size = fs * 1.05;
-    s += T(1, fs * 1.05, str, { size: Math.min(size, size * (L.W - 2) / tw(str, size, 'bold')), style: 'bold', fill: C.ink });
+    s += T(1, fs * 1.05, str, { size: Math.min(size, size * (L.W - 2) / twTitle(str, size)), style: 'bold', family: titleFamily(), fill: C.ink });
   }
-  return s;
-}
-function catLabels(key, L, centers) {
-  const { tfs, y1, pad, capH, tlh } = L, cl = L.cats[key];
-  let s = '';
-  cl.items.forEach((it, i) => {
-    if (cl.mode === 'rot') {
-      s += T(centers[i] + tfs * 0.25, y1 + pad + 2 + tfs * 0.6, it.lines[0], { size: tfs, anchor: 'end', rotate: -36, fill: C.ink });
-    } else {
-      it.lines.forEach((ln, j) => { s += T(centers[i], y1 + pad + 1.5 + capH + j * tlh, ln, { size: tfs, anchor: 'middle', fill: C.ink }); });
-    }
-  });
   return s;
 }
 // A bar as the method figures draw a window: its tier's fill, outlined in the tier's ink (the
@@ -686,74 +708,79 @@ function drawA(L, screen) {
 }
 
 // ---------------------------------------------------------------- (b) tier dynamics
+// Draws a bar panel's marks for layout L; returns the SVG and the rects its legend must avoid.
+// With no room for the legend inside the plot, the plot is drawn again under a legend band.
+// Panels whose legend had to go above the plot at the current size; the page says so under them.
+const BANDED = {};
+function withLegend(key, L, items, x0, x1, marks) {
+  let m = marks(L);
+  const inside = legend(items, L, x0, x1, m.avoid);
+  BANDED[key] = inside == null;
+  if (inside != null) return m.s + inside;
+  const band = legendBand(items, L, x0, x1);
+  m = marks(Object.assign({}, L, { y0: L.y0 + band.h }));
+  return m.s + band.marks(L.y0 + 1);
+}
 function drawB(L, screen) {
-  const { fs, x0, y0, y1, annoFs, bw } = L, x1 = L.xr.b;
-  const yMax = TICKS.b.yMax, sy = v => y1 - v / yMax * (y1 - y0);
-  const n = DATA.b.length, slot = (x1 - x0) / n;
+  const x0 = L.x0, x1 = L.xr.b, n = DATA.b.length, slot = (x1 - x0) / n;
   const centers = DATA.b.map((_, i) => x0 + slot * (i + 0.5));
-  const refY = sy(1);
-  let s = '';
-  // the candidate-set average (1×), behind the bars like a gridline
-  s += Ln(x0, refY, x1, refY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  DATA.b.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, C[d.tier]); });
-  DATA.b.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
-  // one word names the line: at its right end, over the two bars that stay under 1×
-  s += T(x1, refY - fs * 0.3, 'Average', { size: annoFs, anchor: 'end', fill: C.ink2 });
-  // the tier each window ends in, top right, over the bars that stay low: stacked, or one row
-  // when a short panel would push the stack into "Average"
-  const avgTop = refY - fs * 0.3 - L.capH - fs * 0.3;
-  const stacked = y0 + 1 + (TIER_KEY.length - 1) * annoFs * 1.25 + annoFs * 0.8 <= Math.min(avgTop, sy(1.35));
-  // a row too wide for the panel (1.75 in at 9 pt) is set smaller rather than run into the ticks
-  const rowW = f => TIER_KEY.reduce((a, [, t]) => a + f * 1.2 + tw(t, f), 0) + f * 0.6 * (TIER_KEY.length - 1);
-  const kFs = stacked ? annoFs : Math.min(annoFs, annoFs * (x1 - x0 - fs * 1.2) / rowW(annoFs));
-  const kRow = kFs * 1.25, kSw = kFs * 0.8, kGap = kFs * 0.4, ws = TIER_KEY.map(([, t]) => tw(t, kFs));
-  let kx = stacked ? x1 - Math.max(...ws) - kSw - kGap : x1 - rowW(kFs);
-  TIER_KEY.forEach(([k, t], i) => {
-    const ky = y0 + 1 + (stacked ? i * kRow : 0);
-    s += bar(kx, ky, kSw, ky + kSw, C[k]);
-    s += T(kx + kSw + kGap, ky + kSw * 0.9, t, { size: kFs, fill: C.ink });
-    if (!stacked) kx += kSw + kGap + ws[i] + kFs * 0.6;
+  return withLegend('b', L, DATA.b, x0, x1, Lp => {
+    const { fs, y0, y1, annoFs, bw, capH } = Lp;
+    const sy = v => y1 - v / TICKS.b.yMax * (y1 - y0), refY = sy(1), pad = fs * 0.35;
+    let s = '';
+    // the candidate-set average (1×), behind the bars like a gridline
+    s += Ln(x0, refY, x1, refY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
+    DATA.b.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, d.style); });
+    DATA.b.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
+    // one word names the line: at its right end, over the two bars that stay under 1×
+    const avgBase = refY - fs * 0.3;
+    s += T(x1, avgBase, 'Average', { size: annoFs, anchor: 'end', fill: C.ink2 });
+    s += chrome('b', Lp, TICKS.b.y, TICKS.b.fmt, sy, {});
+    if (screen) {
+      DATA.b.forEach((d, i) => {
+        const tip = `<b>${esc(d.label)}:</b> ${d.v.toFixed(2)}× the candidate-set average over the next 32 steps (CI ${d.lo.toFixed(2)}–${d.hi.toFixed(2)}, n = ${d.n})`;
+        s += Rect(centers[i] - slot / 2, y0, slot, y1 - y0, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(tip)}"`);
+      });
+    }
+    // the legend keeps clear of every bar and whisker, the dashed line and its label
+    const avoid = DATA.b.map((d, i) => ({ x0: centers[i] - bw / 2 - pad, x1: centers[i] + bw / 2 + pad,
+      y0: (state.ci ? Math.min(sy(d.v), sy(d.hi)) : sy(d.v)) - pad, y1 }));
+    avoid.push({ x0: x1 - tw('Average', annoFs) - pad, x1, y0: avgBase - capH - pad, y1: refY + 1 });
+    avoid.push({ x0, x1, y0: refY - 1, y1: refY + 1 });
+    return { s, avoid };
   });
-  s += chrome('b', L, TICKS.b.y, TICKS.b.fmt, sy, {});
-  s += catLabels('b', L, centers);
-  if (screen) {
-    DATA.b.forEach((d, i) => {
-      const tip = `<b>${esc(d.label)}:</b> ${d.v.toFixed(2)}× the candidate-set average over the next 32 steps (CI ${d.lo.toFixed(2)}–${d.hi.toFixed(2)}, n = ${d.n})`;
-      s += Rect(centers[i] - slot / 2, y0, slot, y1 - y0, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(tip)}"`);
-    });
-  }
-  return s;
 }
 
 // ---------------------------------------------------------------- (c) gate recall
 function drawC(L, screen) {
-  const { fs, x0, y0, y1, annoFs, bw } = L, x1 = L.xr.c;
-  const sy = v => y1 - v / 100 * (y1 - y0);
-  const n = DATA.c.length, slot = (x1 - x0) / n;
+  const x0 = L.x0, x1 = L.xr.c, n = DATA.c.length, slot = (x1 - x0) / n;
   const centers = DATA.c.map((_, i) => x0 + slot * (i + 0.5));
-  const uY = sy(DATA.uniform);
-  let s = '';
-  // a uniform pick of the same 7 of 26 windows, behind the bars like (b)'s average
-  s += Ln(x0, uY, x1, uY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  DATA.c.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, d.style); });
-  DATA.c.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
-  // named once, above the line in the open space between the two bars
-  s += T((x0 + x1) / 2, uY - fs * 0.3, 'Uniform', { size: annoFs, anchor: 'middle', fill: C.ink2 });
-  s += chrome('c', L, TICKS.c.y, fmtTick, sy, {});
-  s += catLabels('c', L, centers);
-  if (screen) {
-    DATA.c.forEach((d, i) => { s += Rect(centers[i] - slot / 2, y0, slot, y1 - y0, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(d.tip)}"`); });
-    const tip = `<b>Uniform:</b> ${DATA.uniform.toFixed(1)}% expected from any 7 of 26 windows (arithmetic, no interval)`;
-    s += Rect(x0, uY - fs * 0.5, x1 - x0, fs, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(tip)}"`);
-  }
-  return s;
+  return withLegend('c', L, DATA.c, x0, x1, Lp => {
+    const { fs, y0, y1, annoFs, bw, capH } = Lp;
+    const sy = v => y1 - v / 100 * (y1 - y0), pad = fs * 0.35, avoid = [];
+    let s = '';
+    DATA.c.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, d.style); });
+    DATA.c.forEach((d, i) => { if (d.lo != null) s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
+    // each bar's share on top of it, above its whisker: the three numbers are the finding
+    DATA.c.forEach((d, i) => {
+      const top = state.ci && d.hi != null ? sy(d.hi) : sy(d.v), base = top - fs * 0.35, txt = `${d.v.toFixed(1)}%`;
+      const half = Math.max(bw, tw(txt, annoFs)) / 2;
+      s += T(centers[i], base, txt, { size: annoFs, anchor: 'middle', fill: C.ink });
+      avoid.push({ x0: centers[i] - half - pad, x1: centers[i] + half + pad, y0: base - capH - pad, y1 });
+    });
+    s += chrome('c', Lp, TICKS.c.y, fmtTick, sy, {});
+    if (screen) {
+      DATA.c.forEach((d, i) => { s += Rect(centers[i] - slot / 2, y0, slot, y1 - y0, '#000', ` fill-opacity="0" class="hit" data-tip="${esc(d.tip)}"`); });
+    }
+    return { s, avoid };
+  });
 }
 
 // ---------------------------------------------------------------- build
 const ARIA = {
   a: 'Cumulative attention mass against the share of historical windows retained, highest importance first, through seven reported points. Top 10% hold 22.4%; 50% of mass needs 32.2% of windows, 80% needs 64.9%, 90% needs 79.4%. Dashed diagonal: uniform importance.',
   b: 'Future-attention lift over the next 32 steps by storage transition: Promoted 2.34, Stay high 1.63, Demoted 1.19, Stay low 0.94, Evicted 0.66; dashed line at the candidate-set average 1.0.',
-  c: 'Share of low-bit attention captured reading 7 of 26 windows: Query-conditioned 59.2% (93.9% of hindsight), Hindsight 63.1%; dashed line at a uniform pick, 26.9%.'
+  c: 'Share of low-bit attention captured reading 7 of 26 windows: uniform pick 26.9%, query-conditioned gate 59.2% (93.9% of hindsight), hindsight oracle 63.1%.'
 };
 function buildSVG(key, mode) {
   const L = layout();
@@ -776,8 +803,10 @@ function render() {
       `${(W / 72).toFixed(2)} × ${(H / 72).toFixed(2)} in · ${state.fontPt} pt ${state.family}`;
     const clash = collisions(document.querySelector(`#svg-${k} svg`));
     const warn = document.getElementById('warn-' + k);
-    warn.hidden = !clash.length;
-    warn.textContent = clash.length ? `Labels collide at this size (${clash[0]}). Try a smaller text size or a wider panel.` : '';
+    const note = clash.length ? `Labels collide at this size (${clash[0]}). Try a smaller text size or a wider panel.`
+      : BANDED[k] ? 'At this size the legend has no room inside the plot, so it sits above a shorter plot. Smaller text or a wider panel fits it inside.' : '';
+    warn.hidden = !note;
+    warn.textContent = note;
   }
   for (const k of ['a', 'b', 'c']) for (const ax of ['x', 'y']) {
     const el = document.getElementById(`${ax}t-${k}`);
@@ -837,12 +866,12 @@ ${sub('c', 'Query-time concentration', 'fig:obs-gate')}
     seven measured points and the dashed diagonal is uniform importance. The top 10\\% hold 22.4\\% of the
     mass, half of it needs 32.2\\% of the windows and 90\\% needs 79.4\\%.
     (b) Future-attention lift over the next 32 steps for each storage-priority transition, relative to the
-    candidate-set average (dashed), coloured by the tier the window ends in: promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
+    candidate-set average (dashed), shaded by the tier the window ends in (light: moved into it, dark: stayed): promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
     stay low 0.94$\\times$, evicted 0.66$\\times$.
     (c) Share of low-bit attention captured reading the same 7 of 26 windows: 59.2\\% when the query picks
-    them, 93.9\\% of the 63.1\\% a hindsight pick captures; dashed is a uniform pick, $7/26 = 26.9\\%$.
+    them, 93.9\\% of the 63.1\\% the best 7 in hindsight capture, against $7/26 = 26.9\\%$ for a uniform pick.
     Whiskers are 95\\% bootstrap CIs over 256 (prompt, layer) traces. Stay low's (0.94--0.95, 391,147
-    windows) is narrower than its stroke and draws as a single tick; the intervals in (a) are within
+    windows) is narrower than its stroke and draws as a single tick; the uniform pick is exact, and the intervals in (a) are within
     $\\pm$0.5 points and sit inside the dots.}
   \\label{fig:observations}
 \\end{${env}}`;
@@ -854,11 +883,12 @@ async function pdfBlob(key) {
   if (!libsReady()) throw new Error('The PDF library did not load. Reload the page and try again.');
   const { W, H, svg } = buildSVG(key, 'pdf');
   const doc = new window.jspdf.jsPDF({ unit: 'pt', format: [W, H], orientation: W >= H ? 'landscape' : 'portrait', compress: true, putOnlyUsedFonts: true });
+  // both faces: the titles are set in the other one; putOnlyUsedFonts embeds just what is drawn
   const F = window.FIG_FONTS, fam = state.family;
-  for (const st of ['normal', 'italic', 'bold']) {
-    const file = `${FONT_ID[fam]}-${st}.ttf`;
-    doc.addFileToVFS(file, F[fam][st]);
-    doc.addFont(file, FONT_ID[fam], st);
+  for (const f of ['serif', 'sans']) for (const st of ['normal', 'italic', 'bold']) {
+    const file = `${FONT_ID[f]}-${st}.ttf`;
+    doc.addFileToVFS(file, F[f][st]);
+    doc.addFont(file, FONT_ID[f], st);
   }
   doc.setFont(FONT_ID[fam], 'normal');
   const host = document.getElementById('export-host');
