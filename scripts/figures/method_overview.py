@@ -37,7 +37,8 @@ ratio). The drawing is proportioned from one real setting (2 fp16 against 8
 int2 windows, 2 of 8 opened), but that is geometry, never text.
 
 Palette: fp16 blue, int2 violet, card green, sink slate, query / new token red,
-dropped a dashed outline; every label and mark one solid ink, no greys.
+dropped a dashed outline, the flow between panels amber; every label and mark
+one solid ink, no greys.
 
 Figure 1's labels are upright (no italics) and start with a capital; a dtype
 (fp16, int2) or a symbol (alpha) keeps its own case.
@@ -64,6 +65,7 @@ LOC_F = "#eef4fb"
 Q_F, Q_S, Q_T, Q_L = "#dccff2", "#6446a4", "#51368a", "#f4f0fb"
 CARD_F, CARD_S, CARD_T = "#d4ecdc", "#3b8a5a", "#2a6d45"
 QRY_F, QRY_S, QRY_T = "#f6cdc9", "#c0392b", "#a93226"
+FLOW_F, FLOW_S = "#f8c865", "#b0701a"   # the flow between panels: no element uses amber
 BLUES = ["#f7fbff", "#deebf7", "#c6dbef", "#9ecae1", "#6baed6", "#4292c6",
          "#2171b5", "#08519c", "#08306b"]
 PURPLES = ["#fcfbfd", "#efedf5", "#dadaeb", "#bcbddc", "#9e9ac8", "#807dba",
@@ -177,9 +179,12 @@ def xmark(g, x, y, r=2.4, stroke=INK, sw=0.9):
            stroke=stroke, sw=sw)
 
 
-def block_arrow(g, x0, y0, x1, y1, shaft=4.5, head=12, hl=9, fill=INK):
+def block_arrow(g, x0, y0, x1, y1, shaft=7, head=17, hl=10.5, fill=FLOW_F, stroke=FLOW_S,
+                sw=0.9):
     """A filled arrow from (x0, y0) to its tip at (x1, y1): the flow between panels, a
-    shape rather than a line, so it never reads as one of a panel's connectors."""
+    shape rather than a line, in a colour no element uses, so it never reads as one of
+    a panel's connectors. Drawn like the figure's other marks: a fill, an outline in
+    the same hue, rounded corners."""
     ln = math.hypot(x1 - x0, y1 - y0)
     dx, dy = (x1 - x0) / ln, (y1 - y0) / ln
     nx, ny = -dy, dx
@@ -188,7 +193,8 @@ def block_arrow(g, x0, y0, x1, y1, shaft=4.5, head=12, hl=9, fill=INK):
            (bx + nx * head / 2, by + ny * head / 2), (x1, y1),
            (bx - nx * head / 2, by - ny * head / 2), (bx - nx * shaft / 2, by - ny * shaft / 2),
            (x0 - nx * shaft / 2, y0 - ny * shaft / 2)]
-    g.path("M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in pts) + " Z", stroke="none", fill=fill)
+    g.path("M" + " L".join(f"{x:.2f},{y:.2f}" for x, y in pts) + " Z", stroke=stroke, sw=sw,
+           fill=fill, extra=' stroke-linejoin="round"')
 
 
 def bracket(g, x1, x2, y, up=True, stroke=INK, sw=0.6, tick=2.5):
@@ -652,9 +658,9 @@ def build_fig1():
     # between panels, across the full gaps, as block arrows: the tiered cache feeds the
     # gate (b, right); the gate's pick, level with (b)'s cache, feeds (c)'s kernel
     xq = XB + CB.cx("q")
-    block_arrow(g, xq, AH + 1.5, xq, BY - 0.5)
+    block_arrow(g, xq, AH + 2, xq, BY - 1)
     yb = BY + CB.yb - CB.fp_h / 2
-    block_arrow(g, XB - 1.5, yb, XC + BW + 0.5, yb)
+    block_arrow(g, XB - 2, yb, XC + BW + 1, yb)
     # every window's attention this step, read or credited, goes back into its score (a):
     # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell. (a)'s own
     # row says what happens to it; the label where it enters says what it carries
