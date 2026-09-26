@@ -1,0 +1,43 @@
+% Decode efficiency: full KV (HF eager, FlashAttention) vs. ours, B = 1 / 32 at
+% 256/8192 and 256/16384. Needs \usepackage{booktabs}. table* spans both
+% columns of a two-column template and is the same as table in a one-column one.
+%
+% Transcribed from two perf-table printouts, both A100-80GB, one GPU:
+%   ours     cache_budget 0.20, q 0.70 (bytes), gate 0.25, local 128, sink 5,
+%            window 8
+%   full KV  outputs/efficiency_fullkv_2f06bc4 (runs=1, warmup=0, stat=median)
+% TPOT: printed steady-state s/token x 1000 (0.1 ms resolution, so exact).
+% Tput: B / TPOT, as printed. Mem.: whole-run peak allocated, weights included.
+% The printers say "GB" but it is MiB / 1024, i.e. GiB -- 14.96 GiB of weights,
+% which is why every B = 1 row sits at 15-17.
+% OOM (256/16384, B = 32) is inferred, not printed: both full-KV arms printed
+% "-" there, and the measured peak grows 2.06 (flash) / 2.29 (eager) GiB per
+% sequence from B = 8 to 16 at that shape, i.e. ~81 / ~88 GiB at B = 32.
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lr rrr rrr rrr@{}}
+\toprule
+ & & \multicolumn{3}{c}{Full KV (eager)} & \multicolumn{3}{c}{Full KV (flash)} & \multicolumn{3}{c}{Ours} \\
+\cmidrule(lr){3-5} \cmidrule(lr){6-8} \cmidrule(l){9-11}
+Prefill/ & & TPOT & Tput & Mem. & TPOT & Tput & Mem. & TPOT & Tput & Mem. \\
+decode & $B$ & (ms)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$
+             & (ms)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$
+             & (ms)$\downarrow$ & (tok/s)$\uparrow$ & (GiB)$\downarrow$ \\
+\midrule
+256/8192  &  1 &  48.9 &  20.5 & 16.15 & \textbf{45.1} & \textbf{22.2} & 16.04 &          67.8  &           14.8  & \textbf{15.61} \\
+          & 32 & 296.2 & 108.0 & 52.19 &          99.1  &         322.8  & 48.51 & \textbf{74.5}  & \textbf{429.3}  & \textbf{34.70} \\
+\addlinespace
+256/16384 &  1 &  48.3 &  20.7 & 17.28 & \textbf{44.9} & \textbf{22.3} & 17.05 &          67.6  &           14.8  & \textbf{16.24} \\
+          & 32 & \multicolumn{3}{c}{OOM} & \multicolumn{3}{c}{OOM}             &         149.3  &          214.3  &         54.78  \\
+\bottomrule
+\end{tabular}
+\caption{Decode efficiency on one A100-80GB (fp16). TPOT is steady-state time
+per output token, throughput is $B/\mathrm{TPOT}$, and memory is peak allocated
+GPU memory including ${\approx}15.0$\,GiB of model weights. Ours keeps 20\% of
+the full KV cache by bytes, 70\% of it in the int2 tier, and reads 25\% of the
+int2 windows per step (8-token windows, 128-token local window, 5 sink tokens).
+OOM: full KV exceeds the 80\,GiB device. Best per row in bold.}
+\label{tab:decode-efficiency}
+\end{table*}
