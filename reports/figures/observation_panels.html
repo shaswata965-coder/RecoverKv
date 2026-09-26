@@ -243,7 +243,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-b"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="b" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="b" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="b" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">Storage moves track future use. Promoted windows draw 2.34× the candidate-set average over the next 32 steps; evicted windows draw 0.66×.</p>
-      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
+      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. Bars take the tier the window ends in, in the method figures' notation: fp16 blue, int2 violet, evicted a dashed empty box. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Count</th><th class="num">Lift</th><th class="num">95% CI</th></tr></thead>
@@ -305,22 +305,25 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
 'use strict';
 
 // ---------------------------------------------------------------- print colours
-// Fixed in both page themes: these land on white paper. One blue for what the run measured
-// (the curve in (a), every bar in (b), the query-conditioned bar in (c)), gray for references.
-// The blue is the method figures' fp16 hue (#3c6ea8, scripts/figures/method_overview.py); the
-// bar step is light enough for a dark whisker to read on it (4.5:1) and still holds 3.6:1
-// against the paper. The old darkest bar gave its whisker 2.0:1, which is why it vanished.
-// Bars are not coloured by tier: that blue and the int2 violet fail the colour-blind check
-// (ΔE 0.8 deutan at matched lightness), and the axis already names each bar.
+// Fixed in both page themes: these land on white paper. Bars wear the tier they are about, in
+// the method figures' notation (scripts/figures/method_overview.py): fp16 blue, int2 violet,
+// each a fill outlined in its tier's ink, and a dropped window as a dashed white box. The two
+// fills sit far apart in lightness, which is what keeps them apart for colour-blind readers
+// (ΔE 14.5 protan, 19.0 normal; at matched lightness they collapse to 0.8). Both fills are
+// light enough for a dark whisker to read on them (4.2:1 and 8.5:1); the old darkest bar gave
+// its whisker 2.0:1, which is why it vanished.
 const C = {
   ink: '#1c2026', ink2: '#555c66', spine: '#4a5059', ref: '#7a818b',
-  curve: '#3c6ea8', wash: '#3c6ea8', bar: '#5489c7', oracle: '#a6abb2',
+  curve: '#3c6ea8', wash: '#3c6ea8',
+  fp: { fill: '#4e83c0', stroke: '#3c6ea8' }, q: { fill: '#bca9e8', stroke: '#6446a4' },
+  drop: { fill: '#ffffff', stroke: '#5b6878', dash: '1.6 1.1' }, oracle: { fill: '#c9cdd3', stroke: '#8b929c' },
   whisker: '#1c2026', paper: '#ffffff'
 };
+const TIER_KEY = [['fp', 'fp16'], ['q', 'int2'], ['drop', 'Evicted']];
 
 // ---------------------------------------------------------------- data (report Part A)
 // Every number the figures used to print is here and in the LaTeX caption; the panels carry
-// only axes, category names and one word per dashed reference.
+// axes, category names, (b)'s tier key and one word per dashed reference.
 const DATA = {
   a: {
     // A.I, mass held by the top share of windows (mean over traces at a fixed share)
@@ -338,18 +341,18 @@ const DATA = {
       { x: 79.4, y: 90, tip: '<b>90%</b> of mass needs <b>79.4%</b> of windows (CI 79.1–79.7)' }
     ]
   },
-  b: [ // A.V, lift over the next 32 steps
-    { label: 'Promoted', v: 2.34, lo: 2.10, hi: 2.59, n: '221' },
-    { label: 'Stay high', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987' },
-    { label: 'Demoted', v: 1.19, lo: 1.09, hi: 1.29, n: '221' },
+  b: [ // A.V, lift over the next 32 steps; `tier` is where the window ends up
+    { label: 'Promoted', v: 2.34, lo: 2.10, hi: 2.59, n: '221', tier: 'fp' },
+    { label: 'Stay high', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', tier: 'fp' },
+    { label: 'Demoted', v: 1.19, lo: 1.09, hi: 1.29, n: '221', tier: 'q' },
     // 391,147 windows, 92% of all candidates (arithmetic); the interval is 0.01 wide, thinner
     // at every panel size than the whisker's own stroke, so it draws as one tick
-    { label: 'Stay low', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147' },
-    { label: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336' }
+    { label: 'Stay low', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', tier: 'q' },
+    { label: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', tier: 'drop' }
   ],
-  c: [ // A.IV, share of low-bit attention captured reading 7 of 26 windows
-    { label: 'Query-conditioned', v: 59.2, lo: 58.6, hi: 59.9, fill: C.bar, tip: '<b>Query-conditioned:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
-    { label: 'Hindsight', v: 63.1, lo: 62.4, hi: 63.7, fill: C.oracle, tip: '<b>Hindsight:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
+  c: [ // A.IV, share of low-bit attention captured reading 7 of 26 windows (int2 violet: the gate reads int2)
+    { label: 'Query-conditioned', v: 59.2, lo: 58.6, hi: 59.9, style: C.q, tip: '<b>Query-conditioned:</b> 59.2% captured (CI 58.6–59.9), 93.9% of hindsight' },
+    { label: 'Hindsight', v: 63.1, lo: 62.4, hi: 63.7, style: C.oracle, tip: '<b>Hindsight:</b> 63.1% captured by the best 7 windows in hindsight (CI 62.4–63.7)' }
   ],
   // A.IV, a uniform pick of 7 of 26 windows: an expectation (arithmetic), so a reference line
   // like (a)'s diagonal rather than a bar that would have no interval to draw
@@ -362,12 +365,11 @@ const FIGS = {
   c: { file: 'obs_gate_recall', tag: '(c)', title: 'Query-time concentration' }
 };
 
-// Default axis titles: the first candidate that fits its axis on one line wins. (b) and (c)
-// name their categories on the axis, so they have no x title unless one is typed in the page.
+// Default axis titles: the first candidate that fits its axis on one line wins.
 const TITLES = {
   a: { x: ['Historical windows retained (%)', 'Windows retained (%)'], y: ['Cumulative attention mass (%)', 'Cumulative attention (%)', 'Cumulative mass (%)'] },
-  b: { x: [], y: ['Future-attention lift (×)', 'Attention lift (×)', 'Lift (×)'] },
-  c: { x: [], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
+  b: { x: ['Storage-priority transition', 'Transition'], y: ['Future-attention lift (×)', 'Attention lift (×)', 'Lift (×)'] },
+  c: { x: ['Window selection rule', 'Selection rule'], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
 };
 
 const WIDTHS = {
@@ -596,6 +598,13 @@ function catLabels(key, L, centers) {
   });
   return s;
 }
+// A bar as the method figures draw a window: its tier's fill, outlined in the tier's ink (the
+// outline sits inside the bar, so heights stay exact); a dropped window is a dashed white box.
+function bar(x, yTop, w, yBase, st) {
+  const sw = 0.6, h = yBase - yTop;
+  return Rect(x, yTop, w, h, st.fill) + Rect(x + sw / 2, yTop + sw / 2, w - sw, h - sw, 'none',
+    ` stroke="${st.stroke}" stroke-width="${sw}"${st.dash ? ` stroke-dasharray="${st.dash}"` : ''}`);
+}
 // A 95% CI at its true extent: ink over a paper-white casing, so it stays readable where it
 // crosses a bar's fill. Every interval is drawn. One narrower than the stroke (Stay low's
 // 0.94-0.95) closes up into a single cased tick at the bar's top; it used to be skipped.
@@ -686,10 +695,25 @@ function drawB(L, screen) {
   let s = '';
   // the candidate-set average (1×), behind the bars like a gridline
   s += Ln(x0, refY, x1, refY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  DATA.b.forEach((d, i) => { s += Rect(centers[i] - bw / 2, sy(d.v), bw, y1 - sy(d.v), C.bar); });
+  DATA.b.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, C[d.tier]); });
   DATA.b.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
   // one word names the line: at its right end, over the two bars that stay under 1×
   s += T(x1, refY - fs * 0.3, 'Average', { size: annoFs, anchor: 'end', fill: C.ink2 });
+  // the tier each window ends in, top right, over the bars that stay low: stacked, or one row
+  // when a short panel would push the stack into "Average"
+  const avgTop = refY - fs * 0.3 - L.capH - fs * 0.3;
+  const stacked = y0 + 1 + (TIER_KEY.length - 1) * annoFs * 1.25 + annoFs * 0.8 <= Math.min(avgTop, sy(1.35));
+  // a row too wide for the panel (1.75 in at 9 pt) is set smaller rather than run into the ticks
+  const rowW = f => TIER_KEY.reduce((a, [, t]) => a + f * 1.2 + tw(t, f), 0) + f * 0.6 * (TIER_KEY.length - 1);
+  const kFs = stacked ? annoFs : Math.min(annoFs, annoFs * (x1 - x0 - fs * 1.2) / rowW(annoFs));
+  const kRow = kFs * 1.25, kSw = kFs * 0.8, kGap = kFs * 0.4, ws = TIER_KEY.map(([, t]) => tw(t, kFs));
+  let kx = stacked ? x1 - Math.max(...ws) - kSw - kGap : x1 - rowW(kFs);
+  TIER_KEY.forEach(([k, t], i) => {
+    const ky = y0 + 1 + (stacked ? i * kRow : 0);
+    s += bar(kx, ky, kSw, ky + kSw, C[k]);
+    s += T(kx + kSw + kGap, ky + kSw * 0.9, t, { size: kFs, fill: C.ink });
+    if (!stacked) kx += kSw + kGap + ws[i] + kFs * 0.6;
+  });
   s += chrome('b', L, TICKS.b.y, TICKS.b.fmt, sy, {});
   s += catLabels('b', L, centers);
   if (screen) {
@@ -711,7 +735,7 @@ function drawC(L, screen) {
   let s = '';
   // a uniform pick of the same 7 of 26 windows, behind the bars like (b)'s average
   s += Ln(x0, uY, x1, uY, { stroke: C.ref, w: 0.7, dash: '2.4 1.8' });
-  DATA.c.forEach((d, i) => { s += Rect(centers[i] - bw / 2, sy(d.v), bw, y1 - sy(d.v), d.fill); });
+  DATA.c.forEach((d, i) => { s += bar(centers[i] - bw / 2, sy(d.v), bw, y1, d.style); });
   DATA.c.forEach((d, i) => { s += whisker(centers[i], sy(d.lo), sy(d.hi), bw * 0.42); });
   // named once, above the line in the open space between the two bars
   s += T((x0 + x1) / 2, uY - fs * 0.3, 'Uniform', { size: annoFs, anchor: 'middle', fill: C.ink2 });
@@ -813,7 +837,7 @@ ${sub('c', 'Query-time concentration', 'fig:obs-gate')}
     seven measured points and the dashed diagonal is uniform importance. The top 10\\% hold 22.4\\% of the
     mass, half of it needs 32.2\\% of the windows and 90\\% needs 79.4\\%.
     (b) Future-attention lift over the next 32 steps for each storage-priority transition, relative to the
-    candidate-set average (dashed): promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
+    candidate-set average (dashed), coloured by the tier the window ends in: promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
     stay low 0.94$\\times$, evicted 0.66$\\times$.
     (c) Share of low-bit attention captured reading the same 7 of 26 windows: 59.2\\% when the query picks
     them, 93.9\\% of the 63.1\\% a hindsight pick captures; dashed is a uniform pick, $7/26 = 26.9\\%$.
