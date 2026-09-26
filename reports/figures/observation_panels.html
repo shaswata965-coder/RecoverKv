@@ -243,7 +243,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-b"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="b" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="b" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="b" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">Storage moves track future use. Promoted windows draw 2.34× the candidate-set average over the next 32 steps; evicted windows draw 0.66×.</p>
-      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. The legend names each bar and the tier the window ends in, in the method figures' notation: fp16 blue, int2 violet, light for a window that moved into the tier and dark for one that stayed; evicted is a dashed empty box. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
+      <p class="prov"><b>Measured</b>A.V, 59 routing events at a 32-step horizon. Lift is a window's future attention over the mean of the windows that eviction decided on; the dashed line at 1× is that average. The legend names each bar and the tier the window ends in, in the method figures' notation: FP16 blue, INT2 violet, light for a window that moved into the tier and dark for one that stayed; evicted is a dashed empty box. Whiskers are 95% CIs. Stay low's, 0.94–0.95, is narrower than the whisker's stroke and closes into a single tick: it averages 391,147 windows, 92% of the candidates (arithmetic).</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Count</th><th class="num">Lift</th><th class="num">95% CI</th></tr></thead>
@@ -269,14 +269,14 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-c"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="c" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="c" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="c" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">A few windows carry most of a query's low-bit attention. Each decode step reads only 7 of the 26 low-bit windows; picked by the card gate, those 7 hold 59.2% of the low-bit attention: 93.9% of what an oracle picking with the true attention gets (63.1%), and 2.2× a random 7 (26.9%).</p>
-      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. <strong>Why 7 of 26:</strong> the gate ratio is 0.25 (the shipped operating point) and this run holds 26 int2 windows per KV head, so each step opens ⌈0.25 × 26⌉ = 7; the other 19 are not dropped, they reach the output through their card's estimate. All three bars read 7 windows and differ only in which: <strong>Random</strong> is 7 windows drawn blindly, without looking at the query or the attention: each window then has a 7-in-26 chance of being read, so on average they hold 7/26 = 26.9% (arithmetic, not a measurement, so its bar has no interval); <strong>Card gate (ours)</strong> is the 7 whose cards score highest for the current query; <strong>Oracle</strong> is the report's hindsight pick, 7 per KV head chosen with the true attention, the ceiling for any gate of that size. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit. <strong>Same windows as the oracle:</strong> per query head, the card's top 7 share 81.0% of their windows with the true top 7 (a random 7 shares 7/26 = 26.9%) and include the hottest window 96.4% of the time (report §7; no interval reported). Attention captured weighs each window by its attention, which is why the gate gets 94% of the oracle's attention while matching 81% of its windows.</p>
+      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. <strong>Why 7 of 26:</strong> the gate ratio is 0.25 (the shipped operating point) and this run holds 26 int2 windows per KV head, so each step opens ⌈0.25 × 26⌉ = 7; the other 19 are not dropped, they reach the output through their card's estimate. All three bars read 7 windows and differ only in which: <strong>Random</strong> is 7 windows drawn blindly, without looking at the query or the attention: each window then has a 7-in-26 chance of being read, so on average they hold 7/26 = 26.9% (arithmetic, not a measurement, so its bar has no interval); <strong>Card gate (Ours)</strong> is the 7 whose cards score highest for the current query; <strong>Oracle</strong> is the report's hindsight pick, 7 per KV head chosen with the true attention, the ceiling for any gate of that size. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit. <strong>Same windows as the oracle:</strong> per query head, the card's top 7 share 81.0% of their windows with the true top 7 (a random 7 shares 7/26 = 26.9%) and include the hottest window 96.4% of the time (report §7; no interval reported). Attention captured weighs each window by its attention, which is why the gate gets 94% of the oracle's attention while matching 81% of its windows.</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Captured</th><th class="num">95% CI</th></tr></thead>
           <tbody>
             <tr><td>Random</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
-            <tr><td>Card gate (ours)</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
-            <tr><td>Oracle (true attention)</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
+            <tr><td>Card gate (Ours)</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
+            <tr><td>Oracle (True Attention)</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
             <tr><td>Ratio</td><td>gate efficiency</td><td class="num">93.9%</td><td class="num">93.7–94.1</td></tr>
             <tr><td>Card's top 7 vs true top 7</td><td>§7, overlap per query head</td><td class="num">81.0%</td><td class="num">–</td></tr>
             <tr><td>Hottest window in card's top 7</td><td>§7, per query head</td><td class="num">96.4%</td><td class="num">–</td></tr>
@@ -346,12 +346,12 @@ const DATA = {
     ]
   },
   b: [ // A.V, lift over the next 32 steps; the shade is the tier the window ends up in
-    { label: 'Promoted', key: 'Promoted (fp16)', v: 2.34, lo: 2.10, hi: 2.59, n: '221', style: C.fpMoved },
-    { label: 'Stay high', key: 'Stay high (fp16)', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', style: C.fpStay },
-    { label: 'Demoted', key: 'Demoted (int2)', v: 1.19, lo: 1.09, hi: 1.29, n: '221', style: C.qMoved },
+    { label: 'Promoted', key: 'Promoted (FP16)', v: 2.34, lo: 2.10, hi: 2.59, n: '221', style: C.fpMoved },
+    { label: 'Stay high', key: 'Stay high (FP16)', v: 1.63, lo: 1.58, hi: 1.67, n: '29,987', style: C.fpStay },
+    { label: 'Demoted', key: 'Demoted (INT2)', v: 1.19, lo: 1.09, hi: 1.29, n: '221', style: C.qMoved },
     // 391,147 windows, 92% of all candidates (arithmetic); the interval is 0.01 wide, thinner
     // at every panel size than the whisker's own stroke, so it draws as one tick
-    { label: 'Stay low', key: 'Stay low (int2)', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', style: C.qStay },
+    { label: 'Stay low', key: 'Stay low (INT2)', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', style: C.qStay },
     { label: 'Evicted', key: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', style: C.drop }
   ],
   // A.IV, share of the low-bit tier's attention in the 7 of its 26 windows a step reads (gate
@@ -360,8 +360,8 @@ const DATA = {
   // hindsight pick: 7 per KV head chosen with the true attention, the ceiling for the gate.
   c: [
     { label: 'Random', key: 'Random', v: 100 * 7 / 26, style: C.chance, tip: '<b>Random:</b> 7 windows drawn blindly, without the query, hold 7/26 = 26.9% of the low-bit attention on average (arithmetic, no interval)' },
-    { label: 'Card gate', key: 'Card gate (ours)', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Card gate (ours):</b> the 7 windows whose cards score highest for the current query hold 59.2% (CI 58.6–59.9), 93.9% of the oracle' },
-    { label: 'Oracle', key: 'Oracle (true attention)', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Oracle (true attention):</b> the 7 windows chosen with the true attention hold 63.1% (CI 62.4–63.7), the ceiling for any 7-window gate' }
+    { label: 'Card gate', key: 'Card gate (Ours)', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Card gate (Ours):</b> the 7 windows whose cards score highest for the current query hold 59.2% (CI 58.6–59.9), 93.9% of the oracle' },
+    { label: 'Oracle', key: 'Oracle (True Attention)', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Oracle (True Attention):</b> the 7 windows chosen with the true attention hold 63.1% (CI 62.4–63.7), the ceiling for any 7-window gate' }
   ]
 };
 
