@@ -268,15 +268,15 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <p class="warn" id="warn-c" role="status" hidden></p>
       <div class="fig-meta"><span class="dims" id="dims-c"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="c" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="c" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="c" data-fmt="png">PNG</button></div></div>
-      <p class="takeaway">A few windows carry most of a query's low-bit attention. Reading the 7 of 26 its query ranks highest captures 59.2%, which is 93.9% of the best possible pick of the same size.</p>
-      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. Uniform pick is the expected share of any 7 of 26 windows, 7/26 = 26.9% (arithmetic), so its bar has no interval. Best possible pick is the 7 windows holding the most of that step's true attention, the ceiling for any 7-window read (the report's hindsight pick). 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
+      <p class="takeaway">A few windows carry most of a query's low-bit attention. Each decode step reads only 7 of the 26 low-bit windows; picked by the card gate, those 7 hold 59.2% of the low-bit attention: 93.9% of what an oracle picking with the true attention gets (63.1%), and 2.2× a random 7 (26.9%).</p>
+      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. <strong>Why 7 of 26:</strong> the gate ratio is 0.25 (the shipped operating point) and this run holds 26 int2 windows per KV head, so each step opens ⌈0.25 × 26⌉ = 7; the other 19 are not dropped, they reach the output through their card's estimate. All three bars read 7 windows and differ only in which: <strong>Random</strong> is any 7, whose expected share is 7/26 (arithmetic), so its bar has no interval; <strong>Card gate (ours)</strong> is the 7 whose cards score highest for the current query; <strong>Oracle</strong> is the report's hindsight pick, 7 per KV head chosen with the true attention, the ceiling for any gate of that size. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Captured</th><th class="num">95% CI</th></tr></thead>
           <tbody>
-            <tr><td>Uniform pick</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
-            <tr><td>Query-conditioned</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
-            <tr><td>Best possible pick</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
+            <tr><td>Random</td><td>7 / 26 (arithmetic)</td><td class="num">26.9%</td><td class="num">–</td></tr>
+            <tr><td>Card gate (ours)</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
+            <tr><td>Oracle (true attention)</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
             <tr><td>Ratio</td><td>gate efficiency</td><td class="num">93.9%</td><td class="num">93.7–94.1</td></tr>
           </tbody></table></div>
         <div class="fields">
@@ -352,13 +352,14 @@ const DATA = {
     { label: 'Stay low', key: 'Stay low (int2)', v: 0.94, lo: 0.94, hi: 0.95, n: '391,147', style: C.qStay },
     { label: 'Evicted', key: 'Evicted', v: 0.66, lo: 0.63, hi: 0.70, n: '1,336', style: C.drop }
   ],
-  // A.IV, share of low-bit attention captured reading 7 of 26 windows. Uniform is the expected
-  // share of any 7 of 26 (arithmetic), so it has no interval to draw.
+  // A.IV, share of the low-bit tier's attention in the 7 of its 26 windows a step reads (gate
+  // ratio 0.25: ceil(0.25 x 26) = 7). The bars differ only in which 7. Random is the expected
+  // share of any 7, 7/26 (arithmetic), so it has no interval to draw. Oracle is the report's
+  // hindsight pick: 7 per KV head chosen with the true attention, the ceiling for the gate.
   c: [
-    { label: 'Uniform', key: 'Uniform pick', v: 100 * 7 / 26, style: C.chance, tip: '<b>Uniform pick:</b> 26.9% expected from any 7 of 26 windows (arithmetic, no interval)' },
-    { label: 'Query-conditioned', key: 'Query-conditioned gate', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Query-conditioned gate:</b> 59.2% captured (CI 58.6–59.9), 93.9% of the best possible pick' },
-    // the report's hindsight pick: the 7 windows with the most true attention, the ceiling
-    { label: 'Best possible', key: 'Best possible pick', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Best possible pick:</b> 63.1% captured by the 7 windows with the most true attention (CI 62.4–63.7)' }
+    { label: 'Random', key: 'Random', v: 100 * 7 / 26, style: C.chance, tip: '<b>Random:</b> any 7 of the 26 windows hold 7/26 = 26.9% of the low-bit attention on average (arithmetic, no interval)' },
+    { label: 'Card gate', key: 'Card gate (ours)', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Card gate (ours):</b> the 7 windows whose cards score highest for the current query hold 59.2% (CI 58.6–59.9), 93.9% of the oracle' },
+    { label: 'Oracle', key: 'Oracle (true attention)', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Oracle (true attention):</b> the 7 windows chosen with the true attention hold 63.1% (CI 62.4–63.7), the ceiling for any 7-window gate' }
   ]
 };
 
@@ -372,7 +373,7 @@ const FIGS = {
 const TITLES = {
   a: { x: ['Historical windows retained (%)', 'Windows retained (%)'], y: ['Cumulative attention mass (%)', 'Cumulative attention (%)', 'Cumulative mass (%)'] },
   b: { x: ['Storage-priority transition', 'Transition'], y: ['Future-attention lift (×)', 'Attention lift (×)', 'Lift (×)'] },
-  c: { x: ['Window selection rule', 'Selection rule'], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
+  c: { x: ['Which 7 of 26 windows are read', 'Which 7 of 26 are read', 'Which 7 are read'], y: ['Low-bit attention captured (%)', 'Attention captured (%)', 'Captured (%)'] }
 };
 
 const WIDTHS = {
@@ -790,7 +791,7 @@ function drawC(L, screen) {
 const ARIA = {
   a: 'Cumulative attention mass against the share of historical windows retained, highest importance first, through seven reported points. Top 10% hold 22.4%; 50% of mass needs 32.2% of windows, 80% needs 64.9%, 90% needs 79.4%. Dashed diagonal: uniform importance.',
   b: 'Future-attention lift over the next 32 steps by storage transition: Promoted 2.34, Stay high 1.63, Demoted 1.19, Stay low 0.94, Evicted 0.66; dashed line at the candidate-set average 1.0.',
-  c: 'Share of low-bit attention captured reading 7 of 26 windows: uniform pick 26.9%, query-conditioned gate 59.2% (93.9% of the best possible), best possible pick 63.1%.'
+  c: 'Share of low-bit attention captured when a decode step reads 7 of its 26 low-bit windows, by how the 7 are chosen: random 26.9%, card gate 59.2% (93.9% of the oracle), oracle using the true attention 63.1%.'
 };
 function buildSVG(key, mode) {
   const L = layout();
@@ -878,11 +879,12 @@ ${sub('c', 'Query-time concentration', 'fig:obs-gate')}
     (b) Future-attention lift over the next 32 steps for each storage-priority transition, relative to the
     candidate-set average (dashed), shaded by the tier the window ends in (light: moved into it, dark: stayed): promoted 2.34$\\times$, stay high 1.63$\\times$, demoted 1.19$\\times$,
     stay low 0.94$\\times$, evicted 0.66$\\times$.
-    (c) Share of low-bit attention captured reading the same 7 of 26 windows: 59.2\\% when the query picks
-    them, 93.9\\% of the 63.1\\% the best possible pick captures (the 7 windows with the most true
-    attention), against $7/26 = 26.9\\%$ for a uniform pick.
+    (c) Share of the low-bit tier's attention held by the 7 of its 26 windows a decode step reads
+    (gate ratio 0.25, $\\lceil 0.25 \\times 26 \\rceil = 7$; the other 19 reach the output through their cards),
+    by how the 7 are chosen: at random, $7/26 = 26.9\\%$; by the card gate, 59.2\\%; by an oracle using the
+    true attention, 63.1\\%. The gate reaches 93.9\\% of the oracle.
     Whiskers are 95\\% bootstrap CIs over 256 (prompt, layer) traces. Stay low's (0.94--0.95, 391,147
-    windows) is narrower than its stroke and draws as a single tick; the uniform pick is exact, and the intervals in (a) are within
+    windows) is narrower than its stroke and draws as a single tick; the random pick is exact, and the intervals in (a) are within
     $\\pm$0.5 points and sit inside the dots.}
   \\label{fig:observations}
 \\end{${env}}`;
