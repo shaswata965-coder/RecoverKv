@@ -40,8 +40,8 @@ Palette: fp16 blue, int2 violet, card green, sink slate, query / new token red,
 dropped a dashed outline, the flow between panels amber; every label and mark
 one solid ink, no greys.
 
-Figure 1's labels are upright (no italics) and start with a capital; a dtype
-(fp16, int2) or a symbol (alpha) keeps its own case.
+Figure 1's labels are upright (no italics) and start with a capital; dtypes are
+all capitals (FP16, INT2), and a symbol (alpha) keeps its own case.
 
 Run:  python scripts/figures/method_overview.py && node scripts/figures/export_figure.mjs
 """
@@ -408,7 +408,7 @@ W1 = 486                                 # 6.75 in: the full width of a two-colu
 LM = 16                                  # left margin: carries the loop back to (a)
 XL = 8                                   # the loop's run up the margin, 8 pt clear of the borders
 GX = GY = 28                             # gaps between panels, where the flow arrows run
-AW, AH = W1 - LM - 1, 135
+AW, AH = W1 - LM - 1, 138
 BW = (AW - GX) / 2
 XC, XB = LM, LM + BW + GX                # (c) left, (b) right: the loop runs clockwise
 BY = AH + GY
@@ -417,12 +417,12 @@ KEY_Y = BY + BH + 15                     # one key under (c) and (b): its marks 
 H1 = KEY_Y + 5
 
 # (a)'s cache: wide, with the dropped windows still visible as ghosts
-CA = Cache(x0=146, yb=93, sink_w=2.2, fp_w=21, q_w=14, loc_w=21, fp_h=20, n_drop=N_DROP,
+CA = Cache(x0=146, yb=96, sink_w=2.2, fp_w=21, q_w=14, loc_w=21, fp_h=20, n_drop=N_DROP,
            gap=7.5, wgap=2.2)
 TRACED = 6                               # the int2 window whose score update is shown:
                                          # far right, so the row under it leaves room for
                                          # the loop's arrow and its label
-A_ROW = 105                              # (a)'s alpha row
+A_ROW = 108                              # (a)'s alpha row
 A_SPAN = 224.5                           # its first cell -> the middle of "New score"
 # (b) and (c): the same cache, narrower, after the eviction. (c) draws it higher: its
 # re-rank box above is short, its kernel box below is level with (b)'s cache, where the
@@ -536,13 +536,20 @@ def fig1_a(g):
         tr = kd == "q" and k - N_FP == TRACED
         g.rect(x_, bb - hgt, wd, hgt, stroke=INK if tr else solid, sw=0.9 if tr else 0.5)
     g.line(CA.fp[0] - 2, bb, CA.drop[-1] + CA.q_w + 2, bb, stroke=INK, sw=0.5)
-    # tier names, straight over their windows
-    for key, top, bot, col in (("sink", None, "Sink", SINK_S), ("fp", "Top-k", "fp16", FP_T),
-                               ("q", "Next top-k", "int2 + card", Q_T),
-                               ("drop", "Rest", "Dropped", INK), ("loc", "Newest", "Local", FP_T)):
+    # tier names, straight over their windows: the rank a tier holds in a badge drawn like
+    # the tier (fill, outline, dashes), then what that tier keeps, below it
+    for key, top, bot, col, badge in (
+            ("sink", None, "Sink", SINK_S, None),
+            ("fp", "Top-k", "FP16", FP_T, (FP_F, FP_S, 30, None)),
+            ("q", "Next top-k", "INT2 + card", Q_T, (Q_F, Q_S, 47, None)),
+            ("drop", "Rest", "Dropped", INK, ("#ffffff", INK, 26, "1.5 1")),
+            ("loc", "Newest", "Local", FP_T, (LOC_F, FP_S, 36, None))):
         if top:
-            g.text(CA.cx(key), 32, top, size=FS, anchor="middle", fill=col, weight="bold")
-        g.text(CA.cx(key), 41, bot, size=FS, anchor="middle", fill=col)
+            fill, stroke, wd, dash = badge
+            g.rect(CA.cx(key) - wd / 2, 20, wd, 11, fill=fill, stroke=stroke, sw=0.7, rx=5.5,
+                   dash=dash)
+            g.text(CA.cx(key), 28.4, top, size=FS, anchor="middle", fill=col, weight="bold")
+        g.text(CA.cx(key), 43, bot, size=FS, anchor="middle", fill=col)
     CA.draw(g, traced=TRACED)
 
 
@@ -676,7 +683,7 @@ def build_fig1():
     g.use("card", 4, 1.5, 9, 9)
     g.text(17, 9, "Card: read for every window", size=FS)
     g.rect(col + 4, 2, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
-    g.text(col + 17, 9, "Opened: its int2 window is read too", size=FS)
+    g.text(col + 17, 9, "Opened: its INT2 window is read too", size=FS)
     g.add('<g opacity="0.45">')
     g.rect(2 * col + 4, 2, 9, 8, fill=Q_F, stroke=Q_S, sw=0.6, dash="1.5 1")
     g.add("</g>")
