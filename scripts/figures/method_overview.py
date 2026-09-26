@@ -8,7 +8,9 @@ figure is built around ONE component, the cache bar
 drawn identically in every panel and annotated differently in each, so the
 reader learns the cache once and then watches it being scored, gated and read:
 
-  (a) the attention map (keys across, queries down) is summed per token, each
+  (a) the attention map -- columns are keys (cached tokens), each row one query
+      token's attention, the prompt's rows then one row per decode step -- is
+      summed down each column, each
       window's tokens stack into its score, the ranked scores split into
       top-k fp16 / next top-k int2 / dropped, and the cache sections are mapped
       onto the byte budget they share. "Scoring one window" shows one step's
@@ -310,8 +312,9 @@ def panel_a(g):
     frame(g, "(a)", "Cumulative attention ranks windows", "re-tiered at every window boundary")
 
     # ---- attention map, with its axes named
-    N, SINK, WSZ, cell = 26, 2, 8, 4.6
-    hx, hy = 46, 84
+    N, SINK, WSZ, cell = 26, 2, 8, 4.2
+    N_PROMPT = 18                               # rows 0..17 prompt, the rest one per decode step
+    hx, hy = 52, 84
     rng = random.Random(3)
     P = []
     for i in range(N):
@@ -328,11 +331,23 @@ def panel_a(g):
             g.rect(hx + j * cell, hy + i * cell, cell, cell, fill=col, stroke="#ffffff", sw=0.4)
     hw = N * cell
     g.rect(hx, hy, hw, hw, stroke=INK3, sw=0.7)
-    # axes: keys across, queries down
-    g.text(hx, hy - 8, "keys (cached tokens)", size=11.5, fill=INK2)
-    g.line(hx + 116, hy - 12, hx + 140, hy - 12, stroke=INK2, sw=1.1, arrow="dark")
-    g.text(hx - 9, hy + 38, "queries", size=11.5, anchor="middle", fill=INK2, rotate=-90)
-    g.line(hx - 13, hy + 72, hx - 13, hy + 96, stroke=INK2, sw=1.1, arrow="dark")
+    # axes: columns are keys (cached tokens); each row is one query token's attention,
+    # the prompt's rows first, then one new row per decode step
+    g.text(hx, hy - 8, "keys (cached tokens)", size=11.5, fill=INK)
+    g.line(hx + 114, hy - 12, hx + 138, hy - 12, stroke=INK, sw=1.1, arrow="dark")
+    g.text(hx - 25, hy + hw / 2, "query tokens, in order", size=11, anchor="middle", fill=INK,
+           rotate=-90)
+    yp = hy + N_PROMPT * cell
+    for (y0, y1, lab, col) in ((hy, yp, "prompt", INK), (yp, hy + hw, "decode", QRY_S)):
+        g.path(f"M{hx - 1.5},{y0 + 0.8} L{hx - 5},{y0 + 0.8} L{hx - 5},{y1 - 0.8} L{hx - 1.5},{y1 - 0.8}",
+               stroke=col, sw=1.2)
+        g.text(hx - 9, (y0 + y1) / 2, lab, size=10, anchor="middle", fill=col, rotate=-90)
+    g.rect(hx, yp, hw, hy + hw - yp, stroke=QRY_S, sw=1, dash="3 2")
+    # summing down each column gives every key its cumulative attention
+    xs_ = hx + hw + 7
+    g.line(xs_, hy + 2, xs_, hy + hw + 1, stroke=INK, sw=1.1, arrow="dark")
+    g.text(xs_ + 9, hy + hw / 2, "summed per column", size=11, anchor="middle", fill=INK,
+           rotate=-90)
 
     # ---- each token's attention, summed down the query axis
     colsum = [sum(P[i][j] for i in range(N)) for j in range(N)]
@@ -384,15 +399,15 @@ def panel_a(g):
     # which bars are which
     ex_ = lambda k: sx + k * (bw + bgp)
     lab_y = 92
-    bracket(g, ex_(0), ex_(N_FP) - bgp, lab_y + 6, up=False, stroke=FP_S, sw=1.2, tick=4)
+    bracket(g, ex_(0), ex_(N_FP) - bgp, lab_y + 5, up=True, stroke=FP_S, sw=1.2, tick=3)
     g.text(ex_(0) - 2, lab_y - 14, "top-k", size=12, weight="bold", fill=FP_T)
     g.text(ex_(0) - 2, lab_y, "fp16", size=11.5, fill=FP_T)
-    bracket(g, ex_(N_FP), ex_(N_FP + N_Q) - bgp, lab_y + 6, up=False, stroke=Q_S, sw=1.2, tick=4)
+    bracket(g, ex_(N_FP), ex_(N_FP + N_Q) - bgp, lab_y + 5, up=True, stroke=Q_S, sw=1.2, tick=3)
     g.text((ex_(N_FP) + ex_(N_FP + N_Q)) / 2 + 8, lab_y - 14, "next top-k, quantized", size=12,
            anchor="middle", weight="bold", fill=Q_T)
     g.text((ex_(N_FP) + ex_(N_FP + N_Q)) / 2 + 8, lab_y, "int2 + card", size=11.5,
            anchor="middle", fill=Q_T)
-    bracket(g, ex_(N_FP + N_Q), ex_(n) - bgp, lab_y + 6, up=False, stroke=INK, sw=1.2, tick=4)
+    bracket(g, ex_(N_FP + N_Q), ex_(n) - bgp, lab_y + 5, up=True, stroke=INK, sw=1.2, tick=3)
     g.text((ex_(N_FP + N_Q) + ex_(n)) / 2, lab_y, "dropped", size=11.5, anchor="middle", fill=INK)
     # stack key
     kx, ky = 296, 126
@@ -617,6 +632,13 @@ def panel_b(g):
             g.rect(x, base - before - add, wd, add, fill="hatch-violet", stroke=Q_S, sw=0.8)
         else:
             g.rect(x, base - before - add, wd, add, fill=FP_S if kd == "fp" else Q_S)
+        # mark each int2 window exactly as the key below does: opened = black border,
+        # card only = dashed outline
+        if kd == "sel":
+            g.rect(x - 0.7, base - before - add - 0.7, wd + 1.4, before + add + 0.7, stroke=INK,
+                   sw=1.5)
+        elif kd == "skip":
+            g.rect(x, base - before - add, wd, before + add, stroke=Q_S, sw=0.8, dash="2 1.5")
     g.line(BX0 - 4, base, LAY["new"] + 8, base, stroke=INK, sw=0.8)
     ky = base + 22
     g.rect(24, ky - 10, 12, 11, fill="#ece6f7")
