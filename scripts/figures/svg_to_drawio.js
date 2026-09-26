@@ -14,10 +14,14 @@
 //                       resizes and deletes as one object)
 //
 // Each panel (<g class="panel">) becomes a draw.io group, so a panel moves as one.
-// Loaded by export_figure.mjs; defines svgToDrawio(svgElement) -> XML string.
+// The figure is drawn in points (1 unit = 1 pt); draw.io works in 96-dpi pixels,
+// so every length and font size is scaled by 96/72 and an 8 pt label stays 8 pt.
+// Loaded by export_figure.mjs; defines svgToDrawio(svgElement, name) -> XML string.
 
-function svgToDrawio(svg) {
-  const W = +svg.getAttribute('width'), H = +svg.getAttribute('height');
+function svgToDrawio(svg, name = 'figure') {
+  const vb = svg.viewBox.baseVal;
+  const W = vb.width, H = vb.height;
+  const S = 96 / 72;
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   const b64 = (s) => btoa(unescape(encodeURIComponent(s)));
@@ -41,7 +45,9 @@ function svgToDrawio(svg) {
     }
     return o;
   };
-  const ctm = (el) => el.getCTM();                 // to SVG user space (scale 1)
+  // element user space -> the figure's own units (viewBox), whatever CSS size it has
+  const root = svg.getScreenCTM().inverse();
+  const ctm = (el) => root.multiply(el.getScreenCTM());
   const apply = (m, x, y) => ({ x: m.a * x + m.c * y + m.e, y: m.b * x + m.d * y + m.f });
 
   // ---- groups: one per panel ------------------------------------------------
@@ -51,7 +57,7 @@ function svgToDrawio(svg) {
     const g = { id: newId(), x: m.e, y: m.f, w: +p.dataset.w, h: +p.dataset.h };
     groups.set(p, g);
     cells.push(`<mxCell id="${g.id}" value="" style="group;fillColor=none;strokeColor=none;" vertex="1" connectable="0" parent="1">` +
-      `<mxGeometry x="${r2(g.x)}" y="${r2(g.y)}" width="${g.w}" height="${g.h}" as="geometry"/></mxCell>`);
+      `<mxGeometry x="${r2(S * g.x)}" y="${r2(S * g.y)}" width="${r2(S * g.w)}" height="${r2(S * g.h)}" as="geometry"/></mxCell>`);
   }
   const parentOf = (el) => {
     const p = el.closest('g.panel');
@@ -63,8 +69,8 @@ function svgToDrawio(svg) {
     const stroke = attr(el, 'stroke', 'none');
     const sw = +attr(el, 'stroke-width', 1);
     const dash = el.getAttribute('stroke-dasharray');
-    let s = `strokeColor=${stroke === 'none' ? 'none' : stroke};strokeWidth=${sw};`;
-    if (dash) s += `dashed=1;fixDash=1;dashPattern=${dash.replace(/,/g, ' ')};`;
+    let s = `strokeColor=${stroke === 'none' ? 'none' : stroke};strokeWidth=${r2(S * sw)};`;
+    if (dash) s += `dashed=1;fixDash=1;dashPattern=${dash.split(/[\s,]+/).map((v) => r2(S * v)).join(' ')};`;
     return s;
   };
   const opacityStyle = (el) => {
@@ -74,12 +80,12 @@ function svgToDrawio(svg) {
   const vertex = (el, x, y, w, h, style, value = '') => {
     const par = parentOf(el);
     cells.push(`<mxCell id="${newId()}" value="${esc(value)}" style="${style}" vertex="1" ` +
-      `parent="${par.id}"><mxGeometry x="${r2(x - par.x)}" y="${r2(y - par.y)}" width="${r2(w)}" ` +
-      `height="${r2(h)}" as="geometry"/></mxCell>`);
+      `parent="${par.id}"><mxGeometry x="${r2(S * (x - par.x))}" y="${r2(S * (y - par.y))}" ` +
+      `width="${r2(S * w)}" height="${r2(S * h)}" as="geometry"/></mxCell>`);
   };
   const edge = (el, pts, style) => {
     const par = parentOf(el);
-    const P = pts.map((p) => ({ x: r2(p.x - par.x), y: r2(p.y - par.y) }));
+    const P = pts.map((p) => ({ x: r2(S * (p.x - par.x)), y: r2(S * (p.y - par.y)) }));
     const mid = P.slice(1, -1).map((p) => `<mxPoint x="${p.x}" y="${p.y}"/>`).join('');
     cells.push(`<mxCell id="${newId()}" value="" style="${style}" edge="1" parent="${par.id}">` +
       `<mxGeometry relative="1" as="geometry">` +
@@ -90,7 +96,8 @@ function svgToDrawio(svg) {
   const arrowStyle = (el) => {
     const m = el.getAttribute('marker-end');
     const sw = +attr(el, 'stroke-width', 1);
-    return m ? `endArrow=block;endFill=1;endSize=${sw >= 1.5 ? 5 : 6};` : 'endArrow=none;';
+    // the SVG marker is 6 stroke widths long
+    return m ? `endArrow=block;endFill=1;endSize=${r2(Math.max(3, 5 * sw * S))};` : 'endArrow=none;';
   };
   const edgeBase = 'html=1;rounded=0;edgeStyle=none;curved=0;startArrow=none;jumpStyle=none;';
 
@@ -182,7 +189,7 @@ function svgToDrawio(svg) {
       const rx = +(el.getAttribute('rx') || 0);
       const fill = attr(el, 'fill', 'black');
       vertex(el, o.x, o.y, w, h,
-        `rounded=${rx > 0 ? 1 : 0};absoluteArcSize=1;arcSize=${r2(rx * 2)};whiteSpace=wrap;html=1;` +
+        `rounded=${rx > 0 ? 1 : 0};absoluteArcSize=1;arcSize=${r2(S * rx * 2)};whiteSpace=wrap;html=1;` +
         `fillColor=${fill === 'none' ? 'none' : fill};` + strokeStyle(el) + opacityStyle(el));
     } else if (tag === 'circle') {
       const r = +el.getAttribute('r');
@@ -213,7 +220,7 @@ function svgToDrawio(svg) {
       const bold = (el.getAttribute('font-weight') || '') === 'bold';
       const italic = (el.getAttribute('font-style') || '') === 'italic';
       const fontStyle = (bold ? 1 : 0) + (italic ? 2 : 0);
-      const pad = 4;
+      const pad = 2;
       const w = b.width + pad, h = b.height;
       const align = anchor === 'middle' ? 'center' : anchor === 'end' ? 'right' : 'left';
       const c = apply(m, b.x + b.width / 2, b.y + b.height / 2);   // centre, rotation included
@@ -223,7 +230,7 @@ function svgToDrawio(svg) {
       vertex(el, x, c.y - h / 2, w, h,
         `text;html=1;fillColor=none;strokeColor=none;whiteSpace=nowrap;align=${align};verticalAlign=middle;spacing=0;` +
         `spacingLeft=0;spacingRight=0;spacingTop=0;spacingBottom=0;fontFamily=Arial;` +
-        `fontSize=${size};fontColor=${attr(el, 'fill', '#000000')};fontStyle=${fontStyle};` +
+        `fontSize=${r2(S * size)};fontColor=${attr(el, 'fill', '#000000')};fontStyle=${fontStyle};` +
         (rot ? `rotation=${rot};` : '') + opacityStyle(el), labelOf(el));
     } else if (tag === 'use') {
       const ref = (el.getAttribute('href') || el.getAttribute('xlink:href') || '').slice(1);
@@ -241,9 +248,9 @@ function svgToDrawio(svg) {
 
   return '<?xml version="1.0" encoding="UTF-8"?>\n' +
     `<mxfile host="app.diagrams.net" type="device">` +
-    `<diagram id="recoverkv-method" name="RecoverKV method">` +
-    `<mxGraphModel dx="${W}" dy="${H}" grid="0" gridSize="10" guides="1" tooltips="1" connect="0" ` +
-    `arrows="0" fold="1" page="1" pageScale="1" pageWidth="${W}" pageHeight="${H}" ` +
+    `<diagram id="recoverkv-${name}" name="${name}">` +
+    `<mxGraphModel dx="${r2(S * W)}" dy="${r2(S * H)}" grid="0" gridSize="10" guides="1" tooltips="1" connect="0" ` +
+    `arrows="0" fold="1" page="1" pageScale="1" pageWidth="${Math.ceil(S * W)}" pageHeight="${Math.ceil(S * H)}" ` +
     `background="#ffffff" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>` +
     cells.join('') + `</root></mxGraphModel></diagram></mxfile>\n`;
 }
