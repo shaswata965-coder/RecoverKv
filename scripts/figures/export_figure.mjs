@@ -5,8 +5,9 @@
 //
 //   node scripts/figures/export_figure.mjs [name ...] [--check-only] [--shots DIR]
 //
-// Figures are drawn in points (1 unit = 1 pt at a 5.5 in text width), so the size
-// check reads font sizes straight off the SVG: labels >= 8 pt, subscripts >= 7 pt.
+// Figures are drawn in points (1 unit = 1 pt, printed at the figure's own width:
+// 6.5 in for method_overview, 5.5 in for method_details), so the size check reads
+// font sizes straight off the SVG: labels >= 8 pt, subscripts >= 7 pt.
 //
 // Needs Playwright with a Chromium; on a machine without the bundled browser set
 // CHROMIUM_PATH to a local Chromium/Chrome binary.

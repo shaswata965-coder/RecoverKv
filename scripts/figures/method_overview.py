@@ -1,9 +1,12 @@
-"""Build the method figures, at print size, for a 5.5 in (396 pt) text width.
+"""Build the method figures at print size: Figure 1 is 6.5 in (468 pt) wide, for
+white space between its panels; Figure 2 is 5.5 in (396 pt).
 
-Two figures, one unit = one printed point, so a font size here IS its size on
-the page. Labels are >= 8 pt, panel titles 9 pt; the only smaller text is a
-subscript (>= 7 pt, LaTeX scriptsize at a 10 pt body). ``export_figure.mjs``
-fails the build on anything below that, or on text that collides.
+Two figures, one unit = one printed point at that width, so a font size here IS
+its size on the page. Labels are >= 8 pt, panel titles 9 pt; the only smaller
+text is a subscript (>= 7 pt, LaTeX scriptsize at a 10 pt body).
+``export_figure.mjs`` fails the build on anything below that, or on text that
+collides. Scaled into a narrower column, Figure 1's labels print smaller (at
+5.5 in: 8 pt -> 6.8 pt).
 
 ``method_overview``  -- Figure 1, the runtime loop, nothing else:
   (a) cumulative attention ranks the windows: the attention map (keys across,
@@ -376,24 +379,27 @@ def svg_doc(g, w, h):
 # ===========================================================================
 # Figure 1 -- the runtime loop
 # ===========================================================================
-W1 = 396
-LM = 14                                  # left margin: carries the loop back to (a)
-XL = 6                                   # the loop's run up the margin, clear of the borders
-AW, AH = W1 - LM - 1, 131
-BW = (W1 - LM - 1 - 8) / 2
-XC, XB = LM, LM + BW + 8                 # (c) left, (b) right: the loop runs clockwise
-BY = AH + 17                             # the gap under (a) carries the loop's label
-BH = 200
+W1 = 468                                 # 6.5 in: wider than Figure 2, for white space
+LM = 22                                  # left margin: the loop back to (a), and its label
+XL = 14                                  # the loop's run up the margin, 8 pt clear of the borders
+GX = GY = 28                             # gaps between panels, where the flow arrows run
+AW, AH = W1 - LM - 1, 135
+BW = (AW - GX) / 2
+XC, XB = LM, LM + BW + GX                # (c) left, (b) right: the loop runs clockwise
+BY = AH + GY
+BH = 212
 H1 = BY + BH + 1
 
 # (a)'s cache: wide, with the dropped windows still visible as ghosts
-CA = Cache(x0=118, yb=93, sink_w=2, fp_w=17, q_w=12, loc_w=17, fp_h=20, n_drop=N_DROP)
+CA = Cache(x0=140, yb=93, sink_w=2.2, fp_w=20, q_w=13.5, loc_w=20, fp_h=20, n_drop=N_DROP,
+           gap=7, wgap=2)
 TRACED = 3                               # the int2 window whose score update is shown
-A_ROW = 103                              # (a)'s alpha row
+A_ROW = 105                              # (a)'s alpha row
+A_SPAN = 224.5                           # its first cell -> the middle of "New score"
 # (b) and (c): the same cache, narrower, after the eviction
-CB = Cache(x0=8, yb=134, sink_w=1.6, fp_w=14, q_w=10, loc_w=14, fp_h=20, gap=3.2, wgap=1.4)
-KY0 = CB.yb + 12                         # (c)'s kernel box; above it the new K, V come in
-KY1 = KY0 + 34
+CB = Cache(x0=9, yb=138, sink_w=1.8, fp_w=15, q_w=11, loc_w=15, fp_h=20, gap=4.5, wgap=1.6)
+KY0 = CB.yb + 13                         # (c)'s kernel box; above it the new K, V come in
+KY1 = KY0 + 38
 
 
 def fig1_a(g):
@@ -433,8 +439,8 @@ def fig1_a(g):
     g.rect(wx0, hy + (N - 1) * cell, WSZ * cell, cell, stroke=INK, sw=0.9)
 
     # ---- one window's score update, this step
-    cw, cg_, ay, ah = 13, 1.5, A_ROW, 14
-    ax0 = CA.qx(TRACED) - 204                 # so "new score" sits under its window
+    cw, cg_, ay, ah = 14, 2, A_ROW, 14
+    ax0 = CA.qx(TRACED) - A_SPAN              # so "New score" sits under its window
     g.path(f"M{wx0},{hy + hw} L{ax0},{ay} M{wx0 + WSZ * cell},{hy + hw} "
            f"L{ax0 + 5 * cw + 4 * cg_},{ay}", stroke=INK, sw=0.5, dash="1.5 1.2")
     shades = [0.30, 0.85, 0.45, None, 0.70]
@@ -449,9 +455,9 @@ def fig1_a(g):
                          anchor="middle", fill="#ffffff" if v > 0.6 else INK)
         x += cw + cg_
     x += 0.5
-    g.line(x, ay + ah / 2, x + 12, ay + ah / 2, stroke=INK, sw=0.7, arrow="dark")
-    g.text(x + 6, ay - 2.5, "Sum", size=FS, anchor="middle")
-    x += 14
+    g.line(x, ay + ah / 2, x + 14, ay + ah / 2, stroke=INK, sw=0.7, arrow="dark")
+    g.text(x + 7, ay - 2.5, "Sum", size=FS, anchor="middle")
+    x += 16
 
     def chip(x0, wd, parts, fill, stroke, bold=False, sw=0.6, tcol=INK):
         g.rect(x0, ay, wd, ah, fill=fill, stroke=stroke, sw=sw, rx=2)
@@ -460,18 +466,18 @@ def fig1_a(g):
         return x0 + wd
 
     c1 = x
-    x = chip(x, 36, [("α", False), ("window", True)], Q_S, Q_S, tcol="#ffffff")
-    g.text(x + 5, ay + 10.5, "+", size=10, anchor="middle", weight="bold")
-    c2 = x + 10
-    x = chip(c2, 38, [("α", False), ("history", True)], Q_F, Q_S)
-    g.text(x + 5, ay + 10.5, "=", size=10, anchor="middle", weight="bold")
-    c3 = x + 10
-    chip(c3, 46, [("New score", False)], "#ffffff", Q_S, bold=True, sw=1.1)
+    x = chip(x, 38, [("α", False), ("window", True)], Q_S, Q_S, tcol="#ffffff")
+    g.text(x + 6.5, ay + 10.5, "+", size=10, anchor="middle", weight="bold")
+    c2 = x + 13
+    x = chip(c2, 40, [("α", False), ("history", True)], Q_F, Q_S)
+    g.text(x + 6.5, ay + 10.5, "=", size=10, anchor="middle", weight="bold")
+    c3 = x + 13
+    chip(c3, 48, [("New score", False)], "#ffffff", Q_S, bold=True, sw=1.1)
     ly = ay + ah + 10
     g.text(ax0 + (5 * cw + 4 * cg_) / 2, ly, "This step's row", size=FS, anchor="middle")
-    g.text(c1 + 18, ly, "Summed", size=FS, anchor="middle")
-    g.text(c2 + 19, ly, "Earlier steps", size=FS, anchor="middle")
-    g.text(c3 + 23, ly, "Ranks it", size=FS, anchor="middle")
+    g.text(c1 + 19, ly, "Summed", size=FS, anchor="middle")
+    g.text(c2 + 20, ly, "Earlier steps", size=FS, anchor="middle")
+    g.text(c3 + 24, ly, "Ranks it", size=FS, anchor="middle")
     g.line(CA.qx(TRACED), ay - 1, CA.qx(TRACED), CA.yb + 1.5, stroke=Q_S, sw=0.9, arrow="violet")
 
     # ---- the ranked scores, standing on the windows they tier
@@ -511,11 +517,11 @@ def fig1_b(g):
     top = CB.card_top()
 
     # the query heads of one GQA group score every card
-    qx, qy, qw = CB.cx("q") - 13, 27, 26
+    qx, qy, qw = CB.cx("q") - 13, 28, 26
     for h in range(4):
         g.rect(qx, qy + h * 3.6, qw, 2.8, fill=QRY_F, stroke=QRY_S, sw=0.5, rx=0.8)
     g.text(qx - 4, qy + 10, "Query heads", size=FS, anchor="end", fill=QRY_T, weight="bold")
-    gy, ch, pitch = qy + 24, 7, 9.4
+    gy, ch, pitch = qy + 25, 7, 9.8
     for c in range(N_Q):
         g.line(CB.cx("q"), qy + 14.5, CB.qx(c), gy - 1.5, stroke=INK, sw=0.4)
     g.text(CB.span("q")[1] + 4, qy + 10, "Score", size=FS)
@@ -546,9 +552,9 @@ def fig1_b(g):
     CB.draw(g, mode="gated")
 
     # the opened windows, and what a step reads of each int2 window
-    g.text(CB.cx("q"), CB.yb + 12, "Top windows opened, at the gate ratio", size=FS,
+    g.text(CB.cx("q"), CB.yb + 13, "Top windows opened, at the gate ratio", size=FS,
            anchor="middle", weight="bold", fill=Q_T)
-    kx, ky, kp = 10, CB.yb + 28, 13
+    kx, ky, kp = 11, CB.yb + 32, 14.5
     g.use("card", kx, ky - 7.5, 9, 9)
     g.text(kx + 13, ky, "Card: read for every window", size=FS)
     g.rect(kx, ky + kp - 7, 9, 8, fill=Q_F, stroke=INK, sw=0.9)
@@ -565,14 +571,14 @@ def fig1_c(g):
     yfp = CB.yb - CB.fp_h
 
     # ---- when the newest window fills: re-rank, then promote / demote / drop
-    chx, chy, chw, chh = 8, 30, 112, 12
+    chx, chy, chw, chh = 9, 31, 114, 12.5
     g.rect(chx, chy, chw, chh, fill="#ffffff", stroke=INK, sw=0.7, rx=3)
-    g.text(chx + chw / 2, chy + 8.6, "Re-rank by cumulative score", size=FS, anchor="middle",
+    g.text(chx + chw / 2, chy + 8.8, "Re-rank by cumulative score", size=FS, anchor="middle",
            weight="bold")
     xn, ym = CB.loc[-1] + CB.loc_w / 2, chy + chh / 2
     g.path(f"M{xn},{yfp - 1} L{xn},{ym} L{chx + chw + 1},{ym}", stroke=INK, sw=0.8, arrow="dark")
     g.text(xn - 2, ym - 3, "Window full", size=FS, anchor="end")
-    y0, yl = chy + chh + 0.5, chy + chh + 30.5
+    y0, yl = chy + chh + 0.5, chy + chh + 32.5
     g.line(CB.cx("fp"), y0, CB.cx("fp"), yfp - 1.5, stroke=FP_S, sw=0.9, arrow="blue")
     g.text(CB.cx("fp") + 3, yl, "Promote", size=FS, fill=FP_T)
     xdm = CB.qx(3)
@@ -593,9 +599,9 @@ def fig1_c(g):
             + [(CB.qx(c), Q_S if c in SEL else CARD_S, "violet" if c in SEL else "green",
                 None if c in SEL else "1.5 1.2", 0.9 if c in SEL else 0.6) for c in range(N_Q)]):
         g.line(x, CB.yb + 1, x, KY0 - 1, stroke=col, sw=sw, dash=dash, arrow=arrow)
-    g.rect(4, KY0, BW - 12, KY1 - KY0, fill="#ffffff", stroke=INK, sw=0.6, rx=3)
-    g.text(8, KY0 + 8.8, "Fused attention reads:", size=FS, weight="bold")
-    mt, mh = KY0 + 11.5, 12
+    g.rect(4.5, KY0, BW - 14, KY1 - KY0, fill="#ffffff", stroke=INK, sw=0.6, rx=3)
+    g.text(9, KY0 + 9.5, "Fused attention reads:", size=FS, weight="bold")
+    mt, mh = KY0 + 13, 12.5
     g.rect(CB.sink[0], mt, CB.sink[1] - CB.sink[0], mh, fill=SINK_F, stroke=SINK_S, sw=0.4)
     for x in CB.fp:
         g.rect(x, mt, CB.fp_w, mh, fill=FP_F, stroke=FP_S, sw=0.5)
@@ -606,18 +612,18 @@ def fig1_c(g):
             g.use("card", x + (CB.q_w - CB.card) / 2, mt + mh - CB.card, CB.card, CB.card)
     for x in CB.loc:
         g.rect(x, mt, CB.loc_w, mh, fill="hatch-blue", stroke=FP_S, sw=0.5)
-    ly = mt + mh + 8.6
+    ly = mt + mh + 8.8
     g.text(CB.qx(SEL[0]), ly, "Decoded", size=FS, anchor="middle", fill=Q_T)
     g.text((CB.qx(4) + CB.qx(5)) / 2, ly, "Card only", size=FS, anchor="middle", fill=CARD_T)
 
     # ---- the token it produces: its K, V go into the newest window, from below, which
     # keeps (c)'s right edge clear at the cache for the arrow coming in from (b)
-    oy, ox0, ox1 = KY1 + 7, 8, 98
+    oy, ox0, ox1 = KY1 + 8, 9, 100
     g.line((ox0 + ox1) / 2, KY1, (ox0 + ox1) / 2, oy - 0.5, stroke=INK, sw=0.8, arrow="dark")
     g.rect(ox0, oy, ox1 - ox0, 11, fill="#ffffff", stroke=QRY_S, sw=0.9, rx=2)
     g.text((ox0 + ox1) / 2, oy + 8, "Output → next token", size=FS, anchor="middle",
            weight="bold", fill=QRY_T)
-    xr, yr = BW - 4, KY0 - 3.5
+    xr, yr = BW - 5, KY0 - 4
     xt = CB.loc[-1] + CB.loc_w * 5.5 / 8                        # its slot in the newest window
     g.path(f"M{ox1},{oy + 5.5} L{xr},{oy + 5.5} L{xr},{yr} L{xt},{yr} L{xt},{CB.yb + 1}",
            stroke=QRY_S, sw=0.9, arrow="red")
@@ -636,21 +642,22 @@ def build_fig1():
     fig1_c(g)
     g.close()
 
-    # between panels: the tiered cache feeds the gate (b, right); the gate's pick feeds
-    # the pass (c, left), level with the cache both of them draw
+    # between panels, across the full gaps: the tiered cache feeds the gate (b, right); the
+    # gate's pick feeds the pass (c, left), level with the cache both of them draw
     xq = XB + CB.cx("q")
-    g.line(xq, AH + 1, xq, BY - 1, stroke=INK, sw=1, arrow="dark")
+    g.line(xq, AH + 1.5, xq, BY - 1.5, stroke=INK, sw=1.6, arrow="dark")
     yb = BY + CB.yb - CB.fp_h / 2
-    g.line(XB - 0.5, yb, XC + BW + 0.5, yb, stroke=INK, sw=1, arrow="dark")
+    g.line(XB - 1.5, yb, XC + BW + 1.5, yb, stroke=INK, sw=1.6, arrow="dark")
     # every window's attention this step, read or credited, goes back into its score (a):
-    # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell
+    # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell; the label
+    # runs up the outside of the line
     yk = BY + (KY0 + KY1) / 2
-    xa = LM + CA.qx(TRACED) - 204
+    xa = LM + CA.qx(TRACED) - A_SPAN
     ya = A_ROW + 7
-    g.path(f"M{XC + 4},{yk} L{XL},{yk} L{XL},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1,
+    g.path(f"M{XC + 4.5},{yk} L{XL},{yk} L{XL},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1,
            arrow="blue")
-    g.text(XL + 5, AH + 11.4, "Every window's attention this step, read or credited, is added "
-           "to its score", size=FS, fill=FP_T, weight="bold")
+    g.text(XL - 3.5, (ya + yk) / 2, "Each window's attention → its score", size=FS,
+           anchor="middle", fill=FP_T, rotate=-90)
     return svg_doc(g, W1, H1), W1, H1
 
 
