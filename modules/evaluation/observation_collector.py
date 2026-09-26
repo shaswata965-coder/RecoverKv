@@ -57,7 +57,7 @@ import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -920,41 +920,105 @@ class ObservationCollector:
 # ---------------------------------------------------------------------------
 
 
+def iter_zip_samples(path: str | Path, keys: Optional[Sequence[str]] = None
+                     ) -> Iterator[Dict[str, np.ndarray]]:
+    """The zip's samples one at a time, optionally only ``keys`` of each, so a
+    multi-GB run never has to sit in memory whole."""
+    with zipfile.ZipFile(path) as zf:
+        meta = json.loads(zf.read("meta.json"))
+        for s in meta["samples"]:
+            with np.load(io.BytesIO(zf.read(s["file"])), allow_pickle=False) as z:
+                yield {k: z[k] for k in (z.files if keys is None else keys)}
+
+
 def load_zip(path: str | Path) -> Tuple[Dict[str, Any], List[Dict[str, np.ndarray]]]:
     """``(meta, [sample arrays...])``."""
     with zipfile.ZipFile(path) as zf:
         meta = json.loads(zf.read("meta.json"))
-        samples = []
-        for s in meta["samples"]:
-            with np.load(io.BytesIO(zf.read(s["file"])), allow_pickle=False) as z:
-                samples.append({k: z[k] for k in z.files})
-    return meta, samples
+    return meta, list(iter_zip_samples(path))
 
 
-def export_parity(zip_path: str | Path, out_dir: str | Path) -> Tuple[Path, Path]:
-    """Write the ``parity_base`` / ``parity_ours`` npz pair the observation
-    suite reads (``qevict_observations``), from one collector zip.
+# What :func:`parity_base` and :func:`parity_ours` read from each sample.
+BASE_KEYS = ("full_mass", "tokens")
+OURS_KEYS = ("tier", "gate_open", "gate_fired", "evict_step", "tokens")
 
-    Base: the full-KV masses of the same run (cumulative per head, per-step
-    head-mean, per-step per head). Ours: the survivor axis (every window the
-    cache holds, ascending), its tiers and the gate's pick on it.
-    """
-    meta, samples = load_zip(zip_path)
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+
+def _parity_ident(meta: Dict[str, Any], n: int, source: str) -> Dict[str, Any]:
     ax, cfg = meta["axes"], meta["config"]
     geom = meta.get("resolved_geometry", {})
-    T = ax["T"]
-    L = meta["model"]["num_layers"]
-    Hk = meta["model"]["num_kv_heads"]
+    return {
+        "seed": cfg["seed"], "dataset": meta["dataset_resolved"]["corpus"],
+        "article_id": cfg["article_index"],
+        "article_index_start": cfg["article_index"],
+        "article_indices": [x["article_index"] for x in meta["samples"]][:n],
+        "article_shas": [x["article_sha"] for x in meta["samples"]][:n],
+        "article_sha": meta["samples"][0]["article_sha"],
+        "num_samples": n, "prefill_len": ax["prefill"],
+        "gen_len": ax["T"], "window_size": ax["window_size"],
+        "num_sink_tokens": ax["num_sink_tokens"],
+        "local_window_size_resolved": geom.get("local_windows", 0) * ax["window_size"],
+        "model_name": cfg["model_path"],
+        "num_attention_heads": meta["model"]["num_heads"],
+        "num_key_value_heads": meta["model"]["num_kv_heads"],
+        "score_accum_dtype": "float32",
+        "source_zip": source,
+    }
 
+
+def _stack_padded(xs: List[np.ndarray], fill) -> np.ndarray:
+    m = max(x.shape[-1] for x in xs)
+    return np.stack([np.concatenate(
+        [x, np.full(x.shape[:-1] + (m - x.shape[-1],), fill, x.dtype)], -1)
+        for x in xs])
+
+
+def parity_base(meta: Dict[str, Any], samples: Iterable[Dict[str, np.ndarray]],
+                source: str = "") -> Dict[str, Any]:
+    """The ``parity_base`` npz as ``qevict_observations.load_parity_npz``
+    returns it (``{"arrays", "metadata", "path"}``; ``path`` is ``source``):
+    the full-KV masses of the same run -- cumulative per head, per-step
+    head-mean, per-step per head. Needs :data:`BASE_KEYS` of each sample;
+    ``samples`` is consumed once, so a generator keeps one in memory at a time.
+    """
+    T, L = meta["axes"]["T"], meta["model"]["num_layers"]
     cum, step_hm, step_h, toks = [], [], [], []
-    ids_all, tier_all, gate_all, fired_all, evict_all = [], [], [], [], []
     for s in samples:
         fm = s["full_mass"].astype(np.float32)                   # [T,L,H,W]
         step_h.append(fm.astype(np.float16))
         step_hm.append(fm.mean(axis=2))
         cum.append(np.cumsum(fm, axis=0).astype(np.float16))
+        del fm
+        toks.append(s["tokens"])
+    n = len(toks)
+    md = {**_parity_ident(meta, n, source), "schema_version": "1.3",
+          "mode": "parity_base",
+          "top_k_windows": meta.get("resolved_geometry", {}).get("top_k_windows", 0),
+          "record_head_step_mass": True,
+          "note": "full-KV attention of the cache run's own queries "
+                  "(observation_collector shadow), not a separate run"}
+    return {"arrays": {
+        "window_scores": np.stack(cum), "step_window_scores": np.stack(step_hm),
+        "step_window_scores_heads": np.stack(step_h),
+        "eviction_step_mask": np.zeros((n, T), bool),
+        "generated_tokens": np.stack(toks),
+        "top_window_indices": np.zeros((n, T, L, 1), np.int64)},
+        "metadata": md, "path": source}
+
+
+def parity_ours(meta: Dict[str, Any], samples: Iterable[Dict[str, np.ndarray]],
+                source: str = "", **meta_override: Any) -> Dict[str, Any]:
+    """The ``parity_ours`` npz, same shape as :func:`parity_base`'s: the
+    survivor axis (every window the cache holds, ascending), its tiers and the
+    gate's pick on it. Needs :data:`OURS_KEYS` of each sample -- which need not
+    be the zip's own: ``promotion_ablation`` passes the one-way replay's tiers
+    and gate picks, and names that arm through ``meta_override``.
+    """
+    cfg = meta["config"]
+    geom = meta.get("resolved_geometry", {})
+    T, L = meta["axes"]["T"], meta["model"]["num_layers"]
+    Hk = meta["model"]["num_kv_heads"]
+    toks, ids_all, tier_all, gate_all, fired_all, evict_all = [], [], [], [], [], []
+    for s in samples:
         toks.append(s["tokens"])
         tier = s["tier"]
         held = (tier == TIER_FP) | (tier == TIER_Q) | (tier == TIER_LOCAL)
@@ -975,63 +1039,51 @@ def export_parity(zip_path: str | Path, out_dir: str | Path) -> Tuple[Path, Path
         gate_all.append(gr)
         fired_all.append(s["gate_fired"])
         evict_all.append(s["evict_step"])
+    n = len(toks)
+    md = {**_parity_ident(meta, n, source), "schema_version": "1.3",
+          "mode": "parity_ours",
+          "top_k_windows": geom.get("top_k_windows", 0),
+          "top_k_fp": geom.get("top_k_fp", 0), "N_q": geom.get("N_q", 0),
+          "quant_ratio": cfg["quant_ratio"],
+          "quant_gate_ratio": cfg["gate_ratio"],
+          "quant_budget_mode": cfg["quant_budget_mode"],
+          "quant_card_bits": geom.get("quant_card_bits"),
+          "quant_promotion": cfg["quant_promotion"],
+          "quant_promote_source": cfg["quant_promote_source"],
+          "cache_budget": cfg["cache_budget"],
+          "read_gate": meta.get("read_gate"), "gate_recorded": True,
+          "first_eviction_step": 0,
+          "bytes_per_q_window": geom.get("bytes_per_q_window"),
+          "bytes_per_gate_card": geom.get("bytes_per_gate_card"),
+          **meta_override}
+    return {"arrays": {
+        "all_window_ids": _stack_padded(ids_all, -1),
+        "all_window_tier": _stack_padded(tier_all, -1),
+        "gate_read": _stack_padded(gate_all, False),
+        "gate_fired": np.stack(fired_all),
+        "eviction_step_mask": np.stack(evict_all),
+        "generated_tokens": np.stack(toks),
+        "top_window_indices": np.zeros((n, T, L, 1), np.int64)},
+        "metadata": md, "path": source}
 
-    def stack(xs, fill):
-        m = max(x.shape[-1] for x in xs)
-        return np.stack([np.concatenate(
-            [x, np.full(x.shape[:-1] + (m - x.shape[-1],), fill, x.dtype)], -1)
-            for x in xs])
 
-    ident = {
-        "seed": cfg["seed"], "dataset": meta["dataset_resolved"]["corpus"],
-        "article_id": cfg["article_index"],
-        "article_index_start": cfg["article_index"],
-        "article_indices": [x["article_index"] for x in meta["samples"]],
-        "article_shas": [x["article_sha"] for x in meta["samples"]],
-        "article_sha": meta["samples"][0]["article_sha"],
-        "num_samples": len(samples), "prefill_len": ax["prefill"],
-        "gen_len": T, "window_size": ax["window_size"],
-        "num_sink_tokens": ax["num_sink_tokens"],
-        "local_window_size_resolved": geom.get("local_windows", 0) * ax["window_size"],
-        "model_name": cfg["model_path"],
-        "num_attention_heads": meta["model"]["num_heads"],
-        "num_key_value_heads": Hk, "score_accum_dtype": "float32",
-        "source_zip": str(zip_path),
-    }
-    base_meta = {**ident, "schema_version": "1.3", "mode": "parity_base",
-                 "top_k_windows": geom.get("top_k_windows", 0),
-                 "record_head_step_mass": True,
-                 "note": "full-KV attention of the cache run's own queries "
-                         "(observation_collector shadow), not a separate run"}
-    ours_meta = {**ident, "schema_version": "1.3", "mode": "parity_ours",
-                 "top_k_windows": geom.get("top_k_windows", 0),
-                 "top_k_fp": geom.get("top_k_fp", 0), "N_q": geom.get("N_q", 0),
-                 "quant_ratio": cfg["quant_ratio"],
-                 "quant_gate_ratio": cfg["gate_ratio"],
-                 "quant_budget_mode": cfg["quant_budget_mode"],
-                 "quant_card_bits": geom.get("quant_card_bits"),
-                 "quant_promotion": cfg["quant_promotion"],
-                 "quant_promote_source": cfg["quant_promote_source"],
-                 "cache_budget": cfg["cache_budget"],
-                 "read_gate": meta.get("read_gate"), "gate_recorded": True,
-                 "first_eviction_step": 0,
-                 "bytes_per_q_window": geom.get("bytes_per_q_window"),
-                 "bytes_per_gate_card": geom.get("bytes_per_gate_card")}
+def export_parity(zip_path: str | Path, out_dir: str | Path) -> Tuple[Path, Path]:
+    """Write the ``parity_base`` / ``parity_ours`` npz pair the observation
+    suite reads (``qevict_observations``), from one collector zip: the arrays
+    :func:`parity_base` and :func:`parity_ours` build, each streamed from the
+    zip one sample at a time."""
+    with zipfile.ZipFile(zip_path) as zf:
+        meta = json.loads(zf.read("meta.json"))
+    base = parity_base(meta, iter_zip_samples(zip_path, BASE_KEYS), str(zip_path))
+    ours = parity_ours(meta, iter_zip_samples(zip_path, OURS_KEYS), str(zip_path))
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
     base_p, ours_p = out / "parity_base.npz", out / "parity_ours.npz"
-    tokens = np.stack(toks)
-    np.savez_compressed(
-        base_p, window_scores=np.stack(cum), step_window_scores=np.stack(step_hm),
-        step_window_scores_heads=np.stack(step_h),
-        eviction_step_mask=np.zeros((len(samples), T), bool),
-        generated_tokens=tokens,
-        top_window_indices=np.zeros((len(samples), T, L, 1), np.int64),
-        metadata_json=np.array([json.dumps(base_meta, default=str)], dtype=object))
-    np.savez_compressed(
-        ours_p, all_window_ids=stack(ids_all, -1), all_window_tier=stack(tier_all, -1),
-        gate_read=stack(gate_all, False), gate_fired=np.stack(fired_all),
-        eviction_step_mask=np.stack(evict_all), generated_tokens=tokens,
-        top_window_indices=np.zeros((len(samples), T, L, 1), np.int64),
-        metadata_json=np.array([json.dumps(ours_meta, default=str)], dtype=object))
+    for path, pair in ((base_p, base), (ours_p, ours)):
+        np.savez_compressed(
+            path, **pair["arrays"],
+            metadata_json=np.array([json.dumps(pair["metadata"], default=str)],
+                                   dtype=object))
     return base_p, ours_p
 
 

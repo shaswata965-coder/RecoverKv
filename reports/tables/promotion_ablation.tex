@@ -1,0 +1,78 @@
+% Q->F promotion, the paper's Table 18 layout, on the q = 0.70 collector run (and
+% q = 0.20 for context). Needs \usepackage{booktabs}.
+%
+% Source: reports/promotion_ablation/q0.7.json and q0.2.json, written by
+%   python -m modules.evaluation.promotion_ablation --zip <run>.zip --out-dir ...
+% Full write-up, definitions and checks: reports/promotion_mass_q0.7_wikitext.md.
+%
+% "With promotion" is the measured run. "No promotion" is the one-way policy
+% (quant_promotion: oneway) REPLAYED on that run's own ranking signal, same queries,
+% same bytes; the read gate re-run by its own rule on the recorded card estimates,
+% with the windows the run had promoted always read (the bracket that favours no
+% promotion -- gate-dependent deltas are lower bounds). The replay reproduces the
+% recorded tiers at 16,384 / 16,384 layer-evictions (bidir); it is not a recorded
+% one-way run. A collector run with --promotion oneway replaces it.
+%
+% Rows below the rule are attention mass: a share of each query head's FullKV
+% attention per decode step. "fp slot" row: the next 32 steps' mass per step of the
+% window a promotion puts in fp (with) vs the fp window demoted for it, which keeps
+% the slot under one-way (no promotion).
+% Bold: the better value where the paired 95% bootstrap CI (256 prompt x layer
+% traces) of the difference excludes zero and it shows at the printed precision.
+% QSA at q = 0.20 is bold on the no-promotion side on purpose: in a replay both arms
+% carry the same scores, so QSA moves only by which windows sit in int2.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Metric & No promotion & With promotion & $\Delta$ \\
+\midrule
+R3 FMM $\downarrow$                              & 28.9\%          & 28.9\%          & $0.0$\,pp  \\
+Quantized-Score Agreement $\uparrow$             & 0.983           & 0.983           & $0.000$    \\
+FullKV attention mass read, $R_Q$ $\uparrow$     & 59.1\%          & \textbf{59.2\%} & $+0.2$\,pp \\
+Global LIR $\uparrow$                            & 0.0\%           & \textbf{0.7\%}  & $+0.7$\,pp \\
+Recorded Q$\to$F transitions                     & 0               & 233             & $+233$     \\
+\midrule
+FullKV mass on the fp tier $\uparrow$            & 1.00\%          & \textbf{1.07\%} & $+0.06$\,pp \\
+FullKV mass reached only via the card $\downarrow$ & 2.90\%        & \textbf{2.87\%} & $-0.03$\,pp \\
+Future mass of the contested fp slot $\uparrow$  & 0.39\%          & \textbf{0.78\%} & $\times 2.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Effect of Q$\to$F promotion at quant ratio 0.70 (2 fp + 26 int2 windows,
+$\Omega = 8$, 20\% byte budget; the read gate opens 7 of 26 int2 windows per KV
+head). Llama-3.1-8B-Instruct, 8 wikitext-103 prompts, 512-token prefill and 512
+decode steps. Both columns use the same prompts and queries: \emph{with promotion}
+is the measured run, \emph{no promotion} replays the one-way policy on that run's
+ranking signal, a paired comparison. $R_Q$: share of the int2 tier's FullKV
+attention in windows the read gate opens, per query head. Promotion does not change
+which windows are kept (identical at every eviction, hence equal R3 FMM); it changes
+which of them are read every step.}
+\label{tab:promotion-q070}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Metric & No promotion & With promotion & $\Delta$ \\
+\midrule
+R3 FMM $\downarrow$                              & 40.5\%          & 40.5\%          & $0.0$\,pp   \\
+Quantized-Score Agreement $\uparrow$             & \textbf{0.940}  & 0.926           & $-0.014$    \\
+FullKV attention mass read, $R_Q$ $\uparrow$     & 53.6\%          & \textbf{57.0\%} & $+3.4$\,pp  \\
+Global LIR $\uparrow$                            & 0.0\%           & \textbf{1.9\%}  & $+1.9$\,pp  \\
+Recorded Q$\to$F transitions                     & 0               & 726             & $+726$      \\
+\midrule
+FullKV mass on the fp tier $\uparrow$            & 3.33\%          & \textbf{3.71\%} & $+0.38$\,pp \\
+FullKV mass reached only via the card $\downarrow$ & 1.03\%        & \textbf{0.86\%} & $-0.17$\,pp \\
+Future mass of the contested fp slot $\uparrow$  & 0.32\%          & \textbf{0.77\%} & $\times 2.4$ \\
+\bottomrule
+\end{tabular}
+\caption{As Table~\ref{tab:promotion-q070}, at quant ratio 0.20 (7 fp + 7 int2
+windows; the gate opens 2 of 7 per KV head), same prompts.}
+\label{tab:promotion-q020}
+\end{table}

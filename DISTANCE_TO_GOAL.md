@@ -1937,3 +1937,41 @@ payload and the read gate per head -- comes from one trajectory.
 reads. CPU-only so far (`tests/test_observation_collector.py`, 9: the taps
 reproduce a tiny Llama's own attention output to 1e-5; the recorder on the real
 cache and gate; zip -> export -> Observations I-V); never run on a GPU.
+
+### 13.3 Promotion, priced in attention mass: Table 18 on one run — 2026-09-26
+
+`modules/evaluation/promotion_ablation.py` builds the paper's Table 18 (no promotion
+vs with promotion) from **one** bidirectional collector run, paired on the same
+prompts and queries. The paper's pilot compares runs on different articles. The
+no-promotion column replays the one-way policy on the run's own `rank_signal`, and
+the read gate is re-run by its own rule on the recorded cards. Windows the run had
+promoted get no card, so the gate is bracketed: `open` (always read, favours no
+promotion, the primary arm) and `closed`. Write-up:
+`reports/promotion_mass_q0.7_wikitext.md`; paper table:
+`reports/tables/promotion_ablation.tex`.
+
+| q = 0.70 (2 fp + 26 int2) | no promotion | with | Δ (`open` … `closed`) |
+|---|---|---|---|
+| R3 FMM (fp + int2) | 28.89% | 28.89% | 0 (kept set identical at every eviction) |
+| FullKV mass on the fp tier | 1.00% | 1.07% | +0.064 pp |
+| mass reached only through the card fill | 2.90% | 2.87% | −0.03 … −0.10 pp |
+| R_Q (int2 mass in opened windows) | 59.07% | 59.24% | +0.17 … +0.84 pp |
+| Global LIR (fp) / Q→F transitions | 0 / 0 | 0.69% / 233 | |
+| promoted vs demoted window, mass per step | 0.39% | 0.78% | 2.0× |
+
+Every mass row favours promotion, and every CI excludes zero, even under the bracket
+that favours no promotion. **At q = 0.70 the aggregate effect is small**, for three
+reasons: promotion reorders the kept set rather than changing it; the fp tier is two
+windows; and the gate already reads the window promotion would pin 92% of the time.
+At q = 0.20 the same table moves R_Q +3.4 … +9.4 pp and fill-only mass −17 … −34%.
+The pilot's magnitudes (R_Q +6.8 pp, FMM −0.7 pp, QSA +0.038) do not reproduce at
+q = 0.70. QSA cannot show them in a replay, because both arms carry the same scores.
+
+Checks, both runs: replaying `bidir` reproduces the recorded tiers at 16,384 / 16,384
+layer-evictions; the gate rule reproduces 99.6% / 99.9% of the recorded picks (fp16
+card rounding); no replayed window lacked a score. `tests/test_promotion_ablation.py`
+(17) pins the replay against `EvictionPolicy.compute_two_tier_retain` for both
+arms, and the gate against `sketch.group_share` + `select_windows`. **Not done:** a
+measured `--promotion oneway` collector run (the command is in the write-up). The
+export was split into `parity_base` / `parity_ours` for this; output is
+byte-identical to before, checked on a 2-prompt zip cut from the real run.
