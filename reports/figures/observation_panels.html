@@ -269,7 +269,7 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
       <div class="fig-meta"><span class="dims" id="dims-c"></span>
         <div class="btns"><button class="btn primary small" type="button" data-export="c" data-fmt="pdf">PDF</button><button class="btn small" type="button" data-export="c" data-fmt="svg">SVG</button><button class="btn small" type="button" data-export="c" data-fmt="png">PNG</button></div></div>
       <p class="takeaway">A few windows carry most of a query's low-bit attention. Each decode step reads only 7 of the 26 low-bit windows; picked by the card gate, those 7 hold 59.2% of the low-bit attention: 93.9% of what an oracle picking with the true attention gets (63.1%), and 2.2× a random 7 (26.9%).</p>
-      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. <strong>Why 7 of 26:</strong> the gate ratio is 0.25 (the shipped operating point) and this run holds 26 int2 windows per KV head, so each step opens ⌈0.25 × 26⌉ = 7; the other 19 are not dropped, they reach the output through their card's estimate. All three bars read 7 windows and differ only in which: <strong>Random</strong> is any 7, whose expected share is 7/26 (arithmetic), so its bar has no interval; <strong>Card gate (ours)</strong> is the 7 whose cards score highest for the current query; <strong>Oracle</strong> is the report's hindsight pick, 7 per KV head chosen with the true attention, the ceiling for any gate of that size. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit.</p>
+      <p class="prov"><b>Measured</b>A.IV, per query head, head-steps with at least 1% of their attention in the low-bit tier. <strong>Why 7 of 26:</strong> the gate ratio is 0.25 (the shipped operating point) and this run holds 26 int2 windows per KV head, so each step opens ⌈0.25 × 26⌉ = 7; the other 19 are not dropped, they reach the output through their card's estimate. All three bars read 7 windows and differ only in which: <strong>Random</strong> is 7 windows drawn blindly, without looking at the query or the attention: each window then has a 7-in-26 chance of being read, so on average they hold 7/26 = 26.9% (arithmetic, not a measurement, so its bar has no interval); <strong>Card gate (ours)</strong> is the 7 whose cards score highest for the current query; <strong>Oracle</strong> is the report's hindsight pick, 7 per KV head chosen with the true attention, the ceiling for any gate of that size. 93.9% is the mean per-trace ratio, so it differs from 59.2 / 63.1 in the last digit. <strong>Same windows as the oracle:</strong> per query head, the card's top 7 share 81.0% of their windows with the true top 7 (a random 7 shares 7/26 = 26.9%) and include the hottest window 96.4% of the time (report §7; no interval reported). Attention captured weighs each window by its attention, which is why the gate gets 94% of the oracle's attention while matching 81% of its windows.</p>
       <details class="data"><summary>Data and axis titles</summary>
         <div class="tbl-wrap"><table>
           <thead><tr><th>Label</th><th>Report row</th><th class="num">Captured</th><th class="num">95% CI</th></tr></thead>
@@ -278,6 +278,8 @@ pre{margin:0;background:var(--raised);border:1px solid var(--line);border-radius
             <tr><td>Card gate (ours)</td><td>per-head recall</td><td class="num">59.2%</td><td class="num">58.6–59.9</td></tr>
             <tr><td>Oracle (true attention)</td><td>hindsight pick, same size</td><td class="num">63.1%</td><td class="num">62.4–63.7</td></tr>
             <tr><td>Ratio</td><td>gate efficiency</td><td class="num">93.9%</td><td class="num">93.7–94.1</td></tr>
+            <tr><td>Card's top 7 vs true top 7</td><td>§7, overlap per query head</td><td class="num">81.0%</td><td class="num">–</td></tr>
+            <tr><td>Hottest window in card's top 7</td><td>§7, per query head</td><td class="num">96.4%</td><td class="num">–</td></tr>
           </tbody></table></div>
         <div class="fields">
           <label class="field">x-axis title<input type="text" id="xt-c"></label>
@@ -357,7 +359,7 @@ const DATA = {
   // share of any 7, 7/26 (arithmetic), so it has no interval to draw. Oracle is the report's
   // hindsight pick: 7 per KV head chosen with the true attention, the ceiling for the gate.
   c: [
-    { label: 'Random', key: 'Random', v: 100 * 7 / 26, style: C.chance, tip: '<b>Random:</b> any 7 of the 26 windows hold 7/26 = 26.9% of the low-bit attention on average (arithmetic, no interval)' },
+    { label: 'Random', key: 'Random', v: 100 * 7 / 26, style: C.chance, tip: '<b>Random:</b> 7 windows drawn blindly, without the query, hold 7/26 = 26.9% of the low-bit attention on average (arithmetic, no interval)' },
     { label: 'Card gate', key: 'Card gate (ours)', v: 59.2, lo: 58.6, hi: 59.9, style: C.qStay, tip: '<b>Card gate (ours):</b> the 7 windows whose cards score highest for the current query hold 59.2% (CI 58.6–59.9), 93.9% of the oracle' },
     { label: 'Oracle', key: 'Oracle (true attention)', v: 63.1, lo: 62.4, hi: 63.7, style: C.qMoved, tip: '<b>Oracle (true attention):</b> the 7 windows chosen with the true attention hold 63.1% (CI 62.4–63.7), the ceiling for any 7-window gate' }
   ]
@@ -881,8 +883,10 @@ ${sub('c', 'Query-time concentration', 'fig:obs-gate')}
     stay low 0.94$\\times$, evicted 0.66$\\times$.
     (c) Share of the low-bit tier's attention held by the 7 of its 26 windows a decode step reads
     (gate ratio 0.25, $\\lceil 0.25 \\times 26 \\rceil = 7$; the other 19 reach the output through their cards),
-    by how the 7 are chosen: at random, $7/26 = 26.9\\%$; by the card gate, 59.2\\%; by an oracle using the
-    true attention, 63.1\\%. The gate reaches 93.9\\% of the oracle.
+    by how the 7 are chosen: at random, without looking at the query ($7/26 = 26.9\\%$ on average); by the
+    card gate, 59.2\\%; by an oracle using the true attention, 63.1\\%. The gate reaches 93.9\\% of the oracle;
+    per query head, the card's top 7 share 81\\% of their windows with the true top 7 (27\\% for a random 7) and
+    include the hottest window 96\\% of the time.
     Whiskers are 95\\% bootstrap CIs over 256 (prompt, layer) traces. Stay low's (0.94--0.95, 391,147
     windows) is narrower than its stroke and draws as a single tick; the random pick is exact, and the intervals in (a) are within
     $\\pm$0.5 points and sit inside the dots.}
