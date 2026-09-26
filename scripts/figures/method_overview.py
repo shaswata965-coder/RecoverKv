@@ -399,8 +399,8 @@ def svg_doc(g, w, h):
 # Figure 1 -- the runtime loop
 # ===========================================================================
 W1 = 486                                 # 6.75 in: the full width of a two-column page
-LM = 22                                  # left margin: the loop back to (a), and its label
-XL = 14                                  # the loop's run up the margin, 8 pt clear of the borders
+LM = 16                                  # left margin: carries the loop back to (a)
+XL = 8                                   # the loop's run up the margin, 8 pt clear of the borders
 GX = GY = 28                             # gaps between panels, where the flow arrows run
 AW, AH = W1 - LM - 1, 135
 BW = (AW - GX) / 2
@@ -503,6 +503,8 @@ def fig1_a(g):
     g.text(c2 + 20, ly, "Earlier steps", size=FS, anchor="middle")
     g.text(c3 + 24, ly, "Ranks it", size=FS, anchor="middle")
     g.line(CA.qx(TRACED), ay - 1, CA.qx(TRACED), CA.yb + 1.5, stroke=Q_S, sw=0.9, arrow="violet")
+    # the loop from (c) comes in from the left at mid-row; its tag sits just above it
+    g.text(3, ay + ah / 2 - 4, "From (c)", size=FS, fill=FP_T)
 
     # ---- the ranked scores, standing on the windows they tier
     bb, bmax = CA.yb - CA.fp_h - 4, 24
@@ -652,15 +654,13 @@ def build_fig1():
     yb = BY + CB.yb - CB.fp_h / 2
     block_arrow(g, XB - 1.5, yb, XC + BW + 0.5, yb)
     # every window's attention this step, read or credited, goes back into its score (a):
-    # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell; the label
-    # runs up the outside of the line
+    # out of (c)'s kernel box, up the left margin, into (a)'s first alpha cell. (a)'s own
+    # row says what happens to it; the tag where it enters says where it came from
     yk = BY + (KY0 + KY1) / 2
     xa = LM + CA.qx(TRACED) - A_SPAN
     ya, r = A_ROW + 7, 4
     g.path(f"M{XC + 4.5},{yk} L{XL + r},{yk} Q{XL},{yk} {XL},{yk - r} L{XL},{ya + r} "
            f"Q{XL},{ya} {XL + r},{ya} L{xa - 0.8},{ya}", stroke=FP_S, sw=1, arrow="blue")
-    g.text(XL - 3.5, (ya + yk) / 2, "Each window's attention → its score", size=FS,
-           anchor="middle", fill=FP_T, rotate=-90)
 
     # the key: what a step reads of each int2 window, for the marks in (b) and (c)
     g.open(LM, KEY_Y - 9, extra=f' class="panel" data-w="{AW}" data-h="13"')
