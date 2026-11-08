@@ -3,7 +3,7 @@
 ## THIS BRANCH: the compressed tier is int4, not int2
 
 `Clustered_int4_paused_fast` is `Clustered_int2_paused_fast` at `2b860f2` plus
-two commits:
+three commits:
 
 1. `639f25a` derives every use of the K/V code width from one constant,
    `modules/quant/quantizer.py: CODE_BITS`. At `CODE_BITS = 2` it is a proven
@@ -12,10 +12,18 @@ two commits:
    tiny-model decode with a live Q tier (its commit message lists them). It is
    shared, byte for byte, with `Clustered_int8_paused_fast`.
 2. The next commit sets `CODE_BITS = 4` and writes this section. Nothing else.
+3. A fix for a compile failure the eviction shares with int2 on torch <= 2.7
+   (`LoweringException: StarDep does not have an index`, on the anchor
+   `mean` in `demote_many` or on the quantiser's `amin`): both
+   `searchsorted` calls in the eviction go through `_searchsorted_realized`,
+   a custom op Inductor cannot inline into a reduction. Same integers from the
+   same ATen kernel; no number moves. **The int2 branch has the same latent
+   failure and does not carry this fix** -- port it there to keep the three
+   branches identical. See `_searchsorted_realized` for the mechanism.
 
-So the **only** difference from the int2 branch is the width of the stored K/V
-codes: 16 levels instead of 4, 2 codes per byte instead of 4. Unchanged,
-on purpose: the KIVI layout (keys per channel over a window, values per token),
+So, that fix aside, the **only** difference from the int2 branch is the width
+of the stored K/V codes: 16 levels instead of 4, 2 codes per byte instead of 4.
+Unchanged, on purpose: the KIVI layout (keys per channel over a window, values per token),
 round-half-even and the clamp, the **one-byte scale/zero grid** and its groups
 of 32, the gate card (`mu4/v8/t8/vm4`, built from the fp keys, so it never sees
 the width), the gate and its GQA union, eviction, promotion, every config and

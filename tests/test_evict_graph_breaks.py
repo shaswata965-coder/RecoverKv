@@ -124,7 +124,9 @@ def test_the_eviction_lowers_to_fused_kernels_and_not_to_aten_calls():
     * **fused kernels > 0** — the quantiser's round/clamp/div chain, the gather
       that feeds it and the scatter that consumes it are in compiled kernels.
     * **extern ops** — ``sort``, ``searchsorted`` and ``cumsum`` have no Inductor
-      lowering on this backend, and fusion cannot cross them. The cap is a
+      lowering on this backend, and fusion cannot cross them. (``searchsorted``
+      is now ``recoverkv::searchsorted`` on every backend, which this regex does
+      not count -- see ``cache._searchsorted_realized``.) The cap is a
       regression guard: four compactions were expressed as sorts and are now
       cumsums (``modules/quant/compact.py``), which took ``aten.sort`` in this
       cycle from 21 calls to 6. Re-introducing one would push this over.
@@ -577,3 +579,52 @@ def test_rotate_half_no_cat_is_bit_identical_to_huggingface():
     # permuted views on the promote path.
     x = torch.randn(4, 8, 16).transpose(0, 1)
     assert same_bits(hf(x), _rotate_half_no_cat(x))
+
+
+# ---------------------------------------------------------------------------
+# searchsorted must stay materialized (torch <= 2.7 StarDep lowering failure)
+# ---------------------------------------------------------------------------
+
+
+def test_the_eviction_has_no_bare_searchsorted():
+    """Every ``searchsorted`` in the eviction body goes through
+    ``_searchsorted_realized``.
+
+    On the Triton backend before torch 2.8, a bare ``torch.searchsorted`` lowers
+    to an un-realized ``ops.bucketize`` that Inductor inlines into downstream
+    reductions, whose split heuristic then raises ``StarDep does not have an
+    index`` (see ``cache._searchsorted_realized``). A CPU build cannot show it --
+    the C++ backend has no BUCKETIZE, so ``searchsorted`` is always extern there
+    -- which is why this is pinned at the source rather than by a compile.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from modules.windowed_cache.cache import WindowedCache
+
+    src = textwrap.dedent(inspect.getsource(WindowedCache._evict_two_tier_impl))
+    bare = [n.lineno for n in ast.walk(ast.parse(src))
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "searchsorted"]
+    assert not bare, (
+        f"bare searchsorted at line(s) {bare} of _evict_two_tier_impl; route it "
+        "through _searchsorted_realized or torch <= 2.7 cannot lower the eviction")
+    assert "_searchsorted_realized(" in src
+
+
+def test_the_materialized_searchsorted_is_searchsorted():
+    """Same integers as ``torch.searchsorted`` (left, int64), eager and compiled,
+    including the non-contiguous values ``_compact`` hands it."""
+    from modules.windowed_cache.cache import _searchsorted_realized
+
+    g = torch.Generator().manual_seed(0)
+    seq = torch.randint(0, 50, (3, 40), generator=g).sort(-1).values
+    vals = torch.randint(-2, 55, (3, 24), generator=g)[:, ::2]      # non-contiguous
+    want = torch.searchsorted(seq, vals)
+    got = _searchsorted_realized(seq, vals)
+    assert got.dtype == torch.int64 and torch.equal(got, want)
+    dynamo.reset()
+    compiled = torch.compile(lambda s, v: _searchsorted_realized(s, v) + 0,
+                             fullgraph=True)
+    assert torch.equal(compiled(seq, vals), want)
