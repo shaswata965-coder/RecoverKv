@@ -65,7 +65,7 @@ from torch import Tensor
 #: slot table's code shapes, the decode kernel's unpack (a constexpr), the price
 #: of a window in the budget, the config's divisibility checks -- derives from
 #: this constant, so two builds that differ here differ in nothing else.
-CODE_BITS = 2
+CODE_BITS = 8
 #: Widths a byte packs without a tail.
 CODE_BITS_ALLOWED = (2, 4, 8)
 if CODE_BITS not in CODE_BITS_ALLOWED:  # pragma: no cover - build-time constant

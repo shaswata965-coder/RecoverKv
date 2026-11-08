@@ -1,5 +1,10 @@
 # RecoverKV — a two-tier evicting KV cache
 
+> **This branch stores the compressed tier as int8, not int2**
+> (`modules/quant/quantizer.py: CODE_BITS = 8`); everything else is
+> `Clustered_int2_paused_fast`. The tier keeps the name "int2" in code and in
+> this document. See the first section of `CLAUDE.md`.
+
 A KV cache for long-context decode that keeps a small fp16 tier exactly, holds a
 much larger int2 tier approximately, and reads only a quarter of that int2 tier
 on any given step. The aim is more batch at the same memory, and decode latency

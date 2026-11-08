@@ -2,6 +2,13 @@
 
 Updated 2026-09-24 (§13: the observation path reads what the decode reads). §12 as of 2026-09-23. §11 as of 2026-09-22. Sections 1–10 as of 2026-09-18/19.
 
+> **Branch `Clustered_int8_paused_fast`: the compressed tier stores int8
+> codes, not int2** (`CODE_BITS = 8`; everything else is the int2 branch's —
+> see the first section of `CLAUDE.md`). Every measurement below was taken at
+> int2 and does not transfer. Where this document says "int2", read "the Q
+> tier"; its byte arithmetic is int2's (a window here is 20,896 B with its
+> card, not 8,608).
+
 **The goal:** beat Flash FullKV, int2 KIVI and QEvict across all six shape/batch
 cells. Today we beat Flash in **one of six**. At our best numbers ever we beat it
 in **two of six**. KIVI and QEvict have never been run — there is no
