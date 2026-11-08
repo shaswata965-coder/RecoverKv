@@ -1,5 +1,73 @@
 # RecoverKv — working notes for Claude
 
+## THIS BRANCH: the compressed tier is int4, not int2
+
+`Clustered_int4_paused_fast` is `Clustered_int2_paused_fast` at `2b860f2` plus
+two commits:
+
+1. `639f25a` derives every use of the K/V code width from one constant,
+   `modules/quant/quantizer.py: CODE_BITS`. At `CODE_BITS = 2` it is a proven
+   no-op against `2b860f2` — bitwise on quantizer outputs, traced op graphs, the
+   decode kernel's Triton IR and PTX, interpreter outputs, and a 40-step
+   tiny-model decode with a live Q tier (its commit message lists them). It is
+   shared, byte for byte, with `Clustered_int8_paused_fast`.
+2. The next commit sets `CODE_BITS = 4` and writes this section. Nothing else.
+
+So the **only** difference from the int2 branch is the width of the stored K/V
+codes: 16 levels instead of 4, 2 codes per byte instead of 4. Unchanged,
+on purpose: the KIVI layout (keys per channel over a window, values per token),
+round-half-even and the clamp, the **one-byte scale/zero grid** and its groups
+of 32, the gate card (`mu4/v8/t8/vm4`, built from the fp keys, so it never sees
+the width), the gate and its GQA union, eviction, promotion, every config and
+the operating point (`utils.config.OPERATING_POINT`).
+
+**The tier is still called "int2" everywhere** — identifiers, metric keys, log
+lines, figure labels, and every section below this one. Read "int2" as "the Q
+tier". Every sidecar records the real width as `quant_code_bits`. **A number
+without `quant_code_bits: 4` beside it did not come from this branch**, and
+quality rows do not compare across the int2 / int4 / int8 branches.
+
+### What the width moves — arithmetic (`H_kv=8, D=128, ws=8`)
+
+| | int2 | **int4 (this branch)** |
+|---|---|---|
+| codes + grid per window | 6,432 B | **10,528 B** |
+| `bytes_per_q_window` (with its card) | 8,608 B | **12,704 B** |
+| fp / q price ratio | 3.81 | **2.58** |
+| card ÷ window token data → gate break-even read ratio | 34% → 0.66 | **21% → 0.79** |
+| Q windows kept at the operating point (`bytes`, budget 0.20, q 0.70, 8k prompt) | 511 | **346 (0.68×)** |
+| keys retained there (the fp tier is 57 windows in both) | 4,677 | **3,357** |
+
+Under the default `quant_budget_mode: bytes` the byte budget is the same and a
+wider window buys fewer of them, so **which windows the cache keeps changes**:
+this branch is a quality change against int2 at equal memory, as intended.
+Under `tokens` (the perf suite's mode) the window counts are identical and only
+the bytes move. The gate's economics move too: the card is a smaller share of a
+wider window, so selection breaks even at a higher read ratio than the int2
+figures below say.
+
+### What it costs in accuracy — CPU-only, synthetic keys (`tests/test_quant_grid.py`)
+
+Reconstruction error falls from int2's 13.4% on keys and 50.1% on values to
+**2.59% and 9.98%**. The one-byte grid is no longer free, but nearly: against an
+fp16 grid it costs ×1.02 on keys and ×1.017 on `q·k` (int2: ×1.0005), and ×1.035
+on the worst channel of wide-gain keys. Re-quantizing an fp16 dequant no longer
+reproduces the codes (2,122 of 131,072 move, by ≤ 2); the cache never
+re-quantizes — re-demotion is a reactivation (design §10), and an evicted window does
+not return — so that is a property of the format, not a path the cache takes.
+
+### What is and is not verified
+
+* CPU, at this width: the quantizer, the packing, the slot table, the budget's
+  price for a window (against the bytes the table actually allocates), and the
+  decode kernel **under `TRITON_INTERPRET=1`** against a dequantized reference
+  (`tests/test_code_bits.py`, `tests/interp_code_bits.py`). That needs Triton
+  3.8: 3.9's interpreter fails on this repo's kernels, int2 included. The
+  kernel also compiles for sm80 through ptxas (`tests/test_kernel_compiles.py`).
+* **Not run on a GPU, and no quality run yet.** Every perf and quality number
+  in the rest of this file and in `DISTANCE_TO_GOAL.md` is an int2 measurement
+  and does not transfer.
+
 `DISTANCE_TO_GOAL.md` is the live status document. Read it before proposing any
 decode work; it holds the current numbers and what is measured vs. argued. This
 file holds the things that are easy to get wrong *while* reading it.
