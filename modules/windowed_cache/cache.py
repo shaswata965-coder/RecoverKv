@@ -412,6 +412,48 @@ class _LayerStoreView:
         self._joint.validate()
 
 
+@torch.library.custom_op("recoverkv::searchsorted", mutates_args=())
+def _searchsorted_realized(sorted_sequence: Tensor, values: Tensor) -> Tensor:
+    """``torch.searchsorted(sorted_sequence, values)``, as a buffer Inductor cannot inline.
+
+    Exactly ``torch.searchsorted`` with its defaults (``side='left'``, int64): the
+    same integers, computed by the same ATen kernel. What changes is only how
+    Inductor sees it. A custom op lowers to an extern kernel, so its output is
+    always a materialized buffer that consumers READ; ``aten.searchsorted``
+    lowers, on the Triton backend, to ``ops.bucketize``, which Inductor before
+    2.8 does NOT realize (2.8 added ``result.realize()`` to the lowering --
+    ``[NOTE: inductor bucketize realize]``). Un-realized, the binary search is
+    inlined into every consumer, through ``_clamp_index`` and the ``gather``
+    that reads the fp body, and into any reduction downstream of that gather.
+
+    ``ops.bucketize`` records its boundaries as a ``StarDep`` (the whole buffer,
+    no index). ``Reduction.num_splits`` calls ``.index`` on every dependency of
+    a reduction whose output is small (fewer elements than ``64 x`` the SM
+    count: 6,912 on an A100) and whose reduced extent exceeds 32. So on torch
+    <= 2.7 any such reduction of gathered keys or values raises
+    ``LoweringException: NotImplementedError: StarDep does not have an index``.
+    The anchor ``mean`` in ``QuantizedStore.demote_many`` is one (``[B,n,H,ws,D]
+    -> [B,H,D]``, i.e. any batch <= 6); the quantiser's ``amin``/``amax`` over a
+    value window's channels is another (``[n, H, ws]`` out, 128 in, any small
+    eviction). WHICH one trips first depends on fusion, which moves with the
+    rest of the graph -- the code width moved it from ``amin`` to ``mean`` --
+    and ``_clamp_index`` below avoided one occurrence without removing the
+    cause. Materializing the index removes the cause: there is no
+    ``ops.bucketize`` left in any inner function, on any torch.
+
+    Reproduced and checked on CPU by making Inductor's lowering take an A100's
+    decisions (BUCKETIZE advertised, 108 SMs, the non-CPU realize heuristics)
+    on torch 2.7.1. A CPU build never sees this unaided: the C++ backend has no
+    BUCKETIZE feature, so ``searchsorted`` is always an extern call there.
+    """
+    return torch.searchsorted(sorted_sequence.contiguous(), values.contiguous()).contiguous()
+
+
+@_searchsorted_realized.register_fake
+def _(sorted_sequence: Tensor, values: Tensor) -> Tensor:
+    return values.new_empty(values.shape, dtype=torch.int64)
+
+
 def _clamp_index(x: Tensor, hi) -> Tensor:
     """Clamp an index tensor to ``[0, hi]`` WITHOUT ever emitting ``aten.amin``.
 
@@ -788,7 +830,14 @@ the identical symbolic error). The message recorded below is the SECOND attempt'
       **The invariant to keep: the compiled eviction may mutate the slot table
       (separate allocations) but must never write a buffer it reads a view of.**
       Putting such a write back re-breaks the build.
-    * an `aten.amin` StarDep from a single-sided clamp -- use `_clamp_index`.
+    * `StarDep does not have an index` on a REDUCTION (`aten.mean`,
+      `aten.amin`, `aten.amax`, ...) on torch <= 2.7 -- an un-realized
+      `searchsorted` (`ops.bucketize`) inlined into it through the fp-body
+      gather. Every `searchsorted` in this body goes through
+      `_searchsorted_realized`, which materializes it; a bare
+      `torch.searchsorted` put back here re-opens it. (An `aten.amin` StarDep
+      used to be attributed to a single-sided clamp, and `_clamp_index` is
+      still used; it moved the failure, it did not remove its cause.)
     * a symbolic scalar reaching `torch.arange`, a `torch.where` sentinel, a
       slice bound or a reshape extent. Still a real hazard class, just NOT the
       one above: every shape-derived scalar in the region is forced with `int()`
@@ -2848,7 +2897,8 @@ class WindowedCache(_HFCacheBase):
 
         fresh_wid, fresh_valid = self._compact(wids, fresh, n_d)
         if n_d > 0 and T_body > 0:
-            start_f = torch.searchsorted(body_wid, fresh_wid.clamp_min(0))  # [B, n_d]
+            # Materialized, never inlined: see `_searchsorted_realized`.
+            start_f = _searchsorted_realized(body_wid, fresh_wid.clamp_min(0))  # [B, n_d]
             tok_f = _clamp_index(
                 (start_f.unsqueeze(-1) + torch.arange(ws, device=device))
                 .reshape(B, n_d * ws),
@@ -2907,7 +2957,7 @@ class WindowedCache(_HFCacheBase):
         jj = rank.unsqueeze(0).expand(B, -1)                          # [B, T_new]
         off = (i - rank * ws).unsqueeze(0)                            # [1, T_new]
 
-        start_of_rank = torch.searchsorted(body_wid, fp_wids)          # [B, n_fp]
+        start_of_rank = _searchsorted_realized(body_wid, fp_wids)      # [B, n_fp]
         src_fp = _clamp_index(
             torch.gather(start_of_rank, 1, jj) + off, max(T_body - 1, 0))
         idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
