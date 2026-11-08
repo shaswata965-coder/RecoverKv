@@ -32,7 +32,8 @@ import triton.language as tl                              # noqa: E402
 from modules.windowed_cache import gate_kernel as gk      # noqa: E402
 from modules.windowed_cache import decode_kernel as dk    # noqa: E402
 from modules.windowed_cache.decode_kernel import window_tiling  # noqa: E402
-from modules.quant.quantizer import grid_group                # noqa: E402
+from modules.quant.quantizer import (CODE_BITS, CODES_PER_BYTE,  # noqa: E402
+                                     grid_group)
 
 #: An A100. Any real target exercises the same front end; the arch only matters
 #: for codegen, which is not what is being checked.
@@ -52,8 +53,10 @@ def _compile(fn, ptrs, consts):
 _DECODE_PTRS = {
     **{n: "*fp16" for n in ("Q", "KFP", "VFP", "COS", "SIN", "OUT",
                             "KSS", "KZS", "VSS", "VZS", "VMS")},
-    **{n: "*u8" for n in ("KC", "VC", "KS", "VS")},
-    **{n: "*i8" for n in ("KZ", "VZ", "VM")},
+    # VM is the value centroid at the shipped vm=4 card width: int4 packed
+    # two per byte, stored unsigned (modules/quant/sketch.card_field_layout).
+    **{n: "*u8" for n in ("KC", "VC", "KS", "VS", "VM")},
+    **{n: "*i8" for n in ("KZ", "VZ")},
     "SEL": "*i32",
     "WSUM": "*fp32", "WMAX": "*fp32", "LOGM": "*fp32", "scale": "fp32",
     "VANC": "*fp32",
@@ -108,9 +111,9 @@ def test_the_fused_decode_kernel_compiles(gated, ws):
     _compile(dk._two_tier_decode_kernel, _DECODE_PTRS, dict(
         HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=dk._pow2_at_least(4),
         BLOCK_NW=block_nw, BLOCK_T=block_t, BLOCK_W=16,
-        PACK_K=max(ws // 4, 1), PACK_V=32,
+        PACK_K=max(ws // CODES_PER_BYTE, 1), PACK_V=128 // CODES_PER_BYTE,
         GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
-        GATED=gated, LOG2E=dk._LOG2E))
+        GATED=gated, LOG2E=dk._LOG2E, VM_BITS=4, CODE_BITS=CODE_BITS))
 
 
 @pytest.mark.parametrize("ws", WINDOW_SIZES)

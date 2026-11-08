@@ -25,6 +25,7 @@ from data.longbench_loader import (
     LONGBENCH_EN_DATASETS,
     load_longbench_dataset,
 )
+from utils.cache_factory import quant_code_bits_record
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.prompting import encode_prompt
 from utils.env_capture import capture_environment
@@ -571,6 +572,7 @@ class LongBenchRunner:
                 "top_k_fp": int(r.top_k_fp),
                 "N_q": int(r.N_q),
                 "quant_card_bits": dict(r.quant_card_bits._asdict()),
+                "quant_code_bits": quant_code_bits_record(),
                 "bytes_per_gate_card": int(r.bytes_per_gate_card),
                 "retained_windows": int(r.retained_windows),
                 "retained_tokens": int(r.retained_tokens),
@@ -761,10 +763,12 @@ class LongBenchRunner:
             lws_resolved = None
 
         from utils.cache_factory import (quant_card_bits_record,
+                                         quant_code_bits_record,
                                          quant_tier_policy_record)
         meta = {
             "read_gate": read_gate,
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            "quant_code_bits": quant_code_bits_record(),
             **quant_tier_policy_record(cfg.cache),
             "dataset": dataset_name,
             "num_examples": num_examples,

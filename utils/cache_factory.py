@@ -230,6 +230,21 @@ def quant_card_bits_record(cache_cfg: Any) -> dict:
     return parse_card_bits(getattr(cache_cfg, "quant_card_bits", None))._asdict()
 
 
+def quant_code_bits_record() -> int:
+    """Bits per stored Q-tier K/V code in this build: 2, 4 or 8.
+
+    For metadata sidecars, next to ``quant_card_bits``. The width is a build
+    constant (``modules.quant.quantizer.CODE_BITS``), not a config knob, so a
+    config cannot say which width a run used -- only the sidecar can. Under
+    ``quant_budget_mode: bytes`` it moves the price of a window and therefore
+    which windows the cache keeps, so a quality or perf number without it does
+    not say which tier produced it. Recorded on every run, including ones with
+    no Q tier, where it is inert.
+    """
+    from modules.quant.quantizer import CODE_BITS
+    return int(CODE_BITS)
+
+
 def quant_tier_policy_kwargs(cache_cfg: Any) -> dict:
     """``quant_promotion`` / ``quant_promote_source`` for a WindowedCacheConfig.
 

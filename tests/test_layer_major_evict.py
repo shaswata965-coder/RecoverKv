@@ -493,12 +493,25 @@ def test_window_size_range_q_positive(ws):
 @pytest.mark.parametrize("ws", [1, 2, 3, 6])
 def test_quant_rejects_window_size_not_multiple_of_four(ws):
     """The int2 constraint is a hard config rejection, not a silent degrade —
-    which is what bounds §5.1/§5.3's supported range at ``q > 0``."""
-    with pytest.raises(ValueError, match="divisible by 4"):
-        WindowedCacheConfig(
+    which is what bounds §5.1/§5.3's supported range at ``q > 0``.
+
+    "Four" is int2's codes per byte. The constraint is ``ws % CODES_PER_BYTE``
+    (``modules.quant.quantizer``): 2 at int4, and nothing at int8, where a
+    window this short is accepted rather than rejected.
+    """
+    from modules.quant.quantizer import CODES_PER_BYTE
+
+    def make():
+        return WindowedCacheConfig(
             window_size=ws, num_sink_tokens=0, local_window_size=ws,
             cache_budget=0.5, quant_ratio=0.5, first_eviction_step=0,
         )
+
+    if ws % CODES_PER_BYTE == 0:
+        assert make().window_size == ws
+        return
+    with pytest.raises(ValueError, match=f"divisible by {CODES_PER_BYTE}"):
+        make()
 
 
 # ---------------------------------------------------------------------------

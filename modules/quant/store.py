@@ -42,6 +42,7 @@ from torch import Tensor
 
 from .compact import stable_partition
 from .quantizer import (
+    CODES_PER_BYTE,
     QGrid,
     dequantize_key_windows,
     dequantize_value_windows,
@@ -570,10 +571,10 @@ class QuantizedStore:
         def take_grid(q_name, s_name):
             return QGrid(take(getattr(t, q_name)), take(getattr(t, s_name)))
 
-        k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//4]
+        k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//P]
         k_scale = take_grid("key_scale_q", "key_scale_s")
         k_zero = take_grid("key_zero_q", "key_zero_s")
-        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
+        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//P]
         v_scale = take_grid("val_scale_q", "val_scale_s")
         v_zero = take_grid("val_zero_q", "val_zero_s")
         pos = take(t.slot_pos, head_axis=False)        # [B,H,n_sel,S]
@@ -584,13 +585,13 @@ class QuantizedStore:
         BH = B * H
         pos_flat = pos.reshape(BH, n_sel * S)
         keys = dequant_rotate_q_keys(
-            k_codes.reshape(BH * n_sel, 1, D, S // 4),
+            k_codes.reshape(BH * n_sel, 1, D, S // CODES_PER_BYTE),
             k_scale.reshape(BH * n_sel, 1, D), k_zero.reshape(BH * n_sel, 1, D),
             S, pos_flat, rope_module, out_dtype, BH, n_sel, 1, D,
         ).reshape(B, H, n_sel * S, D)
 
         values = dequantize_value_windows(
-            v_codes.reshape(BH * n_sel, 1, S, D // 4),
+            v_codes.reshape(BH * n_sel, 1, S, D // CODES_PER_BYTE),
             v_scale.reshape(BH * n_sel, 1, S), v_zero.reshape(BH * n_sel, 1, S),
             D, out_dtype=out_dtype,
         ).reshape(B, H, n_sel * S, D).to(out_dtype)

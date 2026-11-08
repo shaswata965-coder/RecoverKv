@@ -8,12 +8,12 @@ cannot express that; a slot table can.
 
 Layout (one layer, ``B`` rows, ``N`` slots)::
 
-    key_codes   [B, N, H_kv, D, ws//4]  uint8   channel-major, 4 tokens/byte
+    key_codes   [B, N, H_kv, D, ws//P]  uint8   channel-major, P tokens/byte
     key_scale_q [B, N, H_kv, D]         uint8   pinned grid, one byte per entry
     key_scale_s [B, N, H_kv, D//g]      fp16    the scale each group shares
     key_zero_q  [B, N, H_kv, D]         int8
     key_zero_s  [B, N, H_kv, D//g]      fp16
-    val_codes   [B, N, H_kv, ws, D//4]  uint8   token-major, 4 channels/byte
+    val_codes   [B, N, H_kv, ws, D//P]  uint8   token-major, P channels/byte
     val_scale_q [B, N, H_kv, ws]        uint8
     val_scale_s [B, N, H_kv, ws//g]     fp16
     val_zero_q  [B, N, H_kv, ws]        int8
@@ -21,6 +21,9 @@ Layout (one layer, ``B`` rows, ``N`` slots)::
     slot_wid    [B, N]                  int64   original_window_id; -1 = free
     slot_active [B, N]                  bool    active vs dormant (§10)
     slot_pos    [B, N, ws]              int64   frozen original positions
+
+``P`` is :data:`~modules.quant.quantizer.CODES_PER_BYTE` (``8 // CODE_BITS``):
+4 at int2, 2 at int4, 1 at int8.
 
 **Slots are addressed by rank, not by window id.** A window id is unbounded
 (generation keeps minting them) so it cannot index a fixed table; instead every
@@ -47,7 +50,7 @@ import torch
 from torch import Tensor
 
 from .compact import stable_partition
-from .quantizer import QGrid, grid_group
+from .quantizer import CODES_PER_BYTE, QGrid, grid_group
 
 FREE = -1
 """``slot_wid`` sentinel for an unoccupied slot. Real window ids are >= 0."""
@@ -138,7 +141,8 @@ class QuantSlotTable:
         self.head_dim = D
         self.num_kv_heads = H
 
-        self.key_codes = torch.zeros((B, N, H, D, S // 4), dtype=torch.uint8, device=device)
+        self.key_codes = torch.zeros((B, N, H, D, S // CODES_PER_BYTE),
+                                     dtype=torch.uint8, device=device)
         # The grid is one byte per entry against an fp16 scale shared by
         # `grid_group` of them (QGrid). uint8 for `scale` (non-negative, and a
         # zero would divide by zero at fit time), int8 for `zero` (an offset).
@@ -147,7 +151,8 @@ class QuantSlotTable:
         self.key_scale_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
         self.key_zero_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
         self.key_zero_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
-        self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
+        self.val_codes = torch.zeros((B, N, H, S, D // CODES_PER_BYTE),
+                                     dtype=torch.uint8, device=device)
         self.val_scale_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
         self.val_scale_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
         self.val_zero_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)

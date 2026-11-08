@@ -36,6 +36,7 @@ from modules.quant.sketch import (CARD_BITS_ALLOWED, CARD_BITS_DEFAULT,
                                   card_field_layout, decode_sketch,
                                   gate_and_score, parse_card_bits,
                                   sketch_bytes_per_head)
+from modules.quant.quantizer import CODE_BITS
 from modules.quant.slots import SKETCH_FIELDS, QuantSlotTable
 from modules.quant.store import QuantizedStore
 
@@ -429,18 +430,25 @@ def _resolve(card_bits=None, mode="bytes", q=0.7):
     return cfg.resolve(3600, MODEL_CONFIG, torch.float16, 128)
 
 
+#: Codes + grid of one window at H_kv=8, D=128, ws=8, by CODE_BITS
+#: (tests/test_quant_grid.py derives the same table).
+_Q_DATA = {2: 6432, 4: 10528, 8: 18720}[CODE_BITS]
+
+
 def test_default_resolve_is_unchanged():
     r = _resolve()
     assert r.quant_card_bits == CARD_BITS_DEFAULT
     assert r.bytes_per_gate_card == 8 * 272 == 2176
-    assert r.bytes_per_q_window == 6432 + 2176
+    assert r.bytes_per_q_window == _Q_DATA + 2176
+    if CODE_BITS == 2:
+        assert r.bytes_per_q_window == 6432 + 2176
 
 
 @pytest.mark.parametrize("spec, card", [(4, 8 * 204), (2, 8 * 106), (8, 8 * 400)])
 def test_the_budget_prices_the_card_it_will_store(spec, card):
     r = _resolve(spec)
     assert r.bytes_per_gate_card == card
-    assert r.bytes_per_q_window == 6432 + card
+    assert r.bytes_per_q_window == _Q_DATA + card
 
 
 def test_a_cheaper_card_buys_more_int2_windows_under_bytes_mode():

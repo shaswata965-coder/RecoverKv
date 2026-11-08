@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from modules.quant.quantizer import (
+    CODE_BITS,
+    CODES_PER_BYTE,
+    _LEVELS,
     dequantize_key_window,
     dequantize_value_window,
     grid_group,
@@ -19,28 +22,57 @@ from modules.quant.quantizer import (
 )
 
 
+def _format_bound(x, scale, zero, group_dim):
+    """The exact worst-case error of this format, at any CODE_BITS.
+
+    Codes are fit to the DECODED one-byte grid (design §2), so the error is half
+    a decoded step, plus whatever that grid's rounding clipped off either end of
+    the range: ``x`` above ``zero + L*scale`` or below ``zero`` clamps to the end
+    code. At int2 the clip is swamped by the step; at int8 it is not, which is
+    why the ``R/(2L)`` bounds below are int2 statements and this one is not.
+    """
+    x = x.float()
+    s = scale.decode().unsqueeze(group_dim)
+    z = zero.decode().unsqueeze(group_dim)
+    mx = x.amax(dim=group_dim, keepdim=True)
+    mn = x.amin(dim=group_dim, keepdim=True)
+    clip = torch.clamp(torch.maximum(mx - (z + _LEVELS * s), z - mn), min=0.0)
+    bound = s / 2 + clip
+    return (bound + 1e-5 * (mx - mn).abs() + 1e-6).squeeze(group_dim)
+
+
 # ---------------------------------------------------------------------------
-# Crumb packing (int2: 4 codes per byte)
+# Packing (CODE_BITS per code, CODES_PER_BYTE codes per byte; int2: 4 per byte)
 # ---------------------------------------------------------------------------
 
 
 class TestPacking:
     def test_pack_unpack_roundtrip(self):
-        codes = torch.randint(0, 4, (3, 4, 8), dtype=torch.uint8)
+        codes = torch.randint(0, 2 ** CODE_BITS, (3, 4, 8), dtype=torch.uint8)
         packed = pack_crumbs_last(codes)
-        assert packed.shape == (3, 4, 2)  # 8 codes / 4 per byte
+        assert packed.shape == (3, 4, 8 // CODES_PER_BYTE)
         out = unpack_crumbs_last(packed, 8)
         assert torch.equal(out, codes)
 
     def test_index_order_low_to_high_bits(self):
-        # codes [1,2,3,0] -> byte = 1 | (2<<2) | (3<<4) | (0<<6) = 1+8+48 = 57
-        codes = torch.tensor([[1, 2, 3, 0]], dtype=torch.uint8)
+        # int2: codes [1,2,3,0] -> byte = 1 | (2<<2) | (3<<4) | (0<<6) = 57.
+        # In general element j of a byte sits at shift CODE_BITS * j.
+        vals = [(j + 1) % (2 ** CODE_BITS) for j in range(CODES_PER_BYTE)]
+        if CODE_BITS == 2:
+            assert vals == [1, 2, 3, 0]
+        codes = torch.tensor([vals], dtype=torch.uint8)
         packed = pack_crumbs_last(codes)
-        assert packed.item() == 57
+        expected = sum(v << (CODE_BITS * j) for j, v in enumerate(vals))
+        assert packed.item() == expected
+        if CODE_BITS == 2:
+            assert expected == 57
 
-    def test_pack_rejects_non_multiple_of_four(self):
+    def test_pack_rejects_non_multiple_of_codes_per_byte(self):
+        if CODES_PER_BYTE == 1:
+            pytest.skip("one code per byte: every length is a multiple")
+        n = 6 if CODES_PER_BYTE == 4 else CODES_PER_BYTE + 1
         with pytest.raises(ValueError):
-            pack_crumbs_last(torch.zeros(6, dtype=torch.uint8))
+            pack_crumbs_last(torch.zeros(n, dtype=torch.uint8))
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +85,7 @@ class TestKeyQuant:
         H, W, D = 8, 8, 128
         k = torch.randn(H, W, D)
         packed, scale, zero = quantize_key_window(k)
-        assert packed.shape == (H, D, W // 4)
+        assert packed.shape == (H, D, W // CODES_PER_BYTE)
         assert packed.dtype == torch.uint8
         # The grid is one byte per (head, channel) over an fp16 scale shared by
         # GRID_GROUP of them -- see QGrid.
@@ -68,7 +100,8 @@ class TestKeyQuant:
         assert k_hat.shape == (H, W, D)
 
     def test_roundtrip_error_bounded(self):
-        # int2 over a group of dynamic range R has max error <= scale/2 = R/6.
+        # Over a group of dynamic range R the max error is <= scale/2 = R/(2L),
+        # L = 2**CODE_BITS - 1 (R/6 at int2).
         H, W, D = 4, 8, 64
         k = torch.randn(H, W, D) * 3.0
         packed, scale, zero = quantize_key_window(k)
@@ -76,11 +109,16 @@ class TestKeyQuant:
         # Per (head, channel) range along the token axis.
         rng = k.amax(dim=1, keepdim=True) - k.amin(dim=1, keepdim=True)  # [H,1,D]
         max_err = (k_hat - k).abs().amax(dim=1)  # [H, D]
-        # Allow a hair over R/6 for the one-byte grid's rounding: the stored
+        # The format's exact bound holds at every width.
+        assert torch.all(max_err <= _format_bound(k, scale, zero, 1))
+        # Allow a hair over R/(2L) for the one-byte grid's rounding: the stored
         # scale can exceed the true one by up to half a group quantum, which
-        # widens the four levels and so the worst-case error with them.
-        bound = (rng.squeeze(1) / 6.0) * 1.20 + 1e-3
-        assert torch.all(max_err <= bound)
+        # widens the four levels and so the worst-case error with them. An int2
+        # statement: at int8 the grid's rounding is no longer a hair against a
+        # step of R/255 (tests/test_quant_grid.py measures what it costs).
+        if CODE_BITS == 2:
+            bound = (rng.squeeze(1) / (2 * _LEVELS)) * 1.20 + 1e-3
+            assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
         # All tokens identical along the token axis -> mx == mn -> x_hat == mn.
@@ -96,6 +134,7 @@ class TestKeyQuant:
         # Dequantizing twice against the pinned fp16 grid is bit-identical, and
         # re-quantizing the dequant reproduces the same codes (pinned-grid
         # idempotence — the basis for reactivation-not-requant, design §10).
+        # The second half is an int2 property; see the guard below.
         H, W, D = 4, 8, 32
         k = torch.randn(H, W, D) * 2.0
         packed, scale, zero = quantize_key_window(k)
@@ -103,8 +142,14 @@ class TestKeyQuant:
         k_hat2 = dequantize_key_window(packed, scale, zero, W, out_dtype=torch.float16)
         assert torch.equal(k_hat1, k_hat2)
         # Re-quantize the fp16 dequant: codes must be identical (idempotent).
-        packed2, scale2, zero2 = quantize_key_window(k_hat1.to(torch.float32))
-        assert torch.equal(packed2, packed)
+        # An int2 property. At wider codes the one-byte grid's rounding is no
+        # longer swamped by the step, so a re-fit moves codes: on the
+        # massive-channel fixture of tests/test_quant_grid.py, 2122 of 131072
+        # (by <= 2) at int4 and 48268 (by <= 40) at int8. The design never
+        # re-quantizes a dormant window -- re-demotion is reactivation (§10).
+        if CODE_BITS == 2:
+            packed2, scale2, zero2 = quantize_key_window(k_hat1.to(torch.float32))
+            assert torch.equal(packed2, packed)
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +162,7 @@ class TestValueQuant:
         H, W, D = 8, 6, 128
         v = torch.randn(H, W, D)
         packed, scale, zero = quantize_value_window(v)
-        assert packed.shape == (H, W, D // 4)
+        assert packed.shape == (H, W, D // CODES_PER_BYTE)
         assert scale.q.shape == (H, W) and scale.q.dtype == torch.uint8
         assert zero.q.shape == (H, W) and zero.q.dtype == torch.int8
         # ws < GRID_GROUP, so a value window's grid shares one scale per head.
@@ -133,8 +178,10 @@ class TestValueQuant:
         v_hat = dequantize_value_window(packed, scale, zero, D, out_dtype=torch.float32)
         rng = v.amax(dim=2, keepdim=True) - v.amin(dim=2, keepdim=True)  # [H,W,1]
         max_err = (v_hat - v).abs().amax(dim=2)  # [H, W]
-        bound = (rng.squeeze(2) / 6.0) * 1.05 + 1e-3
-        assert torch.all(max_err <= bound)
+        assert torch.all(max_err <= _format_bound(v, scale, zero, 2))
+        if CODE_BITS == 2:   # an int2 statement -- see the key test above
+            bound = (rng.squeeze(2) / (2 * _LEVELS)) * 1.05 + 1e-3
+            assert torch.all(max_err <= bound)
 
     def test_degenerate_group_exact(self):
         H, W, D = 2, 4, 16
@@ -241,7 +288,11 @@ class TestStore:
         # dequant error bounded
         k_hat = k_hat[0, 0]
         rngk = k_pre.amax(1, keepdim=True) - k_pre.amin(1, keepdim=True)
-        assert torch.all((k_hat - k_pre).abs().amax(1) <= rngk.squeeze(1) / 6.0 * 1.05 + 1e-3)
+        _, ks_ref, kz_ref = quantize_key_window(k_pre)   # the grid the store fit
+        err = (k_hat - k_pre).abs().amax(1)
+        assert torch.all(err <= _format_bound(k_pre, ks_ref, kz_ref, 1))
+        if CODE_BITS == 2:   # an int2 statement -- see TestKeyQuant
+            assert torch.all(err <= rngk.squeeze(1) / (2 * _LEVELS) * 1.05 + 1e-3)
 
     def test_redemotion_reactivates_no_requantize(self):
         store = _store()

@@ -22,7 +22,9 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from modules.quant.quantizer import (  # noqa: E402
+    CODE_BITS,
     GRID_GROUP,
+    _LEVELS,
     QGrid,
     _quantize_grid,
     bytes_per_q_window,
@@ -35,6 +37,10 @@ from modules.quant.quantizer import (  # noqa: E402
 )
 
 D, WS, H = 128, 8, 8
+
+#: Codes + grid of one window at (H, D, WS), by CODE_BITS. The codes cost
+#: 2*D*WS*CODE_BITS/8 B per head; the grid is 292 B per head at every width.
+Q_WINDOW_BYTES = {2: 6432, 4: 10528, 8: 18720}
 
 
 def _keys(n=64, hot=6.0, spread=1.0, seed=0):
@@ -71,10 +77,10 @@ def _fp16_grid_roundtrip(x, group_dim):
     x32 = x.float()
     mx = x32.amax(group_dim, keepdim=True)
     mn = x32.amin(group_dim, keepdim=True)
-    scale = torch.where(mx == mn, torch.ones_like(mx), (mx - mn) / 3.0)
+    scale = torch.where(mx == mn, torch.ones_like(mx), (mx - mn) / _LEVELS)
     sg = scale.to(torch.float16).float()
     zg = mn.to(torch.float16).float()
-    return torch.round((x32 - zg) / sg).clamp_(0, 3) * sg + zg
+    return torch.round((x32 - zg) / sg).clamp_(0, _LEVELS) * sg + zg
 
 
 def _grouped_roundtrip(x, group_dim, group):
@@ -82,7 +88,7 @@ def _grouped_roundtrip(x, group_dim, group):
     x32 = x.float()
     mx = x32.amax(group_dim, keepdim=True)
     mn = x32.amin(group_dim, keepdim=True)
-    scale = torch.where(mx == mn, torch.ones_like(mx), (mx - mn) / 3.0)
+    scale = torch.where(mx == mn, torch.ones_like(mx), (mx - mn) / _LEVELS)
 
     def enc(v, signed):
         v = v.squeeze(group_dim)
@@ -97,7 +103,7 @@ def _grouped_roundtrip(x, group_dim, group):
         return (q * s32).reshape(*lead, n).unsqueeze(group_dim)
 
     sg, zg = enc(scale, False), enc(mn, True)
-    return torch.round((x32 - zg) / sg).clamp_(0, 3) * sg + zg
+    return torch.round((x32 - zg) / sg).clamp_(0, _LEVELS) * sg + zg
 
 
 def _rel(a, b):
@@ -125,11 +131,18 @@ def test_the_grid_is_one_byte_per_entry_plus_its_group_scales():
 
 
 def test_a_q_window_costs_6432_bytes_before_its_card():
-    """The number the memory claim rests on, at the shipped geometry."""
-    assert bytes_per_q_window(H, D, WS) == 6432
-    fp16_grid_era = H * ((D * WS) // 2 + 4 * D + 4 * WS)
-    assert fp16_grid_era == 8448
-    assert bytes_per_q_window(H, D, WS) / fp16_grid_era == pytest.approx(0.761, abs=1e-3)
+    """The number the memory claim rests on, at the shipped geometry.
+
+    6432 B at int2; the table carries the other widths (the codes scale with
+    CODE_BITS, the grid does not).
+    """
+    assert bytes_per_q_window(H, D, WS) == Q_WINDOW_BYTES[CODE_BITS]
+    if CODE_BITS == 2:
+        assert bytes_per_q_window(H, D, WS) == 6432
+    fp16_grid_era = H * ((2 * D * WS * CODE_BITS) // 8 + 4 * D + 4 * WS)
+    assert fp16_grid_era == {2: 8448, 4: 12544, 8: 20736}[CODE_BITS]
+    assert bytes_per_q_window(H, D, WS) / fp16_grid_era == pytest.approx(
+        {2: 0.761, 4: 0.839, 8: 0.903}[CODE_BITS], abs=1e-3)
 
 
 def test_the_budget_buys_21_percent_more_int2_windows():
@@ -148,14 +161,18 @@ def test_the_budget_buys_21_percent_more_int2_windows():
         return int((q * m_evict) // b_q)
 
     now = n_q(bytes_per_q_window(H, D, WS) + b_card)
-    before = n_q(H * ((D * WS) // 2 + 4 * D + 4 * WS) + b_card)
+    before = n_q(H * ((2 * D * WS * CODE_BITS) // 8 + 4 * D + 4 * WS) + b_card)
     assert now > before
-    # 1.23 with the int4 card (2176 B); it read 1.21 when the card was int8
-    # (3200 B), and the assertion outlived that change.
-    assert now / before == pytest.approx(1.234, abs=0.01)
-    # And an int2 window is still much cheaper than an fp16 one, card included:
-    # 32768 / 8608, the fp/q price ratio DISTANCE_TO_GOAL.md quotes.
-    assert b_fp / (bytes_per_q_window(H, D, WS) + b_card) == pytest.approx(3.81, abs=0.01)
+    # 1.23 with the int4 card (2176 B) at int2 codes; it read 1.21 when the card
+    # was int8 (3200 B), and the assertion outlived that change. Wider codes
+    # make the grid a smaller share of the window, so the narrowing buys less.
+    assert now / before == pytest.approx(
+        {2: 1.234, 4: 1.159, 8: 1.096}[CODE_BITS], abs=0.01)
+    # And a Q window is still cheaper than an fp16 one, card included:
+    # 32768 / 8608 = 3.81 at int2, the fp/q price ratio DISTANCE_TO_GOAL.md
+    # quotes; 32768 / 12704 at int4, 32768 / 20896 at int8.
+    assert b_fp / (bytes_per_q_window(H, D, WS) + b_card) == pytest.approx(
+        {2: 3.81, 4: 2.58, 8: 1.57}[CODE_BITS], abs=0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +180,27 @@ def test_the_budget_buys_21_percent_more_int2_windows():
 # ---------------------------------------------------------------------------
 
 
+#: What the one-byte grid costs against an fp16 one, as an upper bound on the
+#: ratio of mean relative errors, by CODE_BITS: (keys, values, logits). The int2
+#: row is the original claim (under one percent). The wider rows are measured
+#: bounds, not claims of near-freedom: the grid is the SAME at every width, and
+#: once the code error stops swamping it, it shows. Measured over these seeds:
+#: int4 keys 1.0195, values 1.0001, logits 1.0165; int8 keys 2.708 (0.00406
+#: against 0.00150 -- at int8 the grid, not the code width, is most of the key
+#: error), values 1.0105, logits 2.678.
+GRID_COST_BOUND = {2: (1.01, 1.01, 1.01), 4: (1.03, 1.01, 1.03),
+                   8: (2.80, 1.02, 2.75)}
+
+
 def test_the_one_byte_grid_costs_under_one_percent_of_reconstruction():
     """Keys and values, against the fp16 grid, on the realistic fixture.
 
-    Near-free because design §2 pins the codes to the STORED grid: a rounded
-    scale repositions the four int2 levels and the codes re-fit against them, so
-    the int2 error (~13% on keys) swamps the grid's own rounding.
+    Near-free at int2 because design §2 pins the codes to the STORED grid: a
+    rounded scale repositions the four int2 levels and the codes re-fit against
+    them, so the int2 error (~13% on keys) swamps the grid's own rounding. At
+    wider codes it does not; :data:`GRID_COST_BOUND` holds what it costs there.
     """
+    k_bound, v_bound, _ = GRID_COST_BOUND[CODE_BITS]
     k_err, f_err = [], []
     for seed in range(6):
         k = _keys(seed=seed)
@@ -177,7 +208,7 @@ def test_the_one_byte_grid_costs_under_one_percent_of_reconstruction():
         got = dequantize_key_windows(codes, scale, zero, WS, out_dtype=torch.float32)
         k_err.append(_rel(got, k))
         f_err.append(_rel(_fp16_grid_roundtrip(k, 2), k))
-    assert sum(k_err) / len(k_err) <= sum(f_err) / len(f_err) * 1.01
+    assert sum(k_err) / len(k_err) <= sum(f_err) / len(f_err) * k_bound
 
     v_err, vf_err = [], []
     for seed in range(6):
@@ -186,11 +217,15 @@ def test_the_one_byte_grid_costs_under_one_percent_of_reconstruction():
         got = dequantize_value_windows(codes, scale, zero, D, out_dtype=torch.float32)
         v_err.append(_rel(got, v))
         vf_err.append(_rel(_fp16_grid_roundtrip(v, 3), v))
-    assert sum(v_err) / len(v_err) <= sum(vf_err) / len(vf_err) * 1.01
+    assert sum(v_err) / len(v_err) <= sum(vf_err) / len(vf_err) * v_bound
 
 
 def test_the_logits_move_by_under_one_percent():
-    """``q·k`` is what attention actually reads, so it gets its own check."""
+    """``q·k`` is what attention actually reads, so it gets its own check.
+
+    Under one percent at int2; :data:`GRID_COST_BOUND` at the other widths.
+    """
+    _, _, l_bound = GRID_COST_BOUND[CODE_BITS]
     ours, fp16 = [], []
     for seed in range(6):
         k = _keys(seed=seed)
@@ -205,7 +240,7 @@ def test_the_logits_move_by_under_one_percent():
         true = logits(k)
         ours.append((logits(got) - true).norm().item() / true.norm().item())
         fp16.append((logits(ref) - true).norm().item() / true.norm().item())
-    assert sum(ours) / len(ours) <= sum(fp16) / len(fp16) * 1.01
+    assert sum(ours) / len(ours) <= sum(fp16) / len(fp16) * l_bound
 
 
 def test_grouping_is_what_makes_the_narrowing_safe():
@@ -216,7 +251,17 @@ def test_grouping_is_what_makes_the_narrowing_safe():
     worst channel decoding to noise (rel err > 1.0, i.e. worse than returning
     zeros) while the Frobenius norm moves by ~0.1% and reports nothing. Groups of
     32 put the worst channel back at the fp16 grid's own figure.
+
+    That is the int2 measurement. The first half -- one scale per head ruins a
+    channel -- holds at every width (the un-grouped worst channel is 3.5x, 18x
+    and 310x fp16's at int2/4/8). The second half does not survive wider codes:
+    grouped, the worst channel is 1.035x fp16's at int4 and 7.2x at int8, and
+    the aggregate stops being blind (1.038x, 4.54x), because the grid's rounding
+    is no longer small against the code step. Those are pinned per width below.
     """
+    grouped_bound, agg_ratio, agg_rel = {
+        2: (1.05, 1.0, 0.01), 4: (1.05, 1.038, 0.01), 8: (7.5, 4.536, 0.01),
+    }[CODE_BITS]
     whole, grouped, fp16 = [], [], []
     for seed in range(4):
         k = _wide_gain_keys(seed=seed)
@@ -231,13 +276,15 @@ def test_grouping_is_what_makes_the_narrowing_safe():
         "the un-grouped grid stopped being the bad case this test exists to "
         f"refuse (worst channel {whole_m:.3f} vs fp16 {fp16_m:.3f})"
     )
-    assert grouped_m <= fp16_m * 1.05, (
+    assert grouped_m <= fp16_m * grouped_bound, (
         f"grouped worst-channel error {grouped_m:.4f} against fp16's {fp16_m:.4f}"
     )
     # ...and the aggregate is blind to all of it, which is why it is not the test.
+    # (At int2. At wider codes the measured aggregate ratio is pinned instead.)
     assert _rel(_grouped_roundtrip(_wide_gain_keys(), 2, D), _wide_gain_keys()) == \
-        pytest.approx(_rel(_fp16_grid_roundtrip(_wide_gain_keys(), 2), _wide_gain_keys()),
-                      rel=0.01)
+        pytest.approx(agg_ratio * _rel(_fp16_grid_roundtrip(_wide_gain_keys(), 2),
+                                       _wide_gain_keys()),
+                      rel=agg_rel)
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +330,15 @@ def test_the_codes_are_fit_to_the_grid_that_will_be_read():
     again = dequantize_key_windows(codes, scale, zero, WS, out_dtype=torch.float16)
     assert torch.equal(once, again)
 
+    if CODE_BITS != 2:
+        # The re-fit half is an int2 property. At wider codes the grid's
+        # rounding is no longer swamped by the step and a re-fit moves codes:
+        # 2122/131072 (by <= 2) at int4, 48268/131072 (by <= 40) at int8, with
+        # the scale drifting 13.8% / 13.3%. The cache never re-fits: a promoted
+        # window keeps its slot while it is retained in either tier and its
+        # re-demotion is a reactivation (§10); a slot is freed only when its
+        # window is evicted outright, and an evicted window does not return.
+        return
     codes2, scale2, zero2 = quantize_key_windows(once.float())
     assert torch.equal(codes2, codes)
     assert torch.equal(zero2.q, zero.q)

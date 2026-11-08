@@ -14,6 +14,7 @@ from typing import Any, Optional, Union
 
 import torch
 
+from modules.quant.quantizer import CODE_BITS, CODES_PER_BYTE
 from modules.quant.sketch import CARD_BITS_DEFAULT, CardBits, parse_card_bits
 
 from .policy import FIRST_EVICTION_STEP
@@ -201,7 +202,8 @@ class WindowedCacheConfig:
         int2 halves the codes vs int4, but the fp16 scale/zero grid is fixed
         overhead, so the honest gain is ~3.9× the windows per fp byte at
         ``window_size = 8`` (see ``resolve``'s ``b_q``), not the naive 8×.
-        Requires a ``window_size`` divisible by 4 (int2 crumb packing).
+        Requires a ``window_size`` divisible by
+        ``modules.quant.quantizer.CODES_PER_BYTE`` (4 at int2: code packing).
     quant_memoize_read : bool, optional
         Cache the dequantized + RoPE'd Q tier between evictions, per layer.
         **Default ``None`` = auto: on at ``B == 1``, off above.**
@@ -463,11 +465,13 @@ class WindowedCacheConfig:
             raise ValueError(
                 f"quant_ratio must be in [0, 1], got {self.quant_ratio}"
             )
-        if self.quant_ratio > 0.0 and self.window_size % 4 != 0:
-            # int2 crumb packing needs a window divisible by 4 (4 codes/byte, §2).
+        if self.quant_ratio > 0.0 and self.window_size % CODES_PER_BYTE != 0:
+            # Code packing needs a window divisible by the codes per byte
+            # (CODES_PER_BYTE = 8 // CODE_BITS: 4 at int2, §2).
             raise ValueError(
-                f"quant_ratio > 0 requires a window_size divisible by 4 (int2 "
-                f"packing), got window_size={self.window_size}"
+                f"quant_ratio > 0 requires a window_size divisible by "
+                f"{CODES_PER_BYTE} (int{CODE_BITS} packing), got "
+                f"window_size={self.window_size}"
             )
 
         # -- quant_memoize_read --
@@ -542,13 +546,15 @@ class WindowedCacheConfig:
                 )
             head_dim = hidden // num_heads
 
-        # int2 packs 4 value channels per byte, so head_dim must be a multiple
-        # of 4 (window_size is validated in __post_init__; head_dim only becomes
-        # known here). Real models satisfy this (128); assert it loudly.
-        if self.quant_ratio > 0.0 and head_dim % 4 != 0:
+        # Values pack CODES_PER_BYTE channels per byte, so head_dim must be a
+        # multiple of it (window_size is validated in __post_init__; head_dim
+        # only becomes known here). Real models satisfy this (128); assert it
+        # loudly.
+        if self.quant_ratio > 0.0 and head_dim % CODES_PER_BYTE != 0:
             raise ValueError(
-                f"quant_ratio > 0 requires head_dim divisible by 4 (int2 crumb "
-                f"packing over the value channel axis), got head_dim={head_dim}"
+                f"quant_ratio > 0 requires head_dim divisible by "
+                f"{CODES_PER_BYTE} (int{CODE_BITS} crumb packing over the value "
+                f"channel axis), got head_dim={head_dim}"
             )
 
         element_size = torch.tensor([], dtype=kv_dtype).element_size()
@@ -617,11 +623,12 @@ class WindowedCacheConfig:
         # yields top_k_fp == top_k_windows and N_q == 0 by construction, so the
         # ResolvedConfig is field-for-field identical to the single-tier path.
         q = self.quant_ratio
-        # one fp window vs one int2 window, in bytes. The int2 codes are half
-        # the int4 codes (2 bits/elem vs 4), but the fp16 scale/zero grid is
-        # UNCHANGED — same granularity, same dtype — so it is fixed overhead
-        # that now dominates the Q window (design.md §2, §7). window_size % 4 == 0
-        # is validated, so the // 2 below is exact.
+        # one fp window vs one Q-tier window, in bytes. The codes cost
+        # CODE_BITS per element (modules.quant.quantizer.CODE_BITS; 2 = int2),
+        # but the scale/zero grid is the same at every width -- same
+        # granularity, same dtype -- so it is fixed overhead, and at int2 it
+        # dominates the Q window (design.md §2, §7). window_size %
+        # CODES_PER_BYTE == 0 is validated, so bytes_per_q_window is exact.
         b_fp = bytes_per_token * self.window_size                       # K+V fp16
         # The GATE CARD IS PART OF THE WINDOW. It is resident for the life of the
         # window, it is allocated unconditionally wherever there is a Q tier, and

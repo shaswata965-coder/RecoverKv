@@ -76,6 +76,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
+from utils.cache_factory import quant_code_bits_record
 from utils.cache_memory import MemoryProbe, format_peak_report
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, ExperimentConfig
 from utils.env_capture import capture_environment
@@ -525,6 +526,8 @@ def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
         # The gate card's widths and what they cost -- a narrower card is a
         # cheaper window, so N_q above already reflects them under "bytes".
         "quant_card_bits": dict(resolved.quant_card_bits._asdict()),
+        # The K/V code width -- a build constant, so only the record says it.
+        "quant_code_bits": quant_code_bits_record(),
         "bytes_per_gate_card": int(resolved.bytes_per_gate_card),
         "fp_tokens": fp_tokens,
         "q_tokens": q_tokens,

@@ -233,6 +233,7 @@ def read_path_info(ours_meta: Dict[str, Any]) -> Dict[str, Any]:
         "quant_gate_ratio": ours_meta.get("quant_gate_ratio"),
         "quant_budget_mode": ours_meta.get("quant_budget_mode"),
         "quant_card_bits": ours_meta.get("quant_card_bits"),
+        "quant_code_bits": ours_meta.get("quant_code_bits"),
         "realised_read_fraction": rg.get("read_fraction"),
         "gate_recorded": recorded,
         "quant_promotion": ours_meta.get("quant_promotion", "bidir"),
@@ -1162,8 +1163,10 @@ def _read_path_line(g: Dict[str, Any]) -> str:
     ratio = g.get("quant_gate_ratio")
     rf = g.get("realised_read_fraction")
     bits = g.get("quant_card_bits")
+    code_bits = g.get("quant_code_bits")
     knobs = (f"gate ratio {ratio}, realised read fraction "
-             f"{'n/a' if rf is None else f'{float(rf):.3f}'}, card bits {bits}")
+             f"{'n/a' if rf is None else f'{float(rf):.3f}'}, card bits {bits}, "
+             f"code bits {'n/a' if code_bits is None else code_bits}")
     return {
         "gated": f"Read path: **gated** — verdict `{g.get('read_gate_verdict')}`, "
                  f"{knobs}; the gate's pick is recorded.",

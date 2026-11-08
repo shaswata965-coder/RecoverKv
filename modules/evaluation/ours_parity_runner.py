@@ -28,7 +28,8 @@ import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
 from utils.cache_factory import (get_cache_classes, quant_budget_mode_kwargs,
-                                 quant_card_bits_record, quant_gate_ratio_kwargs,
+                                 quant_card_bits_record, quant_code_bits_record,
+                                 quant_gate_ratio_kwargs,
                                  quant_tier_policy_kwargs,
                                  quant_tier_policy_record,
                                  validate_backend_attn_pairing)
@@ -800,6 +801,7 @@ class OursParityRunner:
                 resolved_cfg, "quant_budget_mode",
                 getattr(cfg.cache, "quant_budget_mode", "bytes"))),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            "quant_code_bits": quant_code_bits_record(),
             **quant_tier_policy_record(cfg.cache),
             "read_gate": read_gate,
             "gate_recorded": bool(record_gate),

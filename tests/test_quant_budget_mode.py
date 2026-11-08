@@ -19,6 +19,7 @@ import types
 import pytest
 import torch
 
+from modules.quant.quantizer import CODE_BITS
 from modules.windowed_cache.config import WindowedCacheConfig
 from utils.cache_factory import ConfigValidationError, quant_budget_mode_kwargs
 from utils.config import CacheConfig
@@ -82,7 +83,13 @@ def test_tokens_mode_underspends_and_that_is_the_regression(q, ceiling):
     Pinning the key count while the keys get cheaper means declining to spend
     the granted budget. This is not a bug in 'tokens' — it is why 'tokens' must
     never be the default for a quality suite.
+
+    The ceilings are int2's. A wider code makes the Q window dearer, so pinning
+    the count leaves less unspent: measured utilisation at q = 0.5 / 0.7 is
+    0.693 / 0.575 at int2, 0.744 / 0.646 at int4, 0.846 / 0.788 at int8.
     """
+    ceiling = {2: {0.5: 0.75, 0.7: 0.65}, 4: {0.5: 0.75, 0.7: 0.65},
+               8: {0.5: 0.90, 0.7: 0.85}}[CODE_BITS][q]
     r = _resolve("tokens", q)
     assert r.budget_utilisation < ceiling
     assert r.retained_windows == _resolve("tokens", 0.0).retained_windows
@@ -106,9 +113,12 @@ def test_bytes_mode_retains_more_keys_than_tokens_mode():
 
     Same config, same budget: 'bytes' holds ~2.2x the keys at q=0.5. That factor
     is the whole of the LongBench delta this plan is chasing.
+
+    At int2. A wider code makes the Q window dearer, so 'bytes' buys fewer of
+    them: measured 2.166x at int2, 1.659x at int4, 1.238x at int8.
     """
     ratio = _resolve("bytes", 0.5).retained_tokens / _resolve("tokens", 0.5).retained_tokens
-    assert ratio > 2.0
+    assert ratio > {2: 2.0, 4: 1.6, 8: 1.2}[CODE_BITS]
 
 
 # ---------------------------------------------------------------------------

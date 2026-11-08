@@ -590,10 +590,12 @@ class RulerRunner:
         compression_ratio = round(1.0 - budget, 2) if budget else None
 
         from utils.cache_factory import (quant_card_bits_record,
+                                         quant_code_bits_record,
                                          quant_tier_policy_record)
         meta = {
             "read_gate": self._read_gate_report(task_name),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
+            "quant_code_bits": quant_code_bits_record(),
             **quant_tier_policy_record(cfg.cache),
             "task": task_name,
             "data_dir": self.ruler.data_dir,

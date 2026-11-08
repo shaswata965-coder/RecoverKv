@@ -27,6 +27,8 @@ Design realities baked in (design.md):
 from __future__ import annotations
 
 from .quantizer import (
+    CODE_BITS,
+    CODES_PER_BYTE,
     dequantize_key_window,
     dequantize_key_windows,
     dequantize_value_window,
@@ -38,6 +40,8 @@ from .quantizer import (
 )
 
 __all__ = [
+    "CODE_BITS",
+    "CODES_PER_BYTE",
     "quantize_key_window",
     "dequantize_key_window",
     "dequantize_key_windows",

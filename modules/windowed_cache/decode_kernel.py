@@ -55,7 +55,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from modules.quant.quantizer import grid_group
+from modules.quant.quantizer import CODE_BITS, CODES_PER_BYTE, grid_group
 from modules.quant.sketch import card_field_layout
 
 try:  # pragma: no cover - import guard, exercised only where triton is present
@@ -588,7 +588,8 @@ if _HAS_TRITON:
     @triton.jit
     def _two_tier_decode_kernel(
         Q, KFP, VFP,
-        # Q keys: codes u8 [B,n,H_kv,D,ws//4]; grid = one byte per (head, channel)
+        # Q keys: codes u8 [B,n,H_kv,D,ws//P], P = 8 // CODE_BITS codes per byte;
+        # grid = one byte per (head, channel)
         # (u8 scale, i8 zero) over an fp16 scale per GROUP_K of them, [B,n,H_kv,D]
         # and [B,n,H_kv,D//GROUP_K]. Values the same over (head, token) and WS.
         KC, KS, KSS, KZ, KZS,
@@ -609,7 +610,7 @@ if _HAS_TRITON:
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
         GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
-        VM_BITS: tl.constexpr,
+        VM_BITS: tl.constexpr, CODE_BITS: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -783,10 +784,15 @@ if _HAS_TRITON:
                          tl.full([BLOCK_R, BLOCK_W], -float("inf"), tl.float32),
                          mask=imask)
 
-        cbyte = (offs_d // 4)
-        cshift = (2 * (offs_d % 4)).to(tl.uint8)
-        byte_t = (t_tok // 4)
-        shift_t = (2 * (t_tok % 4)).to(tl.uint8)
+        # K/V codes at CODE_BITS (modules.quant.quantizer.CODE_BITS), CPB per
+        # byte, element j at byte j // CPB, shift CODE_BITS * (j % CPB), low
+        # lanes first. At int2 this is the crumb unpack: // 4, 2 * (j % 4), & 3.
+        CPB: tl.constexpr = 8 // CODE_BITS
+        CMASK: tl.constexpr = (1 << CODE_BITS) - 1
+        cbyte = (offs_d // CPB)
+        cshift = (CODE_BITS * (offs_d % CPB)).to(tl.uint8)
+        byte_t = (t_tok // CPB)
+        shift_t = (CODE_BITS * (t_tok % CPB)).to(tl.uint8)
         # A statement, not a ternary: `if` on a constexpr is the form Triton's
         # frontend is guaranteed to fold, and only the taken branch is traced.
         if GATED:
@@ -840,8 +846,8 @@ if _HAS_TRITON:
             kb_hi = tl.load(KC + b * kcb + widx[None, :] * kcn + kv * kch
                             + (offs_hl + HALF)[:, None] * PACK_K + byte_t[None, :],
                             mask=qmask[None, :], other=0)
-            k_lo = ((kb_lo >> shift_t[None, :]) & 3).to(tl.float32) * ks_lo + kz_lo
-            k_hi = ((kb_hi >> shift_t[None, :]) & 3).to(tl.float32) * ks_hi + kz_hi
+            k_lo = ((kb_lo >> shift_t[None, :]) & CMASK).to(tl.float32) * ks_lo + kz_lo
+            k_hi = ((kb_hi >> shift_t[None, :]) & CMASK).to(tl.float32) * ks_hi + kz_hi
             crow = widx * WS + t_tok
             c = tl.load(COS + b * cob + crow[None, :] * HALF + offs_hl[:, None],
                         mask=qmask[None, :], other=0.0).to(tl.float32)
@@ -866,7 +872,7 @@ if _HAS_TRITON:
             vb = tl.load(VC + b * vcb + widx[:, None] * vcn + kv * vch
                          + t_tok[:, None] * PACK_V + cbyte[None, :],
                          mask=qmask[:, None], other=0)
-            vv = ((vb >> cshift[None, :]) & 3).to(tl.float32) * vs[:, None] + vz[:, None]
+            vv = ((vb >> cshift[None, :]) & CMASK).to(tl.float32) * vs[:, None] + vz[:, None]
             acc = acc * corr[:, None] + tl.dot(p, vv)
             l = l * corr + tl.sum(p, axis=1)
             m = m_new
@@ -1452,10 +1458,12 @@ def _decode_triton(
     dev = q.device
     gk, gv = grid_group(D), grid_group(ws)
     if qtier is None:
-        kc = torch.zeros((B, 1, H_kv, D, max(ws // 4, 1)), dtype=torch.uint8, device=dev)
+        kc = torch.zeros((B, 1, H_kv, D, max(ws // CODES_PER_BYTE, 1)),
+                         dtype=torch.uint8, device=dev)
         kq = torch.zeros((B, 1, H_kv, D), dtype=torch.uint8, device=dev)
         kgs = torch.zeros((B, 1, H_kv, D // gk), dtype=torch.float16, device=dev)
-        vc = torch.zeros((B, 1, H_kv, ws, max(D // 4, 1)), dtype=torch.uint8, device=dev)
+        vc = torch.zeros((B, 1, H_kv, ws, max(D // CODES_PER_BYTE, 1)),
+                         dtype=torch.uint8, device=dev)
         vq = torch.zeros((B, 1, H_kv, ws), dtype=torch.uint8, device=dev)
         vgs = torch.zeros((B, 1, H_kv, ws // gv), dtype=torch.float16, device=dev)
         cs = torch.zeros((B, 1, half), dtype=q.dtype, device=dev)
@@ -1465,6 +1473,15 @@ def _decode_triton(
         COS, SIN = cs, cs
     else:
         KC, VC = qtier["k_codes"], qtier["v_codes"]
+        # The codes are read at CODE_BITS; a tier packed at another width would
+        # read the right addresses and the wrong values. Checked, not inferred.
+        for name, t, last in (("k_codes", KC, ws // CODES_PER_BYTE),
+                              ("v_codes", VC, D // CODES_PER_BYTE)):
+            if t.dtype != torch.uint8 or t.shape[-1] != last:
+                raise RuntimeError(
+                    f"{name} must be uint8 packed {CODES_PER_BYTE} per byte "
+                    f"(CODE_BITS={CODE_BITS}), last dim {last}; got "
+                    f"{tuple(t.shape)} {t.dtype}.")
         KS, KSS = qtier["k_scale"]
         KZ, KZS = qtier["k_zero"]
         VS, VSS = qtier["v_scale"]
@@ -1618,9 +1635,9 @@ def _decode_triton(
             HEAD_DIM=D, HALF=half, WS=ws,
             BLOCK_R=BLOCK_R, BLOCK_NW=BLOCK_NW, BLOCK_T=BLOCK_T,
             BLOCK_W=BLOCK_W,
-            PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
+            PACK_K=max(ws // CODES_PER_BYTE, 1), PACK_V=max(D // CODES_PER_BYTE, 1),
             GROUP_K=gk, GROUP_V=gv,
-            GATED=gated, LOG2E=_LOG2E, VM_BITS=vm_bits,
+            GATED=gated, LOG2E=_LOG2E, VM_BITS=vm_bits, CODE_BITS=CODE_BITS,
             num_stages=num_stages, num_warps=num_warps,
         )
 

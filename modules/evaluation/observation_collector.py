@@ -64,6 +64,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from utils.cache_factory import quant_code_bits_record
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -892,7 +893,8 @@ class ObservationCollector:
                 "bytes_per_fp_window": int(r.bytes_per_fp_window),
                 "bytes_per_q_window": int(r.bytes_per_q_window),
                 "bytes_per_gate_card": int(r.bytes_per_gate_card),
-                "quant_card_bits": dict(r.quant_card_bits._asdict())}
+                "quant_card_bits": dict(r.quant_card_bits._asdict()),
+                "quant_code_bits": quant_code_bits_record()}
             meta["samples"].append({
                 "file": f"sample_{si:03d}.npz", "article_index": int(art_idx),
                 "article_sha": sha256_string(articles[art_idx]),
@@ -1048,6 +1050,7 @@ def parity_ours(meta: Dict[str, Any], samples: Iterable[Dict[str, np.ndarray]],
           "quant_gate_ratio": cfg["gate_ratio"],
           "quant_budget_mode": cfg["quant_budget_mode"],
           "quant_card_bits": geom.get("quant_card_bits"),
+          "quant_code_bits": geom.get("quant_code_bits"),
           "quant_promotion": cfg["quant_promotion"],
           "quant_promote_source": cfg["quant_promote_source"],
           "cache_budget": cfg["cache_budget"],
