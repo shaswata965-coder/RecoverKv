@@ -1680,5 +1680,13 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
+    if qtier is not None and qtier.get("value_alias", False):
+        # An MLA latent (models/deepseek_v2): one KV head of width Dc+Dr whose
+        # value is its latent lanes. Same algorithm, same contract; the kernel
+        # differs only in how it tiles a non-power-of-two head and in reading V
+        # from the key tile (mla_decode_kernel's docstring lists all three).
+        from .mla_decode_kernel import mla_decode_triton
+        return mla_decode_triton(q, k_fp, qtier, scaling, num_sink, n_body_win,
+                                 sel, logmass, centroids, vm_bits)
     return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
                           sel, logmass, centroids, vm_bits)

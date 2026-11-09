@@ -395,6 +395,38 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     return out.unsqueeze(1)                            # [B, 1, H_q, D] (flash layout)
 
 
+def pending() -> Optional[dict]:
+    """The armed fused context, without consuming it (``None`` if unarmed)."""
+    return _PENDING["ctx"]
+
+
+def run_pending(q_flash: torch.Tensor, k_flash: torch.Tensor,
+                v_flash: torch.Tensor) -> torch.Tensor:
+    """Consume the armed context and run :func:`_run_fused` -- for an OWNED forward.
+
+    The ``flash_attn_func`` wrapper below is the seam for models whose attention
+    calls transformers' module-global symbol (Llama, Qwen2). DeepSeek-V2's remote
+    code imports ``flash_attn_func`` into its own namespace, so that seam is never
+    reached; its attention forward is owned instead
+    (``models/deepseek_v2/attention.py``) and calls this at exactly the point the
+    wrapper would have been called. It is the same ``_run_fused`` -- the same read
+    gate, the same ``fired`` / ``gated`` counters, the same verdicts -- so there
+    is still one decode read path, reached by a second door.
+
+    Raises :class:`FusedDecodeNotReached` if nothing is armed: an owned forward
+    that thinks it is on the fused path when the cache did not arm it would be
+    attending over the fp tier alone.
+    """
+    ctx = _PENDING["ctx"]
+    if ctx is None:
+        raise FusedDecodeNotReached(
+            "run_pending() with no armed fused context: the cache did not hand "
+            "this layer an int2 tier, so there is nothing to fuse.")
+    _PENDING["ctx"] = None
+    _STATS["fired"] += 1
+    return _run_fused(ctx, q_flash, k_flash, v_flash)
+
+
 def _make_wrapper(orig):
     def wrapper(*args, **kwargs):
         ctx = _PENDING["ctx"]

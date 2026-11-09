@@ -1,0 +1,69 @@
+# ============================================================================
+# LongBench — Ours on DeepSeek-V2-Lite-Chat (flash backend, MLA latent cache)
+# ============================================================================
+# The operating point (utils.config.OPERATING_POINT), unchanged from Llama: the
+# port changes the data layout and the model seam, not the method.
+# Loaded through utils.model_loading.load_causal_lm: trust_remote_code at the
+# pinned revision (models/deepseek_v2/loader.PINNED_REVISIONS) and the owned
+# MLA attention forward. The cache holds the 576-wide latent (1,152 B/token at
+# bf16), NOT the remote code's decompressed 12,288 B/token.
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: deepseek-ai/DeepSeek-V2-Lite-Chat
+  revision: 85864749cd611b4353ce1decdb286193298f64c7
+  dtype: bfloat16                           # DeepSeek-V2 is a bf16 model
+  attn_implementation: flash_attention_2    # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  # V2-Lite is a 32k-context model: middle-truncate to leave room for the
+  # longest generation (THUDM convention), unlike Llama-3.1's 128K.
+  max_length: 31500
+  output_dir: outputs/longbench/deepseek_v2_lite_ours_flash_compression_0.8
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

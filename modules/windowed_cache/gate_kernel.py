@@ -463,6 +463,10 @@ def _check_card_layout(card, bits, D: int, ws: int) -> None:
     mu_q, _, v_q, _, t_q, _, vm_q, _ = card
     for name, t, n, w in (("mu", mu_q, D, bits.mu), ("v", v_q, D, bits.v),
                           ("t", t_q, ws, bits.t), ("vm", vm_q, D, bits.vm)):
+        if t is None and name == "vm":
+            # An aliased-value card (MLA) has no centroid of its own -- it is
+            # `mu` (sketch.value_centroid). The gate never reads it either way.
+            continue
         width, dtype = card_field_layout(n, w)
         if t.shape[-1] != width or t.dtype != dtype:
             raise RuntimeError(

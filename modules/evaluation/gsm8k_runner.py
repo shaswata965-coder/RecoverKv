@@ -105,6 +105,7 @@ class GSM8KRunner:
 
     def _load_model_and_tokenizer(self) -> Tuple:
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.model_loading import load_causal_lm, load_tokenizer
 
         cfg = self.config
         dtypes = {
@@ -115,7 +116,7 @@ class GSM8KRunner:
         model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
 
         log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = load_tokenizer(
             cfg.model.name, revision=getattr(cfg.model, "revision", None)
         )
         if tokenizer.pad_token is None:
@@ -125,7 +126,7 @@ class GSM8KRunner:
             "Loading model: %s (dtype=%s, attn=%s)",
             cfg.model.name, cfg.model.dtype, cfg.model.attn_implementation,
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
             torch_dtype=model_dtype,

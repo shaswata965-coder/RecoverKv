@@ -253,7 +253,8 @@ def card_field_layout(n: int, bits: int) -> Tuple[int, torch.dtype]:
 
 
 def sketch_bytes_per_head(head_dim: int, window_size: int,
-                          bits: Any = CARD_BITS_DEFAULT) -> int:
+                          bits: Any = CARD_BITS_DEFAULT,
+                          value_alias: bool = False) -> int:
     """Bytes one head's card costs — for the budget arithmetic.
 
     Each field is its packed codes plus one fp16 scale: ``mu``, ``v`` and
@@ -280,8 +281,13 @@ def sketch_bytes_per_head(head_dim: int, window_size: int,
     overrun on the tier the memory claim is made about.
     """
     b = _as_bits(bits)
-    return sum(card_field_layout(n, w)[0] + 2 for n, w in (
-        (head_dim, b.mu), (head_dim, b.v), (window_size, b.t), (head_dim, b.vm)))
+    fields = [(head_dim, b.mu), (head_dim, b.v), (window_size, b.t)]
+    if not value_alias:
+        # MLA (`value_alias`): the value is the key's latent dims, so the value
+        # centroid IS `mu` restricted to them (`value_centroid`) and costs
+        # nothing. Priced at zero, stored nowhere.
+        fields.append((head_dim, b.vm))
+    return sum(card_field_layout(n, w)[0] + 2 for n, w in fields)
 
 
 class Sketch(NamedTuple):
@@ -426,6 +432,7 @@ def build_sketch(
     values: Tensor,
     v_anchor: Tensor,
     bits: Any = CARD_BITS_DEFAULT,
+    value_alias: bool = False,
 ) -> Sketch:
     """One pass over a window's **post-RoPE** keys and values -> its card.
 
@@ -489,6 +496,13 @@ def build_sketch(
     v_q, v_s = _q_symb(v, b.v)
     t_q, t_s = _q_symb(t, b.t)
 
+    if value_alias:
+        # MLA: the value is the key's latent dims, so `vbar` would be `mu` over
+        # them -- the same mean of the same tokens. It is not stored twice;
+        # `value_centroid` reads it out of `mu` (fields None, priced at zero by
+        # `sketch_bytes_per_head(value_alias=True)`).
+        return Sketch(mu_q, mu_s, v_q, v_s, t_q, t_s, None, None)
+
     vbar = values.to(torch.float32).mean(dim=-2)               # [N, H, D]
     vm_q, vm_s = _q_symb(vbar - _align_anchor(v_anchor, vbar), b.vm)
 
@@ -520,6 +534,13 @@ def value_centroid(s: Sketch, v_anchor: Tensor,
     windows measured this step, so the term is calibrated against real attention
     on every step rather than trusted open-loop.
     """
+    if s.vm_q is None:
+        # Aliased value (MLA): the centroid is the key mean `mu` itself, and
+        # `v_anchor` is the key anchor. Its latent dims are the window's mean
+        # latent -- exactly `vbar` -- and its RoPE dims are dropped by the
+        # attention module with the rest of the output's RoPE dims.
+        mu = _dq_symb(s.mu_q, s.mu_s, _as_bits(bits).mu)
+        return mu + _align_anchor(v_anchor, mu)
     vm = _dq_symb(s.vm_q, s.vm_s, _as_bits(bits).vm)
     return vm + _align_anchor(v_anchor, vm)
 

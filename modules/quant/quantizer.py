@@ -168,13 +168,22 @@ def grid_bytes_per_head(axis_len: int) -> int:
     return 2 * axis_len + 4 * (axis_len // grid_group(axis_len))
 
 
-def bytes_per_q_window(num_kv_heads: int, head_dim: int, window_size: int) -> int:
+def bytes_per_q_window(num_kv_heads: int, head_dim: int, window_size: int,
+                       value_alias: bool = False) -> int:
     """Bytes one int2 window costs: codes + both grids, **excluding its card**.
 
     The card is priced by :func:`modules.quant.sketch.sketch_bytes_per_head`;
     the caller adds it when the gate is live. At ``H=8, D=128, ws=8`` this is
     6432 B against the fp16 grid's 8448.
+
+    ``value_alias`` (MLA, ``models/deepseek_v2/geometry.py``): the value is the
+    key's latent dims, so the window stores the KEY codes and the key grid only
+    -- the latent is quantized once, per channel, as a key. At DeepSeek-V2-Lite's
+    ``H=1, D=576, ws=8`` that is 1152 + 1224 = 2376 B.
     """
+    if value_alias:
+        return num_kv_heads * ((head_dim * window_size) // 4
+                               + grid_bytes_per_head(head_dim))
     codes = (head_dim * window_size) // 2          # K and V, 2 bits per element
     return num_kv_heads * (codes + grid_bytes_per_head(head_dim)
                            + grid_bytes_per_head(window_size))

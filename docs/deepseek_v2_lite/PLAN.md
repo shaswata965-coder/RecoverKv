@@ -131,10 +131,16 @@ latent it has to be re-measured with `quant_card_bits`: `v` at int4 gives a
 
 | prompt/gen | latent grid | `top_k_fp` | `N_q` | keys held | `n_sel` at 0.25 |
 |---|---|---|---|---|---|
-| 4096/256 | per-channel | 27 | 182 | 1,805 (41%) | 46 |
+| 4096/256 | per-channel | 27 | 184 | 1,821 (42%) | 46 |
 | 4096/256 | per-token | 27 | 271 | 2,517 (58%) | 68 |
-| 32768/256 | per-channel | 242 | 1,603 | 14,893 (45%) | 401 |
+| 32768/256 | per-channel | 242 | 1,605 | 14,909 (45%) | 402 |
 | 32768/256 | per-token | 242 | 2,387 | 21,165 (64%) | 597 |
+
+The per-channel rows are now from `WindowedCacheConfig.resolve` on the real
+config (`tests/test_deepseek_mla.py` pins 27/184), which also spends the
+remainder; the first draft used two plain floor divisions and read 182 / 1,603.
+The per-token rows are still that floor-division arithmetic (per-token is not
+implemented).
 
 ### 3.3 Where a decode step's bytes go: the claim map
 

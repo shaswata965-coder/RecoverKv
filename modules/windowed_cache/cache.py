@@ -334,9 +334,12 @@ class _ReadOnlySlotTableView(QuantSlotTable):
         self.window_size = parent.window_size
         self.head_dim = parent.head_dim
         self.num_kv_heads = parent.num_kv_heads
+        self.value_alias = getattr(parent, "value_alias", False)
         for field in ("key_codes", "val_codes", *GRID_FIELDS,
                       "slot_wid", "slot_active", "slot_pos"):
-            setattr(self, field, getattr(parent, field)[r0:r0 + rows])
+            t = getattr(parent, field)
+            # An aliased (MLA) table holds no value columns; they stay None.
+            setattr(self, field, None if t is None else t[r0:r0 + rows])
         self._row_base = (
             torch.arange(rows, device=parent.slot_wid.device) * parent.n_slots
         ).unsqueeze(1)
@@ -1053,6 +1056,28 @@ class WindowedCache(_HFCacheBase):
                 # interface, so skipping the base init is safe.
                 pass
 
+        # A raw DeepSeek-V2 config describes the decompressed per-head path; the
+        # cache holds the MLA latent. Convert at this boundary, explicitly, so
+        # every runner that hands the cache `model.config` and the model's
+        # rotary module gets the latent view (one KV head of width Dc+Dr whose
+        # value aliases its key) and the packed RoPE adapter -- and `resolve()`
+        # keeps refusing a raw one, so nothing can price it by accident.
+        if (getattr(model_config, "model_type", None) == "deepseek_v2"
+                and not getattr(model_config, "mla_latent", False)):
+            from models.deepseek_v2.geometry import MLAGeometry
+            from models.deepseek_v2.rope import PackedRope
+            _geo = MLAGeometry.from_config(model_config)
+            model_config = _geo.cache_config()
+            if not isinstance(rope_module, PackedRope):
+                rope_module = PackedRope(rope_module, _geo)
+        if getattr(model_config, "mla_latent", False):
+            from models.deepseek_v2.rope import PackedRope
+            if not isinstance(rope_module, PackedRope):
+                raise ValueError(
+                    "an MLA latent cache needs the packed RoPE adapter "
+                    "(models.deepseek_v2.rope.PackedRope): the model's own rotary "
+                    "module rotates a 64-wide key, not the 576-wide packed one.")
+
         self.config = config
         self.resolved = config.resolve(prefill_len, model_config, kv_dtype, max_tokens)
         # Kept for the fused path's RoPE tables, which must be built at the STORE's
@@ -1076,6 +1101,25 @@ class WindowedCache(_HFCacheBase):
         # every path below is byte-identical to the single-tier fp16 cache.
         self._q: float = self.resolved.quant_ratio
         self._stores: List[Optional[QuantizedStore]] = [None] * num_layers
+        # MLA (models/deepseek_v2/geometry.py): the model config is a latent
+        # view -- one KV head of width Dc+Dr whose value IS its latent dims. The
+        # fp tier then stores one tensor and the int2 tier one set of codes.
+        # False for every other model, where every path below is unchanged.
+        self._value_alias: bool = bool(getattr(model_config, "kv_value_alias", False))
+        # The packed layout's per-half split (latent lanes, RoPE lanes), which
+        # the fused MLA kernel tiles by (mla_decode_kernel). None off MLA.
+        # A view without the dims (a unit-test stand-in) leaves it None, and the
+        # MLA kernel then refuses the tier rather than guess the split.
+        _lat = getattr(model_config, "latent_dim", None)
+        _rop = getattr(model_config, "rope_dim", None)
+        self._mla_split = ((int(_lat) // 2, int(_rop) // 2)
+                           if self._value_alias and _lat is not None
+                           and _rop is not None else None)
+        # The softmax scale, when the model states it. DeepSeek-V2's is
+        # `q_head_dim**-0.5 * mscale**2` (0.11472), which no head dim of this
+        # cache produces (576**-0.5 is 2.75x too small). Llama/Qwen configs do
+        # not set it, so they keep `head_dim**-0.5` exactly as before.
+        _stated_scale = getattr(model_config, "attn_softmax_scale", None)
         if self._q > 0.0:
             num_kv_heads = getattr(
                 model_config, "num_key_value_heads",
@@ -1103,11 +1147,13 @@ class WindowedCache(_HFCacheBase):
                     # fp K/V beside its codes; off unless asked for.
                     shadow_dtype=(kv_dtype if self.resolved.quant_promote_source
                                   == "original" else None),
+                    value_alias=self._value_alias,
                 )
                 for _ in range(num_layers)
             ]
             # Softmax scale for the fused decode kernel (Llama/Qwen: head_dim**-0.5).
-            self._attn_scaling: float = head_dim ** -0.5
+            self._attn_scaling: float = (head_dim ** -0.5 if _stated_scale is None
+                                         else float(_stated_scale))
         else:
             self._attn_scaling = 1.0
         self._memoization_resolved = False
@@ -1154,7 +1200,8 @@ class WindowedCache(_HFCacheBase):
             r.window_size, r.first_eviction_step + 1
         )
         self._states: List[CacheState] = [
-            CacheState(capacity=steady, prefill_capacity=prefill_cap)
+            CacheState(capacity=steady, prefill_capacity=prefill_cap,
+                       value_alias=self._value_alias)
             for _ in range(num_layers)
         ]
         self._policies: List[EvictionPolicy] = [
@@ -1257,6 +1304,27 @@ class WindowedCache(_HFCacheBase):
         if store is None:
             return t_fp
         return t_fp + store.num_active_tokens
+
+    def get_max_cache_shape(self) -> Optional[int]:
+        """``None`` -- no static max. transformers 4.47's base raises here.
+
+        ``Cache.get_usable_length`` calls it, and DeepSeek-V2's remote model
+        forward calls ``get_usable_length`` every step. Llama's path never does.
+        """
+        return None
+
+    @property
+    def _seen_tokens(self) -> int:
+        """Absolute tokens appended -- what ``Cache.seen_tokens`` reports.
+
+        DeepSeek-V2's remote ``prepare_inputs_for_generation`` slices the prompt
+        with ``past_key_values.seen_tokens`` (``past_length``). For an evicting
+        cache that must be the MONOTONIC count, never the held key count
+        (``get_seq_length``), or ``generate()`` would re-feed tokens the cache
+        has already seen. Read-only: it is ``_tokens_seen``, which ``update``
+        advances.
+        """
+        return self._tokens_seen
 
     def get_max_length(self) -> Optional[int]:
         """Return ``None`` — windowed cache doesn't have a static max."""
@@ -2073,8 +2141,13 @@ class WindowedCache(_HFCacheBase):
         def by_layer(t: Tensor) -> Tensor:
             return t.reshape(L, B, n, *t.shape[1:])
 
-        kc, vc = by_layer(kc), by_layer(vc)
-        ks, kz, vs, vz = (g.map(by_layer) for g in (ks, kz, vs, vz))
+        # An aliased (MLA) store has no value fields; the kernel reads V from
+        # the dequantized key tile (`value_alias` in the qtier hand-off).
+        kc = by_layer(kc)
+        ks, kz = (g.map(by_layer) for g in (ks, kz))
+        if vc is not None:
+            vc = by_layer(vc)
+            vs, vz = (g.map(by_layer) for g in (vs, vz))
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -2099,10 +2172,13 @@ class WindowedCache(_HFCacheBase):
                 "qtier": {
                     "k_codes": kc[i], "k_scale": ks.map(lambda t: t[i]),
                     "k_zero": kz.map(lambda t: t[i]),
-                    "v_codes": vc[i], "v_scale": vs.map(lambda t: t[i]),
-                    "v_zero": vz.map(lambda t: t[i]),
+                    "v_codes": None if vc is None else vc[i],
+                    "v_scale": None if vc is None else vs.map(lambda t: t[i]),
+                    "v_zero": None if vc is None else vz.map(lambda t: t[i]),
                     "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
                     "window_size": ws,
+                    "value_alias": vc is None,
+                    "mla_split": self._mla_split,
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
@@ -2113,7 +2189,8 @@ class WindowedCache(_HFCacheBase):
                 # _run_fused died on every layer-major decode.
                 "gate": None if joint_gate is None else {
                     **joint_gate,
-                    "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
+                    "card": tuple(None if t is None else t[r0:r0 + B]
+                                  for t in joint_gate["card"]),
                     "anchor": joint_gate["anchor"][r0:r0 + B],
                     "centroid": tuple(t[r0:r0 + B]
                                       for t in joint_gate["centroid"]),
@@ -2236,8 +2313,11 @@ class WindowedCache(_HFCacheBase):
         def by_row(t: Tensor) -> Tensor:
             return t.reshape(B, n, *t.shape[1:])
 
-        kc, vc = by_row(kc), by_row(vc)
-        ks, kz, vs, vz = (g.map(by_row) for g in (ks, kz, vs, vz))
+        kc = by_row(kc)
+        ks, kz = (g.map(by_row) for g in (ks, kz))
+        if vc is not None:                    # absent on an aliased (MLA) store
+            vc = by_row(vc)
+            vs, vz = (g.map(by_row) for g in (vs, vz))
         qpos_flat = qpos.reshape(B, n * ws)
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -2249,6 +2329,8 @@ class WindowedCache(_HFCacheBase):
             "k_codes": kc, "k_scale": ks, "k_zero": kz,
             "v_codes": vc, "v_scale": vs, "v_zero": vz,
             "cos": cos_h, "sin": sin_h, "window_size": ws,
+            "value_alias": vc is None,
+            "mla_split": self._mla_split,
         }
         # A new Q tier invalidates the scatter map built against the old one.
         self._fused_ctx[layer_idx] = {
@@ -2291,10 +2373,18 @@ class WindowedCache(_HFCacheBase):
         # `bits` travels with the card because the card cannot say how it was
         # encoded: a packed field's shape does not determine its width once `D`
         # is not known, and both kernels take the widths as constexprs.
+        # Aliased value (MLA): the centroid IS the key mean `mu` (vbar over the
+        # latent dims, `sketch.value_centroid`), stored at `mu`'s width -- which
+        # `resolve()` forces `vm` to equal -- against the key anchor. Handing the
+        # kernel `mu`'s columns as the centroid makes its centroid path compute
+        # exactly `value_centroid`, with no second copy of the field.
+        alias = getattr(store, "value_alias", False)
+        centroid = ((card[0], card[1], store._anchor) if alias
+                    else (card[-2], card[-1], store._v_anchor))
         return {
             "card": card,
             "anchor": store._anchor,
-            "centroid": (card[-2], card[-1], store._v_anchor),
+            "centroid": centroid,
             "bits": store.card_bits,
             "n_sel": max(1, math.ceil(ratio * n)),
         }
@@ -2571,7 +2661,9 @@ class WindowedCache(_HFCacheBase):
             # of the graph so the two branches stay the same operation.
             state.replace(
                 join(state.key_states[:, :, :num_sink, :], new_k, 2),
-                join(state.value_states[:, :, :num_sink, :], new_v, 2),
+                # An aliased value (MLA) has no buffer and no body of its own.
+                (None if new_v is None
+                 else join(state.value_states[:, :, :num_sink, :], new_v, 2)),
                 join(state.position_ids[:, :num_sink], new_pos, 1),
             )
 
@@ -2799,8 +2891,14 @@ class WindowedCache(_HFCacheBase):
             (min(self.resolved.N_q, n_fp), n_q, n_q),
         )
 
+        # MLA: the value aliases the key (`CacheState._value_alias`), so there
+        # is no value body to gather, splice or install -- `alias` is a config
+        # constant, so under Dynamo these branches fold away at trace time.
+        # Every KEY operation below, and therefore which windows are kept, which
+        # tier each lands in and every byte of the rebuilt store, is unchanged.
+        alias = self._value_alias
         body_k = state.key_states[:, :, num_sink:, :]
-        body_v = state.value_states[:, :, num_sink:, :]
+        body_v = None if alias else state.value_states[:, :, num_sink:, :]
         body_pos = state.position_ids[:, num_sink:]
         # Token → window id. Non-decreasing per row (the fp store is
         # [sink ‖ windows by ascending id] and generation appends the newest
@@ -2833,7 +2931,7 @@ class WindowedCache(_HFCacheBase):
                     pos_pre.reshape(B, p_max * ws),
                     rope,
                 ).to(dtype)                                            # [B,H,p*ws,D]
-            prom_v = v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
+            prom_v = None if alias else v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
                 B, H_kv, p_max * ws, D)
             prom_pos = pos_pre.reshape(B, p_max * ws).to(body_pos.dtype)
 
@@ -2856,7 +2954,8 @@ class WindowedCache(_HFCacheBase):
             )
             idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_d * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
-            v_tok = torch.gather(body_v, 2, idx_d)
+            # Aliased: the store quantizes the key once and ignores `values`.
+            v_tok = k_post if alias else torch.gather(body_v, 2, idx_d)
             prange = torch.gather(body_pos, 1, tok_f)
             k_pre_d = unrotate_key_window(k_post, prange, rope)
             store.demote_many(
@@ -2912,7 +3011,7 @@ class WindowedCache(_HFCacheBase):
             torch.gather(start_of_rank, 1, jj) + off, max(T_body - 1, 0))
         idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
         new_k = torch.gather(body_k, 2, idx_fp)
-        new_v = torch.gather(body_v, 2, idx_fp)
+        new_v = None if alias else torch.gather(body_v, 2, idx_fp)
         new_pos = torch.gather(body_pos, 1, src_fp)
 
         if p_max > 0:
@@ -2925,7 +3024,8 @@ class WindowedCache(_HFCacheBase):
             idx_pr = src_pr.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
             sel = tok_is_prom.unsqueeze(1).unsqueeze(-1)
             new_k = torch.where(sel, torch.gather(prom_k, 2, idx_pr), new_k)
-            new_v = torch.where(sel, torch.gather(prom_v, 2, idx_pr), new_v)
+            if not alias:
+                new_v = torch.where(sel, torch.gather(prom_v, 2, idx_pr), new_v)
             new_pos = torch.where(
                 tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
             )

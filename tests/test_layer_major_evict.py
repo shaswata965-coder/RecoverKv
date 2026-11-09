@@ -69,28 +69,30 @@ class _Rope(torch.nn.Module):
 
 def _make_cache(*, layer_major, quant_ratio, num_layers, prefill_len,
                 ws=4, num_sink=0, budget=0.5):
-    os.environ["STICKYKV_LAYER_MAJOR_DECODE"] = "1" if layer_major else "0"
-    try:
-        cfg = WindowedCacheConfig(
-            window_size=ws,
-            num_sink_tokens=num_sink,
-            local_window_size=ws,
-            cache_budget=budget,
-            quant_ratio=quant_ratio,
-            first_eviction_step=0,
-        )
-        cache = WindowedCache(
-            config=cfg,
-            prefill_len=prefill_len,
-            model_config=_Cfg(),
-            kv_dtype=torch.float32,
-            rope_module=_Rope(),
-            num_layers=num_layers,
-            max_tokens=prefill_len + 64,
-        )
-    finally:
-        del os.environ["STICKYKV_LAYER_MAJOR_DECODE"]
-    assert cache._layer_major is layer_major
+    # The per-layer arm is the REFERENCE this file pins the layer-major path
+    # against. Its env switch (STICKYKV_LAYER_MAJOR_DECODE) was deleted with the
+    # other knobs in 0974687 and the cache is layer-major unconditionally; the
+    # per-layer body still exists (it serves prefill and the first eviction), so
+    # the reference arm is selected on the instance, which is test-only.
+    cfg = WindowedCacheConfig(
+        window_size=ws,
+        num_sink_tokens=num_sink,
+        local_window_size=ws,
+        cache_budget=budget,
+        quant_ratio=quant_ratio,
+        first_eviction_step=0,
+    )
+    cache = WindowedCache(
+        config=cfg,
+        prefill_len=prefill_len,
+        model_config=_Cfg(),
+        kv_dtype=torch.float32,
+        rope_module=_Rope(),
+        num_layers=num_layers,
+        max_tokens=prefill_len + 64,
+    )
+    assert cache._layer_major is True, "the shipped cache is layer-major"
+    cache._layer_major = layer_major
     return cache
 
 
@@ -399,20 +401,17 @@ def test_inside_a_real_model_forward():
     ids = torch.randint(0, 256, (1, prefill))
 
     def run(layer_major):
-        os.environ["STICKYKV_LAYER_MAJOR_DECODE"] = "1" if layer_major else "0"
-        try:
-            cache = WindowedCache(
-                config=WindowedCacheConfig(
-                    window_size=ws, num_sink_tokens=num_sink,
-                    local_window_size=ws, cache_budget=0.5, quant_ratio=0.5,
-                    first_eviction_step=0,
-                ),
-                prefill_len=prefill, model_config=cfg, kv_dtype=torch.float32,
-                rope_module=model.model.rotary_emb,
-                num_layers=cfg.num_hidden_layers, max_tokens=steps,
-            )
-        finally:
-            del os.environ["STICKYKV_LAYER_MAJOR_DECODE"]
+        cache = WindowedCache(
+            config=WindowedCacheConfig(
+                window_size=ws, num_sink_tokens=num_sink,
+                local_window_size=ws, cache_budget=0.5, quant_ratio=0.5,
+                first_eviction_step=0,
+            ),
+            prefill_len=prefill, model_config=cfg, kv_dtype=torch.float32,
+            rope_module=model.model.rotary_emb,
+            num_layers=cfg.num_hidden_layers, max_tokens=steps,
+        )
+        cache._layer_major = layer_major      # see _make_cache
 
         gen = torch.Generator().manual_seed(4242)
 

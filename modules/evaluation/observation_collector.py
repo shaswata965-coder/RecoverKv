@@ -733,6 +733,7 @@ class ObservationCollector:
         from modules.windowed_cache import (WindowedCache, WindowedCacheConfig,
                                             flash_decode, install_score_hooks)
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.model_loading import load_causal_lm, load_tokenizer
         from utils.cache_factory import (assert_transformers_version_supported,
                                          validate_backend_attn_pairing)
         from utils.hashing import sha256_string
@@ -751,10 +752,10 @@ class ObservationCollector:
         dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16,
                   "float32": torch.float32}
         kv_dtype = dtypes[cfg.dtype]
-        tok = AutoTokenizer.from_pretrained(cfg.model_path)
+        tok = load_tokenizer(cfg.model_path)
         indices = select_parity_articles(articles, tok, cfg.article_index,
                                          cfg.num_samples, cfg.prefill)
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model_path, torch_dtype=kv_dtype, attn_implementation=attn_impl,
             device_map="auto").eval()
         mc = model.config

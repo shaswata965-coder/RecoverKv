@@ -1230,13 +1230,14 @@ class PerfRunner:
 
     def _measure_config(self, c: dict, prefill_len: int, gen_len: int, batch_size: int, pc, cfg) -> List[dict]:
         from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+        from utils.model_loading import load_causal_lm, load_tokenizer
         dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         torch_dtype = dtypes.get(cfg.model.dtype, torch.float16)
         attn_impl = c.get("attn_implementation", "eager")
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, revision=cfg.model.revision)
+        tokenizer = load_tokenizer(cfg.model.name, revision=cfg.model.revision)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name, revision=cfg.model.revision,
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")

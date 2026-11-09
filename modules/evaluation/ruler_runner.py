@@ -109,6 +109,7 @@ class RulerRunner:
     def _load_model_and_tokenizer(self) -> Tuple:
         """Load model and tokenizer (lazy, called once)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.model_loading import load_causal_lm, load_tokenizer
 
         cfg = self.config
 
@@ -120,7 +121,7 @@ class RulerRunner:
         model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
 
         log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = load_tokenizer(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
         )
@@ -133,7 +134,7 @@ class RulerRunner:
             cfg.model.dtype,
             cfg.model.attn_implementation,
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
             torch_dtype=model_dtype,

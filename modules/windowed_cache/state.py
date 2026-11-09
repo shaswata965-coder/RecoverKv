@@ -116,9 +116,11 @@ class CacheState:
 
     __slots__ = ("key_states", "value_states", "position_ids",
                  "window_scores", "original_window_ids",
-                 "_key_buf", "_val_buf", "_pos_buf", "_capacity", "_prefill_capacity")
+                 "_key_buf", "_val_buf", "_pos_buf", "_capacity", "_prefill_capacity",
+                 "_value_alias")
 
-    def __init__(self, capacity: int = 0, prefill_capacity: int = 0) -> None:
+    def __init__(self, capacity: int = 0, prefill_capacity: int = 0,
+                 value_alias: bool = False) -> None:
         self.key_states: Optional[Tensor] = None
         self.value_states: Optional[Tensor] = None
         self.position_ids: Optional[Tensor] = None
@@ -130,6 +132,12 @@ class CacheState:
         self._pos_buf: Optional[Tensor] = None
         self._capacity: int = max(int(capacity), 0)
         self._prefill_capacity: int = max(int(prefill_capacity), self._capacity)
+        # MLA (models/deepseek_v2/geometry.py): the value IS the key's latent
+        # dims, so there is no value buffer at all and ``value_states`` is the
+        # key view. Every write below skips the value side; the attention
+        # module reads the latent dims of the returned key. False everywhere
+        # else, where every path is the one it always was.
+        self._value_alias: bool = bool(value_alias)
 
     # -----------------------------------------------------------------
     # seq_length property
@@ -154,7 +162,8 @@ class CacheState:
     def _reslice(self, length: int) -> None:
         """Re-point the public views at ``[:, :, :length]`` of the buffers."""
         self.key_states = self._key_buf[:, :, :length]
-        self.value_states = self._val_buf[:, :, :length]
+        self.value_states = (self.key_states if self._value_alias
+                             else self._val_buf[:, :, :length])
         self.position_ids = self._pos_buf[:, :length]
 
     def _allocate(self, key: Tensor, capacity: int) -> None:
@@ -175,7 +184,7 @@ class CacheState:
         self._key_buf = torch.empty(
             (rows, heads, capacity, dim), dtype=dtype, device=device
         )
-        self._val_buf = torch.empty(
+        self._val_buf = None if self._value_alias else torch.empty(
             (rows, heads, capacity, dim), dtype=dtype, device=device
         )
         self._pos_buf = torch.empty(
@@ -198,7 +207,8 @@ class CacheState:
         self._allocate(old_k, new_cap)
         if cur > 0:
             self._key_buf[:, :, :cur] = old_k[:, :, :cur]
-            self._val_buf[:, :, :cur] = old_v[:, :, :cur]
+            if not self._value_alias:
+                self._val_buf[:, :, :cur] = old_v[:, :, :cur]
             self._pos_buf[:, :cur] = old_p[:, :cur]
         self._reslice(cur)
 
@@ -254,7 +264,8 @@ class CacheState:
             )
 
         self._key_buf[:, :, cur:cur + n_new] = key
-        self._val_buf[:, :, cur:cur + n_new] = value
+        if not self._value_alias:
+            self._val_buf[:, :, cur:cur + n_new] = value
         self._pos_buf[:, cur:cur + n_new] = new_pos.to(self._pos_buf.device)
         self._reslice(cur + n_new)
 
@@ -284,7 +295,8 @@ class CacheState:
         if self._key_buf is not None and not _tracing():
             if key.untyped_storage().data_ptr() == self._key_buf.untyped_storage().data_ptr():
                 key = key.clone()
-            if value.untyped_storage().data_ptr() == self._val_buf.untyped_storage().data_ptr():
+            if (not self._value_alias and value.untyped_storage().data_ptr()
+                    == self._val_buf.untyped_storage().data_ptr()):
                 value = value.clone()
             if position_ids.untyped_storage().data_ptr() == self._pos_buf.untyped_storage().data_ptr():
                 position_ids = position_ids.clone()
@@ -295,7 +307,8 @@ class CacheState:
             self._allocate(key, target)
 
         self._key_buf[:, :, :n] = key
-        self._val_buf[:, :, :n] = value
+        if not self._value_alias:
+            self._val_buf[:, :, :n] = value
         self._pos_buf[:, :n] = position_ids.to(self._pos_buf.device)
         self._reslice(n)
 
@@ -328,7 +341,8 @@ class CacheState:
         # Gather allocates, so the result never aliases the buffer we copy it
         # back into.
         new_k = torch.gather(self.key_states, dim=2, index=idx_k)
-        new_v = torch.gather(self.value_states, dim=2, index=idx_k)
+        new_v = (None if self._value_alias
+                 else torch.gather(self.value_states, dim=2, index=idx_k))
 
         # Gather position_ids to the surviving tokens' ORIGINAL positions.
         # The keys retain the RoPE rotation they were stored with, so their
@@ -374,7 +388,8 @@ class CacheState:
         if ref.key_states is None:
             raise RuntimeError("join_layers before the first append")
         B, H, n, D = ref.key_states.shape
-        joint = cls(capacity=capacity, prefill_capacity=capacity)
+        joint = cls(capacity=capacity, prefill_capacity=capacity,
+                    value_alias=ref._value_alias)
         joint._allocate_shape(
             len(states) * B, H, D, ref.key_states.dtype,
             ref.key_states.device, max(capacity, n),
@@ -388,8 +403,11 @@ class CacheState:
                     "in lockstep for the batched eviction to be well defined"
                 )
             r0 = i * B
+            if st._value_alias != ref._value_alias:
+                raise RuntimeError("join_layers: layers disagree on value aliasing")
             joint._key_buf[r0:r0 + B, :, :n] = st.key_states
-            joint._val_buf[r0:r0 + B, :, :n] = st.value_states
+            if not joint._value_alias:
+                joint._val_buf[r0:r0 + B, :, :n] = st.value_states
             joint._pos_buf[r0:r0 + B, :n] = st.position_ids
         joint._reslice(n)
 
@@ -469,7 +487,8 @@ class CacheState:
                 f"rows={self._key_buf.shape[0]}"
             )
         self._key_buf[row0:row0 + n_rows, :, start:start + n] = key
-        self._val_buf[row0:row0 + n_rows, :, start:start + n] = value
+        if not self._value_alias:
+            self._val_buf[row0:row0 + n_rows, :, start:start + n] = value
 
     def replace_body(
         self, num_sink: int, body_key: Tensor, body_value: Tensor,
@@ -498,6 +517,8 @@ class CacheState:
                 ("value", body_value, self._val_buf),
                 ("positions", body_positions, self._pos_buf),
             ):
+                if src is None or buf is None:      # aliased value: no buffer
+                    continue
                 if src.untyped_storage().data_ptr() == buf.untyped_storage().data_ptr():
                     raise RuntimeError(
                         f"replace_body: body_{name} aliases the {name} buffer it "
@@ -509,7 +530,8 @@ class CacheState:
             # Preserves the live prefix, which is exactly where the sinks are.
             self._grow(n)
         self._key_buf[:, :, num_sink:n] = body_key
-        self._val_buf[:, :, num_sink:n] = body_value
+        if not self._value_alias:
+            self._val_buf[:, :, num_sink:n] = body_value
         self._pos_buf[:, num_sink:n] = body_positions.to(self._pos_buf.device)
         self._reslice(n)
 

@@ -346,6 +346,7 @@ def main() -> None:
     import torch
     from torch.profiler import ProfilerActivity, profile
     from transformers import AutoModelForCausalLM, AutoTokenizer
+    from utils.model_loading import load_causal_lm, load_tokenizer
 
     from utils.config import load_config
 
@@ -367,8 +368,8 @@ def main() -> None:
     pkg, attn_impl = resolve_backend(cfg)
 
     print(f"loading {cfg.model.name} (attn={attn_impl}, cache_package={pkg}) ...")
-    tok = AutoTokenizer.from_pretrained(cfg.model.name)
-    model = AutoModelForCausalLM.from_pretrained(
+    tok = load_tokenizer(cfg.model.name)
+    model = load_causal_lm(
         cfg.model.name, torch_dtype=dtype,
         attn_implementation=attn_impl, device_map="auto")
     model.eval()

@@ -1,0 +1,54 @@
+# ============================================================================
+# LongBench — FullKV baseline on DeepSeek-V2-Lite-Chat (LATENT cache)
+# ============================================================================
+# backend: dynamic -> transformers.DynamicCache, no eviction. With the owned MLA
+# forward installed (utils.model_loading), the DynamicCache holds the packed
+# latent as one head plus a zero-width value: 1,152 B/token, the same cache the
+# method's budget is a fraction of, decoded with the same absorbed math. The
+# remote code's own decompressed cache (12,288 B/token) is NOT the baseline.
+_base_: base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: deepseek-ai/DeepSeek-V2-Lite-Chat
+  revision: 85864749cd611b4353ce1decdb286193298f64c7
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500
+  output_dir: outputs/longbench/deepseek_v2_lite_full_cache
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

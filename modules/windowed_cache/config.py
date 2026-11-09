@@ -523,6 +523,28 @@ class WindowedCacheConfig:
             against the full expected sequence (prefill + generation) so the
             cache is not undersized when the output is long.
         """
+        # A RAW DeepSeek-V2 config prices the decompressed per-head path:
+        # `num_key_value_heads=16` x `hidden/heads=128` x K+V = 8,192 B/token,
+        # 7.1x the 1,152 B latent the cache actually holds. The MLA cache is
+        # built against `models.deepseek_v2.geometry.MLACacheConfig`, which says
+        # "one head of width Dc+Dr whose value aliases its key". Refuse the raw
+        # one rather than resolve a budget 7x too generous.
+        if (getattr(model_config, "model_type", None) == "deepseek_v2"
+                and not getattr(model_config, "mla_latent", False)):
+            raise ValueError(
+                "resolve() was handed a raw deepseek_v2 config. Its "
+                "num_key_value_heads describes the decompressed per-head path "
+                "and would price the cache at 8,192 B/token instead of the "
+                "latent's 1,152. Build the cache with "
+                "models.deepseek_v2.loader.make_cache (or pass "
+                "MLAGeometry.from_config(cfg).cache_config()).")
+        value_alias = bool(getattr(model_config, "kv_value_alias", False))
+        if value_alias and self.quant_card_bits.vm != self.quant_card_bits.mu:
+            raise ValueError(
+                f"quant_card_bits vm={self.quant_card_bits.vm} differs from "
+                f"mu={self.quant_card_bits.mu}, but this cache's value aliases its "
+                "key (MLA): the value centroid IS `mu`, so it has no width of its "
+                "own. Set vm equal to mu (or leave both at the default).")
         num_kv_heads = getattr(
             model_config,
             "num_key_value_heads",
@@ -552,8 +574,10 @@ class WindowedCacheConfig:
             )
 
         element_size = torch.tensor([], dtype=kv_dtype).element_size()
-        # K + V, each shaped [num_kv_heads, head_dim] per token
-        bytes_per_token = num_kv_heads * head_dim * element_size * 2
+        # K + V, each shaped [num_kv_heads, head_dim] per token -- or, when the
+        # value aliases the key (MLA), the key alone: one latent per token.
+        bytes_per_token = (num_kv_heads * head_dim * element_size
+                           * (1 if value_alias else 2))
 
         # Total byte budget and token budget
         total_budget_bytes = int(self.cache_budget * (prefill_len + max_tokens) * bytes_per_token)
@@ -639,9 +663,11 @@ class WindowedCacheConfig:
 
         gate_live = q > 0.0
         b_card = (num_kv_heads * sketch_bytes_per_head(
-                      head_dim, self.window_size, self.quant_card_bits)
+                      head_dim, self.window_size, self.quant_card_bits,
+                      value_alias=value_alias)
                   if gate_live else 0)
-        b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size) + b_card
+        b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size,
+                                 value_alias=value_alias) + b_card
         m_evict = remaining * bytes_per_token                           # evictable bytes
         if self.quant_budget_mode == "bytes":
             # Historic split: q divides the BYTES. An int2 window is ~2.8x

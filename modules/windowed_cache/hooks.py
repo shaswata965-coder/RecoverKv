@@ -167,6 +167,46 @@ class HookHandles:
 # install_score_hooks
 # ---------------------------------------------------------------------------
 
+
+def _install_mla(model: nn.Module, cache: Any, handles: "HookHandles") -> "HookHandles":
+    """The DeepSeek-V2 branch of :func:`install_score_hooks`.
+
+    Requires the owned MLA forward (``models.deepseek_v2.loader``); a model
+    without it would attend through upstream code that slices RoPE by the held
+    length and caches the decompressed heads, so this raises instead.
+    """
+    from models.deepseek_v2.loader import attention_modules
+
+    mods = attention_modules(model)
+    if not all(hasattr(m, "_recoverkv_geometry") for m in mods):
+        raise RuntimeError(
+            "a deepseek_v2 model reached install_score_hooks without the owned "
+            "MLA attention forward. Load it through "
+            "models.deepseek_v2.loader.load_model / install_recoverkv_mla (or "
+            "utils.model_loading.load_causal_lm), which every runner uses.")
+    flash = bool(getattr(mods[0], "_recoverkv_flash", False))
+    cuda = torch.cuda.is_available()
+    fused = flash and cuda and fused_decode_enabled()
+    handles.fused_decode = fused
+    handles.lse_active = flash and cuda
+    handles.lse_label = "flash (owned MLA forward)" if handles.lse_active else "off"
+    if fused:
+        assert_prefill_kernel_available(True)
+        assert_decode_kernel_available(True)
+        setattr(cache, "_fused_decode_active", True)
+        for m in mods:
+            h = m.register_forward_pre_hook(lambda _m, _a: flash_decode.clear())
+            handles._hook_handles.append(h)
+    if not _PATH_ANNOUNCED[0]:
+        _PATH_ANNOUNCED[0] = True
+        print(
+            "[StickyKV] score path: OWNED MLA forward (deepseek_v2) | prefill "
+            f"scoring -> {'Triton score kernel, L from flash' if flash and cuda else 'eager softmax'} | "
+            f"decode -> {describe_decode_backend(cuda) if fused else 'materialize (CPU oracle / eager)'}",
+            flush=True,
+        )
+    return handles
+
 # Guards the one-per-process "which scoring path" banner (install runs per
 # sample in the runners, so an unguarded print would spam thousands of lines).
 _PATH_ANNOUNCED = [False]
@@ -231,6 +271,15 @@ def install_score_hooks(
         Call ``.remove()`` to uninstall all hooks.
     """
     handles = HookHandles()
+
+    # DeepSeek-V2 (MLA): there is nothing to hook. Its attention forward is
+    # OWNED (models/deepseek_v2/attention.py, installed at load), and it writes
+    # the eviction scores itself, at exactly the point these hooks would --
+    # because its remote code imports `flash_attn_func` into its own namespace,
+    # so the seam below is never reached. What remains of this function's job
+    # is arming the fused decode on CUDA, with the same Triton-or-raise gates.
+    if getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v2":
+        return _install_mla(model, cache, handles)
 
     # Committed to the Triton path? Choosing the flash backend on CUDA commits to
     # the Triton PREFILL score kernel unconditionally — compute_token_scores has
