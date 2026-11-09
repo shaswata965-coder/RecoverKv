@@ -58,6 +58,19 @@ when the value is an alias; that branch is a trace-time constant.
 
 The vendored upstream files are hash-pinned (`test_vendored_upstream_is_unmodified`).
 
+**Regression net** (CPU, torch 2.15, transformers 4.47.1, Triton 3.9):
+
+| | `tests/` | `modules/evaluation` + `data` |
+|---|---|---|
+| base commit `78a995b` | 93 failed / 1071 passed | 36 failed + 6 errors / 421 passed |
+| this branch | **64 failed / 1122 passed** | 36 failed + 6 errors / 421 passed (identical set) |
+
+**No test that passed at the base fails here.** Every one of the 64 failures was
+already failing at the base commit: these are the stale tests `CLAUDE.md` describes.
+That includes the shipped kernel's interpreter test, which hits a Triton 3.9
+interpreter quirk with Python-int loop indices (the MLA kernel avoids it). The
++51 passes are the 22 new DeepSeek tests and 29 repaired layer-major tests.
+
 ---
 
 ## 3. Decisions (PLAN.md §4) as implemented
