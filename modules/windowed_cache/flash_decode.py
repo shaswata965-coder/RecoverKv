@@ -69,7 +69,12 @@ _PENDING: dict = {"ctx": None}
 #: SHAPE), so it costs no kernel launch and no device sync — the read fraction is
 #: readable without a ``.item()`` anywhere on the decode path.
 _STATS: dict = {"armed": 0, "fired": 0, "gated": 0,
-                "windows_read": 0, "windows_active": 0}
+                "windows_read": 0, "windows_active": 0,
+                # The completion-term ablation's epilogue
+                # (modules/windowed_cache/completion.py). 0 on the shipped
+                # path; on an ablation arm it must equal `gated`, which is the
+                # proof the variant was applied on every gated layer.
+                "completion_applied": 0}
 
 
 def stats() -> dict:
@@ -371,11 +376,32 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     #    both in an epilogue pass that already runs. Doing either on the host cost
     #    22 torch ops here, 704 launches per token at L=32, on a path bound by
     #    launch count.
+    spec = getattr(ctx["cache"].resolved, "quant_completion", None)
+    # The shipped call is exactly the pre-knob call: `out_dtype` is passed only
+    # on an ablation arm, which needs the kernel's output in fp32 to invert it.
+    extra = {} if spec is None else {"out_dtype": torch.float32}
     out, wsum = fused_two_tier_decode(
         q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
         sel=sel, logmass=logmass, centroids=gate["centroid"],
-        vm_bits=gate["bits"].vm,
+        vm_bits=gate["bits"].vm, **extra,
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+
+    # 2b. Evaluation only: the completion-term ablation. `spec is None` on the
+    #     shipped path, which is then exactly what it was before the knob. On an
+    #     ablation arm the kernel wrote `out` in fp32, and the epilogue recovers
+    #     o_bar, the fill and log Z_A from it and applies the variant
+    #     (completion.py; checked against two_tier_window_reference on CPU).
+    if spec is not None:
+        from .completion import apply_completion
+        wids = None
+        if spec.sigma > 0.0:
+            wids = ctx["cache"]._stores[ctx["layer_idx"]].active_ids()
+        out, wsum = apply_completion(
+            spec, out=out, wsum=wsum, n_body_win=n_body_win, sel=sel,
+            logmass=logmass, centroids=gate["centroid"], vm_bits=gate["bits"].vm,
+            q=q_hd, k_fp=k_fp, scaling=ctx["scaling"], wids=wids,
+            layer_idx=ctx["layer_idx"], out_dtype=q_hd.dtype)
+        _STATS["completion_applied"] += 1
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is
     # the physical -> merged-id permutation. This replaces

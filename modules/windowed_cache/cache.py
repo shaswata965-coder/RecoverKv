@@ -1646,6 +1646,16 @@ class WindowedCache(_HFCacheBase):
                 self._last_score_meta[layer_idx] = None
                 return state.key_states, state.value_states
 
+            if (getattr(self.resolved, "quant_completion", None) is not None
+                    and store is not None and store.num_active_windows > 0 and not is_prefill):
+                # Kernel-or-error: the completion ablation lives in the fused flash
+                # decode (flash_decode._run_fused). Materializing the tier here would
+                # run the shipped completion under the ablation's name.
+                raise RuntimeError(
+                    "quant_completion is set, but this decode step took the "
+                    "materialize path, which has no completion epilogue (eager "
+                    "backend, or the fused flash decode is off). The ablation only "
+                    "exists on the fused flash path; it would be inert here.")
             eff_k, eff_v, score_meta = self._materialize(layer_idx)
             # Hand the effective K + its score-scatter map to the score hook
             # (fix #2) so it need not rebuild them. Overwritten each step; the
@@ -2045,6 +2055,16 @@ class WindowedCache(_HFCacheBase):
             self._last_score_meta[layer_idx] = None
             return k_layer, v_layer
 
+        if (getattr(self.resolved, "quant_completion", None) is not None
+                and store is not None and store.num_active_windows > 0):
+            # Kernel-or-error: the completion ablation lives in the fused flash
+            # decode (flash_decode._run_fused). Materializing the tier here would
+            # run the shipped completion under the ablation's name.
+            raise RuntimeError(
+                "quant_completion is set, but this decode step took the "
+                "materialize path, which has no completion epilogue (eager "
+                "backend, or the fused flash decode is off). The ablation only "
+                "exists on the fused flash path; it would be inert here.")
         eff_k, eff_v, score_meta = self._materialize_joint(layer_idx, B)
         self._last_effective_k[layer_idx] = eff_k
         self._last_score_meta[layer_idx] = score_meta

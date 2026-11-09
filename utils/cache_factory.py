@@ -246,6 +246,14 @@ def quant_tier_policy_kwargs(cache_cfg: Any) -> dict:
         out["quant_promotion"] = promo
     if src != "dequant":
         out["quant_promote_source"] = src
+    # The completion-term ablation rides the same seam, for the same reason:
+    # passed only when set, so a default run builds its cache exactly as before.
+    from utils.completion_spec import from_config
+    spec = from_config(cache_cfg)
+    if spec is not None:
+        out.update(quant_completion=spec.mode, quant_completion_scale=spec.scale,
+                   quant_completion_sigma=spec.sigma, quant_completion_seed=spec.seed,
+                   quant_completion_scores=spec.scores)
     return out
 
 
@@ -256,10 +264,15 @@ def quant_tier_policy_record(cache_cfg: Any) -> dict:
     windows the cache keeps or what a promoted one holds, so a quality number
     without them does not say which method produced it.
     """
+    from utils.completion_spec import completion_record, from_config
     return {
         "quant_promotion": getattr(cache_cfg, "quant_promotion", "bidir") or "bidir",
         "quant_promote_source": (getattr(cache_cfg, "quant_promote_source",
                                          "dequant") or "dequant"),
+        # mode "native" = the shipped kernel path. Anything else is an ablation
+        # arm; the sidecar's read_gate.completion_applied must then equal
+        # read_gate.gated, which proves the epilogue ran on every gated layer.
+        "quant_completion": completion_record(from_config(cache_cfg)),
     }
 
 

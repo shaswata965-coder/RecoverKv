@@ -212,8 +212,30 @@ class CacheConfig:
     # (evaluation-only). Both are quality changes; sidecars record them.
     quant_promotion: str = "bidir"
     quant_promote_source: str = "dequant"
+    # Completion-term ablation (utils/completion_spec.py). null = the shipped
+    # kernel path. Any mode routes the gated step through an evaluation epilogue
+    # that replaces the skipped windows' completion term: "calibrated" (identity
+    # at scale 1, sigma 0), "off", "uncalibrated"; scale / sigma perturb the
+    # calibrated term after selection and delta; scores "coupled" also moves the
+    # eviction scores. Evaluation only; a quality change; sidecars record it.
+    quant_completion: Optional[str] = None
+    quant_completion_scale: float = 1.0
+    quant_completion_sigma: float = 0.0
+    quant_completion_seed: int = 0
+    quant_completion_scores: str = "output"
 
     def __post_init__(self) -> None:
+        from utils.completion_spec import parse_completion
+        try:
+            parse_completion(self.quant_completion, self.quant_completion_scale,
+                             self.quant_completion_sigma, self.quant_completion_seed,
+                             self.quant_completion_scores)
+        except ValueError as exc:
+            raise ConfigValidationError(str(exc)) from None
+        if self.quant_completion is not None and float(self.quant_ratio) <= 0.0:
+            raise ConfigValidationError(
+                "quant_completion is set but quant_ratio is 0: there is no int2 "
+                "tier, so no window is skipped and the knob would be inert.")
         if self.quant_promotion not in ("bidir", "oneway"):
             raise ConfigValidationError(
                 f"quant_promotion must be 'bidir' or 'oneway', got "

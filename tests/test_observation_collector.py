@@ -182,7 +182,7 @@ L, HK, HQ, D, WS, NS, P, STEPS = 2, 2, 4, 16, 4, 2, 48, 40
 RATIO = 0.5
 
 
-def _drive(source: str, monkeypatch):
+def _drive(source: str, monkeypatch, completion_rungs: bool = False):
     from modules.evaluation.ours_parity_runner import GateRecorder
     from modules.windowed_cache import flash_decode
     from modules.windowed_cache.cache import WindowedCache
@@ -206,7 +206,12 @@ def _drive(source: str, monkeypatch):
     T = STEPS + 1
     shadow = OC.ShadowKV(L, HK, S_max, D, torch.float32, torch.device("cpu"))
     OC.attach_shadow(cache, shadow)
-    buf = OC.SampleBuffers(T, L, HQ, HK, W, S_max, False, torch.device("cpu"))
+    buf = OC.SampleBuffers(T, L, HQ, HK, W, S_max, False, torch.device("cpu"),
+                           completion_rungs=completion_rungs)
+    # With the rungs on, a second, rung-less buffer records the SAME states, so
+    # "the flag changes nothing else" is checked exactly, within one trajectory.
+    bufs = [buf] + ([OC.SampleBuffers(T, L, HQ, HK, W, S_max, False, torch.device("cpu"))]
+                    if completion_rungs else [])
     gate = GateRecorder()
     gate.bind(cache)
     armed = []
@@ -245,15 +250,17 @@ def _drive(source: str, monkeypatch):
                          cache_kwargs={"cache_position": torch.arange(P)})
             cache.cache_kwargs[i]["window_scores"] = torch.rand(
                 1, HQ, merged(i), generator=g)
-            OC.record_prefill_layer(buf, i, torch.randn(HQ, P, D, generator=g),
-                                    cache, shadow, NS, WS, scale)
+            qp = torch.randn(HQ, P, D, generator=g)
+            for b in bufs:
+                OC.record_prefill_layer(b, i, qp, cache, shadow, NS, WS, scale)
         for t in range(1, T):
             step["t"] = t
             gate.clear()
             if any(cache._policies[i].should_evict(cache._generation_step[i])
                    for i in range(L)):
-                buf.evict_step[t] = True
-                OC.snapshot_rank_signal(buf, t, cache, L)
+                for b in bufs:
+                    b.evict_step[t] = True
+                    OC.snapshot_rank_signal(b, t, cache, L)
             for i in range(L):
                 k = torch.randn(1, HK, 1, D, generator=g)
                 k_fp, v_fp = cache.update(
@@ -268,12 +275,16 @@ def _drive(source: str, monkeypatch):
                 else:
                     cache.cache_kwargs[i]["window_scores"] = torch.rand(
                         1, HQ, merged(i), generator=g) * (2.0 ** t)
-                OC.record_decode_layer(buf, t, i, q, held_output(i, q), cache,
-                                       shadow, gate, NS, WS, scale)
+                o_act = held_output(i, q)
+                for b in bufs:
+                    OC.record_decode_layer(b, t, i, q, o_act, cache,
+                                           shadow, gate, NS, WS, scale)
                 for d in (gate.picks, gate.logmass, gate.active_ids):
                     d.pop(i, None)
     finally:
         flash_decode.clear_gate_observer()
+    if completion_rungs:
+        return cache, buf.to_numpy(), W, bufs[1].to_numpy()
     return cache, buf.to_numpy(), W
 
 
@@ -281,7 +292,9 @@ def _drive(source: str, monkeypatch):
 def runs():
     mp = pytest.MonkeyPatch()
     try:
-        return {src: _drive(src, mp) for src in ("dequant", "original")}
+        out = {src: _drive(src, mp) for src in ("dequant", "original")}
+        out["rungs"] = _drive("dequant", mp, completion_rungs=True)
+        return out
     finally:
         mp.undo()
 
@@ -401,3 +414,45 @@ def test_zip_roundtrip_export_and_observations(runs, tmp_path):
     rs = res["observation4"]["recall_summary"]
     assert rs["gated"] and rs["head_mass_source"] == "recorded_head_step_mass"
     assert res["observation5"]["summary"]["events_scored"] > 0
+
+
+class TestCompletionRungs:
+    """Experiment 1b (``--completion-rungs``) on the real cache, store and gate."""
+
+    def test_recorded_exactly_where_the_gate_fired(self, runs):
+        a = runs["rungs"][1]
+        assert "comp_err" not in runs["dequant"][1]
+        g = a["gate_fired"]
+        assert g[1:].any(), "the gate never fired -- nothing checked"
+        assert np.isfinite(a["comp_err"][g]).all()
+        assert np.isnan(a["comp_err"][~g]).all()
+
+    def test_the_full_oracle_is_the_collectors_own_held_read(self, runs):
+        from modules.windowed_cache.completion import COMPLETION_RUNGS
+        a = runs["rungs"][1]
+        g = a["gate_fired"]
+        assert np.nanmax(a["comp_err"][g][..., COMPLETION_RUNGS.index("full_oracle"), 0]) < 1e-5
+        # o_actual is the held read in this harness, so cal-vs-actual IS cal-vs-held
+        np.testing.assert_allclose(a["comp_cal_vs_actual"][g],
+                                   a["comp_err"][g][..., COMPLETION_RUNGS.index("cal"), 0],
+                                   rtol=1e-4, atol=1e-6)
+
+    def test_exact_masses_cover_the_tier_and_delta_centres_the_read_windows(self, runs):
+        a = runs["rungs"][1]
+        for t, li in zip(*np.nonzero(a["gate_fired"])):
+            is_q = a["tier"][t, li] == OC.TIER_Q
+            assert (np.isfinite(a["comp_log_mstar"][t, li]).any(0) == is_q).all()
+            opened = np.repeat(a["gate_open"][t, li], HQ // HK, axis=0)
+            e = a["comp_logerr_cal"][t, li].astype(np.float64)
+            mean_read = np.where(opened, e, 0.0).sum(1) / opened.sum(1)
+            assert np.abs(mean_read).max() < 5e-3          # 0 up to fp16 storage
+
+    def test_the_flag_changes_nothing_else(self, runs):
+        """Same states, recorded with and without the rungs: every shared array
+        is bit-identical, so the counterfactuals never touch what they sit beside."""
+        rung, plain = runs["rungs"][1], runs["rungs"][3]
+        assert set(rung) - set(plain) == {"comp_err", "comp_cal_vs_actual", "comp_log_mstar",
+                                          "comp_logerr_cal", "comp_uncal_shift", "comp_delta",
+                                          "comp_log_za"}
+        for k, v in plain.items():
+            np.testing.assert_array_equal(v, rung[k], err_msg=k)

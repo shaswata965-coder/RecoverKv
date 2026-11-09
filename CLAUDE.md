@@ -153,7 +153,7 @@ attacked the 3%. A window's fields live in six separate tensors plus four card
 tensors, so one selected window is ten scattered fetches; interleaving them into
 one per-window block is the real fix and needs a GPU to verify.
 
-### Two ablation knobs, off by default
+### Three ablation knobs, off by default
 
 `quant_promotion: oneway` (no int2 → fp promotion, matched tier sizes) and
 `quant_promote_source: original` (promote the exact fp window from a shadow held
@@ -161,6 +161,18 @@ OUTSIDE the byte budget — an evaluation-only oracle, never a method). Both are
 quality changes and every sidecar records them next to `read_gate`. They exist
 for `scripts/run_recoverkv_all.sh` (E2 / E3, `DISTANCE_TO_GOAL.md` §13.1); do not
 quote either as the method.
+
+`quant_completion` (+ `_scale`, `_sigma`, `_seed`, `_scores`;
+`utils/completion_spec.py`) replaces the gated step's completion term for the
+Reviewer-2 ablation (`DISTANCE_TO_GOAL.md` §14). `null` is the shipped kernel
+path, untouched — the call into the kernel is literally the pre-knob call. Any
+mode, `calibrated` included, goes through a torch epilogue
+(`modules/windowed_cache/completion.py`) that recovers `o_bar`, the fill and
+`log Z_A` exactly from the kernel's own (fp32-buffered) output; the kernel source
+is unchanged. Proof on every run: `read_gate.completion_applied == gated` on an
+ablation arm, `0` on a native one; the cache raises if the knob is set on a path
+with no epilogue. Use `off`, never `none` — the override parser turns `none` into
+null. A quality change; never the method.
 
 ## How to read a decode number here
 

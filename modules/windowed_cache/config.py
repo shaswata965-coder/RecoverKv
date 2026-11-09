@@ -15,6 +15,7 @@ from typing import Any, Optional, Union
 import torch
 
 from modules.quant.sketch import CARD_BITS_DEFAULT, CardBits, parse_card_bits
+from utils.completion_spec import CompletionSpec, parse_completion
 
 from .policy import FIRST_EVICTION_STEP
 
@@ -90,6 +91,10 @@ class ResolvedConfig:
     # verbatim. Defaults are the shipped method.
     quant_promotion: str = "bidir"
     quant_promote_source: str = "dequant"
+    # Completion-term ablation (utils/completion_spec.py), parsed. None is the
+    # shipped kernel path; anything else routes the gated decode step through
+    # modules/windowed_cache/completion.py. Evaluation only.
+    quant_completion: Optional[CompletionSpec] = None
 
     @property
     def retained_evictable_bytes(self) -> int:
@@ -325,6 +330,17 @@ class WindowedCacheConfig:
     # shadow is NOT in the byte budget, so "original" is an evaluation-only
     # ORACLE for the promotion-payload experiment, never a method.
     quant_promote_source: str = "dequant"
+    # The completion-term ablation (utils/completion_spec.py for every value).
+    # None (default) runs the shipped kernel path, byte- and launch-identical to
+    # the build before this knob existed. Any mode routes each gated decode step
+    # through an evaluation epilogue that replaces the skipped windows'
+    # completion term after the gate's selection and after delta. Evaluation
+    # only; a quality change; sidecars record it next to read_gate.
+    quant_completion: Optional[str] = None
+    quant_completion_scale: float = 1.0
+    quant_completion_sigma: float = 0.0
+    quant_completion_seed: int = 0
+    quant_completion_scores: str = "output"
     # Decode step of the FIRST eviction, independent of window_size. Default 0:
     # the prompt is compressed on decode step 0, before that step's query
     # attends, so every generated token is produced against the budgeted cache.
@@ -438,6 +454,19 @@ class WindowedCacheConfig:
                 "window OUTSIDE the byte budget. It is the evaluation-only "
                 "oracle of the promotion-payload experiment; its memory and "
                 "quality are not the method's.", stacklevel=2)
+        self._completion = parse_completion(
+            self.quant_completion, self.quant_completion_scale,
+            self.quant_completion_sigma, self.quant_completion_seed,
+            self.quant_completion_scores)
+        if self._completion is not None:
+            if not gate_live:
+                raise ValueError(
+                    "quant_completion is set but quant_ratio is 0: there is no "
+                    "int2 tier, nothing is skipped, and the knob would be inert.")
+            warnings.warn(
+                f"quant_completion={self._completion} replaces the gated step's "
+                "completion term through an evaluation epilogue. It is an "
+                "ablation of the method, not the method.", stacklevel=2)
 
         # -- quant_budget_mode (what quant_ratio divides) --
         if self.quant_budget_mode not in ("tokens", "bytes"):
@@ -718,6 +747,7 @@ class WindowedCacheConfig:
             quant_card_bits=self.quant_card_bits,
             quant_promotion=self.quant_promotion,
             quant_promote_source=self.quant_promote_source,
+            quant_completion=self._completion,
             first_eviction_step=self.first_eviction_step,
         )
 

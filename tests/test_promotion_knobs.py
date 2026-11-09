@@ -63,7 +63,9 @@ class TestConfig:
         assert quant_tier_policy_kwargs(c) == {
             "quant_promotion": "oneway", "quant_promote_source": "original"}
         assert quant_tier_policy_record(CacheConfig()) == {
-            "quant_promotion": "bidir", "quant_promote_source": "dequant"}
+            "quant_promotion": "bidir", "quant_promote_source": "dequant",
+            "quant_completion": {"mode": "native", "scale": 1.0, "sigma": 0.0,
+                                 "seed": 0, "scores": "output"}}
 
     def test_every_cache_building_runner_threads_the_knobs(self):
         import pathlib

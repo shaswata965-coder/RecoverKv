@@ -1997,3 +1997,67 @@ Checks, both runs:
 module takes them as `--oneway-zip` / `--gate-off-zip`; the commands are in the
 write-up. The export was split into `parity_base` / `parity_ours` for this; output is
 byte-identical to before, checked on a 2-prompt zip cut from the real run.
+
+---
+
+## 14. The completion term, made an experiment — 2026-11-09
+
+Reviewer 2 asks how sensitive quality is to the accuracy of the calibrated
+completion term, `m~(u) = exp(logmass(u) + delta)`, that every skipped int2
+window attends with through its value centroid. Four experiments answer it
+(`notebooks/completion_ablation_colab.ipynb`, one Colab A100 notebook):
+
+| # | question | arms |
+|---|---|---|
+| 1 | how close is `m~` to the true mass, on the SAME decode state, and what output error does each variant cause there | collector `--completion-rungs` |
+| 2 | is completion needed | `cal` vs `off`, ceiling `quant_gate_ratio = 1.0` |
+| 3 | is calibration needed | `cal` vs `uncalibrated` (`exp(logmass - log Z_A)`, NOT `delta = 0`) |
+| 4 | how sensitive is quality | common scale `c`; total-preserving noise `sigma` per window; `coupled` scores |
+
+**What was built.**
+* `quant_completion` (§ `CLAUDE.md`, "Three ablation knobs") and its spec in
+  `two_tier_window_reference(..., completion=)`.
+* The production path is a torch epilogue around the UNCHANGED kernel. The GATED
+  epilogue returns `out = (o_bar + Σ fill·nu) / (1 + Σ fill)` and every score
+  divided by the same `den`, so `den = 1 / (1 - S_U)`, `fill = wsum_u · den`,
+  `o_bar = out · den - Σ fill·nu`, and `log Z_A = logsumexp(q·k_fp) -
+  log(1 - Σ_R m_bar)` are exact. The only kernel-side change is an `out_dtype`
+  (fp32 OUT buffer on ablation arms; the store already casts to the buffer's
+  dtype) and a matching flag in the tile-search signature.
+* Every perturbation acts after selection and after `delta`. The eviction scores
+  keep the shipped fill unless `scores: coupled`; `off` + `coupled` is refused (it
+  would evict the tier, which measures a collapse, not the completion term).
+* `completion.completion_rungs` and the collector's `comp_*` arrays (schema 1.1):
+  `m*(u)` over `Z_A`, `delta`, `log Z_A`, and 15 outputs per head-step — off,
+  uncal, cal, five scales, four noise levels, a mass oracle (exact `m*` with the
+  stored centroid), a value oracle and the full oracle (= `o_held`).
+
+**Verified, CPU only.** `tests/test_completion_ablation.py` (85): the epilogue
+against the spec for every mode, three head regimes, `exp2` on and off, ratios
+0.10–1.0; `off` against the read-set attention and `uncalibrated` against brute
+force, both independent of the spec; identity at `scale = 1`; the noise's
+determinism, persistence per window, normality and exact total; config, factory
+and sidecar; `_run_fused` on the real cache (stubbed kernel) — the shipped call
+carries no new argument and `completion_applied == gated` on ablation arms; the
+cache refusing the knob on the materialize path. `tests/test_observation_collector.py`
+(14): the rungs on the real cache, store, cards and gate, `full_oracle` reproducing
+the collector's own `o_held` to 1e-5, and every pre-existing array bit-identical
+with the flag on (two buffers recording the same states). The neighbouring
+suites fail the same 12 stale tests before and after (`_tile_override`, removed
+control arms). Local runs need `ATEN_CPU_CAPABILITY=default`: this sandbox's
+Inductor C++ codegen fails at AVX2/AVX-512 (`convert<uint8_t,...>`), before and
+after the change.
+
+**Not verified.** Any GPU execution: the fp32-OUT kernel specialization, the
+epilogue's cost, and the reconstruction against the real kernel. The notebook
+refuses Experiment 1 if the recomputed calibrated output differs from the
+kernel's real one by more than 1e-2 (median), and runs `cal_ep` (the epilogue at
+identity) as a floor beside `cal_repeat`.
+
+**Two corrections to things said while designing this.** (1) An unknown key
+inside a config SECTION raises (`CacheConfig(**...)`); only an unknown top-level
+SECTION is dropped silently. (2) The collector's existing "fill calibration" row
+compares `cache_step_mass` with `full_mass`, whose normalisers differ per step
+(`Z_A · den` against the full-KV `Z`); compare within a step, against the read
+windows, or use `comp_*`.
+

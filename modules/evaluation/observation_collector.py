@@ -64,11 +64,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from modules.windowed_cache.completion import COMPLETION_RUNGS
 from utils.logger import get_logger
 
 log = get_logger(__name__)
 
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"   # 1.1: optional Experiment 1b arrays (comp_*)
 
 #: Tier codes on the absolute window axis.
 TIER_NONE, TIER_FP, TIER_Q, TIER_LOCAL, TIER_EVICTED = -1, 0, 1, 2, 3
@@ -108,6 +109,8 @@ class CollectorConfig:
     quant_card_bits: Any = None
     quant_promotion: str = "bidir"
     quant_promote_source: str = "dequant"
+    # Experiment 1b: record every completion variant on the same decode states.
+    completion_rungs: bool = False
     backend: str = "flash_attn"
     dtype: str = "float16"
     token_heads: bool = False
@@ -220,7 +223,8 @@ class SampleBuffers:
     ``S`` absolute token positions.
     """
 
-    def __init__(self, T, L, H, Hk, W, S, token_heads, device):
+    def __init__(self, T, L, H, Hk, W, S, token_heads, device,
+                 completion_rungs: bool = False):
         f16, f32 = torch.float16, torch.float32
         nan = float("nan")
 
@@ -246,6 +250,19 @@ class SampleBuffers:
         self.q_recon_err = full((L, Hk, W, 2), nan, f32)
         self.q_first_step = full((L, W), -1, torch.int32)
         self.evict_step = full((T,), False, torch.bool)
+        # Experiment 1b (--completion-rungs): every completion variant on the SAME
+        # decode state. See modules/windowed_cache/completion.completion_rungs.
+        if completion_rungs:
+            K = len(COMPLETION_RUNGS)
+            self.comp_err = full((T, L, H, K, 2), nan, f32)
+            self.comp_cal_vs_actual = full((T, L, H), nan, f32)
+            self.comp_log_mstar = full((T, L, H, W), nan, f16)
+            self.comp_logerr_cal = full((T, L, H, W), nan, f16)
+            self.comp_uncal_shift = full((T, L, H), nan, f32)
+            self.comp_delta = full((T, L, H), nan, f32)
+            self.comp_log_za = full((T, L, H), nan, f32)
+        else:
+            self.comp_err = None
         self.rank_signal: List[Tuple[int, Tensor]] = []      # (t, [L, H, W] f32)
         self.tokens: List[int] = []
         self.token_logprob: List[float] = []
@@ -486,6 +503,60 @@ def record_decode_layer(buf: SampleBuffers, t: int, layer: int, q: Tensor,
         keep = act < W
         buf.card_logmass[t, layer][:, act[keep]] = lm[:, keep].to(torch.float16)
 
+        if buf.comp_err is not None and q_tier is not None:
+            record_completion_rungs(buf, t, layer, q, o_actual, o_held, o_full,
+                                    fpK, fpV, qK, qV, q_ids, cache, gate, ws,
+                                    scale, W)
+
+
+def record_completion_rungs(buf: SampleBuffers, t: int, layer: int, q: Tensor,
+                            o_actual: Tensor, o_held: Tensor, o_full: Tensor,
+                            fpK: Tensor, fpV: Tensor, qK: Tensor, qV: Tensor,
+                            q_ids: Tensor, cache, gate, ws: int, scale: float,
+                            W: int) -> None:
+    """Experiment 1b: every completion variant on THIS decode state.
+
+    The step's own query, its fp tier, its dequantized int2 tier, the gate's
+    pick, the cards' estimates and value centroids -- the state the decode
+    step just read -- go to :func:`completion.completion_rungs`, so every
+    variant is scored against the same ``o_held`` (attention over every held
+    window) and none of them feeds back into the run.
+    """
+    from modules.quant.sketch import _dq_symb
+    from modules.windowed_cache.completion import completion_rungs
+
+    act = gate.active_ids[layer][0].long()
+    if act.numel() != q_ids.numel() or not torch.equal(act, q_ids.long().to(act.device)):
+        raise RuntimeError(
+            f"layer {layer} step {t}: the gate's active windows are not the held "
+            "int2 tier in the same order; the rungs would pair cards with the "
+            "wrong windows.")
+    pick = gate.picks[layer][0].long()                               # [Hk, n_sel] ids
+    read_kv = (pick.unsqueeze(-1) == act.view(1, 1, -1)).any(1)      # [Hk, n]
+    fctx = getattr(cache, "_fused_ctx", None)
+    slot = fctx[layer] if fctx is not None and layer < len(fctx) else None
+    g = slot.get("gate") if isinstance(slot, dict) else None
+    if g is None:
+        raise RuntimeError(f"layer {layer} step {t}: no gate context on the cache; "
+                           "--completion-rungs needs the fused decode path.")
+    vm_q, vm_s, v_anc = g["centroid"]
+    nu = _dq_symb(vm_q[0], vm_s[0], g["bits"].vm)                    # [n, Hk, D]
+    va = v_anc[0] if v_anc.dim() == 3 else v_anc
+    nu = (nu + va.float().unsqueeze(0)).permute(1, 0, 2)             # [Hk, n, D]
+    r = completion_rungs(q, fpK, fpV, qK, qV, ws, read_kv,
+                         gate.logmass[layer][0].float(), nu, scale, act, layer)
+    outs = r["outs"]                                                 # [K, H, D]
+    buf.comp_err[t, layer, :, :, 0] = _rel(outs, o_held.unsqueeze(0), o_full.unsqueeze(0)).T
+    buf.comp_err[t, layer, :, :, 1] = _rel(outs, o_full.unsqueeze(0), o_full.unsqueeze(0)).T
+    buf.comp_cal_vs_actual[t, layer] = _rel(outs[COMPLETION_RUNGS.index("cal")],
+                                            o_actual.float(), o_full)
+    keep = act < W
+    buf.comp_log_mstar[t, layer][:, act[keep]] = r["log_mstar"][:, keep].to(torch.float16)
+    buf.comp_logerr_cal[t, layer][:, act[keep]] = r["logerr_cal"][:, keep].to(torch.float16)
+    buf.comp_uncal_shift[t, layer] = r["uncal_shift"]
+    buf.comp_delta[t, layer] = r["delta"]
+    buf.comp_log_za[t, layer] = r["log_za"]
+
 
 def record_prefill_layer(buf: SampleBuffers, layer: int, q: Tensor, cache,
                          shadow: ShadowKV, ns: int, ws: int, scale: float) -> None:
@@ -697,6 +768,11 @@ in a shadow beside the cache (no second run).
 | `token_logprob`, `token_entropy` | T f32 | its log-probability; the entropy of the next-token distribution |
 | `token_top5_ids`, `token_top5_logprob` | T,5 | the top five |
 | `prompt_ids` | P i64 | the prompt |
+| `comp_err` | T,L,H,K,2 f32 | **--completion-rungs only.** Each completion variant on the SAME state (K = meta `completion_rungs`): rel. L2 error vs `o_held` [..., 0] and vs the full-KV output [..., 1], both normalised by the full-KV output's norm |
+| `comp_cal_vs_actual` | T,L,H f32 | the recomputed calibrated output vs the kernel's real output (a check on the reconstruction) |
+| `comp_log_mstar` | T,L,H,W f16 | exact int2 window mass over the read set's normaliser `Z_A`, natural log (NaN off-tier) |
+| `comp_logerr_cal` | T,L,H,W f16 | `log m~_cal - log m*` per int2 window; on read windows the in-sample residual (mean 0 by construction of delta) |
+| `comp_uncal_shift`, `comp_delta`, `comp_log_za` | T,L,H f32 | `log m~_uncal - log m~_cal` (= -(delta + log Z_A)), delta, log Z_A |
 
 ## Which array feeds which observation
 
@@ -715,7 +791,8 @@ in a shadow beside the cache (no second run).
 | E1 card ranking vs truth | `card_logmass` vs `full_mass` on tier 1; `gate_open` |
 | E2 one-way counterfactual | replay `rank_signal` with int2 windows blocked from fp; score with `full_mass` |
 | E3 promotion payload | `fp_dequant`, `out_step_err[..., 2]` (promotion_payload), `q_recon_err` |
-| fill calibration | `cache_step_mass` vs `full_mass` where tier 1 and not `gate_open` |
+| fill calibration | `cache_step_mass` vs `full_mass` where tier 1 and not `gate_open` (both normalisers differ per step: compare within a step, against the read windows) |
+| Experiment 1b, completion accuracy | `comp_*` (exact, on `Z_A`), `gate_open`, `tier` |
 | granularity (any window size) | `token_mass` re-bucketed |
 """
 
@@ -787,6 +864,12 @@ class ObservationCollector:
             "tier_codes": {"none": TIER_NONE, "fp": TIER_FP, "int2": TIER_Q,
                            "local": TIER_LOCAL, "evicted": TIER_EVICTED},
             "ladder": list(LADDER), "ladder_steps": list(LADDER_STEPS),
+            # Experiment 1b: the rung order of comp_err's K axis (None = not recorded).
+            "completion_rungs": list(COMPLETION_RUNGS) if cfg.completion_rungs else None,
+            # The collector runs the shipped method; the rungs are counterfactuals
+            # computed beside it and never fed back.
+            "quant_completion": {"mode": "native", "scale": 1.0, "sigma": 0.0,
+                                 "seed": 0, "scores": "output"},
             "samples": [],
             "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -846,7 +929,8 @@ class ObservationCollector:
                                   rope_module=rope, num_layers=L,
                                   max_tokens=cfg.gen)
             shadow = ShadowKV(L, Hk, S_max, D, kv_dtype, dev)
-            buf = SampleBuffers(T, L, H, Hk, W, S_max, cfg.token_heads, dev)
+            buf = SampleBuffers(T, L, H, Hk, W, S_max, cfg.token_heads, dev,
+                                completion_rungs=cfg.completion_rungs)
             state.update(cache=cache, shadow=shadow, buf=buf, t=0)
             attach_shadow(cache, shadow)
             hooks = install_score_hooks(model, cache, cache_cfg)
@@ -1126,6 +1210,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         p.add_argument("--backend", default="flash_attn",
                        choices=("flash_attn", "eager"))
         p.add_argument("--dtype", default="float16")
+        p.add_argument("--completion-rungs", action="store_true",
+                       help="Experiment 1b: every completion variant on the same states")
         p.add_argument("--token-heads", action="store_true",
                        help="also store per-head per-token attention [T,L,H,S]")
         p.add_argument("--seed", type=int, default=42)
@@ -1154,6 +1240,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         quant_budget_mode=a.quant_budget_mode, quant_card_bits=_card_bits(a.card_bits),
         quant_promotion=a.promotion, quant_promote_source=a.promote_source,
         backend=a.backend, dtype=a.dtype, token_heads=a.token_heads, seed=a.seed,
+        completion_rungs=a.completion_rungs,
         out=a.out, longbench_dir=a.longbench_dir, ruler_data=a.ruler_data,
         text_field=a.text_field, record_filter=a.record_filter)
     path = ObservationCollector(cfg).run()

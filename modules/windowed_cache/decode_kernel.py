@@ -318,8 +318,19 @@ def two_tier_window_reference(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tensor] = None,
+    completion: Optional[dict] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
+
+    ``completion`` is the SPEC of the completion-term ablation
+    (``utils/completion_spec.py``), computed directly from this oracle's own
+    read-set output and ``lse`` -- never by inverting the output, which is what
+    the production epilogue (``completion.apply_completion``) does and what this
+    exists to check. ``None`` is the shipped term. Otherwise a dict with
+    ``mode`` (``calibrated`` / ``off`` / ``uncalibrated``), and optionally
+    ``scale``, ``sigma``, ``eps`` (standard normals ``[B, H_q, n_active]``) and
+    ``scores`` (``output`` / ``coupled``). Needs ``sel``, ``logmass`` and
+    ``centroids``.
 
     This is deliberately not a shortcut. It reproduces the kernel's actual
     algorithm — sink prologue, window-tiled body, window-tiled Q tier, the online
@@ -566,11 +577,36 @@ def two_tier_window_reference(
         if centroids is not None:
             skipped = (~read).to(fill.dtype)
             mhat = fill * skipped                              # [B,H_q,n_active]
+            den_fill = 1.0 + mhat.sum(-1, keepdim=True)
+            if completion is not None:
+                mode = completion["mode"]
+                if mode == "off":
+                    mhat = torch.zeros_like(mhat)
+                elif mode == "uncalibrated":
+                    # lse is the READ SET's log-normaliser, log Z_A, in this
+                    # oracle's units; logmass is natural-log.
+                    lse_nat = lse.unsqueeze(-1) * (math.log(2.0) if exp2 else 1.0)
+                    mhat = (logmass.float() - lse_nat).exp() * skipped
+                elif mode == "calibrated":
+                    mhat = mhat * float(completion.get("scale", 1.0))
+                    sigma = float(completion.get("sigma", 0.0))
+                    if sigma > 0.0:
+                        mp = mhat * (sigma * completion["eps"]).exp() * skipped
+                        mhat = mp * (mhat.sum(-1, keepdim=True)
+                                     / mp.sum(-1, keepdim=True).clamp_min(1e-38))
+                else:
+                    raise ValueError(f"unknown completion mode {mode!r}")
             out = out.float() + torch.einsum(
                 "bhw,bhwd->bhd", mhat, centroids.to(torch.float32))
             den = 1.0 + mhat.sum(-1, keepdim=True)
             out = out / den
-            wsum = wsum / den
+            if completion is not None and completion.get("scores", "output") == "coupled":
+                wsum = torch.cat([
+                    wsum[..., :n_body_win],
+                    torch.where(read, wsum[..., n_body_win:], mhat),
+                ], dim=-1) / den
+            else:
+                wsum = wsum / den_fill
     return out.to(v_eff.dtype), wsum
 
 
@@ -1391,6 +1427,7 @@ def _decode_triton(
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
     vm_bits: int = 4,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -1441,7 +1478,7 @@ def _decode_triton(
 
     # `out` is NOT scratch: it leaves this function as the model's attention
     # output and stays live until that layer's o_proj has consumed it.
-    out = torch.empty((B, H_q, D), device=q.device, dtype=q.dtype)
+    out = torch.empty((B, H_q, D), device=q.device, dtype=out_dtype or q.dtype)
     # `wsum` is consumed by the score gather inside `_run_fused` and `wmax` is
     # never read outside the kernel, so both are dead before the next layer runs.
     wsum = _scratch("wsum", (B, H_q, W_phys), torch.float32, q.device)
@@ -1597,8 +1634,12 @@ def _decode_triton(
     # are bucketed by bit length so the fp store's one-token-per-step growth
     # between evictions does not re-trigger the search every step; `B` is exact
     # because it moves the grid.
+    # The output buffer's dtype joins it too: an fp32 OUT (the completion
+    # ablation's epilogue, see `out_dtype`) is a separate specialization, and its
+    # winner is not evidence about the shipped fp16 store's.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
-           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(vm_bits))
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(vm_bits),
+           out.dtype == torch.float32)
 
     def _launch(rung):
         target_keys, num_stages, num_warps = rung
@@ -1651,6 +1692,7 @@ def fused_two_tier_decode(
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
     vm_bits: int = 4,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -1665,6 +1707,10 @@ def fused_two_tier_decode(
         to read the whole tier.
     vm_bits : the width the value centroids were built at (``CardBits.vm``,
         the ``quant_card_bits`` knob); 4 is the shipped card.
+    out_dtype : dtype of the output buffer. ``None`` (shipped) is ``q.dtype``.
+        The completion ablation passes ``float32`` so its epilogue can invert the
+        kernel's output exactly; the kernel's store casts to the buffer's dtype,
+        so the kernel source is the same either way.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
     physical order (body windows, then Q windows). ``W_phys`` counts the **whole**
@@ -1681,4 +1727,4 @@ def fused_two_tier_decode(
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
     return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
-                          sel, logmass, centroids, vm_bits)
+                          sel, logmass, centroids, vm_bits, out_dtype)
