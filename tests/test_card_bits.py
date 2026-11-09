@@ -469,7 +469,7 @@ def test_the_sidecar_record_is_the_parsed_widths():
 
 @pytest.mark.parametrize("runner", [
     "gsm8k_runner", "longbench_runner", "ours_parity_runner", "perf_runner",
-    "ruler_runner",
+    "ruler_runner", "longgenbench_runner",
 ])
 def test_every_runner_forwards_the_knob(runner):
     """A YAML key a runner never forwards is inert, and the run record then

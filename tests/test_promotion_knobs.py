@@ -70,7 +70,7 @@ class TestConfig:
     def test_every_cache_building_runner_threads_the_knobs(self):
         import pathlib
         for f in ("longbench_runner", "ruler_runner", "gsm8k_runner",
-                  "ours_parity_runner"):
+                  "ours_parity_runner", "longgenbench_runner"):
             src = pathlib.Path(f"modules/evaluation/{f}.py").read_text()
             assert "quant_tier_policy_kwargs(cfg.cache)" in src, f
             assert "quant_tier_policy_record(cfg.cache)" in src, f

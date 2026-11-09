@@ -82,6 +82,7 @@ OPERATING_POINT_EXEMPT = {
     "base.yaml": "the schema's defaults, not a run",
     "longbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
     "gsm8k_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "longgenbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
     "eval_parity_base.yaml": "parity harness; budget 0.25 is its own control",
     "eval_parity_ours_eager.yaml": "parity harness; matched to the base arm",
     "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",
@@ -851,6 +852,60 @@ class GSM8KConfig:
 
 
 # ---------------------------------------------------------------------------
+# LongGenBench config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LongGenBenchConfig:
+    """LongGenBench, as SCOPE runs it (mode ``longgenbench``).
+
+    See ``data/longgenbench_loader.py`` for the benchmark, the pin and the
+    settings, and ``modules/evaluation/longgenbench_runner.py`` for the protocol.
+    """
+
+    #: Directory written by ``python -m data.longgenbench_loader --out <dir>``.
+    data_dir: str = "data/longgenbench"
+    #: "4K" (K = 30/30/40, 4,096 new tokens) or "8K" (K = 60/60/80, 7,950).
+    setting: str = "8K"
+    tasks: List[str] = field(default_factory=lambda: ["gsm8k", "mmlu", "csqa"])
+    output_dir: str = "outputs/longgenbench/run"
+    #: Contiguous slice [start, end) of each task's examples, AFTER the MMLU
+    #: drop. The notebook runs a task in chunks this way; None = to the end.
+    start: int = 0
+    end: Optional[int] = None
+    #: Drop MMLU rows 21, 30, 31, 48 as run_longgenbench.py does, so a score is
+    #: comparable with SCOPE's table. False scores all 57 subjects.
+    drop_scope_oom: bool = True
+    skip_oom: bool = False
+    #: torch.cuda.empty_cache() after every example, as the reference does.
+    aggressive_cache_clear: bool = True
+    #: Override the setting's generation budget. Smoke runs only: a lower cap
+    #: cuts the answer list short and is not the benchmark.
+    max_new_tokens: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.setting not in ("4K", "8K"):
+            raise ConfigValidationError(
+                f"longgenbench.setting must be '4K' or '8K', got {self.setting!r}")
+        tasks = [self.tasks] if isinstance(self.tasks, str) else list(self.tasks)
+        bad = [t for t in tasks if t not in ("gsm8k", "mmlu", "csqa")]
+        if bad or not tasks:
+            raise ConfigValidationError(
+                f"longgenbench.tasks must be a non-empty subset of gsm8k/mmlu/csqa, got {self.tasks!r}")
+        self.tasks = tasks
+        if isinstance(self.start, bool) or not isinstance(self.start, int) or self.start < 0:
+            raise ConfigValidationError(f"longgenbench.start must be an int >= 0, got {self.start!r}")
+        if self.end is not None and (isinstance(self.end, bool) or not isinstance(self.end, int)
+                                     or self.end <= self.start):
+            raise ConfigValidationError(
+                f"longgenbench.end must be None or an int > start, got {self.end!r}")
+        if self.max_new_tokens is not None and self.max_new_tokens < 1:
+            raise ConfigValidationError(
+                f"longgenbench.max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}")
+
+
+# ---------------------------------------------------------------------------
 # ExperimentConfig (top-level)
 # ---------------------------------------------------------------------------
 
@@ -873,6 +928,7 @@ class ExperimentConfig:
     longbench: LongBenchConfig = field(default_factory=LongBenchConfig)
     ruler: RulerConfig = field(default_factory=RulerConfig)
     gsm8k: GSM8KConfig = field(default_factory=GSM8KConfig)
+    longgenbench: LongGenBenchConfig = field(default_factory=LongGenBenchConfig)
 
     # Paths
     base_run_npz: Optional[str] = None
@@ -927,6 +983,7 @@ def _dict_to_config(d: dict[str, Any]) -> ExperimentConfig:
         longbench=LongBenchConfig(**lb_raw),
         ruler=RulerConfig(**ruler_raw),
         gsm8k=GSM8KConfig(**d.get("gsm8k", {})),
+        longgenbench=LongGenBenchConfig(**d.get("longgenbench", {})),
         base_run_npz=d.get("base_run_npz"),
         output_path=d.get("output_path"),
     )

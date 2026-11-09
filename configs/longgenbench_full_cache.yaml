@@ -1,0 +1,37 @@
+# ============================================================================
+# LongGenBench — full-cache baseline (SCOPE's ALLKV)
+# ============================================================================
+# The reference every compressed run is read against. On Llama-3.1-8B-Instruct
+# SCOPE publishes 44.44 / 51.01 / 64.92 (gsm8k / mmlu / csqa) in the 8K setting
+# and 53.26 / 54.40 / 71.67 in 4K; data/longgenbench_loader.REFERENCE_FILES
+# carries those numbers and SCOPE's own predictions to compare against.
+#
+# Produces: outputs/longgenbench/8K/fullkv/{<task>.jsonl, <task>.meta.json}
+_base_: base.yaml
+
+run:
+  mode: longgenbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: null
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic          # DynamicCache: no eviction, no quantization
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longgenbench:
+  data_dir: data/longgenbench
+  setting: 8K
+  tasks: [gsm8k, mmlu, csqa]
+  output_dir: outputs/longgenbench/8K/fullkv
+  drop_scope_oom: true
+  skip_oom: false
+  aggressive_cache_clear: true

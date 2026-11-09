@@ -32,3 +32,4 @@ data/pg19/
 # Harness state (worktrees, agent metadata)
 .claude/
 data/gsm8k_cot/
+data/longgenbench/

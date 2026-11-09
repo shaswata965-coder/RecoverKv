@@ -51,7 +51,7 @@ silent no-cards case, which looks exactly like success everywhere else.
 `flash_decode.expect_gated(backend, quant_ratio, cuda)` is the single definition
 of "should this have gated" (flash backend, `quant_ratio > 0`, CUDA), and
 `gate_report` turns the counters into one of four stable verdicts — `gated`,
-`not-expected`, `NOT-GATED-kernel-never-fired`, `NOT-GATED-partial`. LongBench,
+`not-expected`, `NOT-GATED-kernel-never-fired`, `NOT-GATED-partial`. LongBench, LongGenBench,
 GSM8K, RULER and the parity ours run record it as `read_gate` in their metadata
 sidecars (the parity run also records the gate's pick, `gate_read`, which the
 observation suite's read ledger scores per query head — `DISTANCE_TO_GOAL.md` §13); perf records

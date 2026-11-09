@@ -1,0 +1,58 @@
+# ============================================================================
+# LongGenBench — Ours (flash-attn backend), at the shipped operating point
+# ============================================================================
+# LongGenBench (Liu et al., EMNLP'24 Findings) as SCOPE (Wu et al., ACL'25)
+# packages and runs it: K questions in one prompt, answered in one long
+# generation (8K setting: 60/60/80 questions, 7,950 new tokens). The prompt is a
+# few thousand tokens and the answer is the long part, so this scores the
+# DECODE phase -- every token after the first comes from the budgeted cache.
+#
+#   python -m data.longgenbench_loader --out data/longgenbench --setting 8K
+#   python main.py --config configs/longgenbench_ours_flash.yaml
+#
+# The budget is cache_budget * (prompt + max_new_tokens), the method's own
+# definition. Colab: notebooks/longgenbench_colab.ipynb.
+#
+# Produces: outputs/longgenbench/8K/ours/{<task>.jsonl, <task>.meta.json}
+_base_: base.yaml
+
+run:
+  mode: longgenbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: null
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  # Pinned to utils.config.OPERATING_POINT -- the one point speed and quality
+  # are both measured at. scripts/check_operating_point.py fails if it drifts.
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_budget_mode: bytes
+  quant_gate_ratio: 0.25
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longgenbench:
+  data_dir: data/longgenbench
+  setting: 8K
+  tasks: [gsm8k, mmlu, csqa]
+  output_dir: outputs/longgenbench/8K/ours
+  drop_scope_oom: true       # SCOPE drops MMLU rows 21, 30, 31, 48; keep for comparability
+  skip_oom: false
+  aggressive_cache_clear: true

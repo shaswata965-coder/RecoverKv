@@ -433,6 +433,7 @@ of four stable verdicts (`gated`, `not-expected`, `NOT-GATED-kernel-never-fired`
 |---|---|
 | LongBench | `read_gate` in the per-dataset metadata sidecar |
 | GSM8K | `read_gate` in the metadata sidecar |
+| LongGenBench | `read_gate` in the per-task metadata sidecar (counters reset per task) |
 | RULER | `read_gate` in the per-task metadata sidecar |
 | perf | `diagnostics.<config>.gate` in the npz, printed under the table |
 
@@ -2061,3 +2062,51 @@ compares `cache_step_mass` with `full_mass`, whose normalisers differ per step
 (`Z_A · den` against the full-KV `Z`); compare within a step, against the read
 windows, or use `comp_*`.
 
+## 15. LongGenBench, wired: the long-generation quality run — 2026-11-09
+
+LongBench answers are short (at most 512 tokens), so its scores mostly test the
+prompt compression on decode step 0. LongGenBench (Liu et al., EMNLP'24
+Findings) is the other regime: K questions in one prompt, all answered in one
+generation of up to 7,950 tokens, so the answer is the long part and nearly
+every token is decoded from the budgeted cache. It is the benchmark SCOPE
+(Wu et al., ACL'25) uses for decode-phase compression on Llama-3.1-8B-Instruct,
+and SCOPE publishes its full-cache predictions.
+
+**What was built.** `mode: longgenbench`
+(`modules/evaluation/longgenbench_runner.py`), the pinned loader
+(`data/longgenbench_loader.py`, SCOPE @ `8cbae48`, SHA-256 per file), the metric
+(`modules/evaluation/longgenbench_scoring.py`), two configs
+(`configs/longgenbench_{ours_flash,full_cache}.yaml`, the first at
+`OPERATING_POINT`), and `notebooks/longgenbench_colab.ipynb`. The protocol is
+SCOPE's `run_longgenbench.py`: its Llama-3 prompt format (not the chat
+template), greedy, `eos = [<|eot_id|>]`, B = 1, fp16, flash-attn 2. Two
+reference quirks are kept because the published numbers include them: the MMLU
+system prompt never receives its subject, and MMLU rows 21/30/31/48 are dropped.
+
+**Measured, CPU-only.** Re-scoring SCOPE's own full-cache predictions with the
+metric here returns its six published scores exactly (8K: 44.4444 / 51.0063 /
+64.9167; 4K: 53.2558 / 54.4025 / 71.6667), and every prompt SCOPE recorded is
+rebuilt byte for byte (`tests/test_longgenbench.py`, 12 cases). The runner was
+run end to end on a stub model, full-cache path only.
+
+**The reference metric pairs answers by position.** One skipped answer shifts
+every later one onto the wrong gold. On SCOPE's own full-cache GSM8K
+predictions that costs about 10 points (8K: 44.44 positional, 54.29 when
+`Answer_N` is paired with question N under the same pattern; 4K: 53.26 vs
+64.26). So the table reports `acc` (the reference metric), `acc_aligned` and
+`coverage`, and a compressed arm that changes how often answers are skipped
+moves `acc` for a reason that is not arithmetic. Read all three.
+
+**Arithmetic, not measured.** At the operating point and a 5,000-token prompt in
+the 8K setting, `resolve()` gives 869 fp16 keys, 818 int2 windows and 7,413 keys
+kept in total: the prompt is int2-compressed on decode step 0 and keys are first
+dropped about 2,400 generated tokens in. The budget is sized on
+`max_new_tokens`, so an answer that stops early holds more than `cache_budget`
+of its own sequence; each record carries `kv_bytes_fraction_upper`. The
+notebook's time table (about 4 h fullkv, about 8 h ours, 8K, one A100) assumes
+30 and 55 ms/token.
+
+**Not verified.** Any GPU execution. No LongGenBench score exists for this
+method, and whether the full-cache arm reproduces SCOPE's numbers on this stack
+(transformers 4.47.1 against its 4.44.2) is unknown until it runs. The notebook
+reports that comparison beside every result.

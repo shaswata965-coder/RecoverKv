@@ -106,7 +106,8 @@ class TestEncodePrompt:
         P._warned_duplicate[0] = False
 
 
-@pytest.mark.parametrize("runner", ["longbench_runner", "gsm8k_runner", "ruler_runner"])
+@pytest.mark.parametrize("runner", ["longbench_runner", "gsm8k_runner", "ruler_runner",
+                                    "longgenbench_runner"])
 def test_every_chat_templated_runner_uses_encode_prompt(runner):
     """No runner may go back to a bare tokenizer() on a templated prompt."""
     import importlib

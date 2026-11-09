@@ -52,6 +52,7 @@ def test_the_decode_graph_is_not_on_by_default(monkeypatch):
     "longbench_ours_flash_attn.yaml",
     "longbench_ours_eager.yaml",
     "gsm8k_budget20.yaml",
+    "longgenbench_ours_flash.yaml",
 ])
 def test_the_quality_configs_resolve_the_same_cache(name):
     """The flash and eager arms are meant to be the same method by two routes,

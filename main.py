@@ -32,6 +32,7 @@ _RUNNER_REGISTRY: dict[str, str] = {
     "ruler_score": "modules.evaluation.ruler_scoring.RulerScorer",
     "gsm8k": "modules.evaluation.gsm8k_runner.GSM8KRunner",
     "gsm8k_score": "modules.evaluation.gsm8k_scoring.GSM8KScorer",
+    "longgenbench": "modules.evaluation.longgenbench_runner.LongGenBenchRunner",
     "visualize": "modules.evaluation.visualize.VisualizeRunner",
 }
 
