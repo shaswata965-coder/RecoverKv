@@ -1014,7 +1014,8 @@ class WindowedCache(_HFCacheBase):
     Rows evict divergently — each ranks its own windows — but the tier split
     keeps the same *count* per row, so both tiers stay dense and rectangular
     (BATCHING_PLAN.md §3). Ragged / left-padded batches are not implemented, at
-    either tier (BATCHING_PLAN.md §4 Phase 3).
+    either tier (BATCHING_PLAN.md §4 Phase 3). On DeepSeek-V2, a left-padded
+    batch runs as one cache per row (``models/deepseek_v2/row_batch.py``).
 
     Parameters
     ----------

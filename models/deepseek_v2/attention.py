@@ -52,6 +52,7 @@ from modules.windowed_cache.scorer import (
 
 from .geometry import MLAGeometry
 from .rope import apply_rotary, cos_sin, ensure_table
+from .row_batch import RowBatchCache, attend_rows
 
 
 #: Per-step evidence of which attention path served each call, keyed by path.
@@ -100,7 +101,9 @@ def _reject_padding_decode(attention_mask: Optional[Tensor], flash: bool) -> Non
         raise RuntimeError(
             "a padding attention mask reached the RecoverKV MLA decode. The cache "
             "models equal-length prompts only (BATCHING_PLAN.md §4) -- a padded "
-            "row would attend over keys it must not see. Use equal-length prompts.")
+            "row would attend over keys it must not see. Use equal-length prompts, "
+            "or run a left-padded batch as one cache per row "
+            "(models.deepseek_v2.row_batch.RowBatchCache).")
 
 
 def _write_scores(cache, layer_idx: int, token_scores: Tensor, score_meta) -> None:
@@ -263,6 +266,11 @@ def mla_attention_forward(
             "generate() supplies them (attention_mask.cumsum - 1); a hand-written "
             "loop must pass them, because an evicting cache's length is not the "
             "next token's position.")
+    if isinstance(past_key_value, RowBatchCache):
+        # A left-padded batch over per-row caches: each row's own tokens go
+        # through this same function as a batch of one (row_batch.py).
+        return attend_rows(self, hidden_states, position_ids, past_key_value,
+                           mla_attention_forward)
     if position_ids.dim() == 1:
         position_ids = position_ids.unsqueeze(0)
     if position_ids.shape[0] != bsz:

@@ -214,14 +214,32 @@ interpreter; nothing has run on a GPU or the real weights.
 
 ### 6.4 The paper run: LongBench at a 10% budget on Colab (2026-11-10)
 
-`notebooks/longbench_deepseek_v2_lite_b010_colab.ipynb` runs QEvict at `cache_budget 0.10` (the paper's Table 2
-"10%" row; local 128, everything else the operating point) and the latent Full-KV reference on the 11 Table 2
-LongBench tasks other than NarrativeQA, on one pinned commit, checkpoint revision and stack (torch 2.6.0, Triton
-3.2.0, transformers 4.47.1, flash-attn 2.7.4.post1, A100 80GB). It runs the benchmark only: one example per
-`generate()` call (batch size 1, as in the paper's LongBench runs), results per task on Drive, resumable by task, and
-each QEvict task's sidecar must report `read_gate: gated`. Larger batches are not offered: the cache batches only
-equal-length prompts, the owned MLA forward rejects padding masks, and at 31.5k tokens the prefill's fp32 logits are
-~13 GB per row (arithmetic), so even 4 rows exceed 80 GB with the weights.
+`notebooks/longbench_deepseek_v2_lite_b010_colab.ipynb` runs QEvict at `cache_budget 0.10` on the 11 Table 2
+LongBench tasks other than NarrativeQA, **under the protocol and batching of the DeepSeek-V2 SnapKV/KVQuant
+baselines** (DefensiveKV's batched kvpress script), so the rows compare. The harness is
+`modules/evaluation/longbench_qevict_batched.py`, a port of that script with the compressor swapped:
+
+* **Protocol, from a pinned DefensiveKV checkout (`9251b95`):** its `context_prompt` / `question_prompt` /
+  `max_new_tokens`, its `KVPressTextGenerationPipeline.preprocess` (source extracted and run unchanged; importing
+  kvpress needs transformers 4.57), its `calculate_metrics`. Context prefilled and compressed, question appended,
+  greedy answer; no chat template and an empty BOS for TREC/TriviaQA/SAMSum. Tokenization is identical under
+  transformers 4.47.1 and 4.57.0 (55 examples, 5 per task, contexts and questions compared id for id).
+* **Batching, the baseline's:** longest contexts first, at most 8 rows and 140,000 padded prefill tokens per batch,
+  no truncation; contexts and question blocks left-padded, per-row positions, lockstep greedy decode, answers cut
+  at the first EOS.
+* **The cache:** one QEvict cache per row (`models/deepseek_v2/row_batch.py`), budget `0.10 x (context + question
+  + max_new_tokens)` per row (the paper's definition). Every non-attention layer runs on the padded batch; attention
+  is split by row, so a row's cache only receives its own tokens. Each row of a padded batch decodes exactly what it
+  decodes alone, and the pad columns' contents change nothing bit for bit (`tests/test_deepseek_row_batch.py`, CPU).
+* **What differs from the SnapKV run:** the question block is fed one column at a time (the cache takes one prompt,
+  then single-token steps through the gated read), so every question token attends to the compressed context and
+  the earlier question tokens, as in a one-shot question forward. Compression happens before the first question
+  token attends (`first_eviction_step = 0`); after that QEvict re-routes every R steps, as it does during
+  generation. The model runs on the repo's stack (remote code + owned MLA forward, latent cache, transformers
+  4.47.1); the baselines run transformers 4.57's native DeepSeek-V2. Same weights and math, different kernels.
+
+Each task's sidecar must report `read_gate: gated`. The earlier version of this notebook ran the paper's THUDM
+protocol at batch size 1; the bullets below date from it.
 
 * **`scripts/deepseek_gpu_preflight.py`** is run separately, before GPU time is spent on the benchmark. On a
   random model with the checkpoint's own attention geometry it checks, on the GPU: the owned forward (FA2 prefill)
