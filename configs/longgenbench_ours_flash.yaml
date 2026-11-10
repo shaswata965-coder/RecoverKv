@@ -55,5 +55,7 @@ longgenbench:
   types: null                # all four: Week, Floor, Menu Week, Block
   output_dir: outputs/longgenbench/16K/ours
   decoding: reference        # the runs behind Table 2: T=0.95, top_p=0.95; greedy = the paper's text
+  batch_size: 16             # equal-length prompts only; on OOM fall back to 8, then 6
+  batch_fallback: [8, 6]
   skip_oom: false
   aggressive_cache_clear: true

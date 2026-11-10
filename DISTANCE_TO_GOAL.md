@@ -2079,7 +2079,7 @@ model attends to is its own output, so it scores the decode-phase cache.
   nothing from this repository, so other baselines' generations are scored with
   the same code.
 * Two configs, and `notebooks/longgenbench_colab.ipynb` (ours → generate →
-  judge → score).
+  judge → score; the whole benchmark at budget 0.10 by default).
 
 **The protocol is the code that produced the paper's Table 2, not the paper's
 prose.** Read from the authors' repository history: the Llama-3.1-8B 16K row
@@ -2101,17 +2101,38 @@ all instructions, wAvg = CR × STIC-2, Len) reproduce 16 of the 18 rows of the
 paper's Table 2 from the authors' own `static.csv` counts, digit for digit. The
 two exceptions are GPT-4o rows with typos in the paper. The pinned data has the
 authors' instruction totals (6,205 / 8,215). `tests/test_longgenbench_eval.py`
-(31) and `tests/test_longgenbench.py` (5) pin parsing, the judge prompt, the
-verdict rule, the judge driver and the runner's protocol. The notebook was driven
-end to end on stub models (generation, one batched judge pass, scoring, reuse),
-and 25 tampered generation sidecars were each refused.
+(31) and `tests/test_longgenbench.py` (10) pin parsing, the judge prompt, the
+verdict rule, the judge driver, the runner's protocol, equal-length batching and
+the out-of-memory fallback. The notebook was driven end to end on stub models
+over all 400 documents, with the real prompt lengths and one injected
+out-of-memory event (generation, one batched judge pass, scoring, reuse), and 18
+tampered batched sidecars were each refused.
 
-**Arithmetic, not measured.** At the operating point and a 700-token prompt,
-`resolve()` gives about 1,090 fp16 keys and 1,070 int2 windows (9,600 keys kept):
-the int2 tier and the read gate start ~400 generated tokens in, and keys are
-first dropped ~8,900 tokens in. The notebook's default (5 documents per type,
-ours only) is ~4 h on one A100 at ~55 ms/token; the whole benchmark at B = 1 is
-days, so a run is a declared subset.
+**Arithmetic, not measured.** At the operating point (budget 0.20) and a
+700-token prompt, `resolve()` gives about 1,090 fp16 keys and 1,070 int2 windows
+(9,600 keys kept): the int2 tier and the read gate start ~400 generated tokens
+in, and keys are first dropped ~8,900 tokens in. At budget 0.10, the notebook's
+default, it is ~590 fp16 keys and ~510 int2 windows (4,660 keys kept), with keys
+first dropped ~4,000 tokens in.
+
+**Batched, equal-length only.** The notebook now runs the whole benchmark,
+batched (cap 16, falling back to 8 then 6 on out-of-memory). `WindowedCache`
+serves `B > 1` only for equal-length prompts (no padding; a padding mask would
+also send flash-attention down the varlen path the fused decode refuses), so a
+batch holds documents of one prompt token length
+(`modules/evaluation/longgenbench_batching.py`). The 400 prompts have 54
+distinct lengths: 58 batches of ~6.9 documents at cap 16. Most batches decode to
+16,000 steps, so the run is ~58 × 16,000 × (ms per step): ~18 h at 70 ms/step,
+which is a guess until the smoke run measures it. The first Colab smoke run
+(B = 1, budget 0.10, 2,048 tokens) took 535 s including the fresh process's
+compiles; the per-step clock added since separates the two.
+
+**The first Colab run found two things.** The judge's vLLM 0.8.5 environment,
+resolved with open-ended dependencies, pulled in transformers 5.x and could not
+load a tokenizer; the judge now installs from a lock resolved as of May 2025
+(`longgenbench_eval/requirements-judge.lock.txt`). And the run was at budget
+0.10 while 0.20 was intended, with nothing saying so; the notebook now prints the
+settings and flags a difference from `OPERATING_POINT` before it runs.
 
 **Not verified.** Any GPU execution, including the vLLM judge (0.8.5.post1 in its
 own virtualenv, because vLLM needs transformers ≥ 4.51 and the cache refuses

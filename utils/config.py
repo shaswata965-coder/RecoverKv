@@ -875,6 +875,17 @@ class LongGenBenchConfig:
     #: Contiguous slice [start, end) of EACH type's documents, in file order.
     start: int = 0
     end: Optional[int] = None
+    #: Explicit document ids (indices in the data file), any types; overrides
+    #: types/start/end. The Colab notebook runs a part this way.
+    ids: Optional[List[int]] = None
+    #: Explicit batches (lists of ids, each of one prompt length); default: planned
+    #: by longgenbench_batching.plan_batches. Only equal-length batches exist: the
+    #: windowed cache takes no padding.
+    batches: Optional[List[List[int]]] = None
+    #: Documents decoded together, and the sizes to fall back to, in order, when a
+    #: batch runs out of GPU memory.
+    batch_size: int = 16
+    batch_fallback: List[int] = field(default_factory=lambda: [8, 6])
     #: "reference": the sampling of the runs behind the paper's Table 2
     #: (inference.py: T=0.95, top_p=0.95, seed 6211027 per document);
     #: "greedy": what the paper's text says. See longgenbench_eval/reference.py.
@@ -908,6 +919,23 @@ class LongGenBenchConfig:
         if self.max_new_tokens is not None and self.max_new_tokens < 1:
             raise ConfigValidationError(
                 f"longgenbench.max_new_tokens must be >= 1 or None, got {self.max_new_tokens!r}")
+        if isinstance(self.batch_size, bool) or not isinstance(self.batch_size, int) or self.batch_size < 1:
+            raise ConfigValidationError(f"longgenbench.batch_size must be an int >= 1, got {self.batch_size!r}")
+        fb = list(self.batch_fallback or [])
+        if any(isinstance(x, bool) or not isinstance(x, int) or x < 1 for x in fb) or \
+                fb != sorted(fb, reverse=True) or (fb and fb[0] >= self.batch_size):
+            raise ConfigValidationError(
+                "longgenbench.batch_fallback must be decreasing ints below batch_size, "
+                f"got {self.batch_fallback!r} with batch_size {self.batch_size}")
+        self.batch_fallback = fb
+        if self.ids is not None:
+            self.ids = [int(i) for i in self.ids]
+            if not self.ids or len(set(self.ids)) != len(self.ids):
+                raise ConfigValidationError("longgenbench.ids must be non-empty and unique")
+        if self.batches is not None:
+            if self.ids is None:
+                raise ConfigValidationError("longgenbench.batches needs longgenbench.ids")
+            self.batches = [[int(i) for i in b] for b in self.batches]
 
 
 # ---------------------------------------------------------------------------

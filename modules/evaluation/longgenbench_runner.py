@@ -11,25 +11,34 @@ paper's Table 2 did (``longgenbench_eval/reference.py``: ``inference.py`` @
   (16,000 for ``16K``, 32,000 for ``32K``);
 * ``output = prefix + generation``, written as ``{"id", "output", ...}`` lines
   that ``longgenbench_eval`` judges and scores like any baseline's;
-* decoding ``reference`` (the code: temperature 0.95, top_p 0.95, no top-k, the
-  same seed for every document, as vLLM's per-request seed) or ``greedy`` (what
-  the paper's text says); batch size 1, flash-attention-2.
+* decoding ``reference`` (the code: temperature 0.95, top_p 0.95, no top-k, one
+  seed set before every batch) or ``greedy`` (what the paper's text says);
+  flash-attention-2.
+
+**Batched, equal-length only.** Documents are grouped by exact prompt token
+length and decoded ``batch_size`` at a time (``longgenbench_batching``): the
+windowed cache keeps rows rectangular and takes no padding, and a padding mask
+would send flash-attention down the varlen path the fused decode refuses. A
+batch that runs out of memory is re-run in smaller batches down
+``batch_fallback`` (16 -> 8 -> 6), and the smaller cap holds for the rest of the
+run; every such event is in the sidecar.
 
 The cache is the only thing that differs between arms: ``cache.backend:
 dynamic`` is the full-cache baseline, ``windowed`` + ``flash_attn`` is this
 repo's method, built exactly as the GSM8K and LongBench runners build it.
 
-Each type writes ``<type>.jsonl`` and ``<type>.meta.json``. The sidecar carries
-what makes the number attributable: the read-gate verdict (counters reset per
-type), the operating point, the resolved geometry, the dataset pin and hash, the
-decoding, and a compression record. The budget is ``cache_budget * (prompt +
-max_new_tokens)``, the method's own definition; a document that stops short of
-``max_new_tokens`` holds more than ``cache_budget`` of its own sequence, and
-``kv_bytes_fraction_upper`` says how much.
+A run writes ``generations.jsonl`` (one record per document) and
+``generations.meta.json``. The sidecar carries what makes the number
+attributable: the read-gate verdict (counters reset per run), the operating
+point, the resolved geometry, the dataset pin and hash, the decoding, the planned
+and realised batches, and a compression record. The budget is ``cache_budget *
+(prompt + max_new_tokens)``, the method's own definition; a document that stops
+short of ``max_new_tokens`` holds more than ``cache_budget`` of its own sequence,
+and ``kv_bytes_fraction_upper`` says how much.
 
-Timing fields (``wall_s``, ``decode_tokps_wallclock``) are wall clock inside a
-quality run: prefill, eviction compiles and Python overhead included. They are
-not a performance measurement; ``mode: perf`` is.
+Timing fields are wall clock inside a quality run: the first token carries the
+process's compiles and tile searches, and one decode step serves every row of a
+batch. They are not a performance measurement; ``mode: perf`` is.
 """
 
 from __future__ import annotations
@@ -44,7 +53,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from longgenbench_eval.data import dataset_sha, load_type, type_slug
+from longgenbench_eval.data import dataset_sha, load_all, load_type
 from longgenbench_eval.metrics import completion_rate, parse_blocks, split_blocks, word_count
 from longgenbench_eval.reference import (
     CODE_REPO,
@@ -58,6 +67,7 @@ from longgenbench_eval.reference import (
     STOP_STRING,
     TYPES,
 )
+from modules.evaluation.longgenbench_batching import next_smaller, plan_batches, split_evenly
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.env_capture import capture_environment
 from utils.logger import get_logger
@@ -200,98 +210,153 @@ class LongGenBenchRunner:
     # run
     # ------------------------------------------------------------------
 
+    def _select_docs(self) -> List[Dict[str, Any]]:
+        """``longgenbench.ids`` if given (any types, in that order), else every
+        type's ``[start:end]`` slice."""
+        lg = self.lg
+        if lg.ids:
+            by_id = {d["id"]: d for d in load_all(lg.data_dir, lg.setting)}
+            missing = [i for i in lg.ids if i not in by_id]
+            if missing:
+                raise ValueError(f"longgenbench.ids not in the {lg.setting} dataset: {missing[:10]}")
+            return [by_id[i] for i in lg.ids]
+        docs: List[Dict[str, Any]] = []
+        for t in self._types():
+            docs += load_type(lg.data_dir, lg.setting, t, lg.start, lg.end)
+        return docs
+
+    def _plan(self, docs: List[Dict[str, Any]], lengths: Dict[int, int]) -> List[List[int]]:
+        """The batches to run: ``longgenbench.batches`` if given (validated), else planned."""
+        lg = self.lg
+        if not lg.batches:
+            return plan_batches(lengths, int(lg.batch_size), order=[d["id"] for d in docs])
+        batches = [[int(i) for i in b] for b in lg.batches]
+        flat = [i for b in batches for i in b]
+        if sorted(flat) != sorted(d["id"] for d in docs) or len(flat) != len(set(flat)):
+            raise ValueError("longgenbench.batches must cover exactly the selected documents, once each")
+        for b in batches:
+            if len(b) > int(lg.batch_size):
+                raise ValueError(f"batch {b} is larger than longgenbench.batch_size={lg.batch_size}")
+            if len({lengths[i] for i in b}) != 1:
+                raise ValueError(f"batch {b} mixes prompt lengths {sorted({lengths[i] for i in b})}: "
+                                 "batches must be equal-length (the cache does not take padding)")
+        return batches
+
     def run(self) -> None:
         if self.is_windowed:
             from utils.cache_factory import assert_transformers_version_supported
 
             assert_transformers_version_supported()
-        lg = self.lg
-        types = self._types()
-        dataset_sha(lg.data_dir, lg.setting)   # missing or altered data: fail before a model load
-
-        self.model, self.tokenizer = self._load_model_and_tokenizer()
-        output_dir = Path(lg.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        log.info("LongGenBench %s: types=%s, documents [%s, %s) of each, decoding=%s, "
-                 "windowed=%s, out=%s", lg.setting, types, lg.start, lg.end, lg.decoding,
-                 self.is_windowed, output_dir)
-        log_operating_point(self.config, self.is_windowed)
-        for t in types:
-            self._run_type(t, output_dir)
-        log.info("LongGenBench run complete. Outputs in %s", output_dir)
-
-    def _run_type(self, type_: str, output_dir: Path) -> None:
         from modules.windowed_cache import flash_decode
 
         lg = self.lg
-        docs = load_type(lg.data_dir, lg.setting, type_, lg.start, lg.end)
+        dataset_sha(lg.data_dir, lg.setting)   # missing or altered data: fail before a model load
+        docs = self._select_docs()
         if not docs:
-            raise ValueError(f"{type_}: no documents in [{lg.start}, {lg.end})")
+            raise ValueError("no documents selected")
+        self.model, self.tokenizer = self._load_model_and_tokenizer()
+        lengths = {d["id"]: int(encode_prompt(self.tokenizer, d["prompt"], truncation=False,
+                                              return_tensors="pt").input_ids.shape[-1]) for d in docs}
+        batches = self._plan(docs, lengths)
+        by_id = {d["id"]: d for d in docs}
         max_new = self._max_new_tokens()
-        log.info("=== %s %s: %d documents (ids %d..%d), %d entries each, max_new_tokens=%d ===",
-                 lg.setting, type_, len(docs), docs[0]["id"], docs[-1]["id"],
-                 docs[0]["number"], max_new)
+        self._cap = int(lg.batch_size)
+        sizes = sorted({int(lg.batch_size), *map(int, lg.batch_fallback)}, reverse=True)
+        output_dir = Path(lg.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log.info("LongGenBench %s: %d documents in %d equal-length batches (cap %d, fallback %s), "
+                 "max_new_tokens=%d, decoding=%s, windowed=%s, out=%s", lg.setting, len(docs),
+                 len(batches), self._cap, sizes[1:], max_new, lg.decoding, self.is_windowed, output_dir)
+        log_operating_point(self.config, self.is_windowed)
 
-        # Process-global, cumulative counters: zero them so this type's sidecar
-        # describes this type's decode steps and nothing else.
+        # Process-global, cumulative counters: zero them so this run's sidecar
+        # describes this run's decode steps and nothing else.
         flash_decode.reset_stats()
         self._reset_type_state()
-
-        slug = type_slug(type_)
+        self._realised: List[Dict[str, Any]] = []
+        self._oom_events: List[Dict[str, Any]] = []
         run_start = time.time()
-        n_oom = tot_gen = 0
-        tot_wall = peak = 0.0
-        with open(output_dir / f"{slug}.jsonl", "w", encoding="utf-8") as f:
-            for i, d in enumerate(docs):
-                try:
-                    output, stats = self._generate(d, max_new)
-                except torch.cuda.OutOfMemoryError:
-                    if not getattr(lg, "skip_oom", False):
+        n_done = 0
+        with open(output_dir / "generations.jsonl", "w", encoding="utf-8") as f:
+            for bi, planned in enumerate(batches):
+                for rec in self._run_planned(bi, [by_id[i] for i in planned], max_new, sizes):
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    f.flush()
+                    n_done += 1
+                log.info("  batch %d/%d done (%d/%d documents)", bi + 1, len(batches), n_done, len(docs))
+        self._report_compression("all")
+        self._write_meta(docs, batches, lengths, max_new, run_start, time.time(), output_dir)
+        log.info("LongGenBench run complete. Outputs in %s", output_dir)
+
+    def _run_planned(self, bi: int, docs: List[Dict[str, Any]], max_new: int,
+                     sizes: List[int]) -> List[Dict[str, Any]]:
+        """One planned batch, split down the fallback sizes if it runs out of memory."""
+        out: List[Dict[str, Any]] = []
+        pending = split_evenly([d["id"] for d in docs], self._cap) if len(docs) > self._cap else [
+            [d["id"] for d in docs]]
+        by_id = {d["id"]: d for d in docs}
+        while pending:
+            ids = pending.pop(0)
+            try:
+                recs = self._generate_batch(bi, [by_id[i] for i in ids], max_new)
+            except torch.cuda.OutOfMemoryError:
+                self._recover_from_oom()
+                smaller = next_smaller(len(ids), sizes)
+                self._oom_events.append({"batch": bi, "ids": ids, "size": len(ids), "fell_back_to": smaller})
+                if smaller is None:
+                    if not getattr(self.lg, "skip_oom", False):
                         raise
-                    log.warning("%s id %d: OOM, recording a null output", type_, d["id"])
-                    output, stats = None, {"oom": True}
-                    n_oom += 1
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                cr = (completion_rate(parse_blocks(split_blocks(output), type_), d["number"])
-                      if output is not None else 0.0)
-                record = {
-                    "id": d["id"], "type": type_, "number": d["number"], "prefix": d["prefix"],
-                    "checks_once": d["checks_once"], "checks_range": d["checks_range"],
-                    "checks_periodic": d["checks_periodic"],
-                    "output": output,
-                    "n_blocks": len(split_blocks(output)) if output is not None else 0,
-                    "word_count": word_count(output) if output is not None else 0,
-                    "completion_rate": round(cr, 2),
-                    **stats,
-                }
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                f.flush()
-                self._step_ms.append(stats.get("decode_ms_per_token"))
-                tot_gen += int(stats.get("gen_tokens") or 0)
-                tot_wall += float(stats.get("wall_s") or 0.0)
-                peak = max(peak, float(stats.get("peak_mem_gib") or 0.0))
-                log.info("  %s %d/%d (id %d): %s new tokens in %.0f s (first token %s s, then %s ms/token; "
-                         "%s ms/token typical late), %d words, CR %.1f%%, stopped on %s", type_, i + 1,
-                         len(docs), d["id"], stats.get("gen_tokens"), stats.get("wall_s") or 0.0,
-                         stats.get("first_token_s"), stats.get("decode_ms_per_token"),
-                         stats.get("decode_ms_per_token_last_half_median"), record["word_count"], cr,
-                         stats.get("stopped_on"))
-        self._report_compression(type_)
-        self._write_meta(type_, docs, max_new, n_oom, run_start, time.time(),
-                         tot_gen, tot_wall, peak, output_dir)
+                    log.warning("batch %d: %d documents ran out of memory at the smallest allowed size; "
+                                "recording null outputs", bi, len(ids))
+                    recs = [self._record(by_id[i], None, {"oom": True, "batch": bi, "batch_size": len(ids),
+                                                          "batch_ids": ids}) for i in ids]
+                    self._realised.append({"batch": bi, "ids": ids, "size": len(ids), "oom": True})
+                    out += recs
+                    continue
+                log.warning("batch %d: out of memory at %d documents; batch size falls back to %d for the "
+                            "rest of this run", bi, len(ids), smaller)
+                self._cap = min(self._cap, smaller)
+                pending = split_evenly(ids, smaller) + pending
+                continue
+            out += recs
+        return out
+
+    def _recover_from_oom(self) -> None:
+        """Free what the failed batch held and disarm the fused path it left armed."""
+        from modules.windowed_cache import flash_decode
+
+        flash_decode._PENDING["ctx"] = None   # an OOM between arming and firing leaves it set
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _record(self, d: Dict[str, Any], output: Optional[str], stats: Dict[str, Any]) -> Dict[str, Any]:
+        cr = completion_rate(parse_blocks(split_blocks(output), d["type"]), d["number"]) if output else 0.0
+        return {
+            "id": d["id"], "type": d["type"], "number": d["number"], "prefix": d["prefix"],
+            "checks_once": d["checks_once"], "checks_range": d["checks_range"],
+            "checks_periodic": d["checks_periodic"],
+            "output": output,
+            "n_blocks": len(split_blocks(output)) if output is not None else 0,
+            "word_count": word_count(output) if output is not None else 0,
+            "completion_rate": round(cr, 2),
+            **stats,
+        }
 
     # ------------------------------------------------------------------
-    # generate one document
+    # generate one batch (equal-length prompts, no padding)
     # ------------------------------------------------------------------
 
-    def _generate(self, d: Dict[str, Any], max_new: int) -> Tuple[str, Dict[str, Any]]:
+    def _generate_batch(self, bi: int, docs: List[Dict[str, Any]], max_new: int) -> List[Dict[str, Any]]:
         model, tokenizer = self.model, self.tokenizer
-        prompt = d["prompt"]
-        inputs = encode_prompt(tokenizer, prompt, truncation=False, return_tensors="pt")
-        input_ids = inputs.input_ids.to(model.device)
-        attention_mask = inputs.attention_mask.to(model.device)
-        ctx = int(input_ids.shape[-1])
+        rows = [encode_prompt(tokenizer, d["prompt"], truncation=False, return_tensors="pt").input_ids[0]
+                for d in docs]
+        ctx = int(rows[0].shape[-1])
+        if any(int(r.shape[-1]) != ctx for r in rows):
+            raise ValueError(f"batch {bi}: prompts of different lengths {[int(r.shape[-1]) for r in rows]}; "
+                             "batches must be equal-length (the cache does not take padding)")
+        input_ids = torch.stack(rows).to(model.device)
+        attention_mask = torch.ones_like(input_ids)      # no padding, so transformers never goes varlen
         self._warn_if_over_context(ctx, max_new)
 
         cache = hooks = None
@@ -299,11 +364,12 @@ class LongGenBenchRunner:
             cache, hooks = self._setup_windowed_cache(input_ids, max_new)
 
         eos_ids = self._eos_ids()
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos_ids[0]
         gen_kwargs: Dict[str, Any] = {
             "attention_mask": attention_mask,
             "max_new_tokens": max_new,
             "eos_token_id": eos_ids,
-            "pad_token_id": tokenizer.pad_token_id or eos_ids[0],
+            "pad_token_id": pad_id,
             "stop_strings": [STOP_STRING],
             "tokenizer": tokenizer,
             "num_beams": 1,
@@ -311,9 +377,9 @@ class LongGenBenchRunner:
         if self.lg.decoding == "greedy":
             gen_kwargs.update(do_sample=False, temperature=1.0, top_p=1.0)
         else:
-            # vLLM's SamplingParams(seed=...) seeds every request with the same
-            # seed; so does this, and both arms of a comparison draw from the
-            # same stream until the cache makes their distributions differ.
+            # One seed, set before every batch: a batch is a deterministic function
+            # of its documents, and both arms of a comparison start each batch from
+            # the same generator state.
             torch.manual_seed(int(self.lg.sample_seed))
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(int(self.lg.sample_seed))
@@ -323,7 +389,6 @@ class LongGenBenchRunner:
             gen_kwargs["output_attentions"] = True
         if cache is not None:
             gen_kwargs["past_key_values"] = cache
-
         clock = _StepClock()
         gen_kwargs["stopping_criteria"] = StoppingCriteriaList([clock])
 
@@ -341,68 +406,79 @@ class LongGenBenchRunner:
         if cuda:
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
-
-        new = out[0][ctx:]
-        n_gen = int(new.shape[-1])
-        text = tokenizer.decode(new, skip_special_tokens=True)
-        # vLLM's stop string ends the text BEFORE the string; HF keeps it.
-        cut = text.find(STOP_STRING)
-        if cut >= 0:
-            text = text[:cut]
-            stopped_on = "stop_string"
-        elif n_gen and int(new[-1]) in eos_ids:
-            stopped_on = "eos"
-        elif n_gen >= max_new:
-            stopped_on = "max_new_tokens"
-        else:
-            stopped_on = "other"
-        output = d["prefix"] + text              # inference.py: input['prefix'] + output.text
-        seq = ctx + n_gen
-        stats: Dict[str, Any] = {
-            "prompt_tokens": ctx,
-            "gen_tokens": n_gen,
-            "hit_token_cap": n_gen >= max_new,
-            "stopped_on": stopped_on,
-            "wall_s": round(wall, 3),
-            "decode_tokps_wallclock": round(n_gen / wall, 2) if wall > 0 else None,
-            **clock.summary(t0),
-            "peak_mem_gib": (round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)
-                             if cuda else None),
-            "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16],
+        timing = clock.summary(t0)
+        ids = [d["id"] for d in docs]
+        batch_stats = {
+            "batch": bi, "batch_size": len(docs), "batch_ids": ids, "batch_steps": len(clock.t),
+            "batch_wall_s": round(wall, 3),
+            "first_token_s": timing["first_token_s"],
+            # one decode step serves every row of the batch
+            "decode_ms_per_step": timing["decode_ms_per_token"],
+            "decode_ms_per_step_last_half_median": timing["decode_ms_per_token_last_half_median"],
+            "peak_mem_gib": round(torch.cuda.max_memory_allocated() / 2 ** 30, 3) if cuda else None,
         }
-        if cache is not None:
-            r = cache.resolved
-            cap = int(r.retained_tokens)
-            # Keys the fp16 tier (sink + local + top_k_fp windows) can hold. A
-            # longer sequence has int2 windows, so the read gate has something to
-            # select over; longer than `cap`, keys have been dropped.
-            fp_cap = int(r.num_sink_tokens + r.local_tokens + r.top_k_fp * r.window_size)
-            stats.update({
-                "budget_tokens": int(r.total_budget_tokens),
-                "retained_tokens_cap": cap,
-                "fp_tokens_cap": fp_cap,
-                "N_q": int(r.N_q),
-                "int2_used": seq > fp_cap,
-                "evicted": seq > cap,
-                # Upper bound on the KV bytes held at the end of this document,
-                # as a fraction of what the full cache holds for the same sequence.
-                "kv_bytes_fraction_upper": round(
-                    min(1.0, r.retained_bytes / max(seq * r.bytes_per_token, 1)), 4),
-            })
-            self._retained.append(min(cap, seq))
-            self._sequence.append(seq)
-            self._bytes_frac.append(stats["kv_bytes_fraction_upper"])
-            self._n_no_eviction += int(not stats["evicted"])
-            self._n_no_int2 += int(not stats["int2_used"])
-            if self._resolved_sample is None:
-                self._resolved_sample = self._geometry(r, ctx)
+        self._realised.append({"batch": bi, "ids": ids, "size": len(docs), "prompt_tokens": ctx,
+                               "steps": len(clock.t), "decode_ms_per_step": timing["decode_ms_per_token"]})
+        self._step_ms.append(timing["decode_ms_per_token"])
 
+        records = []
+        r = cache.resolved if cache is not None else None
+        for row, d in enumerate(docs):
+            new = out[row][ctx:].tolist()
+            # Generation ends at this row's first EOS; after a row finishes (EOS
+            # or the stop string), generate fills it with the pad id, which is an
+            # EOS id here, so the first EOS id also marks the end of a stop-string row.
+            k = next((j for j, t in enumerate(new) if t in eos_ids), len(new))
+            text = tokenizer.decode(new[:k], skip_special_tokens=True)
+            cut = text.find(STOP_STRING)          # vLLM ends the text BEFORE the stop string
+            if cut >= 0:
+                text, stopped_on, n_gen = text[:cut], "stop_string", k
+            elif k < len(new):
+                stopped_on, n_gen = "eos", k + 1
+            elif len(new) >= max_new:
+                stopped_on, n_gen = "max_new_tokens", len(new)
+            else:
+                stopped_on, n_gen = "other", len(new)
+            seq = ctx + n_gen
+            stats: Dict[str, Any] = {
+                "prompt_tokens": ctx, "gen_tokens": n_gen, "hit_token_cap": n_gen >= max_new,
+                "stopped_on": stopped_on, **batch_stats,
+                "prompt_sha": hashlib.sha256(d["prompt"].encode("utf-8")).hexdigest()[:16],
+            }
+            if r is not None:
+                cap = int(r.retained_tokens)
+                # Keys the fp16 tier (sink + local + top_k_fp windows) holds. A longer
+                # sequence has int2 windows, so the read gate has something to select
+                # over; longer than `cap`, keys have been dropped.
+                fp_cap = int(r.num_sink_tokens + r.local_tokens + r.top_k_fp * r.window_size)
+                stats.update({
+                    "budget_tokens": int(r.total_budget_tokens), "retained_tokens_cap": cap,
+                    "fp_tokens_cap": fp_cap, "N_q": int(r.N_q),
+                    "int2_used": seq > fp_cap, "evicted": seq > cap,
+                    # Upper bound on the KV bytes held when this row finished, as a
+                    # fraction of what the full cache holds for the same sequence.
+                    "kv_bytes_fraction_upper": round(
+                        min(1.0, r.retained_bytes / max(seq * r.bytes_per_token, 1)), 4),
+                })
+                self._retained.append(min(cap, seq))
+                self._sequence.append(seq)
+                self._bytes_frac.append(stats["kv_bytes_fraction_upper"])
+                self._n_no_eviction += int(not stats["evicted"])
+                self._n_no_int2 += int(not stats["int2_used"])
+                if self._resolved_sample is None:
+                    self._resolved_sample = self._geometry(r, ctx)
+            records.append(self._record(d, d["prefix"] + text, stats))
+            log.info("    id %d (%s): %d new tokens, %d words, CR %.1f%%, stopped on %s", d["id"], d["type"],
+                     n_gen, records[-1]["word_count"], records[-1]["completion_rate"], stopped_on)
+        log.info("  batch %d: %d documents x %d prompt tokens, %d steps in %.0f s (first token %s s, then %s "
+                 "ms/step; %s ms typical late)", bi, len(docs), ctx, len(clock.t), wall, timing["first_token_s"],
+                 timing["decode_ms_per_token"], timing["decode_ms_per_token_last_half_median"])
         # Drop this frame's references before empty_cache, or the cache's
         # buffers are still alive when the allocator is asked to release them.
-        del out, new, inputs, input_ids, attention_mask
-        cache = hooks = None
+        del out, input_ids, attention_mask, rows
+        cache = hooks = r = None
         self._cleanup_memory()
-        return output, stats
+        return records
 
     @staticmethod
     def _geometry(r, prefill_len: int) -> Dict[str, Any]:
@@ -557,21 +633,22 @@ class LongGenBenchRunner:
                         "generated with no int2 window and no read gate.", type_,
                         s["n_examples_no_int2"])
 
-    def _write_meta(self, type_: str, docs: List[Dict[str, Any]], max_new: int, n_oom: int,
-                    run_start: float, run_end: float, tot_gen: int, tot_wall: float,
-                    peak: float, output_dir: Path) -> None:
+    def _write_meta(self, docs: List[Dict[str, Any]], planned: List[List[int]], lengths: Dict[int, int],
+                    max_new: int, run_start: float, run_end: float, output_dir: Path) -> None:
         cfg, lg = self.config, self.lg
         budget = cfg.cache.cache_budget
         from utils.cache_factory import quant_card_bits_record, quant_tier_policy_record
 
+        realised = self._realised
+        done = [b for b in realised if not b.get("oom")]
+        steps = sum(b["steps"] for b in done)
         meta = {
-            "read_gate": self._read_gate_report(f"longgenbench {lg.setting} {type_}"),
+            "read_gate": self._read_gate_report(f"longgenbench {lg.setting}"),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
             **quant_tier_policy_record(cfg.cache),
             "benchmark": "LongGenBench",
             "setting": lg.setting,
-            "type": type_,
-            "number": docs[0]["number"],
+            "types": sorted({d["type"] for d in docs}),
             "dataset": HF_DATASET,
             "dataset_revision": HF_REVISION,
             "reference_code": CODE_REPO,
@@ -579,24 +656,31 @@ class LongGenBenchRunner:
             "data_file": FILES[lg.setting][0],
             "dataset_sha": dataset_sha(lg.data_dir, lg.setting),
             "prompt_format": PROMPT_FORMAT,
-            "start": lg.start,
-            "end": lg.end,
-            "ids": [d["id"] for d in docs],
+            "ids": sorted(d["id"] for d in docs),
             "num_examples": len(docs),
-            "num_oom": n_oom,
+            "num_oom": sum(len(b["ids"]) for b in realised if b.get("oom")),
+            "prompt_tokens": {str(i): lengths[i] for i in sorted(lengths)},
             "max_new_tokens": max_new,
             "max_new_tokens_override": getattr(lg, "max_new_tokens", None),
             "generation": {
                 "decoding": lg.decoding,
                 "sampling": ({**GENERATION_SAMPLING, "seed": int(lg.sample_seed),
-                              "seed_rule": "the same seed for every document"}
+                              "seed_rule": "the same seed set before every batch"}
                              if lg.decoding == "reference" else None),
                 "stop_string": STOP_STRING,
                 "stop_string_in_output": False,
                 "eos_token_id": self._eos_ids(),
                 "output": "prefix + generation",
-                "batch_size": 1,
+                "batching": "equal-length prompts, no padding",
+                "batch_size": int(lg.batch_size),
+                "batch_fallback": [int(x) for x in lg.batch_fallback],
             },
+            "batches_planned": planned,
+            "batches_realised": realised,
+            # Every out-of-memory batch: its size and the size it fell back to
+            # (None: no smaller size was allowed, its documents scored as failed).
+            "oom_events": self._oom_events,
+            "final_batch_cap": self._cap,
             "model_name": cfg.model.name,
             "model_revision": getattr(cfg.model, "revision", None),
             "tokenizer_sha": self._get_tokenizer_sha(),
@@ -623,16 +707,14 @@ class LongGenBenchRunner:
             "track_scores": False,
             # Wall clock inside a quality run (prefill + compiles included):
             # context for the reader, not a performance number.
-            "total_gen_tokens": tot_gen,
-            "total_generate_wall_s": round(tot_wall, 1),
-            "decode_tokps_wallclock": round(tot_gen / tot_wall, 2) if tot_wall > 0 else None,
-            "decode_ms_per_token_by_document": [r for r in self._step_ms],
-            "peak_mem_gib_max": round(peak, 3),
+            "total_decode_steps": steps,
+            "decode_ms_per_step_by_batch": [b["decode_ms_per_step"] for b in done],
             **capture_environment(),
             "run_started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_start)),
             "run_finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_end)),
+            "run_wall_s": round(run_end - run_start, 1),
         }
-        (output_dir / f"{type_slug(type_)}.meta.json").write_text(
+        (output_dir / "generations.meta.json").write_text(
             json.dumps(meta, indent=2, default=str), encoding="utf-8")
 
     def _get_tokenizer_sha(self) -> str:
