@@ -61,7 +61,11 @@ def _stub_run(tmp_path, monkeypatch, decoding, text):
         def generate(self, input_ids, **kw):
             seen.update(kw)
             seen["seeds"].append(torch.initial_seed())
-            return torch.cat([input_ids, torch.tensor([[8, 8, 9]])], dim=-1)
+            out = torch.cat([input_ids, torch.tensor([[8, 8, 9]])], dim=-1)
+            for k in range(3):                       # generate calls the criteria once per step
+                for crit in kw["stopping_criteria"]:
+                    assert not crit(out[:, :input_ids.shape[1] + k + 1], None).any()
+            return out
 
     cfg = ExperimentConfig()
     cfg.model = ModelConfig(name="meta-llama/Llama-3.1-8B-Instruct", dtype="float16",
@@ -89,6 +93,10 @@ def test_runner_generates_as_the_reference_runs_did(tmp_path, monkeypatch):
     assert r["output"] == "#*# Floor 1:\nLobby.\n#*# Floor 2:\nStudio.\n"   # prefix + text, cut at the stop
     assert r["stopped_on"] == "stop_string" and r["prompt_tokens"] == 4     # one BOS
     assert r["completion_rate"] == 50.0
+    # the step clock: first token vs steady decode, kept apart
+    assert r["first_token_s"] is not None and r["decode_ms_per_token"] is not None
+    assert r["decode_ms_per_token_last_half_median"] is not None
+    assert meta["decode_ms_per_token_by_document"] == [x["decode_ms_per_token"] for x in recs]
     assert meta["generation"]["decoding"] == "reference"
     assert meta["generation"]["sampling"]["seed"] == 6211027
     assert meta["dataset_revision"] == R.HF_REVISION and meta["prompt_format"] == "raw_completion"

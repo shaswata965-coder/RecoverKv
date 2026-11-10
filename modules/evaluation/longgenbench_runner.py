@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from transformers import StoppingCriteria, StoppingCriteriaList
 
 from longgenbench_eval.data import dataset_sha, load_type, type_slug
 from longgenbench_eval.metrics import completion_rate, parse_blocks, split_blocks, word_count
@@ -67,6 +68,38 @@ log = get_logger(__name__)
 #: "reference": the sampling of the runs behind the paper's Table 2;
 #: "greedy": what the paper's text says (no run in the reference repo used it).
 DECODINGS = ("reference", "greedy")
+
+
+class _StepClock(StoppingCriteria):
+    """Never stops; records when each decode step finishes.
+
+    ``generate`` reads ``unfinished_sequences.max()`` on the host every step, so
+    consecutive calls are a step apart in device time too. This separates what a
+    document's wall clock mixes: the first token (prefill, plus every Triton and
+    Inductor compile and tile search a fresh process does) and the steady decode
+    rate that a long document is made of.
+    """
+
+    def __init__(self) -> None:
+        self.t: List[float] = []
+
+    def __call__(self, input_ids, scores, **kwargs):
+        self.t.append(time.perf_counter())
+        return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+
+    def summary(self, t0: float) -> Dict[str, Any]:
+        if len(self.t) < 3:
+            return {"first_token_s": round(self.t[0] - t0, 3) if self.t else None,
+                    "decode_ms_per_token": None, "decode_ms_per_token_last_half_median": None}
+        steps = [b - a for a, b in zip(self.t, self.t[1:])]
+        half = sorted(steps[len(steps) // 2:])
+        return {
+            "first_token_s": round(self.t[0] - t0, 3),
+            # every step after the first, evictions and tile searches included
+            "decode_ms_per_token": round(1e3 * (self.t[-1] - self.t[0]) / len(steps), 2),
+            # a typical step once the document is well under way
+            "decode_ms_per_token_last_half_median": round(1e3 * half[len(half) // 2], 2),
+        }
 
 
 class LongGenBenchRunner:
@@ -108,6 +141,7 @@ class LongGenBenchRunner:
         self._retained: List[int] = []
         self._sequence: List[int] = []
         self._bytes_frac: List[float] = []
+        self._step_ms: List[Optional[float]] = []
 
     # ------------------------------------------------------------------
     # setup
@@ -233,12 +267,16 @@ class LongGenBenchRunner:
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
+                self._step_ms.append(stats.get("decode_ms_per_token"))
                 tot_gen += int(stats.get("gen_tokens") or 0)
                 tot_wall += float(stats.get("wall_s") or 0.0)
                 peak = max(peak, float(stats.get("peak_mem_gib") or 0.0))
-                log.info("  %s %d/%d (id %d): %s new tokens in %.0f s, %d words, CR %.1f%%, "
-                         "stopped on %s", type_, i + 1, len(docs), d["id"], stats.get("gen_tokens"),
-                         stats.get("wall_s") or 0.0, record["word_count"], cr, stats.get("stopped_on"))
+                log.info("  %s %d/%d (id %d): %s new tokens in %.0f s (first token %s s, then %s ms/token; "
+                         "%s ms/token typical late), %d words, CR %.1f%%, stopped on %s", type_, i + 1,
+                         len(docs), d["id"], stats.get("gen_tokens"), stats.get("wall_s") or 0.0,
+                         stats.get("first_token_s"), stats.get("decode_ms_per_token"),
+                         stats.get("decode_ms_per_token_last_half_median"), record["word_count"], cr,
+                         stats.get("stopped_on"))
         self._report_compression(type_)
         self._write_meta(type_, docs, max_new, n_oom, run_start, time.time(),
                          tot_gen, tot_wall, peak, output_dir)
@@ -286,6 +324,9 @@ class LongGenBenchRunner:
         if cache is not None:
             gen_kwargs["past_key_values"] = cache
 
+        clock = _StepClock()
+        gen_kwargs["stopping_criteria"] = StoppingCriteriaList([clock])
+
         cuda = torch.cuda.is_available()
         if cuda:
             torch.cuda.reset_peak_memory_stats()
@@ -324,6 +365,7 @@ class LongGenBenchRunner:
             "stopped_on": stopped_on,
             "wall_s": round(wall, 3),
             "decode_tokps_wallclock": round(n_gen / wall, 2) if wall > 0 else None,
+            **clock.summary(t0),
             "peak_mem_gib": (round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)
                              if cuda else None),
             "prompt_sha": hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:16],
@@ -584,6 +626,7 @@ class LongGenBenchRunner:
             "total_gen_tokens": tot_gen,
             "total_generate_wall_s": round(tot_wall, 1),
             "decode_tokps_wallclock": round(tot_gen / tot_wall, 2) if tot_wall > 0 else None,
+            "decode_ms_per_token_by_document": [r for r in self._step_ms],
             "peak_mem_gib_max": round(peak, 3),
             **capture_environment(),
             "run_started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_start)),

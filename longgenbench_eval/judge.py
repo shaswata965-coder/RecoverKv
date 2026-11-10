@@ -21,7 +21,7 @@ for sensitivity checks; neither is the paper's.
 A known-answer selftest (four trivially decidable questions) runs first in the
 same engine; fewer than three right stops the run.
 
-Needs ``vllm`` (``requirements-judge.txt``: 0.8.5.post1, run on its V0 engine; the
+Needs ``vllm`` (``requirements-judge.lock.txt``: 0.8.5.post1, run on its V0 engine; the
 paper used 0.5.4). Everything else is standard library.
 """
 

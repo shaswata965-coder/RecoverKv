@@ -1,1 +1,9 @@
+# The judge's environment (vLLM). Install the fully pinned lock, not this file:
+#   uv pip install --python <env>/bin/python -r longgenbench_eval/requirements-judge.lock.txt
+# vLLM 0.8.5.post1 declares open-ended dependencies; resolved today they pull in
+# transformers 5.x, which vLLM 0.8.5 cannot load a tokenizer with. The lock is this
+# file resolved for Python 3.12 / linux x86_64 as of the release
+# (uv pip compile requirements-judge.txt --python-version 3.12
+#  --python-platform x86_64-manylinux_2_28 --exclude-newer 2025-05-15T00:00:00Z).
 vllm==0.8.5.post1
+transformers==4.51.3

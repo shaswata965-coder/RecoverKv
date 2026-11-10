@@ -10,7 +10,7 @@ repository around it, so you can copy this directory next to any baseline's code
 * `metrics.py`, `reference.py`: the definitions, and every constant with its source.
 
 `metrics.py`, `data.py` and `score.py` need only the Python standard library.
-`judge.py` needs `vllm` (`requirements-judge.txt`).
+`judge.py` needs `vllm` (`requirements-judge.lock.txt`).
 
 ## What "as the paper did" means
 
@@ -66,16 +66,19 @@ The reference's own `inference.py` output (a JSON list with `input` and
 python -m longgenbench_eval.data --out data/longgenbench
 ```
 
-Judging runs in an environment with `vllm` (`requirements-judge.txt`: 0.8.5.post1, on its
-V0 engine by default; the paper ran 0.5.4). The judge can live in its own virtualenv; it
-does not need your generation stack:
+Judging runs in an environment with `vllm` 0.8.5.post1 (on its V0 engine by default; the paper
+ran 0.5.4). Install it from the pinned lock, not from `requirements-judge.txt`: vLLM 0.8.5's
+dependencies are open-ended, and resolved today they pull in transformers 5.x, which it cannot
+load a tokenizer with. The lock is the May-2025 resolution for Python 3.12 / linux x86_64.
+
+The judge can live in its own virtualenv; it does not need your generation stack:
 
 ```bash
 uv venv --python 3.12 judge_env
 ```
 
 ```bash
-uv pip install --python judge_env/bin/python -r longgenbench_eval/requirements-judge.txt
+uv pip install --python judge_env/bin/python -r longgenbench_eval/requirements-judge.lock.txt
 ```
 
 Then judge with that environment's Python:
