@@ -1,7 +1,7 @@
 """``scripts/deepseek_gpu_preflight.py`` under the Triton interpreter, on CPU.
 
-The script exists to run on a GPU before a long DeepSeek-V2-Lite benchmark (the
-Colab notebook calls it). Its ``--interpret`` mode runs the checks that do not need
+The script exists to run on a GPU before a long DeepSeek-V2-Lite benchmark. Its
+``--interpret`` mode runs the checks that do not need
 FA2 -- the fused decode against the materialize path, the gate verdict at the
 run's ratio, the compiled eviction -- on CPU tensors through the same kernels, so
 the script itself cannot rot unnoticed. The geometry comes from the vendored

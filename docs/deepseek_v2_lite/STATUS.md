@@ -217,9 +217,13 @@ interpreter; nothing has run on a GPU or the real weights.
 `notebooks/longbench_deepseek_v2_lite_b010_colab.ipynb` runs QEvict at `cache_budget 0.10` (the paper's Table 2
 "10%" row; local 128, everything else the operating point) and the latent Full-KV reference on the 11 Table 2
 LongBench tasks other than NarrativeQA, on one pinned commit, checkpoint revision and stack (torch 2.6.0, Triton
-3.2.0, transformers 4.47.1, flash-attn 2.7.4.post1, A100 80GB). Every chunk's sidecar is verified before it is kept.
+3.2.0, transformers 4.47.1, flash-attn 2.7.4.post1, A100 80GB). It runs the benchmark only: one example per
+`generate()` call (batch size 1, as in the paper's LongBench runs), results per task on Drive, resumable by task, and
+each QEvict task's sidecar must report `read_gate: gated`. Larger batches are not offered: the cache batches only
+equal-length prompts, the owned MLA forward rejects padding masks, and at 31.5k tokens the prefill's fp32 logits are
+~13 GB per row (arithmetic), so even 4 rows exceed 80 GB with the weights.
 
-* **`scripts/deepseek_gpu_preflight.py`** is the notebook's gate before any GPU time is spent on the benchmark. On a
+* **`scripts/deepseek_gpu_preflight.py`** is run separately, before GPU time is spent on the benchmark. On a
   random model with the checkpoint's own attention geometry it checks, on the GPU: the owned forward (FA2 prefill)
   against upstream; the Triton score kernel against eager scores; the fused decode against the materialize path, in
   bf16 and in fp32 (per-layer attention outputs and per-step window scores, not just logits, which in a random model
