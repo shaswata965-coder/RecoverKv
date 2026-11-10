@@ -858,42 +858,44 @@ class GSM8KConfig:
 
 @dataclass
 class LongGenBenchConfig:
-    """LongGenBench, as SCOPE runs it (mode ``longgenbench``).
+    """LongGenBench (Wu et al., ICLR'25), mode ``longgenbench``.
 
     See ``data/longgenbench_loader.py`` for the benchmark, the pin and the
-    settings, and ``modules/evaluation/longgenbench_runner.py`` for the protocol.
+    protocol, and ``modules/evaluation/longgenbench_runner.py`` for generation.
     """
 
     #: Directory written by ``python -m data.longgenbench_loader --out <dir>``.
     data_dir: str = "data/longgenbench"
-    #: "4K" (K = 30/30/40, 4,096 new tokens) or "8K" (K = 60/60/80, 7,950).
-    setting: str = "8K"
-    tasks: List[str] = field(default_factory=lambda: ["gsm8k", "mmlu", "csqa"])
+    #: "16K" (Dataset_short.json, up to 16,000 new tokens) or "32K" (32,000).
+    setting: str = "16K"
+    #: Task types to run; None = all four of the setting (checked at run time,
+    #: because the names differ: Week/Menu Week at 16K, Day/Menu Day at 32K).
+    types: Optional[List[str]] = None
     output_dir: str = "outputs/longgenbench/run"
-    #: Contiguous slice [start, end) of each task's examples, AFTER the MMLU
-    #: drop. The notebook runs a task in chunks this way; None = to the end.
+    #: Contiguous slice [start, end) of EACH type's documents, in file order.
     start: int = 0
     end: Optional[int] = None
-    #: Drop MMLU rows 21, 30, 31, 48 as run_longgenbench.py does, so a score is
-    #: comparable with SCOPE's table. False scores all 57 subjects.
-    drop_scope_oom: bool = True
+    #: "greedy" (the paper) or "repo_sampling" (inference.py: T=0.95, top_p=0.95).
+    decoding: str = "greedy"
+    #: repo_sampling only: document d is drawn with seed sample_seed + d's id.
+    sample_seed: int = 6211027
     skip_oom: bool = False
-    #: torch.cuda.empty_cache() after every example, as the reference does.
     aggressive_cache_clear: bool = True
     #: Override the setting's generation budget. Smoke runs only: a lower cap
-    #: cuts the answer list short and is not the benchmark.
+    #: cuts every document short and is not the benchmark.
     max_new_tokens: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.setting not in ("4K", "8K"):
+        if self.setting not in ("16K", "32K"):
             raise ConfigValidationError(
-                f"longgenbench.setting must be '4K' or '8K', got {self.setting!r}")
-        tasks = [self.tasks] if isinstance(self.tasks, str) else list(self.tasks)
-        bad = [t for t in tasks if t not in ("gsm8k", "mmlu", "csqa")]
-        if bad or not tasks:
+                f"longgenbench.setting must be '16K' or '32K', got {self.setting!r}")
+        if self.types is not None:
+            self.types = [self.types] if isinstance(self.types, str) else list(self.types)
+            if not self.types:
+                raise ConfigValidationError("longgenbench.types must be null or non-empty")
+        if self.decoding not in ("greedy", "repo_sampling"):
             raise ConfigValidationError(
-                f"longgenbench.tasks must be a non-empty subset of gsm8k/mmlu/csqa, got {self.tasks!r}")
-        self.tasks = tasks
+                f"longgenbench.decoding must be 'greedy' or 'repo_sampling', got {self.decoding!r}")
         if isinstance(self.start, bool) or not isinstance(self.start, int) or self.start < 0:
             raise ConfigValidationError(f"longgenbench.start must be an int >= 0, got {self.start!r}")
         if self.end is not None and (isinstance(self.end, bool) or not isinstance(self.end, int)

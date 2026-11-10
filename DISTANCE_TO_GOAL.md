@@ -2062,51 +2062,55 @@ compares `cache_step_mass` with `full_mass`, whose normalisers differ per step
 (`Z_A · den` against the full-KV `Z`); compare within a step, against the read
 windows, or use `comp_*`.
 
-## 15. LongGenBench, wired: the long-generation quality run — 2026-11-09
+## 15. LongGenBench-16K, wired: the long-generation quality run — 2026-11-10
 
 LongBench answers are short (at most 512 tokens), so its scores mostly test the
-prompt compression on decode step 0. LongGenBench (Liu et al., EMNLP'24
-Findings) is the other regime: K questions in one prompt, all answered in one
-generation of up to 7,950 tokens, so the answer is the long part and nearly
-every token is decoded from the budgeted cache. It is the benchmark SCOPE
-(Wu et al., ACL'25) uses for decode-phase compression on Llama-3.1-8B-Instruct,
-and SCOPE publishes its full-cache predictions.
+prompt compression on decode step 0. LongGenBench (Wu et al., ICLR'25) is the
+other extreme: a ~700-token prompt asks for one structured document of up to
+16,000 tokens (52 diary weeks, 52 menus, 100 floors, 100 city blocks), with
+instructions that must surface in particular entries (once, over a range,
+periodically). Almost everything the model attends to is its own output, so it
+scores the decode-phase cache directly.
 
 **What was built.** `mode: longgenbench`
 (`modules/evaluation/longgenbench_runner.py`), the pinned loader
-(`data/longgenbench_loader.py`, SCOPE @ `8cbae48`, SHA-256 per file), the metric
-(`modules/evaluation/longgenbench_scoring.py`), two configs
-(`configs/longgenbench_{ours_flash,full_cache}.yaml`, the first at
-`OPERATING_POINT`), and `notebooks/longgenbench_colab.ipynb`. The protocol is
-SCOPE's `run_longgenbench.py`: its Llama-3 prompt format (not the chat
-template), greedy, `eos = [<|eot_id|>]`, B = 1, fp16, flash-attn 2. Two
-reference quirks are kept because the published numbers include them: the MMLU
-system prompt never receives its subject, and MMLU rows 21/30/31/48 are dropped.
+(`data/longgenbench_loader.py`: `mozhu/LongGenBench` @ `3c96cac`, SHA-256 per
+file, identical to the GitHub copy), the metric
+(`modules/evaluation/longgenbench_scoring.py`), the judge
+(`modules/evaluation/longgenbench_judge.py`, a separate process on a clean
+full-cache model), two configs (`configs/longgenbench_{ours_flash,full_cache}.yaml`,
+the first at `OPERATING_POINT`), and `notebooks/longgenbench_colab.ipynb`.
+The protocol is the reference code's (`mozhu621/LongGenBench` @ `45c320e`): raw
+prompt, no chat template, stop at `*** finished`, `prefix + generation`, split on
+`#*#`; the judge is the paper's (Llama-3.1-8B-Instruct) with `eval.py`'s few-shot
+prompt and its `'yes' in response` rule. Where the paper and the code disagree
+the paper wins and the code is an option: greedy decoding (the code samples at
+T = 0.95), and a greedy B = 1 judge (the code samples it too).
 
-**Measured, CPU-only.** Re-scoring SCOPE's own full-cache predictions with the
-metric here returns its six published scores exactly (8K: 44.4444 / 51.0063 /
-64.9167; 4K: 53.2558 / 54.4025 / 71.6667), and every prompt SCOPE recorded is
-rebuilt byte for byte (`tests/test_longgenbench.py`, 12 cases). The runner was
-run end to end on a stub model, full-cache path only.
+A first version (`72d8e07`, `ff0a51d`) implemented the other benchmark of the
+same name (Liu et al., EMNLP'24, as SCOPE runs it). It was replaced, not kept.
 
-**The reference metric pairs answers by position.** One skipped answer shifts
-every later one onto the wrong gold. On SCOPE's own full-cache GSM8K
-predictions that costs about 10 points (8K: 44.44 positional, 54.29 when
-`Answer_N` is paired with question N under the same pattern; 4K: 53.26 vs
-64.26). So the table reports `acc` (the reference metric), `acc_aligned` and
-`coverage`, and a compressed arm that changes how often answers are skipped
-moves `acc` for a reason that is not arithmetic. Read all three.
+**Measured, CPU-only.** The pinned files have 400 documents and 6,205 (16K) /
+8,215 (32K) instructions, the "Total Checks" in the authors' own results table.
+`tests/test_longgenbench.py` (19) pins block parsing, the judge prompt character
+for character, the verdict rule and every aggregate (CR, STIC-1, STIC-2, wAvg,
+once/range/periodic, Len) to the reference code, and runs the runner and the
+judge driver end to end on stub models. The notebook's helpers were driven end
+to end the same way, and 31 tampered sidecars were each refused.
 
-**Arithmetic, not measured.** At the operating point and a 5,000-token prompt in
-the 8K setting, `resolve()` gives 869 fp16 keys, 818 int2 windows and 7,413 keys
-kept in total: the prompt is int2-compressed on decode step 0 and keys are first
-dropped about 2,400 generated tokens in. The budget is sized on
-`max_new_tokens`, so an answer that stops early holds more than `cache_budget`
-of its own sequence; each record carries `kv_bytes_fraction_upper`. The
-notebook's time table (about 4 h fullkv, about 8 h ours, 8K, one A100) assumes
-30 and 55 ms/token.
+**Not verifiable here.** The authors publish no per-document outputs for
+Llama-3.1-8B, so there is no reproduction target finer than their Table 2 row
+(CR 93.5, STIC-1 23.4, STIC-2 22.0, wAvg 20.6 at 16K), which used vLLM, bf16,
+all 400 documents and its own decoding. The notebook prints it as context only.
+
+**Arithmetic, not measured.** At the operating point and a 700-token prompt,
+`resolve()` gives about 1,090 fp16 keys and 1,070 int2 windows (9,600 keys
+kept): the int2 tier and the read gate start ~400 generated tokens in, and keys
+are first dropped ~8,900 tokens in, inside most documents. The notebook's time
+table (5 documents per type: ~2.2 h fullkv, ~4 h ours, one A100) assumes 30 and
+55 ms/token at B = 1 and ~13,000 new tokens per document. The whole benchmark at
+B = 1 is about five days, so a Colab run is a declared subset (the first N
+documents of each type, the same in every arm).
 
 **Not verified.** Any GPU execution. No LongGenBench score exists for this
-method, and whether the full-cache arm reproduces SCOPE's numbers on this stack
-(transformers 4.47.1 against its 4.44.2) is unknown until it runs. The notebook
-reports that comparison beside every result.
+method yet.

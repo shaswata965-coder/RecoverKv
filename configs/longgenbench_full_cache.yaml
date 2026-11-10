@@ -1,12 +1,12 @@
 # ============================================================================
-# LongGenBench — full-cache baseline (SCOPE's ALLKV)
+# LongGenBench-16K — full-cache baseline
 # ============================================================================
-# The reference every compressed run is read against. On Llama-3.1-8B-Instruct
-# SCOPE publishes 44.44 / 51.01 / 64.92 (gsm8k / mmlu / csqa) in the 8K setting
-# and 53.26 / 54.40 / 71.67 in 4K; data/longgenbench_loader.REFERENCE_FILES
-# carries those numbers and SCOPE's own predictions to compare against.
+# The reference every compressed run is read against. For context, the paper
+# reports Llama-3.1-8B-Instruct at 16K as CR 93.5%, STIC-1 23.4%, STIC-2 22.0%,
+# wAvg 20.6% (vLLM, bf16, all 400 documents); data/longgenbench_loader
+# .PUBLISHED_LLAMA31_8B carries those numbers.
 #
-# Produces: outputs/longgenbench/8K/fullkv/{<task>.jsonl, <task>.meta.json}
+# Produces: outputs/longgenbench/16K/fullkv/{<type>.jsonl, <type>.meta.json}
 _base_: base.yaml
 
 run:
@@ -29,9 +29,9 @@ telemetry:
 
 longgenbench:
   data_dir: data/longgenbench
-  setting: 8K
-  tasks: [gsm8k, mmlu, csqa]
-  output_dir: outputs/longgenbench/8K/fullkv
-  drop_scope_oom: true
+  setting: 16K
+  types: null
+  output_dir: outputs/longgenbench/16K/fullkv
+  decoding: greedy
   skip_oom: false
   aggressive_cache_clear: true

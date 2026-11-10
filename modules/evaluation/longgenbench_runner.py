@@ -1,33 +1,33 @@
-"""LongGenBench runner (mode ``longgenbench``): long generation, decode-phase eviction.
+"""LongGenBench runner (mode ``longgenbench``): long-form generation, decode-phase cache.
 
-Reproduces SCOPE's ``run_longgenbench.py`` protocol for Llama-3.1-8B-Instruct
-(see ``data/longgenbench_loader.py`` for the benchmark, the pin and the two
-reference quirks it keeps):
+Reproduces the generation side of ``mozhu621/LongGenBench`` (see
+``data/longgenbench_loader.py`` for the benchmark, the pin and the protocol):
 
-* prompt: ``build_chat_llama3_modify(system_prompt, prompt)``, one BOS from the
-  tokenizer (``encode_prompt`` adds it because the string carries none);
-* greedy: ``num_beams=1, do_sample=False, temperature=1.0``,
-  ``min_length = prompt + 1``, ``eos_token_id = [tokenizer.eos_token_id]``,
-  ``max_new_tokens`` 4,096 (``4K``) or 7,950 (``8K``);
-* batch size 1, fp16, flash-attention-2; ``torch.cuda.empty_cache()`` after
-  every example, as the reference does.
+* the dataset prompt verbatim, raw completion, one BOS (``encode_prompt`` adds
+  it because the prompt carries none), no chat template;
+* stop at ``*** finished`` (cut from the text, as vLLM does), at the model's
+  EOS (the generation config's, as vLLM uses), or at ``max_new_tokens``
+  (16,000 for ``16K``, 32,000 for ``32K``);
+* ``output = prefix + generation``; scored by ``longgenbench_scoring`` and judged
+  afterwards, in a separate process, by ``longgenbench_judge``;
+* decoding ``greedy`` (the paper) or ``repo_sampling`` (inference.py's
+  ``temperature=0.95, top_p=0.95``, seeded per example so both arms draw from
+  the same stream); batch size 1, fp16, flash-attention-2.
 
 The cache is the only thing that differs between arms: ``cache.backend:
-dynamic`` is the full-cache baseline (SCOPE's ``ALLKV``), ``windowed`` +
-``flash_attn`` is this repo's method, built exactly as the GSM8K and LongBench
-runners build it.
+dynamic`` is the full-cache baseline, ``windowed`` + ``flash_attn`` is this
+repo's method, built exactly as the GSM8K and LongBench runners build it.
 
-Every task writes ``<task>.jsonl`` (one record per example) and
-``<task>.meta.json``. The sidecar carries what makes the number attributable:
-the read-gate verdict (counters reset per task, so they describe that task
-only), the operating point, the resolved geometry, the benchmark pin and file
-hash, and a compression diagnostic. The budget is ``cache_budget * (prompt +
-max_new_tokens)``, the method's own definition, so an answer that stops well
-short of ``max_new_tokens`` is held at MORE than ``cache_budget`` of its real
-sequence; ``effective_retention`` says by how much, and
-``n_examples_no_eviction`` says whether any example never evicted at all.
+Each type writes ``<type>.jsonl`` (one record per document) and
+``<type>.meta.json``. The sidecar carries what makes the number attributable:
+the read-gate verdict (counters reset per type, so they describe that type
+only), the operating point, the resolved geometry, the dataset pin and hash, the
+decoding, and a compression record. The budget is ``cache_budget * (prompt +
+max_new_tokens)``, the method's own definition; a document that stops well
+short of ``max_new_tokens`` holds more than ``cache_budget`` of its own
+sequence, and ``kv_bytes_fraction_upper`` says how much.
 
-Timing fields (``wall_s``, ``decode_tokps_wallclock``) are wall-clock inside a
+Timing fields (``wall_s``, ``decode_tokps_wallclock``) are wall clock inside a
 quality run: prefill, eviction compiles and Python overhead included. They are
 not a performance measurement; ``mode: perf`` is.
 """
@@ -44,17 +44,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from data.longgenbench_loader import (
-    FIRST_QUESTION_INDEX,
-    K_PER_TASK,
+    CODE_COMMIT,
+    CODE_REPO,
+    DECODINGS,
+    HF_DATASET,
+    HF_REVISION,
     MAX_NEW_TOKENS,
     PROMPT_FORMAT,
-    SCOPE_COMMIT,
-    SCOPE_DROPPED_MMLU,
-    SCOPE_REPO,
-    assert_supported_model,
-    data_relpath,
+    REPO_SAMPLING,
+    STOP_STRING,
+    TYPES,
+    data_filename,
     dataset_sha,
-    load_longgenbench,
+    load_type,
+    type_slug,
+)
+from modules.evaluation.longgenbench_scoring import (
+    completion_rate,
+    parse_blocks,
+    split_blocks,
+    word_count,
 )
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.env_capture import capture_environment
@@ -65,7 +74,7 @@ log = get_logger(__name__)
 
 
 class LongGenBenchRunner:
-    """End-to-end LongGenBench prediction runner."""
+    """End-to-end LongGenBench generation runner."""
 
     def __init__(self, config) -> None:
         self._assert_tracking_off(config)
@@ -73,7 +82,8 @@ class LongGenBenchRunner:
         self.lg = getattr(config, "longgenbench", None)
         if self.lg is None:
             raise ValueError("Config must have a 'longgenbench' section for longgenbench mode.")
-        assert_supported_model(config.model.name)
+        if self.lg.decoding not in DECODINGS:
+            raise ValueError(f"longgenbench.decoding must be one of {DECODINGS}")
 
         cache_backend = getattr(config.cache, "backend", "dynamic")
         cache_package = getattr(config.cache, "backend_package", None)
@@ -93,9 +103,9 @@ class LongGenBenchRunner:
         self.model = None
         self.tokenizer = None
         self._over_context_warned = False
-        self._reset_task_state()
+        self._reset_type_state()
 
-    def _reset_task_state(self) -> None:
+    def _reset_type_state(self) -> None:
         self._resolved_sample: Optional[Dict[str, Any]] = None
         self._n_no_eviction = 0
         self._n_no_int2 = 0
@@ -112,7 +122,7 @@ class LongGenBenchRunner:
         if getattr(getattr(config, "telemetry", None), "track_scores", False):
             raise ValueError(
                 "track_scores must be False for LongGenBench runs: telemetry buffers "
-                "grow with every decode step, and these generate up to 7,950 tokens.")
+                "grow with every decode step, and these generate up to 32,000 tokens.")
 
     def _load_model_and_tokenizer(self) -> Tuple:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -141,6 +151,21 @@ class LongGenBenchRunner:
         override = getattr(self.lg, "max_new_tokens", None)
         return int(override) if override else MAX_NEW_TOKENS[self.lg.setting]
 
+    def _types(self) -> List[str]:
+        types = self.lg.types or list(TYPES[self.lg.setting])
+        for t in types:
+            if t not in TYPES[self.lg.setting]:
+                raise ValueError(f"{self.lg.setting} LongGenBench types are "
+                                 f"{list(TYPES[self.lg.setting])}, got {t!r}")
+        return list(types)
+
+    def _eos_ids(self) -> List[int]:
+        """The model's generation-config EOS ids: what vLLM stops on by default."""
+        eos = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
+        if eos is None:
+            eos = self.tokenizer.eos_token_id
+        return [int(e) for e in (eos if isinstance(eos, (list, tuple)) else [eos])]
+
     # ------------------------------------------------------------------
     # run
     # ------------------------------------------------------------------
@@ -150,86 +175,85 @@ class LongGenBenchRunner:
             from utils.cache_factory import assert_transformers_version_supported
 
             assert_transformers_version_supported()
-
         lg = self.lg
-        tasks = [lg.tasks] if isinstance(lg.tasks, str) else list(lg.tasks)
-        # Fail on a missing or altered data file before spending a model load.
-        for t in tasks:
-            dataset_sha(lg.data_dir, lg.setting, t)
+        types = self._types()
+        dataset_sha(lg.data_dir, lg.setting)   # missing or altered data: fail before a model load
 
         self.model, self.tokenizer = self._load_model_and_tokenizer()
         output_dir = Path(lg.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        log.info("LongGenBench %s: tasks=%s, examples [%s, %s), windowed=%s, out=%s",
-                 lg.setting, tasks, lg.start, lg.end, self.is_windowed, output_dir)
+        log.info("LongGenBench %s: types=%s, documents [%s, %s) of each, decoding=%s, "
+                 "windowed=%s, out=%s", lg.setting, types, lg.start, lg.end, lg.decoding,
+                 self.is_windowed, output_dir)
         log_operating_point(self.config, self.is_windowed)
-        for t in tasks:
-            self._run_task(t, output_dir)
+        for t in types:
+            self._run_type(t, output_dir)
         log.info("LongGenBench run complete. Outputs in %s", output_dir)
 
-    def _run_task(self, task: str, output_dir: Path) -> None:
+    def _run_type(self, type_: str, output_dir: Path) -> None:
         from modules.windowed_cache import flash_decode
 
         lg = self.lg
-        examples = load_longgenbench(lg.data_dir, lg.setting, task,
-                                     drop_scope_oom=lg.drop_scope_oom,
-                                     start=lg.start, end=lg.end)
-        if not examples:
-            raise ValueError(f"{task}: no examples in [{lg.start}, {lg.end})")
+        docs = load_type(lg.data_dir, lg.setting, type_, lg.start, lg.end)
+        if not docs:
+            raise ValueError(f"{type_}: no documents in [{lg.start}, {lg.end})")
         max_new = self._max_new_tokens()
-        log.info("=== %s %s: %d examples (ids %d..%d), K=%d, max_new_tokens=%d ===",
-                 lg.setting, task, len(examples), examples[0]["id"], examples[-1]["id"],
-                 K_PER_TASK[lg.setting][task], max_new)
+        log.info("=== %s %s: %d documents (ids %d..%d), %d entries each, max_new_tokens=%d ===",
+                 lg.setting, type_, len(docs), docs[0]["id"], docs[-1]["id"],
+                 docs[0]["number"], max_new)
 
-        # The gate counters are process-global and cumulative; zero them so this
-        # task's sidecar describes this task's decode steps and nothing else.
+        # Process-global, cumulative counters: zero them so this type's sidecar
+        # describes this type's decode steps and nothing else.
         flash_decode.reset_stats()
-        self._reset_task_state()
+        self._reset_type_state()
 
-        out_path = output_dir / f"{task}.jsonl"
+        slug = type_slug(type_)
         run_start = time.time()
-        n_oom = 0
-        tot_gen = 0
-        tot_wall = 0.0
-        peak = 0.0
-        with open(out_path, "w", encoding="utf-8") as f:
-            for i, ex in enumerate(examples):
+        n_oom = tot_gen = 0
+        tot_wall = peak = 0.0
+        with open(output_dir / f"{slug}.jsonl", "w", encoding="utf-8") as f:
+            for i, d in enumerate(docs):
                 try:
-                    pred, stats = self._predict(ex, max_new)
+                    output, stats = self._generate(d, max_new)
                 except torch.cuda.OutOfMemoryError:
                     if not getattr(lg, "skip_oom", False):
                         raise
-                    log.warning("%s id %d: OOM, recording a null prediction", task, ex["id"])
-                    pred, stats = None, {"oom": True}
+                    log.warning("%s id %d: OOM, recording a null output", type_, d["id"])
+                    output, stats = None, {"oom": True}
                     n_oom += 1
-                    torch.cuda.empty_cache()
                     gc.collect()
-                record = {"id": ex["id"], "task": task, "subject": ex["subject"],
-                          "pred": pred, "answers": ex["answers"],
-                          "n_questions": ex["n_questions"], **stats}
+                    torch.cuda.empty_cache()
+                cr = (completion_rate(parse_blocks(split_blocks(output), type_), d["number"])
+                      if output is not None else 0.0)
+                record = {
+                    "id": d["id"], "type": type_, "number": d["number"], "prefix": d["prefix"],
+                    "checks_once": d["checks_once"], "checks_range": d["checks_range"],
+                    "checks_periodic": d["checks_periodic"],
+                    "output": output,
+                    "n_blocks": len(split_blocks(output)) if output is not None else 0,
+                    "word_count": word_count(output) if output is not None else 0,
+                    "completion_rate": round(cr, 2),
+                    **stats,
+                }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 tot_gen += int(stats.get("gen_tokens") or 0)
                 tot_wall += float(stats.get("wall_s") or 0.0)
                 peak = max(peak, float(stats.get("peak_mem_gib") or 0.0))
-                log.info("  %s %d/%d (id %d): %s new tokens in %.0f s%s", task, i + 1,
-                         len(examples), ex["id"], stats.get("gen_tokens"),
-                         stats.get("wall_s") or 0.0,
-                         "  [hit max_new_tokens]" if stats.get("hit_token_cap") else "")
-        run_end = time.time()
-        self._report_compression(task)
-        self._write_meta(task, examples, max_new, n_oom, run_start, run_end,
+                log.info("  %s %d/%d (id %d): %s new tokens in %.0f s, %d words, CR %.1f%%, "
+                         "stopped on %s", type_, i + 1, len(docs), d["id"], stats.get("gen_tokens"),
+                         stats.get("wall_s") or 0.0, record["word_count"], cr, stats.get("stopped_on"))
+        self._report_compression(type_)
+        self._write_meta(type_, docs, max_new, n_oom, run_start, time.time(),
                          tot_gen, tot_wall, peak, output_dir)
 
     # ------------------------------------------------------------------
-    # predict
+    # generate one document
     # ------------------------------------------------------------------
 
-    def _predict(self, ex: Dict[str, Any], max_new: int) -> Tuple[str, Dict[str, Any]]:
+    def _generate(self, d: Dict[str, Any], max_new: int) -> Tuple[str, Dict[str, Any]]:
         model, tokenizer = self.model, self.tokenizer
-        prompt = ex["prompt"]
-        # SCOPE: tokenizer(prompt, add_special_tokens=True) on a string with no
-        # BOS. encode_prompt makes the same decision from the string itself.
+        prompt = d["prompt"]
         inputs = encode_prompt(tokenizer, prompt, truncation=False, return_tensors="pt")
         input_ids = inputs.input_ids.to(model.device)
         attention_mask = inputs.attention_mask.to(model.device)
@@ -240,17 +264,24 @@ class LongGenBenchRunner:
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_new)
 
-        eos_ids = [tokenizer.eos_token_id]
+        eos_ids = self._eos_ids()
         gen_kwargs: Dict[str, Any] = {
             "attention_mask": attention_mask,
             "max_new_tokens": max_new,
-            "num_beams": 1,
-            "do_sample": False,
-            "temperature": 1.0,
-            "min_length": ctx + 1,
             "eos_token_id": eos_ids,
-            "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
+            "pad_token_id": tokenizer.pad_token_id or eos_ids[0],
+            "stop_strings": [STOP_STRING],
+            "tokenizer": tokenizer,
+            "num_beams": 1,
         }
+        if self.lg.decoding == "greedy":
+            gen_kwargs.update(do_sample=False, temperature=1.0, top_p=1.0)
+        else:
+            # Same seed for the same document in every arm: the arms draw from
+            # one stream until the cache makes their distributions differ.
+            torch.manual_seed(int(self.lg.sample_seed) + int(d["id"]))
+            gen_kwargs.update(do_sample=True, temperature=REPO_SAMPLING["temperature"],
+                              top_p=REPO_SAMPLING["top_p"], top_k=REPO_SAMPLING["top_k"])
         if self.cache_backend_package == "eager":
             gen_kwargs["output_attentions"] = True
         if cache is not None:
@@ -263,7 +294,7 @@ class LongGenBenchRunner:
         t0 = time.perf_counter()
         try:
             with torch.no_grad():
-                output = model.generate(input_ids, **gen_kwargs)
+                out = model.generate(input_ids, **gen_kwargs)
         finally:
             if hooks is not None:
                 hooks.remove()
@@ -271,15 +302,27 @@ class LongGenBenchRunner:
             torch.cuda.synchronize()
         wall = time.perf_counter() - t0
 
-        new = output[0][ctx:]
+        new = out[0][ctx:]
         n_gen = int(new.shape[-1])
-        pred = tokenizer.decode(new, skip_special_tokens=True)
+        text = tokenizer.decode(new, skip_special_tokens=True)
+        # vLLM's stop string ends the text BEFORE the string; HF keeps it.
+        cut = text.find(STOP_STRING)
+        if cut >= 0:
+            text = text[:cut]
+            stopped_on = "stop_string"
+        elif n_gen and int(new[-1]) in eos_ids:
+            stopped_on = "eos"
+        elif n_gen >= max_new:
+            stopped_on = "max_new_tokens"
+        else:
+            stopped_on = "other"
+        output = d["prefix"] + text              # inference.py: input['prefix'] + output.text
         seq = ctx + n_gen
         stats: Dict[str, Any] = {
             "prompt_tokens": ctx,
             "gen_tokens": n_gen,
             "hit_token_cap": n_gen >= max_new,
-            "stopped_on_eos": bool(n_gen and int(new[-1]) in eos_ids),
+            "stopped_on": stopped_on,
             "wall_s": round(wall, 3),
             "decode_tokps_wallclock": round(n_gen / wall, 2) if wall > 0 else None,
             "peak_mem_gib": (round(torch.cuda.max_memory_allocated() / 2 ** 30, 3)
@@ -290,8 +333,8 @@ class LongGenBenchRunner:
             r = cache.resolved
             cap = int(r.retained_tokens)
             # Keys the fp16 tier (sink + local + top_k_fp windows) can hold. A
-            # sequence longer than this has int2 windows, so the read gate has
-            # something to select over; longer than `cap`, keys were dropped.
+            # longer sequence has int2 windows, so the read gate has something to
+            # select over; longer than `cap`, keys have been dropped.
             fp_cap = int(r.num_sink_tokens + r.local_tokens + r.top_k_fp * r.window_size)
             stats.update({
                 "budget_tokens": int(r.total_budget_tokens),
@@ -300,8 +343,8 @@ class LongGenBenchRunner:
                 "N_q": int(r.N_q),
                 "int2_used": seq > fp_cap,
                 "evicted": seq > cap,
-                # Upper bound on the KV bytes held at the end of this example, as
-                # a fraction of what the full cache holds for the same sequence.
+                # Upper bound on the KV bytes held at the end of this document,
+                # as a fraction of what the full cache holds for the same sequence.
                 "kv_bytes_fraction_upper": round(
                     min(1.0, r.retained_bytes / max(seq * r.bytes_per_token, 1)), 4),
             })
@@ -315,10 +358,10 @@ class LongGenBenchRunner:
 
         # Drop this frame's references before empty_cache, or the cache's
         # buffers are still alive when the allocator is asked to release them.
-        del output, new, inputs, input_ids, attention_mask
+        del out, new, inputs, input_ids, attention_mask
         cache = hooks = None
         self._cleanup_memory()
-        return pred, stats
+        return output, stats
 
     @staticmethod
     def _geometry(r, prefill_len: int) -> Dict[str, Any]:
@@ -406,13 +449,13 @@ class LongGenBenchRunner:
         model_max = getattr(getattr(self.model, "config", None), "max_position_embeddings", None)
         if model_max and ctx + max_new > model_max and not self._over_context_warned:
             log.warning("prompt + generation = %d tokens exceeds the model's %d-token "
-                        "context; scores past it are unreliable.", ctx + max_new, model_max)
+                        "context; output past it is unreliable.", ctx + max_new, model_max)
             self._over_context_warned = True
 
     def _read_gate_report(self, label: str) -> dict:
         """Did the read gate actually run? Recorded into every sidecar.
 
-        An ungated run reads the whole int2 tier, writes correct answers and
+        An ungated run reads the whole int2 tier, writes a correct document and
         scores normally, so the verdict is recorded rather than inferred from
         the config (``CLAUDE.md``, "It is the only read path").
         """
@@ -427,7 +470,6 @@ class LongGenBenchRunner:
         return flash_decode.log_gate_report(log, label, expect)
 
     def _cleanup_memory(self) -> None:
-        # run_longgenbench.py calls torch.cuda.empty_cache() after every example.
         if getattr(self.lg, "aggressive_cache_clear", True) and torch.cuda.is_available():
             gc.collect()
             torch.cuda.empty_cache()
@@ -448,66 +490,72 @@ class LongGenBenchRunner:
             "mean_sequence_tokens": round(sum(self._sequence) / n, 1),
             "mean_retained_tokens": round(sum(self._retained) / n, 1),
             # Keys retained (either tier) over keys the full cache holds at the
-            # end of each example. Under quant_budget_mode "bytes" an int2 key
-            # costs ~1/4 of an fp16 one, so this is well above cache_budget.
+            # end of each document. An int2 key costs ~1/4 of an fp16 one under
+            # quant_budget_mode "bytes", so this is well above cache_budget.
             "effective_retention": round(sum(self._retained) / max(sum(self._sequence), 1), 4),
-            # The memory claim: KV bytes held over the full cache's, per example
-            # (an upper bound), averaged. Above cache_budget whenever answers stop
-            # before max_new_tokens, because the budget is sized on max_new_tokens.
+            # The memory claim: KV bytes held over the full cache's, per document
+            # (an upper bound), averaged.
             "mean_kv_bytes_fraction_upper": round(sum(self._bytes_frac) / n, 4),
         }
 
-    def _report_compression(self, task: str) -> None:
+    def _report_compression(self, type_: str) -> None:
         if not self.is_windowed:
-            log.info("%s: full-cache baseline, no compression applied.", task)
+            log.info("%s: full-cache baseline, no compression applied.", type_)
             return
         s = self._compression_summary()
         if s.get("n_examples_no_eviction") is None:
             return
         log.info("%s compression: mean sequence %.0f tok, mean retained %.0f tok "
                  "(keys %.3f, KV bytes <= %.3f of full); int2 tier unused on %d/%d, "
-                 "no key dropped on %d/%d", task, s["mean_sequence_tokens"],
+                 "no key dropped on %d/%d", type_, s["mean_sequence_tokens"],
                  s["mean_retained_tokens"], s["effective_retention"],
                  s["mean_kv_bytes_fraction_upper"], s["n_examples_no_int2"],
                  len(self._sequence), s["n_examples_no_eviction"], len(self._sequence))
         if s["n_examples_no_int2"]:
-            log.warning("%s: %d example(s) never filled past the fp16 tier, so they were "
-                        "generated with no int2 window and no read gate.", task,
+            log.warning("%s: %d document(s) never filled past the fp16 tier, so they were "
+                        "generated with no int2 window and no read gate.", type_,
                         s["n_examples_no_int2"])
 
-    def _write_meta(self, task: str, examples: List[Dict[str, Any]], max_new: int,
-                    n_oom: int, run_start: float, run_end: float, tot_gen: int,
-                    tot_wall: float, peak: float, output_dir: Path) -> None:
+    def _write_meta(self, type_: str, docs: List[Dict[str, Any]], max_new: int, n_oom: int,
+                    run_start: float, run_end: float, tot_gen: int, tot_wall: float,
+                    peak: float, output_dir: Path) -> None:
         cfg, lg = self.config, self.lg
         budget = cfg.cache.cache_budget
         from utils.cache_factory import quant_card_bits_record, quant_tier_policy_record
 
         meta = {
-            "read_gate": self._read_gate_report(f"longgenbench {lg.setting} {task}"),
+            "read_gate": self._read_gate_report(f"longgenbench {lg.setting} {type_}"),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
             **quant_tier_policy_record(cfg.cache),
             "benchmark": "LongGenBench",
-            "task": task,
             "setting": lg.setting,
-            "questions_per_prompt": K_PER_TASK[lg.setting][task],
-            "first_question_index": FIRST_QUESTION_INDEX[task],
-            "reference_repo": SCOPE_REPO,
-            "reference_commit": SCOPE_COMMIT,
-            "data_file": data_relpath(lg.setting, task),
-            "dataset_sha": dataset_sha(lg.data_dir, lg.setting, task),
+            "type": type_,
+            "number": docs[0]["number"],
+            "dataset": HF_DATASET,
+            "dataset_revision": HF_REVISION,
+            "reference_code": CODE_REPO,
+            "reference_commit": CODE_COMMIT,
+            "data_file": data_filename(lg.setting),
+            "dataset_sha": dataset_sha(lg.data_dir, lg.setting),
             "prompt_format": PROMPT_FORMAT,
-            "drop_scope_oom": bool(lg.drop_scope_oom),
-            "dropped_ids": list(SCOPE_DROPPED_MMLU) if task == "mmlu" and lg.drop_scope_oom else [],
             "start": lg.start,
             "end": lg.end,
-            "ids": [e["id"] for e in examples],
-            "num_examples": len(examples),
+            "ids": [d["id"] for d in docs],
+            "num_examples": len(docs),
             "num_oom": n_oom,
             "max_new_tokens": max_new,
             "max_new_tokens_override": getattr(lg, "max_new_tokens", None),
-            "generation": {"num_beams": 1, "do_sample": False, "temperature": 1.0,
-                           "min_new_tokens": 1, "eos_token_id": [self.tokenizer.eos_token_id],
-                           "batch_size": 1},
+            "generation": {
+                "decoding": lg.decoding,
+                "sampling": ({**REPO_SAMPLING, "seed": int(lg.sample_seed),
+                              "seed_rule": "sample_seed + document id"}
+                             if lg.decoding == "repo_sampling" else None),
+                "stop_string": STOP_STRING,
+                "stop_string_in_output": False,
+                "eos_token_id": self._eos_ids(),
+                "output": "prefix + generation",
+                "batch_size": 1,
+            },
             "model_name": cfg.model.name,
             "model_revision": getattr(cfg.model, "revision", None),
             "tokenizer_sha": self._get_tokenizer_sha(),
@@ -532,7 +580,7 @@ class LongGenBenchRunner:
             **self._compression_summary(),
             "seed": cfg.run.seed,
             "track_scores": False,
-            # Wall-clock inside a quality run (prefill + compiles included):
+            # Wall clock inside a quality run (prefill + compiles included):
             # context for the reader, not a performance number.
             "total_gen_tokens": tot_gen,
             "total_generate_wall_s": round(tot_wall, 1),
@@ -542,7 +590,7 @@ class LongGenBenchRunner:
             "run_started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_start)),
             "run_finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run_end)),
         }
-        (output_dir / f"{task}.meta.json").write_text(
+        (output_dir / f"{type_slug(type_)}.meta.json").write_text(
             json.dumps(meta, indent=2, default=str), encoding="utf-8")
 
     def _get_tokenizer_sha(self) -> str:

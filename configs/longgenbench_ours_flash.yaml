@@ -1,19 +1,20 @@
 # ============================================================================
-# LongGenBench — Ours (flash-attn backend), at the shipped operating point
+# LongGenBench-16K — Ours (flash-attn backend), at the shipped operating point
 # ============================================================================
-# LongGenBench (Liu et al., EMNLP'24 Findings) as SCOPE (Wu et al., ACL'25)
-# packages and runs it: K questions in one prompt, answered in one long
-# generation (8K setting: 60/60/80 questions, 7,950 new tokens). The prompt is a
-# few thousand tokens and the answer is the long part, so this scores the
-# DECODE phase -- every token after the first comes from the budgeted cache.
+# LongGenBench (Wu et al., ICLR'25): one ~700-token prompt asks for a long
+# structured document (a year of weekly diary entries, a 100-floor skyscraper,
+# ...) with instructions that must surface in particular entries; the answer
+# runs up to 16,000 tokens. The prompt is tiny, so this scores the DECODE-phase
+# cache: almost everything the model attends to is its own generation.
 #
-#   python -m data.longgenbench_loader --out data/longgenbench --setting 8K
+#   python -m data.longgenbench_loader --out data/longgenbench --setting 16K
 #   python main.py --config configs/longgenbench_ours_flash.yaml
+#   python -m modules.evaluation.longgenbench_judge --runs outputs/longgenbench/16K/ours
 #
 # The budget is cache_budget * (prompt + max_new_tokens), the method's own
 # definition. Colab: notebooks/longgenbench_colab.ipynb.
 #
-# Produces: outputs/longgenbench/8K/ours/{<task>.jsonl, <task>.meta.json}
+# Produces: outputs/longgenbench/16K/ours/{<type>.jsonl, <type>.meta.json}
 _base_: base.yaml
 
 run:
@@ -50,9 +51,9 @@ telemetry:
 
 longgenbench:
   data_dir: data/longgenbench
-  setting: 8K
-  tasks: [gsm8k, mmlu, csqa]
-  output_dir: outputs/longgenbench/8K/ours
-  drop_scope_oom: true       # SCOPE drops MMLU rows 21, 30, 31, 48; keep for comparability
+  setting: 16K
+  types: null                # all four: Week, Floor, Menu Week, Block
+  output_dir: outputs/longgenbench/16K/ours
+  decoding: greedy           # the paper; repo_sampling = inference.py's T=0.95, top_p=0.95
   skip_oom: false
   aggressive_cache_clear: true
