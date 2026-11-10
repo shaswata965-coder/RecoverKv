@@ -1,0 +1,38 @@
+# ============================================================================
+# GSM8K — FullKV baseline on DeepSeek-V2-Lite-Chat (LATENT cache)
+# ============================================================================
+# backend: dynamic -> transformers.DynamicCache, no eviction. With the owned MLA
+# forward installed (utils.model_loading), the DynamicCache holds the packed
+# latent as one head plus a zero-width value: 1,152 B/token, the cache the
+# method's budget is a fraction of, decoded with the same absorbed math.
+#
+# Produces: outputs/gsm8k_deepseek_v2_lite/full_cache/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: deepseek-ai/DeepSeek-V2-Lite-Chat
+  revision: 85864749cd611b4353ce1decdb286193298f64c7
+  dtype: bfloat16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k_deepseek_v2_lite/full_cache
+  results_dir: outputs/gsm8k_deepseek_v2_lite
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

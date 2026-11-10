@@ -150,12 +150,23 @@ def _prefill_eager(module, q_nope, q_pe, k_pe, c, attention_mask):
     return attn_output, token_scores, attn_weights
 
 
-def _prefill_flash(module, q_nope, q_pe, k_pe, c):
+def _flash_prefill(module, hidden_states: Tensor) -> bool:
+    """Whether this prefill runs FA2 (flash attention implementation, on CUDA)."""
+    return bool(getattr(module, "_recoverkv_flash", False)) and hidden_states.is_cuda
+
+
+def _prefill_flash(module, q_nope, q_pe, k_pe, c, score: bool = True):
     """FA2 over the decompressed heads; the score kernel reuses its LSE.
 
     ``flash_attn_func`` is called HERE, by name, with ``return_attn_probs=True``
     for ``softmax_lse`` -- the L-reuse contract (README §2): the prefill score is
     never a second O(N^2) pass to recompute L.
+
+    ``score=False`` skips the score kernel and returns ``None`` scores. Only a
+    RecoverKV cache consumes prefill scores; the latent FullKV baseline does not,
+    and running the score kernel there anyway costs a second O(N^2) pass per
+    layer that inflates the baseline's prefill time (TTFT) and changes nothing
+    it outputs.
     """
     from flash_attn import flash_attn_func
     from modules.windowed_cache.score_kernel import compute_token_scores
@@ -175,6 +186,8 @@ def _prefill_flash(module, q_nope, q_pe, k_pe, c):
         v_pad.transpose(1, 2), 0.0, softmax_scale=module.softmax_scale,
         causal=True, return_attn_probs=True)
     attn_output = out[..., :g.v_head_dim].transpose(1, 2)              # [B,H,T,v]
+    if not score:
+        return attn_output, None
     # The score kernel tiles the head with `tl.arange(0, HEAD_DIM)`, which wants
     # a power of two; the decompressed head is 192. Zero lanes change no dot
     # product, so padding to 256 scores exactly the logits flash normalised with
@@ -310,9 +323,10 @@ def mla_attention_forward(
                 f"layer {self.layer_idx}: a {q_len}-token prefill found "
                 f"{k_eff.shape[2] - q_len} keys already cached. The RecoverKV MLA "
                 "path models one prompt followed by single-token decode.")
-        if flash and hidden_states.is_cuda:
+        if _flash_prefill(self, hidden_states):
             _PATH_STATS["prefill_flash"] += 1
-            attn_output, token_scores = _prefill_flash(self, q_nope, q_pe, k_pe, c)
+            attn_output, token_scores = _prefill_flash(self, q_nope, q_pe, k_pe, c,
+                                                       score=windowed)
         else:
             _PATH_STATS["prefill_eager"] += 1
             attn_output, token_scores, weights = _prefill_eager(

@@ -43,20 +43,36 @@ def rotate_half(x: Tensor) -> Tensor:
     return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
 
 
+#: Positions the table grows by. Upstream regrows to EXACTLY the length it needs,
+#: and because that length rises by one every decode step it rebuilds the whole
+#: table (~20 kernels) in every layer on every step. A table row depends only on
+#: its own position (``outer(arange(n), inv_freq)`` then elementwise ``cos``/
+#: ``sin``), so building it longer changes no value; growing in chunks turns that
+#: per-step rebuild into one rebuild per ``_TABLE_CHUNK`` positions, for at most
+#: ``_TABLE_CHUNK`` spare rows (1 MB per layer at bf16).
+_TABLE_CHUNK = 4096
+
+
 def ensure_table(rotary_emb: nn.Module, needed_len: int, device, dtype) -> None:
     """Grow upstream's cached tables to cover ``needed_len`` positions.
 
     ``needed_len`` is a HOST int (absolute positions seen + this step's tokens),
-    so this costs no device sync. Upstream builds the tables to
-    ``max_position_embeddings`` (163,840 on V2-Lite) at construction, so in
-    practice this never fires; it exists so a longer run regrows exactly as
-    upstream's own ``forward`` would, rather than indexing past the end.
+    so this costs no device sync.
+
+    Upstream builds a ``max_position_embeddings`` table at construction and then
+    sets ``max_seq_len_cached = None`` (``modeling_deepseek.py`` l.132), so its
+    own ``forward`` rebuilds on the first call, at the prompt's length and the
+    activation dtype, and again on every step after that. The first call here
+    does the same (same function, same ``dtype``), so every row is bit-identical
+    to upstream's. After that the table grows in :data:`_TABLE_CHUNK` steps
+    rather than one position at a time, which changes no row
+    (``tests/test_deepseek_mla.py`` pins both).
     """
     cached = getattr(rotary_emb, "max_seq_len_cached", None)
     if cached is None or needed_len > cached:
+        n = -(-int(needed_len) // _TABLE_CHUNK) * _TABLE_CHUNK
         # Upstream's own forward regrows with `dtype=x.dtype`; so does this.
-        rotary_emb._set_cos_sin_cache(seq_len=needed_len, device=device,
-                                      dtype=dtype)
+        rotary_emb._set_cos_sin_cache(seq_len=n, device=device, dtype=dtype)
 
 
 def cos_sin(rotary_emb: nn.Module, position_ids: Tensor, dtype) -> Tuple[Tensor, Tensor]:
@@ -112,11 +128,21 @@ class PackedRope(nn.Module):
         super().__init__()
         self.rotary_emb = rotary_emb
         self.geometry = geometry
-        self.register_buffer("freq_index", geometry.rope_freq_index(), persistent=False)
-        self.register_buffer("rope_mask", geometry.rope_mask(), persistent=False)
+        # Built on the rotary module's device. The cache never moves this module,
+        # so CPU-built index buffers would make every call below an H2D copy from
+        # pageable memory -- which CUDA performs only after a stream sync -- and
+        # that call sits inside the compiled eviction (unrotate at demotion,
+        # rotate at promotion) and the fused hand-off's table build.
+        dev = getattr(rotary_emb, "inv_freq", None)
+        dev = dev.device if isinstance(dev, Tensor) else None
+        self.register_buffer("freq_index", geometry.rope_freq_index(device=dev),
+                             persistent=False)
+        self.register_buffer("rope_mask", geometry.rope_mask(device=dev),
+                             persistent=False)
 
     def forward(self, x: Tensor, position_ids: Tensor) -> Tuple[Tensor, Tensor]:
         cos_r, sin_r = cos_sin(self.rotary_emb, position_ids, x.dtype)   # [B, T, Dr]
+        # A no-op whenever the rotary module's buffers live where its tables do.
         idx = self.freq_index.to(cos_r.device)
         mask = self.rope_mask.to(cos_r.device)
         cos = torch.where(mask, cos_r.index_select(-1, idx), 1.0)

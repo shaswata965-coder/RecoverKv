@@ -117,10 +117,17 @@ def _check(seed: int, gated: bool) -> str:
     err = (logm - ref_logm).abs().max().item()
     if err > 1e-4:
         raise AssertionError(f"gate logmass vs gate_and_score {err:.2e}")
-    want = S.select_windows(S.group_share(ref_logm, 1), n_sel)
+    share = S.group_share(ref_logm, 1)
     picked = torch.zeros(B, 1, N, dtype=torch.bool)
     picked.scatter_(-1, sel.long(), True)
-    if not torch.equal(picked, want):
+    # Exactly the reference's pick, except where the n_sel-th and (n_sel+1)-th
+    # shares tie (to 1e-5, well above the 4e-6 the kernel's logmass is off by):
+    # there either window is the share-union's pick, and two top-k calls may
+    # break the tie differently. At D = 576 random keys saturate some heads, so
+    # several windows tie at a share of exactly 0.
+    kth = share.sort(-1, descending=True).values[..., n_sel - 1:n_sel]
+    must, may = share > kth + 1e-5, share >= kth - 1e-5
+    if not (bool((picked | ~must).all()) and bool((~picked | may).all())):
         raise AssertionError("gate pick differs from the share-union reference")
 
     cen = (card.mu_q, card.mu_s, anchor)              # the aliased centroid
@@ -243,6 +250,19 @@ def _e2e() -> str:
             f"verdict {rep['verdict']}")
 
 
+def _at_real_dims() -> str:
+    """``_check`` at DeepSeek-V2-Lite's own packed geometry: D = 576, halves of
+    [256 latent | 32 RoPE] lanes, rep = 16 -- the shapes production launches."""
+    global HA, HB, HALF, D, N_SEL
+    saved = (HA, HB, HALF, D, N_SEL)
+    HA, HB = 256, 32
+    HALF, D, N_SEL = HA + HB, 2 * (HA + HB), 3
+    try:
+        return "; ".join(f"gated={g}: {_check(0, g)}" for g in (True, False))
+    finally:
+        HA, HB, HALF, D, N_SEL = saved
+
+
 def main() -> int:
     for seed in range(2):
         for gated in (True, False):
@@ -252,6 +272,11 @@ def main() -> int:
                 print(f"FAIL seed {seed} gated={gated}: {exc}")
                 return 1
             print(f"ok seed {seed} gated={gated}: {msg}")
+    try:
+        print("ok real dims (D=576, 256+32 per half, rep=16):", _at_real_dims())
+    except AssertionError as exc:
+        print(f"FAIL real dims: {exc}")
+        return 1
     try:
         print("ok e2e:", _e2e())
     except AssertionError as exc:

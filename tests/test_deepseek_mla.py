@@ -587,3 +587,126 @@ def test_output_attentions_match_upstream_at_full_cache():
     for a_ref, a_got in zip(ref, got):
         for x, y in zip(a_ref, a_got):
             torch.testing.assert_close(y, x, rtol=1e-5, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# the quality runners, as they build the cache
+# ---------------------------------------------------------------------------
+
+
+def test_gsm8k_runner_builds_the_mla_cache():
+    """The GSM8K runner's cache set-up, on a DeepSeek model, at the operating point.
+
+    It used to resolve the budget itself, by handing ``model.config`` -- the RAW
+    DeepSeek config -- to ``WindowedCacheConfig.resolve``, which refuses it (it
+    would price 8,192 B/token). So every windowed DeepSeek GSM8K run raised on its
+    first example. The runner now reads the resolution off the cache, which
+    converts the raw config to the latent view first, exactly as LongBench does.
+    """
+    from modules.evaluation.gsm8k_runner import GSM8KRunner
+    from utils.config import load_config
+
+    runner = GSM8KRunner(load_config("configs/gsm8k_deepseek_v2_lite_budget20.yaml"))
+    assert runner.is_windowed and runner.cache_backend_package == "flash_attn"
+    m = tiny_model()
+    h_mla = install_recoverkv_mla(m, flash=False)
+    try:
+        runner.model = m
+        # 145 tokens is the median DeepSeek-tokenized GSM8K prompt; 512 is the cap.
+        cache, hooks, resolved = runner._setup_windowed_cache(
+            torch.zeros(1, 145, dtype=torch.long), 512)
+        hooks.remove()
+        assert resolved is cache.resolved
+        assert cache._value_alias
+        assert resolved.bytes_per_token == (48 + 16) * 2        # bf16 latent
+        # The operating-point finding the runner now reports: sink + local is
+        # 133 tokens against a ~131-token budget, so there is no int2 tier.
+        assert resolved.retained_tokens == 5 + 128 and resolved.N_q == 0
+    finally:
+        h_mla.remove()
+
+    runner._sequence_tokens = [400, 400, 400, 400]
+    runner._retained_tokens = [133, 133, 157, 157]
+    runner._int2_windows = [0, 0, 3, 3]
+    s = runner._compression_summary(4)
+    assert s["n_examples_with_int2_tier"] == 2
+    assert s["pct_examples_with_int2_tier"] == 50.0
+
+
+def test_flash_prefill_scores_only_for_a_windowed_cache(monkeypatch):
+    """The score kernel runs at prefill only when a RecoverKV cache consumes it.
+
+    The latent FullKV baseline runs the same owned forward; scoring its prefill
+    is a second O(N^2) pass per layer that changes nothing it outputs and
+    inflates its prefill time. The flash branch itself needs CUDA, so this
+    routes the prefill through a recorder that stands in for it.
+    """
+    from transformers import DynamicCache
+
+    calls = []
+
+    def fake_flash(module, q_nope, q_pe, k_pe, c, score=True):
+        calls.append(score)
+        out, scores, _ = mla_attention._prefill_eager(module, q_nope, q_pe, k_pe,
+                                                      c, None)
+        return out, (scores if score else None)
+
+    monkeypatch.setattr(mla_attention, "_flash_prefill", lambda mod, h: True)
+    monkeypatch.setattr(mla_attention, "_prefill_flash", fake_flash)
+    m = tiny_model()
+    h_mla = install_recoverkv_mla(m, flash=False)
+    try:
+        ids = torch.randint(0, 128, (1, 24), generator=torch.Generator().manual_seed(2))
+        with torch.no_grad():
+            m(input_ids=ids, past_key_values=DynamicCache(), use_cache=True,
+              position_ids=torch.arange(24).unsqueeze(0))
+        assert calls and not any(calls)
+        calls.clear()
+        cfg = WindowedCacheConfig(window_size=4, num_sink_tokens=2,
+                                  local_window_size=8, cache_budget=0.5,
+                                  quant_ratio=0.7, first_eviction_step=0)
+        wc = WindowedCache(config=cfg, prefill_len=24, model_config=m.config,
+                           kv_dtype=torch.float32,
+                           rope_module=m.model.layers[0].self_attn.rotary_emb,
+                           num_layers=2, max_tokens=4)
+        with torch.no_grad():
+            m(input_ids=ids, past_key_values=wc, use_cache=True,
+              position_ids=torch.arange(24).unsqueeze(0))
+        assert calls and all(calls)
+        assert all("window_scores" in wc.cache_kwargs[i] for i in range(2))
+    finally:
+        h_mla.remove()
+
+
+def test_rope_table_grows_in_chunks_with_upstreams_values():
+    """``ensure_table`` rebuilds once per chunk, and every row is upstream's.
+
+    Upstream regrows its table to the exact length on every decode step, in
+    every layer (it sets ``max_seq_len_cached = None`` after construction, so
+    even the first call rebuilds). A row depends only on its own position, so a
+    longer table holds the same rows, bit for bit.
+    """
+    from models.deepseek_v2 import rope as R
+
+    attn = up.DeepseekV2Attention(tiny_config(), layer_idx=0)
+    rot = attn.rotary_emb
+    assert rot.max_seq_len_cached is None            # upstream's own post-init state
+    builds = []
+    orig = rot._set_cos_sin_cache
+
+    def counting(seq_len, device, dtype):
+        builds.append(seq_len)
+        return orig(seq_len=seq_len, device=device, dtype=dtype)
+
+    rot._set_cos_sin_cache = counting
+    for n in range(100, 2 * R._TABLE_CHUNK + 1, 7):    # one decode step at a time
+        R.ensure_table(rot, n, torch.device("cpu"), torch.bfloat16)
+    assert builds == [R._TABLE_CHUNK, 2 * R._TABLE_CHUNK]
+    for dtype in (torch.float32, torch.bfloat16):
+        R.ensure_table(rot, 5000, torch.device("cpu"), dtype)
+        ref = up.DeepseekV2Attention(tiny_config(), layer_idx=0).rotary_emb
+        ref._set_cos_sin_cache(seq_len=4321, device=torch.device("cpu"), dtype=dtype)
+        if rot.cos_cached.dtype != dtype:            # a dtype change rebuilds, as upstream
+            orig(seq_len=rot.max_seq_len_cached, device=torch.device("cpu"), dtype=dtype)
+        assert torch.equal(rot.cos_cached[:4321], ref.cos_cached)
+        assert torch.equal(rot.sin_cached[:4321], ref.sin_cached)

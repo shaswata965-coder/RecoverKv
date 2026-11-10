@@ -83,6 +83,7 @@ OPERATING_POINT_EXEMPT = {
     "longbench_full_cache.yaml": "the FullKV baseline -- no eviction at all",
     "longbench_deepseek_v2_lite_full_cache.yaml": "the DeepSeek-V2-Lite FullKV (latent) baseline -- no eviction at all",
     "gsm8k_full_cache.yaml": "the FullKV baseline -- no eviction at all",
+    "gsm8k_deepseek_v2_lite_full_cache.yaml": "the DeepSeek-V2-Lite FullKV (latent) baseline -- no eviction at all",
     "eval_parity_base.yaml": "parity harness; budget 0.25 is its own control",
     "eval_parity_ours_eager.yaml": "parity harness; matched to the base arm",
     "eval_parity_ours_flash.yaml": "parity harness; matched to the base arm",

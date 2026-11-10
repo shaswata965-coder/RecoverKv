@@ -1,0 +1,58 @@
+# ============================================================================
+# GSM8K — Ours on DeepSeek-V2-Lite-Chat at the operating point (flash backend)
+# ============================================================================
+# The shipped operating point (utils.config.OPERATING_POINT), unchanged from
+# Llama -- scripts/check_operating_point.py fails if it drifts. Loaded through
+# utils.model_loading.load_causal_lm: trust_remote_code at the pinned revision
+# and the owned MLA attention forward; the cache holds the 576-wide latent.
+#
+# READ BEFORE QUOTING (measured with the real tokenizer on all 1,319 test
+# problems): prompts are 110-276 tokens, so 0.20 * (prompt + 512) is ~131
+# tokens at the median -- below sink + local = 133. The resolver then keeps
+# sink + local and buys no evictable window, so only the 231 problems with a
+# prompt of >= 168 tokens get an int2 tier at all. The run's meta.json records
+# `n_examples_with_int2_tier`; the read gate exists only on those, and a
+# `gated` verdict speaks for them alone. The same holds for the Llama config.
+#
+# Produces: outputs/gsm8k_deepseek_v2_lite/budget20/{predictions.jsonl,meta.json}
+_base_: base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: deepseek-ai/DeepSeek-V2-Lite-Chat
+  revision: 85864749cd611b4353ce1decdb286193298f64c7
+  dtype: bfloat16                           # DeepSeek-V2 is a bf16 model
+  attn_implementation: flash_attention_2    # MUST match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k_deepseek_v2_lite/budget20
+  results_dir: outputs/gsm8k_deepseek_v2_lite
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false
