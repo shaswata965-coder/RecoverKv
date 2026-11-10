@@ -80,9 +80,15 @@ GRID_GROUP = 32
 # multi-millisecond kernels, because the break stops Inductor fusing the one part
 # of the eviction worth fusing.
 #
-# The lowering bug is fixed upstream (>= 2.7, the boundary the original
-# workaround named). But tracing this function is only SAFE under a second
-# condition, and it is the more important one:
+# The original workaround named >= 2.7 as the boundary where the lowering bug is
+# fixed. Not on the evidence: on torch 2.7.1 + CUDA (Colab A100, 2026-11-09) the
+# eviction's compile stopped at decode step 0 with the same "StarDep does not
+# have an index" -- the log did not name the op, but this trace is the one
+# thing 2.7 added to that graph -- and 2.7.1's CPU backend fails differently
+# under emulate_precision_casts (`CppVecOverrides.to_dtype() got an unexpected
+# keyword argument 'use_compute_types'`). So 2.7 keeps the graph break, as 2.6
+# does; >= 2.8 is traced. Tracing this function is also only SAFE under a
+# second condition, and it is the more important one:
 #
 #   Inductor, by default, does not emulate intermediate precision casts. It
 #   drops an fp32 -> fp16 -> fp32 round trip and keeps the fp32 value in a
@@ -110,7 +116,7 @@ def _quant_may_be_traced() -> bool:
         major, minor = (int(p) for p in torch.__version__.split(".")[:2])
     except Exception:  # pragma: no cover - unparseable version string
         return False
-    if (major, minor) < (2, 7):  # pragma: no cover - torch-version dependent
+    if (major, minor) < (2, 8):  # pragma: no cover - torch-version dependent
         return False  # gather -> amin StarDep lowering failure
     try:
         from torch._inductor import config as _inductor_config
