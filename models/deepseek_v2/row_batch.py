@@ -32,7 +32,6 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Sequence
 
-import torch
 from torch import Tensor
 
 try:  # the HF base class, so the remote model keeps the object as is
