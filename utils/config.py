@@ -860,11 +860,11 @@ class GSM8KConfig:
 class LongGenBenchConfig:
     """LongGenBench (Wu et al., ICLR'25), mode ``longgenbench``.
 
-    See ``data/longgenbench_loader.py`` for the benchmark, the pin and the
-    protocol, and ``modules/evaluation/longgenbench_runner.py`` for generation.
+    See ``longgenbench_eval/`` for the benchmark, the pin, the judge and the
+    metrics, and ``modules/evaluation/longgenbench_runner.py`` for generation.
     """
 
-    #: Directory written by ``python -m data.longgenbench_loader --out <dir>``.
+    #: Directory written by ``python -m longgenbench_eval.data --out <dir>``.
     data_dir: str = "data/longgenbench"
     #: "16K" (Dataset_short.json, up to 16,000 new tokens) or "32K" (32,000).
     setting: str = "16K"
@@ -875,9 +875,12 @@ class LongGenBenchConfig:
     #: Contiguous slice [start, end) of EACH type's documents, in file order.
     start: int = 0
     end: Optional[int] = None
-    #: "greedy" (the paper) or "repo_sampling" (inference.py: T=0.95, top_p=0.95).
-    decoding: str = "greedy"
-    #: repo_sampling only: document d is drawn with seed sample_seed + d's id.
+    #: "reference": the sampling of the runs behind the paper's Table 2
+    #: (inference.py: T=0.95, top_p=0.95, seed 6211027 per document);
+    #: "greedy": what the paper's text says. See longgenbench_eval/reference.py.
+    decoding: str = "reference"
+    #: reference decoding only: every document is drawn with this seed, as
+    #: vLLM's per-request SamplingParams(seed=...) does.
     sample_seed: int = 6211027
     skip_oom: bool = False
     aggressive_cache_clear: bool = True
@@ -893,9 +896,9 @@ class LongGenBenchConfig:
             self.types = [self.types] if isinstance(self.types, str) else list(self.types)
             if not self.types:
                 raise ConfigValidationError("longgenbench.types must be null or non-empty")
-        if self.decoding not in ("greedy", "repo_sampling"):
+        if self.decoding not in ("reference", "greedy"):
             raise ConfigValidationError(
-                f"longgenbench.decoding must be 'greedy' or 'repo_sampling', got {self.decoding!r}")
+                f"longgenbench.decoding must be 'reference' or 'greedy', got {self.decoding!r}")
         if isinstance(self.start, bool) or not isinstance(self.start, int) or self.start < 0:
             raise ConfigValidationError(f"longgenbench.start must be an int >= 0, got {self.start!r}")
         if self.end is not None and (isinstance(self.end, bool) or not isinstance(self.end, int)

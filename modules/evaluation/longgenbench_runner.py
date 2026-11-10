@@ -1,31 +1,31 @@
 """LongGenBench runner (mode ``longgenbench``): long-form generation, decode-phase cache.
 
-Reproduces the generation side of ``mozhu621/LongGenBench`` (see
-``data/longgenbench_loader.py`` for the benchmark, the pin and the protocol):
+Generates LongGenBench documents (Wu et al., ICLR'25) the way the runs behind the
+paper's Table 2 did (``longgenbench_eval/reference.py``: ``inference.py`` @
+``7b59ec6``), with this repository's cache in place of vLLM's:
 
 * the dataset prompt verbatim, raw completion, one BOS (``encode_prompt`` adds
   it because the prompt carries none), no chat template;
 * stop at ``*** finished`` (cut from the text, as vLLM does), at the model's
   EOS (the generation config's, as vLLM uses), or at ``max_new_tokens``
   (16,000 for ``16K``, 32,000 for ``32K``);
-* ``output = prefix + generation``; scored by ``longgenbench_scoring`` and judged
-  afterwards, in a separate process, by ``longgenbench_judge``;
-* decoding ``greedy`` (the paper) or ``repo_sampling`` (inference.py's
-  ``temperature=0.95, top_p=0.95``, seeded per example so both arms draw from
-  the same stream); batch size 1, fp16, flash-attention-2.
+* ``output = prefix + generation``, written as ``{"id", "output", ...}`` lines
+  that ``longgenbench_eval`` judges and scores like any baseline's;
+* decoding ``reference`` (the code: temperature 0.95, top_p 0.95, no top-k, the
+  same seed for every document, as vLLM's per-request seed) or ``greedy`` (what
+  the paper's text says); batch size 1, flash-attention-2.
 
 The cache is the only thing that differs between arms: ``cache.backend:
 dynamic`` is the full-cache baseline, ``windowed`` + ``flash_attn`` is this
 repo's method, built exactly as the GSM8K and LongBench runners build it.
 
-Each type writes ``<type>.jsonl`` (one record per document) and
-``<type>.meta.json``. The sidecar carries what makes the number attributable:
-the read-gate verdict (counters reset per type, so they describe that type
-only), the operating point, the resolved geometry, the dataset pin and hash, the
+Each type writes ``<type>.jsonl`` and ``<type>.meta.json``. The sidecar carries
+what makes the number attributable: the read-gate verdict (counters reset per
+type), the operating point, the resolved geometry, the dataset pin and hash, the
 decoding, and a compression record. The budget is ``cache_budget * (prompt +
-max_new_tokens)``, the method's own definition; a document that stops well
-short of ``max_new_tokens`` holds more than ``cache_budget`` of its own
-sequence, and ``kv_bytes_fraction_upper`` says how much.
+max_new_tokens)``, the method's own definition; a document that stops short of
+``max_new_tokens`` holds more than ``cache_budget`` of its own sequence, and
+``kv_bytes_fraction_upper`` says how much.
 
 Timing fields (``wall_s``, ``decode_tokps_wallclock``) are wall clock inside a
 quality run: prefill, eviction compiles and Python overhead included. They are
@@ -43,27 +43,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from data.longgenbench_loader import (
-    CODE_COMMIT,
+from longgenbench_eval.data import dataset_sha, load_type, type_slug
+from longgenbench_eval.metrics import completion_rate, parse_blocks, split_blocks, word_count
+from longgenbench_eval.reference import (
     CODE_REPO,
-    DECODINGS,
+    FILES,
+    GENERATION_CODE,
+    GENERATION_SAMPLING,
     HF_DATASET,
     HF_REVISION,
     MAX_NEW_TOKENS,
     PROMPT_FORMAT,
-    REPO_SAMPLING,
     STOP_STRING,
     TYPES,
-    data_filename,
-    dataset_sha,
-    load_type,
-    type_slug,
-)
-from modules.evaluation.longgenbench_scoring import (
-    completion_rate,
-    parse_blocks,
-    split_blocks,
-    word_count,
 )
 from utils.config import FIRST_EVICTION_STEP_DEFAULT, log_operating_point
 from utils.env_capture import capture_environment
@@ -71,6 +63,10 @@ from utils.logger import get_logger
 from utils.prompting import encode_prompt
 
 log = get_logger(__name__)
+
+#: "reference": the sampling of the runs behind the paper's Table 2;
+#: "greedy": what the paper's text says (no run in the reference repo used it).
+DECODINGS = ("reference", "greedy")
 
 
 class LongGenBenchRunner:
@@ -277,11 +273,14 @@ class LongGenBenchRunner:
         if self.lg.decoding == "greedy":
             gen_kwargs.update(do_sample=False, temperature=1.0, top_p=1.0)
         else:
-            # Same seed for the same document in every arm: the arms draw from
-            # one stream until the cache makes their distributions differ.
-            torch.manual_seed(int(self.lg.sample_seed) + int(d["id"]))
-            gen_kwargs.update(do_sample=True, temperature=REPO_SAMPLING["temperature"],
-                              top_p=REPO_SAMPLING["top_p"], top_k=REPO_SAMPLING["top_k"])
+            # vLLM's SamplingParams(seed=...) seeds every request with the same
+            # seed; so does this, and both arms of a comparison draw from the
+            # same stream until the cache makes their distributions differ.
+            torch.manual_seed(int(self.lg.sample_seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(self.lg.sample_seed))
+            gen_kwargs.update(do_sample=True, temperature=GENERATION_SAMPLING["temperature"],
+                              top_p=GENERATION_SAMPLING["top_p"], top_k=GENERATION_SAMPLING["top_k"])
         if self.cache_backend_package == "eager":
             gen_kwargs["output_attentions"] = True
         if cache is not None:
@@ -534,8 +533,8 @@ class LongGenBenchRunner:
             "dataset": HF_DATASET,
             "dataset_revision": HF_REVISION,
             "reference_code": CODE_REPO,
-            "reference_commit": CODE_COMMIT,
-            "data_file": data_filename(lg.setting),
+            "reference_generation": GENERATION_CODE,
+            "data_file": FILES[lg.setting][0],
             "dataset_sha": dataset_sha(lg.data_dir, lg.setting),
             "prompt_format": PROMPT_FORMAT,
             "start": lg.start,
@@ -547,9 +546,9 @@ class LongGenBenchRunner:
             "max_new_tokens_override": getattr(lg, "max_new_tokens", None),
             "generation": {
                 "decoding": lg.decoding,
-                "sampling": ({**REPO_SAMPLING, "seed": int(lg.sample_seed),
-                              "seed_rule": "sample_seed + document id"}
-                             if lg.decoding == "repo_sampling" else None),
+                "sampling": ({**GENERATION_SAMPLING, "seed": int(lg.sample_seed),
+                              "seed_rule": "the same seed for every document"}
+                             if lg.decoding == "reference" else None),
                 "stop_string": STOP_STRING,
                 "stop_string_in_output": False,
                 "eos_token_id": self._eos_ids(),

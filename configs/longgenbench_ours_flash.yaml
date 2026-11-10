@@ -7,9 +7,9 @@
 # runs up to 16,000 tokens. The prompt is tiny, so this scores the DECODE-phase
 # cache: almost everything the model attends to is its own generation.
 #
-#   python -m data.longgenbench_loader --out data/longgenbench --setting 16K
+#   python -m longgenbench_eval.data --out data/longgenbench --setting 16K
 #   python main.py --config configs/longgenbench_ours_flash.yaml
-#   python -m modules.evaluation.longgenbench_judge --runs outputs/longgenbench/16K/ours
+#   python -m longgenbench_eval.judge --generations outputs/longgenbench/16K/ours/<type>.jsonl
 #
 # The budget is cache_budget * (prompt + max_new_tokens), the method's own
 # definition. Colab: notebooks/longgenbench_colab.ipynb.
@@ -54,6 +54,6 @@ longgenbench:
   setting: 16K
   types: null                # all four: Week, Floor, Menu Week, Block
   output_dir: outputs/longgenbench/16K/ours
-  decoding: greedy           # the paper; repo_sampling = inference.py's T=0.95, top_p=0.95
+  decoding: reference        # the runs behind Table 2: T=0.95, top_p=0.95; greedy = the paper's text
   skip_oom: false
   aggressive_cache_clear: true

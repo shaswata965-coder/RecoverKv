@@ -2068,49 +2068,51 @@ LongBench answers are short (at most 512 tokens), so its scores mostly test the
 prompt compression on decode step 0. LongGenBench (Wu et al., ICLR'25) is the
 other extreme: a ~700-token prompt asks for one structured document of up to
 16,000 tokens (52 diary weeks, 52 menus, 100 floors, 100 city blocks), with
-instructions that must surface in particular entries (once, over a range,
-periodically). Almost everything the model attends to is its own output, so it
-scores the decode-phase cache directly.
+instructions that must surface in particular entries. Almost everything the
+model attends to is its own output, so it scores the decode-phase cache.
 
-**What was built.** `mode: longgenbench`
-(`modules/evaluation/longgenbench_runner.py`), the pinned loader
-(`data/longgenbench_loader.py`: `mozhu/LongGenBench` @ `3c96cac`, SHA-256 per
-file, identical to the GitHub copy), the metric
-(`modules/evaluation/longgenbench_scoring.py`), the judge
-(`modules/evaluation/longgenbench_judge.py`, a separate process on a clean
-full-cache model), two configs (`configs/longgenbench_{ours_flash,full_cache}.yaml`,
-the first at `OPERATING_POINT`), and `notebooks/longgenbench_colab.ipynb`.
-The protocol is the reference code's (`mozhu621/LongGenBench` @ `45c320e`): raw
-prompt, no chat template, stop at `*** finished`, `prefix + generation`, split on
-`#*#`; the judge is the paper's (Llama-3.1-8B-Instruct) with `eval.py`'s few-shot
-prompt and its `'yes' in response` rule. Where the paper and the code disagree
-the paper wins and the code is an option: greedy decoding (the code samples at
-T = 0.95), and a greedy B = 1 judge (the code samples it too).
+**What was built.**
+* `mode: longgenbench` (`modules/evaluation/longgenbench_runner.py`) generates
+  with this repo's cache.
+* `longgenbench_eval/` is a self-contained harness: the pinned data, the paper's
+  judge under vLLM (batched, one engine), and the paper's metrics. It imports
+  nothing from this repository, so other baselines' generations are scored with
+  the same code.
+* Two configs, and `notebooks/longgenbench_colab.ipynb` (ours → generate →
+  judge → score).
 
-A first version (`72d8e07`, `ff0a51d`) implemented the other benchmark of the
-same name (Liu et al., EMNLP'24, as SCOPE runs it). It was replaced, not kept.
+**The protocol is the code that produced the paper's Table 2, not the paper's
+prose.** Read from the authors' repository history: the Llama-3.1-8B 16K row
+first appears on 2024-08-18. In force then:
+* `inference.py` @ `7b59ec6`: vLLM on the raw prompt, temperature 0.95,
+  top_p 0.95, seed 6211027, stop `*** finished`, `prefix + text`.
+* `eval.py` @ `951769c`: a ZERO-shot judge prompt, Meta-Llama-3.1-8B-Instruct,
+  sampled at 0.95 with seed 42, verdict `'yes' in response`.
 
-**Measured, CPU-only.** The pinned files have 400 documents and 6,205 (16K) /
-8,215 (32K) instructions, the "Total Checks" in the authors' own results table.
-`tests/test_longgenbench.py` (19) pins block parsing, the judge prompt character
-for character, the verdict rule and every aggregate (CR, STIC-1, STIC-2, wAvg,
-once/range/periodic, Len) to the reference code, and runs the runner and the
-judge driver end to end on stub models. The notebook's helpers were driven end
-to end the same way, and 31 tampered sidecars were each refused.
+The paper's text says greedy decoding; no run in the repository used it.
+Today's few-shot judge prompt and the 70B judge arrived in February 2025, after
+the paper. Earlier commits on this branch had the first point as an option and
+the second as the default; both are corrected. A first version (`72d8e07`,
+`ff0a51d`) implemented the other benchmark named LongGenBench (Liu et al., as
+SCOPE runs it); it was replaced.
 
-**Not verifiable here.** The authors publish no per-document outputs for
-Llama-3.1-8B, so there is no reproduction target finer than their Table 2 row
-(CR 93.5, STIC-1 23.4, STIC-2 22.0, wAvg 20.6 at 16K), which used vLLM, bf16,
-all 400 documents and its own decoding. The notebook prints it as context only.
+**Measured, CPU-only.** The formulas (CR, STIC-1 = yes ÷ judged, STIC-2 = yes ÷
+all instructions, wAvg = CR × STIC-2, Len) reproduce 16 of the 18 rows of the
+paper's Table 2 from the authors' own `static.csv` counts, digit for digit. The
+two exceptions are GPT-4o rows with typos in the paper. The pinned data has the
+authors' instruction totals (6,205 / 8,215). `tests/test_longgenbench_eval.py`
+(31) and `tests/test_longgenbench.py` (5) pin parsing, the judge prompt, the
+verdict rule, the judge driver and the runner's protocol. The notebook was driven
+end to end on stub models (generation, one batched judge pass, scoring, reuse),
+and 25 tampered generation sidecars were each refused.
 
 **Arithmetic, not measured.** At the operating point and a 700-token prompt,
-`resolve()` gives about 1,090 fp16 keys and 1,070 int2 windows (9,600 keys
-kept): the int2 tier and the read gate start ~400 generated tokens in, and keys
-are first dropped ~8,900 tokens in, inside most documents. The notebook's time
-table (5 documents per type: ~2.2 h fullkv, ~4 h ours, one A100) assumes 30 and
-55 ms/token at B = 1 and ~13,000 new tokens per document. The whole benchmark at
-B = 1 is about five days, so a Colab run is a declared subset (the first N
-documents of each type, the same in every arm).
+`resolve()` gives about 1,090 fp16 keys and 1,070 int2 windows (9,600 keys kept):
+the int2 tier and the read gate start ~400 generated tokens in, and keys are
+first dropped ~8,900 tokens in. The notebook's default (5 documents per type,
+ours only) is ~4 h on one A100 at ~55 ms/token; the whole benchmark at B = 1 is
+days, so a run is a declared subset.
 
-**Not verified.** Any GPU execution. No LongGenBench score exists for this
-method yet.
+**Not verified.** Any GPU execution, including the vLLM judge (0.8.5.post1 in its
+own virtualenv, because vLLM needs transformers ≥ 4.51 and the cache refuses
+anything past 4.47.1). No LongGenBench score exists for this method yet.
