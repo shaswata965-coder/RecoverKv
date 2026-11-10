@@ -582,6 +582,8 @@ class GSM8KRunner:
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "local_window_size": cfg.cache.local_window_size,
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
+            "quant_budget_mode": getattr(cfg.cache, "quant_budget_mode", "bytes"),
+            "quant_gate_ratio": getattr(cfg.cache, "quant_gate_ratio", None),
             "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "stop_strings": STOP_STRINGS if self._supports_stop_strings() else None,

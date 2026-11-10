@@ -789,6 +789,9 @@ class LongBenchRunner:
             # under 'tokens' holds 63% of the bytes it holds under 'bytes' at
             # q=0.5, and nothing else in this sidecar distinguishes them.
             "quant_budget_mode": getattr(cfg.cache, "quant_budget_mode", "bytes"),
+            # The read ratio as configured. `read_gate.read_fraction` is the same
+            # number as realised; a sidecar should state both.
+            "quant_gate_ratio": getattr(cfg.cache, "quant_gate_ratio", None),
             # What the budget RESOLVED to, not just what was asked for.
             "resolved_geometry_first_example": self._resolved_sample,
             "quant_memoize_read": getattr(cfg.cache, "quant_memoize_read", None),

@@ -211,3 +211,26 @@ interpreter; nothing has run on a GPU or the real weights.
   unchanged by them (`quant_completion = null` is the pre-knob call), so the
   method this branch ports is current; the ablation knob itself is not ported
   and would need `out_dtype` in the MLA kernel.
+
+### 6.4 The paper run: LongBench at a 10% budget on Colab (2026-11-10)
+
+`notebooks/longbench_deepseek_v2_lite_b010_colab.ipynb` runs QEvict at `cache_budget 0.10` (the paper's Table 2
+"10%" row; local 128, everything else the operating point) and the latent Full-KV reference on the 11 Table 2
+LongBench tasks other than NarrativeQA, on one pinned commit, checkpoint revision and stack (torch 2.6.0, Triton
+3.2.0, transformers 4.47.1, flash-attn 2.7.4.post1, A100 80GB). Every chunk's sidecar is verified before it is kept.
+
+* **`scripts/deepseek_gpu_preflight.py`** is the notebook's gate before any GPU time is spent on the benchmark. On a
+  random model with the checkpoint's own attention geometry it checks, on the GPU: the owned forward (FA2 prefill)
+  against upstream; the Triton score kernel against eager scores; the fused decode against the materialize path, in
+  bf16 and in fp32 (per-layer attention outputs and per-step window scores, not just logits, which in a random model
+  hide kernel errors); the gate verdict at rho = 0.25; a compiled eviction. Under the interpreter
+  (`tests/test_deepseek_gpu_preflight.py`) it catches a 1% error injected into the MLA kernel's output.
+* **On torch 2.6 (the GPU stack), CPU:** `tests/test_deepseek_mla.py` passes, including the compiled eviction over
+  the aliased latent, with `ATEN_CPU_CAPABILITY=default`. Without it torch 2.6's CPU Inductor emits an AVX-512
+  `convert<uint8_t,1,int64_t,2>` that does not compile (a CPU codegen bug; the GPU compiles through Triton).
+* **Triton 3.2's interpreter cannot run any of the repo's kernels** (it passes scalar kernel arguments as
+  one-element arrays: `for r in range(0, REP)` fails in the shipped gate kernel). The kernels pass under Triton
+  3.9's interpreter; on 3.2 only the compiled GPU check (the preflight) applies.
+* **Budget geometry at 10%** (real tokenizer, all 2,150 examples): 14 examples have no INT2 tier (11 MultiNews,
+  3 2WikiMQA: sink + local exceed the budget); KV memory is 9.99% nominal (the resolver's active allocation) and
+  11.61% physical (Appendix B.4's Eq. 9 with this cache's slot table, slack, positions and ledger).
