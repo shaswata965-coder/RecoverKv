@@ -737,8 +737,44 @@ class LongBenchConfig:
     skip_oom: bool = False          # record OOM'd examples as pred=null
     aggressive_cache_clear: bool = False  # essential on Kaggle T4
     num_samples: Union[int, str] = "max"  # "max" = all examples; int = cap per dataset
+    # ---- batched generation (LongBenchRunner._run_dataset_batched) ----
+    # The windowed cache batches only rows of exactly the same length (no
+    # padding). {dataset: L} middle-truncates every prompt of that dataset to
+    # exactly L tokens (the final, templated ids) and skips examples shorter
+    # than L, so all of its rows batch together; num_samples then counts the
+    # examples that qualify. Replaces max_length for those datasets.
+    prompt_tokens: Optional[Dict[str, int]] = None
+    # Rows decoded together (1 = the original one-example-at-a-time path, unless
+    # prompt_tokens or completion_rungs selects the batched path). On OOM a
+    # batch is halved, and the lower cap holds for the rest of the dataset.
+    batch_size: int = 1
+    # Cap rows per batch so rows x prompt length <= batch_tokens (memory).
+    batch_tokens: Optional[int] = None
+    # Record every completion variant on the run's own decode states, every
+    # completion_rungs_stride-th step, for every row (modules/evaluation/
+    # completion_recorder.py). Flash backend only; writes <output_dir>/rungs/.
+    completion_rungs: bool = False
+    completion_rungs_stride: int = 16
 
     def __post_init__(self) -> None:
+        for k in ("batch_size", "completion_rungs_stride"):
+            v = getattr(self, k)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ConfigValidationError(f"longbench.{k} must be an int >= 1, got {v!r}")
+        bt = self.batch_tokens
+        if bt is not None and (isinstance(bt, bool) or not isinstance(bt, int) or bt < 1):
+            raise ConfigValidationError(f"longbench.batch_tokens must be None or an int >= 1, got {bt!r}")
+        if self.prompt_tokens is not None:
+            if not isinstance(self.prompt_tokens, dict):
+                raise ConfigValidationError(
+                    f"longbench.prompt_tokens must be a {{dataset: tokens}} mapping, got {self.prompt_tokens!r}")
+            for d, n in self.prompt_tokens.items():
+                if isinstance(n, bool) or not isinstance(n, int) or n < 16:
+                    raise ConfigValidationError(
+                        f"longbench.prompt_tokens[{d!r}] must be an int >= 16, got {n!r}")
+        if not isinstance(self.completion_rungs, bool):
+            raise ConfigValidationError(
+                f"longbench.completion_rungs must be true or false, got {self.completion_rungs!r}")
         ns = self.num_samples
         if isinstance(ns, bool):
             # bool is a subclass of int in Python; explicitly reject it.

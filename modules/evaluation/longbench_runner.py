@@ -67,6 +67,7 @@ class LongBenchRunner:
         # quant_budget_mode regression stayed invisible. See
         # ACCURACY_RECOVERY_PLAN.md §2.
         self._resolved_sample = None
+        self._batch_meta: Optional[Dict[str, Any]] = None
 
         # Extract longbench-specific config
         self.lb = getattr(config, "longbench", None)
@@ -244,8 +245,19 @@ class LongBenchRunner:
 
         log.info("LongBench run complete. Outputs in %s", output_dir)
 
+    def _batched(self, name: str) -> bool:
+        """The batched path runs when asked for (batch_size > 1), when the dataset
+        has a fixed prompt length, or when the completion recorder is on."""
+        lb = self.lb
+        return (int(getattr(lb, "batch_size", 1) or 1) > 1
+                or name in (getattr(lb, "prompt_tokens", None) or {})
+                or bool(getattr(lb, "completion_rungs", False)))
+
     def _run_dataset(self, name: str, output_dir: Path) -> None:
         """Run predictions on a single dataset."""
+        if self._batched(name):
+            return self._run_dataset_batched(name, output_dir)
+        self._batch_meta = None
         log.info("=== Dataset: %s ===", name)
 
         use_e = getattr(self.lb, "use_e_variants", False)
@@ -339,6 +351,69 @@ class LongBenchRunner:
         model = self.model
         tokenizer = self.tokenizer
 
+        # Steps 1-4 (template, THUDM truncation, chat template, tokenize) live in
+        # _encode_example, which the batched path shares.
+        inputs = self._encode_example(ex, prompt_template, dataset_name)
+        input_ids = inputs.input_ids.to(model.device)
+        # Pass the mask explicitly: pad_token == eos_token on Llama, so
+        # transformers cannot infer it and warns on every example. All-ones at
+        # batch size 1, so the result is unchanged — but leaving it implicit
+        # buries real warnings under thousands of spurious ones.
+        attention_mask = inputs.attention_mask.to(model.device)
+        context_length = input_ids.shape[-1]
+
+        # Guard: a prompt longer than the model's positional range yields
+        # out-of-distribution RoPE positions (garbage / errors). Surface it
+        # loudly instead of silently scoring noise — almost always means
+        # truncation was disabled (max_length null) on a SHORT-context model.
+        # Llama-3.1-8B (128K) fits every LongBench prompt; the original
+        # Llama-3-8B (8K) does not.
+        self._warn_if_over_context(context_length, max_gen_len)
+
+        # 5. Set up cache
+        cache = None
+        hooks = None
+
+        if self.is_windowed:
+            cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
+
+        # 6. Generate
+        try:
+            gen_kwargs = self._gen_kwargs(dataset_name, max_gen_len, attention_mask, context_length)
+            if cache is not None:
+                gen_kwargs["past_key_values"] = cache
+
+            with torch.no_grad():
+                output = model.generate(input_ids, **gen_kwargs)
+
+        finally:
+            # 7. Clean up hooks (no leakage between examples)
+            if hooks is not None:
+                hooks.remove()
+
+        # 8. Decode only new tokens
+        pred = tokenizer.decode(
+            output[0][context_length:], skip_special_tokens=True
+        )
+
+        # 9. Post-processing (dataset-specific, matches THUDM pred.py)
+        pred = self._post_process(pred, dataset_name)
+
+        # 10. Memory hygiene
+        self._cleanup_memory(cache)
+
+        return pred
+
+    def _encode_example(self, ex: Dict[str, Any], prompt_template: str, dataset_name: str,
+                        thudm_truncate: bool = True):
+        """Steps 1-4 of the protocol: the example's model input, as a BatchEncoding [1, n].
+
+        ``thudm_truncate=False`` skips the ``max_length`` middle truncation: the
+        batched path truncates the final ids to an exact length instead.
+        """
+        cfg = self.config
+        tokenizer = self.tokenizer
+
         # 1. Format prompt from template
         prompt = prompt_template.format(
             context=ex["context"], input=ex.get("input", "")
@@ -349,7 +424,7 @@ class LongBenchRunner:
         #    matches DefensiveKV, which uses Llama-3.1-8B's 128K window and does
         #    not pre-truncate). A positive value reproduces official
         #    THUDM/LongBench middle-truncation for short-context models.
-        max_length = getattr(self.lb, "max_length", None)
+        max_length = getattr(self.lb, "max_length", None) if thudm_truncate else None
         tokenized = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
 
         if max_length and max_length > 0 and len(tokenized) > max_length:
@@ -394,87 +469,291 @@ class LongBenchRunner:
         #    template (NO_CHAT_TEMPLATE_DATASETS) still get their BOS from the
         #    tokenizer. THUDM/LongBench and DefensiveKV tokenize the templated
         #    string without re-adding specials; this matches them.
-        inputs = encode_prompt(tokenizer, prompt, truncation=False,
-                               return_tensors="pt")
-        input_ids = inputs.input_ids.to(model.device)
-        # Pass the mask explicitly: pad_token == eos_token on Llama, so
-        # transformers cannot infer it and warns on every example. All-ones at
-        # batch size 1, so the result is unchanged — but leaving it implicit
-        # buries real warnings under thousands of spurious ones.
-        attention_mask = inputs.attention_mask.to(model.device)
-        context_length = input_ids.shape[-1]
+        return encode_prompt(tokenizer, prompt, truncation=False, return_tensors="pt")
 
-        # Guard: a prompt longer than the model's positional range yields
-        # out-of-distribution RoPE positions (garbage / errors). Surface it
-        # loudly instead of silently scoring noise — almost always means
-        # truncation was disabled (max_length null) on a SHORT-context model.
-        # Llama-3.1-8B (128K) fits every LongBench prompt; the original
-        # Llama-3-8B (8K) does not.
-        self._warn_if_over_context(context_length, max_gen_len)
+    def _gen_kwargs(self, dataset_name: str, max_gen_len: int, attention_mask: torch.Tensor,
+                    context_length: int) -> Dict[str, Any]:
+        """``generate`` kwargs, shared by the B=1 and batched paths (cache not included)."""
+        tokenizer = self.tokenizer
+        gen_kwargs = {
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_gen_len,
+            "num_beams": 1,
+            "do_sample": False,
+            "temperature": 1.0,
+            "pad_token_id": tokenizer.pad_token_id
+            or tokenizer.eos_token_id,
+        }
 
-        # 5. Set up cache
-        cache = None
-        hooks = None
+        # THUDM/LongBench + DefensiveKV use PURE greedy with NO repetition
+        # penalty. Only pass one if the user explicitly opted in to a
+        # non-1.0 value; otherwise the default must stay absent so results
+        # match the published protocol exactly.
+        rep_pen = getattr(self.lb, "repetition_penalty", 1.0)
+        if rep_pen is not None and rep_pen != 1.0:
+            gen_kwargs["repetition_penalty"] = rep_pen
 
+        # output_attentions only for eager backend
+        if self.cache_backend_package == "eager":
+            gen_kwargs["output_attentions"] = True
+
+        # samsum special handling: stop at newline
+        if dataset_name == "samsum":
+            newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
+            gen_kwargs["eos_token_id"] = [
+                tokenizer.eos_token_id,
+                newline_id,
+            ]
+            gen_kwargs["min_length"] = context_length + 1
+        return gen_kwargs
+
+    # ------------------------------------------------------------------
+    # batched path: equal-length rows, no padding
+    # ------------------------------------------------------------------
+    #
+    # WindowedCache serves B > 1 only for rows of exactly the same length: it
+    # keeps every row's tiers dense and rectangular and takes no padding, and a
+    # padding mask would send flash-attention down the varlen path the fused
+    # decode refuses. LongBench prompts all differ in length, so a batch needs a
+    # common length. ``longbench.prompt_tokens[<dataset>] = L`` gives one: every
+    # prompt is middle-truncated to exactly L tokens (examples shorter than L are
+    # skipped), and then all rows of a dataset batch together. Without it, rows
+    # batch only with others of identical length (``plan_batches``).
+
+    @staticmethod
+    def middle_truncate_ids(ids: List[int], length: int) -> List[int]:
+        """Exactly ``length`` ids: the first ``length // 2`` and the last ``length - length // 2``.
+
+        Applied to the FINAL (templated) ids, so the chat header at the start and
+        the question and assistant header at the end survive; only document text
+        in the middle is dropped. That is THUDM's middle truncation, done on tokens
+        so that every row of a batch has exactly the same length.
+        """
+        if length < 2:
+            raise ValueError(f"prompt length must be >= 2, got {length}")
+        ids = list(ids)
+        if len(ids) <= length:
+            return ids
+        h = length // 2
+        return ids[:h] + ids[len(ids) - (length - h):]
+
+    def _eos_ids(self, dataset_name: str) -> List[int]:
+        """The ids ``generate`` stops a row on (and the batched decode cuts at)."""
+        tok = self.tokenizer
+        if dataset_name == "samsum":            # _gen_kwargs: EOS or newline
+            return [int(tok.eos_token_id), int(tok.encode("\n", add_special_tokens=False)[-1])]
+        eos = getattr(getattr(self.model, "generation_config", None), "eos_token_id", None)
+        if eos is None:
+            eos = tok.eos_token_id
+        return [int(e) for e in (eos if isinstance(eos, (list, tuple)) else [eos])]
+
+    def _recover_from_oom(self) -> None:
+        """Free what a failed batch held and disarm the fused path it left armed."""
+        from modules.windowed_cache import flash_decode
+
+        flash_decode._PENDING["ctx"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _run_dataset_batched(self, name: str, output_dir: Path) -> None:
+        """One dataset, ``batch_size`` equal-length rows at a time; same records as the B=1 path."""
+        from modules.evaluation.longgenbench_batching import plan_batches, split_evenly
+
+        lb = self.lb
+        log.info("=== Dataset: %s (batched) ===", name)
+        examples_list = list(load_longbench_dataset(name, use_e_variant=getattr(lb, "use_e_variants", False)))
+        max_gen_len = self.dataset2maxlen.get(name, 128)
+        prompt_template = self.dataset2prompt.get(name)
+        if prompt_template is None:
+            log.error("No prompt template for dataset %s — skipping", name)
+            return
+        fixed = (getattr(lb, "prompt_tokens", None) or {}).get(name)
+        ns = getattr(lb, "num_samples", "max")
+        cap_n = ns if isinstance(ns, int) and not isinstance(ns, bool) and ns >= 0 else None
+
+        # The first num_samples examples that are at least `fixed` tokens long.
+        rows: List[Tuple[int, Dict[str, Any], List[int]]] = []
+        skipped: List[str] = []
+        orig_len: Dict[str, int] = {}
+        for i, ex in enumerate(examples_list):
+            if cap_n is not None and len(rows) >= cap_n:
+                break
+            ids = self._encode_example(ex, prompt_template, name,
+                                       thudm_truncate=fixed is None).input_ids[0].tolist()
+            eid = ex.get("_id", str(i))
+            if fixed is not None:
+                if len(ids) < fixed:
+                    skipped.append(eid)
+                    continue
+                orig_len[eid] = len(ids)
+                ids = self.middle_truncate_ids(ids, fixed)
+            else:
+                orig_len[eid] = len(ids)
+            rows.append((i, ex, ids))
+        if cap_n is not None and len(rows) < cap_n:
+            log.warning("%s: only %d examples are at least %s tokens long (asked for %d)",
+                        name, len(rows), fixed, cap_n)
+        if not rows:
+            raise ValueError(f"{name}: no example selected")
+
+        bs = int(getattr(lb, "batch_size", 1) or 1)
+        bt = getattr(lb, "batch_tokens", None)
+        longest = max(len(r[2]) for r in rows)
+        cap = bs if not bt else max(1, min(bs, int(bt) // longest))
+        lengths = {k: len(r[2]) for k, r in enumerate(rows)}
+        planned = plan_batches(lengths, cap, order=list(range(len(rows))))
+        log.info("%s: %d examples (%d skipped as shorter than %s tokens) in %d equal-length batches "
+                 "(cap %d)", name, len(rows), len(skipped), fixed, len(planned), cap)
+
+        preds: Dict[int, Optional[str]] = {}
+        realised: List[Dict[str, Any]] = []
+        oom_events: List[Dict[str, Any]] = []
+        self._cap = cap
+        run_start = time.time()
+        for bi, planned_b in enumerate(planned):
+            pending = [planned_b] if len(planned_b) <= self._cap else split_evenly(planned_b, self._cap)
+            while pending:
+                part = pending.pop(0)
+                try:
+                    out, info = self._generate_rows(name, bi, [rows[k] for k in part], max_gen_len,
+                                                    output_dir)
+                except torch.cuda.OutOfMemoryError:
+                    self._recover_from_oom()
+                    if len(part) > 1:
+                        smaller = -(-len(part) // 2)
+                        oom_events.append({"batch": bi, "size": len(part), "fell_back_to": smaller})
+                        log.warning("%s batch %d: out of memory at %d rows; falling back to %d for the "
+                                    "rest of this dataset", name, bi, len(part), smaller)
+                        self._cap = min(self._cap, smaller)
+                        pending = split_evenly(part, smaller) + pending
+                        continue
+                    if not getattr(lb, "skip_oom", False):
+                        raise
+                    oom_events.append({"batch": bi, "size": 1, "fell_back_to": None})
+                    log.warning("%s batch %d: OOM at a single row — recording null pred", name, bi)
+                    preds[part[0]] = None
+                    realised.append({"batch": bi, "ids": [rows[part[0]][1].get("_id", str(rows[part[0]][0]))],
+                                     "size": 1, "oom": True})
+                    continue
+                for k, p in zip(part, out):
+                    preds[k] = p
+                realised.append(info)
+                log.info("  %s batch %d: %d rows x %d tokens, %d steps in %.0f s (%d/%d examples done)",
+                         name, bi, info["size"], info["prompt_tokens"], info["steps"], info["wall_s"],
+                         len(preds), len(rows))
+
+        out_path = output_dir / f"{name}.jsonl"
+        with open(out_path, "w", encoding="utf-8") as f:
+            for k, (i, ex, _) in enumerate(rows):
+                # Output schema matches THUDM/LongBench/pred.py exactly (as the B=1 path)
+                f.write(json.dumps({"pred": preds.get(k), "answers": ex["answers"],
+                                    "all_classes": ex.get("all_classes"), "length": ex["length"],
+                                    "_id": ex.get("_id", str(i))}, ensure_ascii=False) + "\n")
+        run_end = time.time()
+        elapsed = run_end - run_start
+        n = len(rows)
+        eps = n / elapsed if elapsed > 0 else 0
+        files = [b["rungs_file"] for b in realised if b.get("rungs_file")]
+        rec_on = bool(getattr(lb, "completion_rungs", False))
+        if rec_on:
+            from modules.evaluation.completion_recorder import STAT_NAMES
+            from modules.windowed_cache.completion import COMPLETION_RUNGS
+        self._batch_meta = {
+            "mode": "equal-length rows, no padding",
+            "batch_size": bs, "batch_tokens": bt, "batch_cap": cap, "final_cap": self._cap,
+            "prompt_tokens": fixed,
+            "truncation": ("middle, on the final (templated) token ids, to exactly prompt_tokens; "
+                           "shorter examples skipped") if fixed else "longbench.max_length (THUDM)",
+            "skipped_short": skipped,
+            "prompt_tokens_original": {r[1].get("_id", str(r[0])): orig_len[r[1].get("_id", str(r[0]))]
+                                       for r in rows},
+            "batches_planned": [[rows[k][1].get("_id", str(rows[k][0])) for k in b] for b in planned],
+            "batches_realised": realised,
+            "oom_events": oom_events,
+            "completion_rungs": ({"stride": int(lb.completion_rungs_stride), "rungs": list(COMPLETION_RUNGS),
+                                  "stats": list(STAT_NAMES), "err_normaliser": "o_held",
+                                  "files": files,
+                                  "records": int(sum(b.get("rung_records", 0) for b in realised))}
+                                 if rec_on else None),
+        }
+        log.info("%s: %d examples, %d OOM events, %.1fs (%.2f ex/s)", name, n, len(oom_events), elapsed, eps)
+        self._write_meta(name, n, max_gen_len, run_start, run_end, eps, output_dir)
+
+    def _generate_rows(self, name: str, bi: int, part_rows, max_gen_len: int,
+                       output_dir: Path) -> Tuple[List[str], Dict[str, Any]]:
+        """One batch of equal-length rows: predictions in row order, and the batch's record."""
+        import numpy as np
+
+        model, tok = self.model, self.tokenizer
+        lens = {len(r[2]) for r in part_rows}
+        if len(lens) != 1:
+            raise ValueError(f"{name} batch {bi}: rows of different lengths {sorted(lens)}; "
+                             "the windowed cache takes no padding")
+        input_ids = torch.tensor([r[2] for r in part_rows], dtype=torch.long, device=model.device)
+        L = int(input_ids.shape[-1])
+        attention_mask = torch.ones_like(input_ids)      # no padding: never the varlen path
+        self._warn_if_over_context(L, max_gen_len)
+        cache = hooks = rec = None
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
-
-        # 6. Generate
+        gen_kwargs = self._gen_kwargs(name, max_gen_len, attention_mask, L)
+        if cache is not None:
+            gen_kwargs["past_key_values"] = cache
+        eos = self._eos_ids(name)
+        if getattr(self.lb, "completion_rungs", False):
+            if cache is None or self.cache_backend_package != "flash_attn":
+                raise RuntimeError("longbench.completion_rungs records the gated decode step: it needs the "
+                                   "windowed cache on the flash_attn backend")
+            from transformers import StoppingCriteriaList
+            from modules.evaluation.completion_recorder import CompletionRecorder
+            rec = CompletionRecorder(model, cache, int(self.lb.completion_rungs_stride), eos)
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([rec.tracker])
+        t0 = time.time()
         try:
-            gen_kwargs = {
-                "attention_mask": attention_mask,
-                "max_new_tokens": max_gen_len,
-                "num_beams": 1,
-                "do_sample": False,
-                "temperature": 1.0,
-                "pad_token_id": tokenizer.pad_token_id
-                or tokenizer.eos_token_id,
-            }
-
-            # THUDM/LongBench + DefensiveKV use PURE greedy with NO repetition
-            # penalty. Only pass one if the user explicitly opted in to a
-            # non-1.0 value; otherwise the default must stay absent so results
-            # match the published protocol exactly.
-            rep_pen = getattr(self.lb, "repetition_penalty", 1.0)
-            if rep_pen is not None and rep_pen != 1.0:
-                gen_kwargs["repetition_penalty"] = rep_pen
-
-            # output_attentions only for eager backend
-            if self.cache_backend_package == "eager":
-                gen_kwargs["output_attentions"] = True
-
-            if cache is not None:
-                gen_kwargs["past_key_values"] = cache
-
-            # samsum special handling: stop at newline
-            if dataset_name == "samsum":
-                newline_id = tokenizer.encode("\n", add_special_tokens=False)[-1]
-                gen_kwargs["eos_token_id"] = [
-                    tokenizer.eos_token_id,
-                    newline_id,
-                ]
-                gen_kwargs["min_length"] = context_length + 1
-
+            if rec is not None:
+                rec.attach()
             with torch.no_grad():
-                output = model.generate(input_ids, **gen_kwargs)
-
+                out = model.generate(input_ids, **gen_kwargs)
         finally:
-            # 7. Clean up hooks (no leakage between examples)
+            if rec is not None:
+                rec.detach()
             if hooks is not None:
                 hooks.remove()
-
-        # 8. Decode only new tokens
-        pred = tokenizer.decode(
-            output[0][context_length:], skip_special_tokens=True
-        )
-
-        # 9. Post-processing (dataset-specific, matches THUDM pred.py)
-        pred = self._post_process(pred, dataset_name)
-
-        # 10. Memory hygiene
-        self._cleanup_memory(cache)
-
-        return pred
+        wall = time.time() - t0
+        eos_set = set(eos)
+        preds, gen_tokens = [], []
+        for r in range(out.shape[0]):
+            new = out[r][L:].tolist()
+            # A finished row is padded until the batch ends: cut at its first EOS.
+            k = next((j for j, t in enumerate(new) if t in eos_set), len(new))
+            gen_tokens.append(k)
+            preds.append(self._post_process(tok.decode(new[:k], skip_special_tokens=True), name))
+        ids = [r[1].get("_id", str(r[0])) for r in part_rows]
+        info: Dict[str, Any] = {"batch": bi, "ids": ids, "size": len(part_rows), "prompt_tokens": L,
+                                "steps": int(out.shape[1] - L), "wall_s": round(wall, 3),
+                                "gen_tokens": gen_tokens}
+        if rec is not None:
+            from modules.evaluation.completion_recorder import STAT_NAMES
+            from modules.windowed_cache.completion import COMPLETION_RUNGS
+            arrays = rec.result()
+            d = output_dir / "rungs" / name
+            d.mkdir(parents=True, exist_ok=True)
+            fname = f"b{bi:03d}_{ids[0]}.npz"
+            np.savez_compressed(d / fname, **arrays, doc_ids=np.array(ids),
+                                gen_tokens=np.array(gen_tokens, np.int32), prompt_tokens=np.int32(L),
+                                stride=np.int32(rec.stride), rungs=np.array(COMPLETION_RUNGS),
+                                stat_names=np.array(STAT_NAMES))
+            info["rungs_file"] = f"rungs/{name}/{fname}"
+            info["rung_records"] = int(arrays["steps"].shape[0])
+            log.info("  %s batch %d: %d matched-state records (stride %d)", name, bi,
+                     info["rung_records"], rec.stride)
+        # Drop this frame's references before empty_cache, or the cache's buffers
+        # are still alive when the allocator is asked to release them.
+        del out, input_ids, attention_mask
+        cache = hooks = rec = None
+        self._cleanup_memory()
+        return preds, info
 
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks."""
@@ -764,6 +1043,9 @@ class LongBenchRunner:
                                          quant_tier_policy_record)
         meta = {
             "read_gate": read_gate,
+            # The batched path's plan, truncation and recorder files; absent on the
+            # B=1 path, whose sidecar is unchanged.
+            **({"batching": self._batch_meta} if getattr(self, "_batch_meta", None) else {}),
             "quant_card_bits": quant_card_bits_record(cfg.cache),
             **quant_tier_policy_record(cfg.cache),
             "dataset": dataset_name,
