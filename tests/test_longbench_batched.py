@@ -8,7 +8,7 @@ On a tiny float64 Llama with the full cache, on CPU:
    shorter examples are skipped, and batching them changes no prediction: a batch
    of 3 gives what batches of 1 give.
 3. A row that finishes early is cut at its first EOS, and an out-of-memory batch
-   is halved and recorded.
+   shrinks by a quarter and is recorded.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def test_fixed_length_truncates_skips_and_batching_changes_nothing(tok, model, m
     assert r.middle_truncate_ids(full, L) == full[:15] + full[85:]
 
 
-def test_rows_are_cut_at_their_own_eos_and_oom_halves_the_batch(tok, model, monkeypatch, tmp_path):
+def test_rows_are_cut_at_their_own_eos_and_oom_shrinks_the_batch(tok, model, monkeypatch, tmp_path):
     ex = _examples([40, 41, 42, 43])
     calls = []
     eos, w = 2, {w_: VOCAB[w_] for w_ in WORDS}
@@ -135,9 +135,9 @@ def test_rows_are_cut_at_their_own_eos_and_oom_halves_the_batch(tok, model, monk
 
     monkeypatch.setattr(model, "generate", fake_generate)
     rows, meta = _run(tok, model, ex, monkeypatch, tmp_path, batch_size=4, prompt_tokens={DS: 30})
-    assert calls[0] == 4 and all(c <= 2 for c in calls[1:])
-    assert meta[2]["oom_events"] and meta[2]["oom_events"][0]["fell_back_to"] == 2
-    assert meta[2]["final_cap"] == 2
+    assert calls == [4, 2, 2]               # a quarter down (cap 3), the 4 rows split evenly: 2 + 2
+    assert [e["fell_back_to"] for e in meta[2]["oom_events"]] == [3]
+    assert meta[2]["final_cap"] == 3
     for r in rows:
         assert "w7" not in r["pred"] or r["pred"].split()[-1] == "w7"
         assert "</s>" not in r["pred"]
@@ -151,3 +151,36 @@ def test_config_refuses_bad_batching_knobs():
                 dict(prompt_tokens=[1, 2]), dict(completion_rungs_stride=0), dict(completion_rungs="yes")):
         with pytest.raises(ConfigValidationError):
             LongBenchConfig(**bad)
+
+
+def test_pooled_datasets_share_batches_and_change_nothing(tok, model, monkeypatch, tmp_path):
+    """Two datasets of one prompt length decoded in shared batches give the predictions each gives alone,
+    with one record file and one sidecar each."""
+    DS2 = "qmsum"
+    ex1, ex2 = _examples([40, 45, 50], seed=1), _examples([42, 47, 52], seed=2)
+    for e in ex2:
+        e["_id"] = "q" + e["_id"]
+    alone = {d: _run(tok, model, ex, monkeypatch, tmp_path / f"alone_{d}", batch_size=6,
+                     prompt_tokens={DS: 30})[0] for d, ex in ((DS, ex1), (DS2, ex2))}
+    r = object.__new__(LR.LongBenchRunner)
+    r.config = types.SimpleNamespace(model=types.SimpleNamespace(name="tiny-base"), cache=types.SimpleNamespace())
+    r.lb = LongBenchConfig(datasets=[DS, DS2], max_length=None, batch_size=6, pool_datasets=True,
+                           prompt_tokens={DS: 30, DS2: 30}, output_dir=str(tmp_path / "pool"))
+    r.model, r.tokenizer = model, tok
+    r.is_windowed, r.cache_backend_package = False, None
+    r.dataset2prompt, r.dataset2maxlen = {DS: TEMPLATE, DS2: TEMPLATE}, {DS: 8, DS2: 8}
+    r._resolved_sample, r._batch_meta = None, None
+    metas = {}
+    monkeypatch.setattr(r, "_write_meta", lambda name, n, mg, a, b, eps, out: metas.__setitem__(
+        name, json.loads(json.dumps(r._batch_meta))))
+    monkeypatch.setattr(LR, "load_longbench_dataset", lambda name, use_e_variant=False: ex1 if name == DS else ex2)
+    out = tmp_path / "pool"
+    out.mkdir()
+    assert r._pools([DS, DS2]) == [[DS, DS2]]
+    r._run_pool([DS, DS2], out)
+    for d in (DS, DS2):
+        rows = [json.loads(l) for l in (out / f"{d}.jsonl").read_text().splitlines()]
+        assert [x["pred"] for x in rows] == [x["pred"] for x in alone[d]]
+        assert metas[d]["pooled_with"] == [DS2 if d == DS else DS]
+    assert [len(b["ids"]) for b in metas[DS]["batches_realised"]] == [6]           # one shared batch of 6
+    assert sorted(metas[DS]["batches_realised"][0]["datasets"]) == [DS] * 3 + [DS2] * 3

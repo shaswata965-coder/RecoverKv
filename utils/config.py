@@ -755,6 +755,10 @@ class LongBenchConfig:
     # completion_recorder.py). Flash backend only; writes <output_dir>/rungs/.
     completion_rungs: bool = False
     completion_rungs_stride: int = 16
+    # Datasets with the same fixed prompt length (and generation length) share
+    # batches: fewer, fuller batches, so fewer full decodes per run. Records and
+    # sidecars stay one per dataset.
+    pool_datasets: bool = False
 
     def __post_init__(self) -> None:
         for k in ("batch_size", "completion_rungs_stride"):
@@ -772,6 +776,9 @@ class LongBenchConfig:
                 if isinstance(n, bool) or not isinstance(n, int) or n < 16:
                     raise ConfigValidationError(
                         f"longbench.prompt_tokens[{d!r}] must be an int >= 16, got {n!r}")
+        if not isinstance(self.pool_datasets, bool):
+            raise ConfigValidationError(
+                f"longbench.pool_datasets must be true or false, got {self.pool_datasets!r}")
         if not isinstance(self.completion_rungs, bool):
             raise ConfigValidationError(
                 f"longbench.completion_rungs must be true or false, got {self.completion_rungs!r}")

@@ -225,6 +225,7 @@ class LongBenchRunner:
         )
         log_operating_point(self.config, self.is_windowed)
 
+        todo = []
         for dataset_name in datasets:
             jsonl_path = output_dir / f"{dataset_name}.jsonl"
 
@@ -241,7 +242,16 @@ class LongBenchRunner:
                     )
                     continue
 
-            self._run_dataset(dataset_name, output_dir)
+            todo.append(dataset_name)
+
+        # Datasets of one fixed prompt length share batches (longbench.pool_datasets).
+        pools = self._pools(todo) if getattr(self.lb, "pool_datasets", False) else []
+        for dataset_name in todo:
+            pool = next((g for g in pools if dataset_name in g), None)
+            if pool is None:
+                self._run_dataset(dataset_name, output_dir)
+            elif pool[0] == dataset_name:
+                self._run_pool(pool, output_dir)
 
         log.info("LongBench run complete. Outputs in %s", output_dir)
 
@@ -556,24 +566,19 @@ class LongBenchRunner:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _run_dataset_batched(self, name: str, output_dir: Path) -> None:
-        """One dataset, ``batch_size`` equal-length rows at a time; same records as the B=1 path."""
-        from modules.evaluation.longgenbench_batching import plan_batches, split_evenly
-
+    def _select_rows(self, name: str) -> Optional[Dict[str, Any]]:
+        """The examples a dataset runs: the first num_samples at least ``prompt_tokens`` long,
+        middle-truncated to exactly that length (or THUDM-truncated when no length is fixed)."""
         lb = self.lb
-        log.info("=== Dataset: %s (batched) ===", name)
         examples_list = list(load_longbench_dataset(name, use_e_variant=getattr(lb, "use_e_variants", False)))
-        max_gen_len = self.dataset2maxlen.get(name, 128)
         prompt_template = self.dataset2prompt.get(name)
         if prompt_template is None:
             log.error("No prompt template for dataset %s — skipping", name)
-            return
+            return None
         fixed = (getattr(lb, "prompt_tokens", None) or {}).get(name)
         ns = getattr(lb, "num_samples", "max")
         cap_n = ns if isinstance(ns, int) and not isinstance(ns, bool) and ns >= 0 else None
-
-        # The first num_samples examples that are at least `fixed` tokens long.
-        rows: List[Tuple[int, Dict[str, Any], List[int]]] = []
+        rows: List[Tuple[str, int, Dict[str, Any], List[int]]] = []
         skipped: List[str] = []
         orig_len: Dict[str, int] = {}
         for i, ex in enumerate(examples_list):
@@ -590,110 +595,170 @@ class LongBenchRunner:
                 ids = self.middle_truncate_ids(ids, fixed)
             else:
                 orig_len[eid] = len(ids)
-            rows.append((i, ex, ids))
+            rows.append((name, i, ex, ids))
         if cap_n is not None and len(rows) < cap_n:
             log.warning("%s: only %d examples are at least %s tokens long (asked for %d)",
                         name, len(rows), fixed, cap_n)
         if not rows:
             raise ValueError(f"{name}: no example selected")
+        return {"name": name, "rows": rows, "skipped": skipped, "orig_len": orig_len, "fixed": fixed,
+                "max_gen_len": self.dataset2maxlen.get(name, 128)}
 
-        bs = int(getattr(lb, "batch_size", 1) or 1)
-        bt = getattr(lb, "batch_tokens", None)
-        longest = max(len(r[2]) for r in rows)
-        cap = bs if not bt else max(1, min(bs, int(bt) // longest))
-        lengths = {k: len(r[2]) for k, r in enumerate(rows)}
-        planned = plan_batches(lengths, cap, order=list(range(len(rows))))
-        log.info("%s: %d examples (%d skipped as shorter than %s tokens) in %d equal-length batches "
-                 "(cap %d)", name, len(rows), len(skipped), fixed, len(planned), cap)
+    def _batch_cap(self, rows) -> int:
+        bs = int(getattr(self.lb, "batch_size", 1) or 1)
+        bt = getattr(self.lb, "batch_tokens", None)
+        longest = max(len(r[3]) for r in rows)
+        return bs if not bt else max(1, min(bs, int(bt) // longest))
 
-        preds: Dict[int, Optional[str]] = {}
+    def _generate_all(self, label: str, rows, max_gen_len: int, output_dir: Path):
+        """Every row, in equal-length batches; ``{(dataset, index): pred}``, the realised batches, OOM events."""
+        from modules.evaluation.longgenbench_batching import plan_batches, split_evenly
+
+        cap = self._batch_cap(rows)
+        planned = plan_batches({k: len(r[3]) for k, r in enumerate(rows)}, cap, order=list(range(len(rows))))
+        log.info("%s: %d examples in %d equal-length batches (cap %d)", label, len(rows), len(planned), cap)
+        preds: Dict[Tuple[str, int], Optional[str]] = {}
         realised: List[Dict[str, Any]] = []
         oom_events: List[Dict[str, Any]] = []
         self._cap = cap
-        run_start = time.time()
         for bi, planned_b in enumerate(planned):
             pending = [planned_b] if len(planned_b) <= self._cap else split_evenly(planned_b, self._cap)
             while pending:
                 part = pending.pop(0)
                 try:
-                    out, info = self._generate_rows(name, bi, [rows[k] for k in part], max_gen_len,
-                                                    output_dir)
+                    out, info = self._generate_rows(bi, [rows[k] for k in part], max_gen_len, output_dir)
                 except torch.cuda.OutOfMemoryError:
                     self._recover_from_oom()
                     if len(part) > 1:
-                        smaller = -(-len(part) // 2)
+                        # Step down by a quarter, not a half: a batch sized near the memory edge
+                        # usually fits a little smaller, and every extra batch costs a full decode.
+                        smaller = max(1, min(len(part) - 1, (3 * len(part)) // 4))
                         oom_events.append({"batch": bi, "size": len(part), "fell_back_to": smaller})
-                        log.warning("%s batch %d: out of memory at %d rows; falling back to %d for the "
-                                    "rest of this dataset", name, bi, len(part), smaller)
+                        log.warning("%s batch %d: out of memory at %d rows; falling back to %d for the rest",
+                                    label, bi, len(part), smaller)
                         self._cap = min(self._cap, smaller)
                         pending = split_evenly(part, smaller) + pending
                         continue
-                    if not getattr(lb, "skip_oom", False):
+                    if not getattr(self.lb, "skip_oom", False):
                         raise
+                    r0 = rows[part[0]]
                     oom_events.append({"batch": bi, "size": 1, "fell_back_to": None})
-                    log.warning("%s batch %d: OOM at a single row — recording null pred", name, bi)
-                    preds[part[0]] = None
-                    realised.append({"batch": bi, "ids": [rows[part[0]][1].get("_id", str(rows[part[0]][0]))],
+                    log.warning("%s batch %d: OOM at a single row — recording null pred", label, bi)
+                    preds[(r0[0], r0[1])] = None
+                    realised.append({"batch": bi, "ids": [r0[2].get("_id", str(r0[1]))], "datasets": [r0[0]],
                                      "size": 1, "oom": True})
                     continue
                 for k, p in zip(part, out):
-                    preds[k] = p
+                    preds[(rows[k][0], rows[k][1])] = p
                 realised.append(info)
-                log.info("  %s batch %d: %d rows x %d tokens, %d steps in %.0f s (%d/%d examples done)",
-                         name, bi, info["size"], info["prompt_tokens"], info["steps"], info["wall_s"],
-                         len(preds), len(rows))
+                log.info("  %s batch %d: %d rows x %d tokens, %d steps in %.0f s, peak %.1f GiB allocated "
+                         "(%.1f reserved) (%d/%d examples done)", label, bi, info["size"], info["prompt_tokens"],
+                         info["steps"], info["wall_s"], info.get("peak_alloc_gib") or 0,
+                         info.get("peak_reserved_gib") or 0, len(preds), len(rows))
+        return preds, realised, oom_events, cap, planned
 
-        out_path = output_dir / f"{name}.jsonl"
-        with open(out_path, "w", encoding="utf-8") as f:
-            for k, (i, ex, _) in enumerate(rows):
-                # Output schema matches THUDM/LongBench/pred.py exactly (as the B=1 path)
-                f.write(json.dumps({"pred": preds.get(k), "answers": ex["answers"],
+    def _finish_dataset(self, sel, preds, realised, oom_events, cap, planned, run_start, run_end,
+                        output_dir: Path, pooled_with: Optional[List[str]] = None) -> None:
+        """Write one dataset's records (THUDM schema, example order) and its sidecar."""
+        lb, name, rows = self.lb, sel["name"], sel["rows"]
+        with open(output_dir / f"{name}.jsonl", "w", encoding="utf-8") as f:
+            for (_, i, ex, _) in rows:
+                f.write(json.dumps({"pred": preds.get((name, i)), "answers": ex["answers"],
                                     "all_classes": ex.get("all_classes"), "length": ex["length"],
                                     "_id": ex.get("_id", str(i))}, ensure_ascii=False) + "\n")
-        run_end = time.time()
+        mine = {(name, r[2].get("_id", str(r[1]))) for r in rows}
+        mine_b = [b for b in realised if set(zip(b.get("datasets", []), b["ids"])) & mine]
+        n_total = sum(b["size"] for b in realised)
         elapsed = run_end - run_start
-        n = len(rows)
-        eps = n / elapsed if elapsed > 0 else 0
-        files = [b["rungs_file"] for b in realised if b.get("rungs_file")]
+        # examples/second of the batches this dataset took part in (a pool shares its throughput)
+        eps = n_total / elapsed if elapsed > 0 else 0
         rec_on = bool(getattr(lb, "completion_rungs", False))
+        rung_meta = None
         if rec_on:
             from modules.evaluation.completion_recorder import STAT_NAMES
             from modules.windowed_cache.completion import COMPLETION_RUNGS
+            rung_meta = {"stride": int(lb.completion_rungs_stride), "rungs": list(COMPLETION_RUNGS),
+                         "stats": list(STAT_NAMES), "err_normaliser": "o_held",
+                         "files": [b["rungs_files"][name] for b in mine_b if name in (b.get("rungs_files") or {})],
+                         "records": int(sum((b.get("rung_records") or {}).get(name, 0) for b in mine_b))}
+        oid = {k: (r[0], r[2].get("_id", str(r[1]))) for k, r in enumerate(self._pool_rows)}
         self._batch_meta = {
             "mode": "equal-length rows, no padding",
-            "batch_size": bs, "batch_tokens": bt, "batch_cap": cap, "final_cap": self._cap,
-            "prompt_tokens": fixed,
+            "batch_size": int(getattr(lb, "batch_size", 1) or 1), "batch_tokens": getattr(lb, "batch_tokens", None),
+            "batch_cap": cap, "final_cap": self._cap, "prompt_tokens": sel["fixed"],
+            "pooled_with": pooled_with or [],
             "truncation": ("middle, on the final (templated) token ids, to exactly prompt_tokens; "
-                           "shorter examples skipped") if fixed else "longbench.max_length (THUDM)",
-            "skipped_short": skipped,
-            "prompt_tokens_original": {r[1].get("_id", str(r[0])): orig_len[r[1].get("_id", str(r[0]))]
+                           "shorter examples skipped") if sel["fixed"] else "longbench.max_length (THUDM)",
+            "skipped_short": sel["skipped"],
+            "prompt_tokens_original": {r[2].get("_id", str(r[1])): sel["orig_len"][r[2].get("_id", str(r[1]))]
                                        for r in rows},
-            "batches_planned": [[rows[k][1].get("_id", str(rows[k][0])) for k in b] for b in planned],
-            "batches_realised": realised,
+            "batches_planned": [[oid[k][1] for k in b if oid[k][0] == name] for b in planned
+                                if any(oid[k][0] == name for k in b)],
+            "batches_realised": mine_b,
+            "peak_alloc_gib": max((b.get("peak_alloc_gib") or 0 for b in mine_b), default=None),
+            "peak_reserved_gib": max((b.get("peak_reserved_gib") or 0 for b in mine_b), default=None),
             "oom_events": oom_events,
-            "completion_rungs": ({"stride": int(lb.completion_rungs_stride), "rungs": list(COMPLETION_RUNGS),
-                                  "stats": list(STAT_NAMES), "err_normaliser": "o_held",
-                                  "files": files,
-                                  "records": int(sum(b.get("rung_records", 0) for b in realised))}
-                                 if rec_on else None),
+            "completion_rungs": rung_meta,
         }
-        log.info("%s: %d examples, %d OOM events, %.1fs (%.2f ex/s)", name, n, len(oom_events), elapsed, eps)
-        self._write_meta(name, n, max_gen_len, run_start, run_end, eps, output_dir)
+        log.info("%s: %d examples, %d OOM events, %.1fs (%.2f ex/s%s)", name, len(rows), len(oom_events), elapsed,
+                 eps, f", pooled with {pooled_with}" if pooled_with else "")
+        self._write_meta(name, len(rows), sel["max_gen_len"], run_start, run_end, eps, output_dir)
 
-    def _generate_rows(self, name: str, bi: int, part_rows, max_gen_len: int,
+    def _run_dataset_batched(self, name: str, output_dir: Path) -> None:
+        """One dataset, ``batch_size`` equal-length rows at a time; same records as the B=1 path."""
+        log.info("=== Dataset: %s (batched) ===", name)
+        sel = self._select_rows(name)
+        if sel is None:
+            return
+        self._pool_rows = sel["rows"]
+        t0 = time.time()
+        preds, realised, ooms, cap, planned = self._generate_all(name, sel["rows"], sel["max_gen_len"], output_dir)
+        self._finish_dataset(sel, preds, realised, ooms, cap, planned, t0, time.time(), output_dir)
+
+    def _pools(self, names: List[str]) -> List[List[str]]:
+        """Datasets that can share batches: same fixed prompt length, same generation length, and
+        the default stopping rule (samsum stops on a newline). Groups of two or more."""
+        pt = getattr(self.lb, "prompt_tokens", None) or {}
+        groups: Dict[Tuple[int, int], List[str]] = {}
+        for n in names:
+            if n in pt and n != "samsum":
+                groups.setdefault((pt[n], self.dataset2maxlen.get(n, 128)), []).append(n)
+        return [g for g in groups.values() if len(g) > 1]
+
+    def _run_pool(self, names: List[str], output_dir: Path) -> None:
+        """Several datasets of one prompt length decoded in shared batches; one record file and one
+        sidecar per dataset, exactly as if each had run alone."""
+        log.info("=== Datasets %s (pooled, batched) ===", names)
+        sels = [s for s in (self._select_rows(n) for n in names) if s is not None]
+        rows = [r for s in sels for r in s["rows"]]
+        self._pool_rows = rows
+        t0 = time.time()
+        preds, realised, ooms, cap, planned = self._generate_all("+".join(names), rows,
+                                                                 sels[0]["max_gen_len"], output_dir)
+        t1 = time.time()
+        for s in sels:
+            self._finish_dataset(s, preds, realised, ooms, cap, planned, t0, t1, output_dir,
+                                 pooled_with=[x["name"] for x in sels if x["name"] != s["name"]])
+
+    def _generate_rows(self, bi: int, part_rows, max_gen_len: int,
                        output_dir: Path) -> Tuple[List[str], Dict[str, Any]]:
-        """One batch of equal-length rows: predictions in row order, and the batch's record."""
+        """One batch of equal-length rows ``(dataset, index, example, ids)``: predictions in row
+        order, and the batch's record. Rows of a pool share generation settings by construction."""
         import numpy as np
 
         model, tok = self.model, self.tokenizer
-        lens = {len(r[2]) for r in part_rows}
+        name = part_rows[0][0]
+        lens = {len(r[3]) for r in part_rows}
         if len(lens) != 1:
-            raise ValueError(f"{name} batch {bi}: rows of different lengths {sorted(lens)}; "
+            raise ValueError(f"batch {bi}: rows of different lengths {sorted(lens)}; "
                              "the windowed cache takes no padding")
-        input_ids = torch.tensor([r[2] for r in part_rows], dtype=torch.long, device=model.device)
+        input_ids = torch.tensor([r[3] for r in part_rows], dtype=torch.long, device=model.device)
         L = int(input_ids.shape[-1])
         attention_mask = torch.ones_like(input_ids)      # no padding: never the varlen path
         self._warn_if_over_context(L, max_gen_len)
+        cuda = torch.cuda.is_available()
+        if cuda:
+            torch.cuda.reset_peak_memory_stats()
         cache = hooks = rec = None
         if self.is_windowed:
             cache, hooks = self._setup_windowed_cache(input_ids, max_gen_len)
@@ -728,28 +793,40 @@ class LongBenchRunner:
             # A finished row is padded until the batch ends: cut at its first EOS.
             k = next((j for j, t in enumerate(new) if t in eos_set), len(new))
             gen_tokens.append(k)
-            preds.append(self._post_process(tok.decode(new[:k], skip_special_tokens=True), name))
-        ids = [r[1].get("_id", str(r[0])) for r in part_rows]
-        info: Dict[str, Any] = {"batch": bi, "ids": ids, "size": len(part_rows), "prompt_tokens": L,
-                                "steps": int(out.shape[1] - L), "wall_s": round(wall, 3),
-                                "gen_tokens": gen_tokens}
+            preds.append(self._post_process(tok.decode(new[:k], skip_special_tokens=True), part_rows[r][0]))
+        ids = [r[2].get("_id", str(r[1])) for r in part_rows]
+        info: Dict[str, Any] = {"batch": bi, "ids": ids, "datasets": [r[0] for r in part_rows],
+                                "size": len(part_rows), "prompt_tokens": L, "steps": int(out.shape[1] - L),
+                                "wall_s": round(wall, 3), "gen_tokens": gen_tokens}
+        if cuda:
+            info["peak_alloc_gib"] = round(torch.cuda.max_memory_allocated() / 2 ** 30, 2)
+            info["peak_reserved_gib"] = round(torch.cuda.max_memory_reserved() / 2 ** 30, 2)
         if rec is not None:
             from modules.evaluation.completion_recorder import STAT_NAMES
             from modules.windowed_cache.completion import COMPLETION_RUNGS
             arrays = rec.result()
-            d = output_dir / "rungs" / name
-            d.mkdir(parents=True, exist_ok=True)
-            fname = f"b{bi:03d}_{ids[0]}.npz"
-            np.savez_compressed(d / fname, **arrays, doc_ids=np.array(ids),
-                                gen_tokens=np.array(gen_tokens, np.int32), prompt_tokens=np.int32(L),
-                                stride=np.int32(rec.stride), rungs=np.array(COMPLETION_RUNGS),
-                                stat_names=np.array(STAT_NAMES))
-            info["rungs_file"] = f"rungs/{name}/{fname}"
-            info["rung_records"] = int(arrays["steps"].shape[0])
-            log.info("  %s batch %d: %d matched-state records (stride %d)", name, bi,
-                     info["rung_records"], rec.stride)
-        # Drop this frame's references before empty_cache, or the cache's buffers
-        # are still alive when the allocator is asked to release them.
+            info["rungs_files"], info["rung_records"] = {}, {}
+            for d in dict.fromkeys(r[0] for r in part_rows):        # one file per dataset in the batch
+                mine = [k for k, r in enumerate(part_rows) if r[0] == d]
+                remap = np.full(len(part_rows), -1, np.int64)
+                remap[mine] = np.arange(len(mine))
+                sel_r = np.isin(arrays["rows"].astype(np.int64), mine)
+                dd = output_dir / "rungs" / d
+                dd.mkdir(parents=True, exist_ok=True)
+                fname = f"b{bi:03d}_{ids[mine[0]]}.npz"
+                np.savez_compressed(dd / fname, steps=arrays["steps"][sel_r],
+                                    rows=remap[arrays["rows"][sel_r].astype(np.int64)].astype(np.int16),
+                                    err=arrays["err"][sel_r], stats=arrays["stats"][sel_r],
+                                    fired=arrays["fired"][sel_r], doc_ids=np.array([ids[k] for k in mine]),
+                                    gen_tokens=np.array([gen_tokens[k] for k in mine], np.int32),
+                                    prompt_tokens=np.int32(L), stride=np.int32(rec.stride),
+                                    rungs=np.array(COMPLETION_RUNGS), stat_names=np.array(STAT_NAMES))
+                info["rungs_files"][d] = f"rungs/{d}/{fname}"
+                info["rung_records"][d] = int(sel_r.sum())
+            log.info("  batch %d: %d matched-state records (stride %d)", bi, int(arrays["steps"].shape[0]),
+                     rec.stride)
+        # Drop this frame's references before empty_cache, or the cache's buffers are still
+        # alive when the allocator is asked to release them.
         del out, input_ids, attention_mask
         cache = hooks = rec = None
         self._cleanup_memory()
