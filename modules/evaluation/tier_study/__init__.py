@@ -119,6 +119,7 @@ from modules.evaluation.qevict_observations import (
     TIER_FP,
     TIER_LOCAL,
     TIER_Q,
+    read_path_info,
     _ci_num,
     _ci_pct,
     _json_safe,
@@ -885,7 +886,14 @@ def _build_view(spec, loaded, sha, base_W, ws_base, *, S, T, layer_ids, labels,
         "schema_version": str(meta.get("schema_version", "?")),
         "mean_alive_units": float((acc_fp | acc_q).sum(axis=-1).mean()),
         "mean_q_units": float(acc_q.sum(axis=-1).mean()),
+        # How the run READ its int2 tier (gate verdict + knobs), so a three-tier
+        # row cannot be quoted without saying whether it gated.
+        **read_path_info(meta),
     }
+    if spec.tiers == "three_tier" and diagnostics["read_path"] == "NOT-GATED":
+        log.warning("%s: read_gate verdict %r — this run should have gated and "
+                    "did not; it is not the shipped method.", spec.cid,
+                    diagnostics["read_gate_verdict"])
     survivor = None
     if keep_ours_scores and "window_scores" in arrays:
         ows = _as5d(np.asarray(arrays["window_scores"]))[:S, :T][:, :, layer_ids]

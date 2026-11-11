@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="figure" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="396pt" height="234pt" viewBox="0 0 396 234" font-family="Arial, 'Liberation Sans', Helvetica, sans-serif">
+<defs><marker id="ah-dark" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#1d2329"/></marker><marker id="ah-slate" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#5b6878"/></marker><marker id="ah-blue" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#3c6ea8"/></marker><marker id="ah-violet" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#6446a4"/></marker><marker id="ah-green" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#3b8a5a"/></marker><marker id="ah-red" viewBox="0 0 10 10" refX="8.6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0.6 L10,5 L0,9.4 z" fill="#c0392b"/></marker><symbol id="card" viewBox="0 0 20 20"><rect x="0.8" y="0.8" width="18.4" height="18.4" rx="3.2" fill="#d4ecdc" stroke="#3b8a5a" stroke-width="1.4"/><circle cx="5.2" cy="12.6" r="1.6" fill="#4f7fb5"/><circle cx="8.4" cy="15.2" r="1.6" fill="#4f7fb5"/><circle cx="4.6" cy="16" r="1.6" fill="#4f7fb5"/><circle cx="9" cy="11.2" r="1.6" fill="#4f7fb5"/><path d="M6.8,13.8 L14.6,6.2" stroke="#2a6d45" stroke-width="1.6"/><circle cx="15.4" cy="5.2" r="2.2" fill="#c0392b"/><path d="M5.5,12.5 L8.1,15.1 M5.5,15.1 L8.1,12.5" stroke="#1d2329" stroke-width="1.2"/></symbol></defs>
+<rect x="0" y="0" width="396" height="234" fill="#ffffff"/>
+<g transform="translate(0,0)" class="panel" data-w="194.0" data-h="140">
+<rect x="0.00" y="0.00" width="194.00" height="140.00" rx="4" fill="#ffffff" stroke="#1d2329" stroke-width="0.6"/>
+<text x="6.00" y="11.00" font-size="9" text-anchor="start" fill="#1d2329" font-weight="bold">(a)  Demoting a window to int2</text>
+<line x1="44.85" y1="60.29" x2="99.73" y2="27.36" stroke="#3b8a5a" stroke-width="0.5" stroke-dasharray="2 1.5"/>
+<circle cx="62.00" cy="50.00" r="15" fill="none" stroke="#3b8a5a" stroke-width="0.5" stroke-dasharray="1 1.5"/>
+<circle cx="52.00" cy="54.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="57.00" cy="43.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="66.00" cy="57.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="71.00" cy="48.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="50.00" cy="48.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="63.00" cy="41.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="68.00" cy="53.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="59.00" cy="60.00" r="2.2" fill="#5ba3d0" stroke="#ffffff" stroke-width="0.4"/>
+<circle cx="92.00" cy="32.00" r="2.8" fill="#c0392b" stroke="#ffffff" stroke-width="0.4"/>
+<line x1="62.00" y1="50.00" x2="89.17" y2="33.70" stroke="#2a6d45" stroke-width="1" marker-end="url(#ah-green)"/>
+<path d="M59.6,47.6 L64.4,52.4 M59.6,52.4 L64.4,47.6" fill="none" stroke="#1d2329" stroke-width="0.9"/>
+<text x="42.00" y="45.00" font-size="8" text-anchor="end" fill="#1d2329">its keys</text>
+<text x="42.00" y="59.00" font-size="8" text-anchor="end" fill="#1d2329">centroid</text>
+<line x1="43.00" y1="56.00" x2="59.00" y2="51.00" stroke="#1d2329" stroke-width="0.4"/>
+<text x="97.00" y="35.00" font-size="8" text-anchor="start" fill="#a93226">outlier</text>
+<line x1="84.00" y1="50.00" x2="95.00" y2="50.00" stroke="#1d2329" stroke-width="0.8" marker-end="url(#ah-dark)"/>
+<use href="#card" xlink:href="#card" x="98.00" y="39.00" width="22" height="22"/>
+<text x="125.00" y="45.00" font-size="8" text-anchor="start" fill="#2a6d45" font-weight="bold">card: centroid</text>
+<text x="125.00" y="54.00" font-size="8" text-anchor="start" fill="#2a6d45" font-weight="bold">+ outlier axis</text>
+<text x="125.00" y="63.00" font-size="8" text-anchor="start" fill="#2a6d45" font-weight="bold">+ value centroid</text>
+<text x="8.00" y="83.00" font-size="8" text-anchor="start" fill="#2c5a8f">the same window in fp16</text>
+<rect x="8.00" y="86.00" width="178.00" height="8.00" rx="0" fill="#cfe0f3" stroke="#3c6ea8" stroke-width="0.5"/>
+<text x="8.00" y="106.00" font-size="8" text-anchor="start" fill="#51368a" font-weight="bold">int2 window + card</text>
+<rect x="8.00" y="109.00" width="11.12" height="8.00" rx="0" fill="#b7a3e3" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="19.12" y="109.00" width="11.12" height="8.00" rx="0" fill="#d8ccf1" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="30.25" y="109.00" width="12.69" height="8.00" rx="0" fill="#9a84cf" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="42.94" y="109.00" width="2.87" height="8.00" rx="0" fill="#a9d8bb" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="45.81" y="109.00" width="6.08" height="8.00" rx="0" fill="#5fae82" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="51.89" y="109.00" width="2.87" height="8.00" rx="0" fill="#cfe9d9" stroke="#ffffff" stroke-width="0.4"/>
+<rect x="8.00" y="109.00" width="46.76" height="8.00" rx="0" fill="none" stroke="#6446a4" stroke-width="0.6"/>
+<rect x="62.76" y="109.20" width="6.50" height="6.50" rx="0" fill="#b7a3e3" stroke="#1d2329" stroke-width="0.3"/>
+<text x="71.76" y="115.50" font-size="8" text-anchor="start" fill="#1d2329">K codes</text>
+<rect x="62.76" y="119.20" width="6.50" height="6.50" rx="0" fill="#d8ccf1" stroke="#1d2329" stroke-width="0.3"/>
+<text x="71.76" y="125.50" font-size="8" text-anchor="start" fill="#1d2329">V codes</text>
+<rect x="62.76" y="129.20" width="6.50" height="6.50" rx="0" fill="#9a84cf" stroke="#1d2329" stroke-width="0.3"/>
+<text x="71.76" y="135.50" font-size="8" text-anchor="start" fill="#1d2329">scale + zero</text>
+<rect x="122.00" y="109.20" width="6.50" height="6.50" rx="0" fill="#a9d8bb" stroke="#1d2329" stroke-width="0.3"/>
+<text x="131.00" y="115.50" font-size="8" text-anchor="start" fill="#1d2329">centroid</text>
+<rect x="122.00" y="119.20" width="6.50" height="6.50" rx="0" fill="#5fae82" stroke="#1d2329" stroke-width="0.3"/>
+<text x="131.00" y="125.50" font-size="8" text-anchor="start" fill="#1d2329">outlier axis</text>
+<rect x="122.00" y="129.20" width="6.50" height="6.50" rx="0" fill="#cfe9d9" stroke="#1d2329" stroke-width="0.3"/>
+<text x="131.00" y="135.50" font-size="8" text-anchor="start" fill="#1d2329">value centroid</text>
+</g>
+<g transform="translate(202.0,0)" class="panel" data-w="194.0" data-h="140">
+<rect x="0.00" y="0.00" width="194.00" height="140.00" rx="4" fill="#ffffff" stroke="#1d2329" stroke-width="0.6"/>
+<text x="6.00" y="11.00" font-size="9" text-anchor="start" fill="#1d2329" font-weight="bold">(b)  Crediting the unread windows</text>
+<rect x="24.00" y="62.64" width="17.50" height="27.36" rx="0" fill="#f4f0fb"/>
+<path d="M24.00,64.20L25.56,62.64M24.00,67.31L28.67,62.64M24.00,70.42L31.78,62.64M24.00,73.53L34.89,62.64M24.00,76.64L38.00,62.64M24.00,79.75L41.11,62.64M24.00,82.86L41.50,65.36M24.00,85.97L41.50,68.47M24.00,89.09L41.50,71.59M26.20,90.00L41.50,74.70M29.31,90.00L41.50,77.81M32.42,90.00L41.50,80.92M35.53,90.00L41.50,84.03M38.64,90.00L41.50,87.14" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="24.00" y="62.64" width="17.50" height="27.36" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="32.75" y1="73.24" x2="32.75" y2="63.84" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="32.75" cy="75.64" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="44.50" y="66.97" width="17.50" height="23.03" rx="0" fill="#dccff2" stroke="#1d2329" stroke-width="0.9"/>
+<line x1="53.25" y1="74.57" x2="53.25" y2="67.77" stroke="#1d2329" stroke-width="0.7"/>
+<circle cx="53.25" cy="76.97" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="65.00" y="61.04" width="17.50" height="28.96" rx="0" fill="#f4f0fb"/>
+<path d="M65.00,62.60L66.56,61.04M65.00,65.71L69.67,61.04M65.00,68.82L72.78,61.04M65.00,71.93L75.89,61.04M65.00,75.04L79.00,61.04M65.00,78.15L82.11,61.04M65.00,81.26L82.50,63.76M65.00,84.37L82.50,66.87M65.00,87.49L82.50,69.99M65.60,90.00L82.50,73.10M68.71,90.00L82.50,76.21M71.82,90.00L82.50,79.32M74.93,90.00L82.50,82.43M78.04,90.00L82.50,85.54M81.15,90.00L82.50,88.65" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="65.00" y="61.04" width="17.50" height="28.96" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="73.75" y1="71.64" x2="73.75" y2="62.24" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="73.75" cy="74.04" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="85.50" y="63.45" width="17.50" height="26.55" rx="0" fill="#f4f0fb"/>
+<path d="M85.50,65.01L87.06,63.45M85.50,68.12L90.17,63.45M85.50,71.23L93.28,63.45M85.50,74.34L96.39,63.45M85.50,77.45L99.50,63.45M85.50,80.56L102.61,63.45M85.50,83.67L103.00,66.17M85.50,86.78L103.00,69.28M85.50,89.90L103.00,72.40M88.51,90.00L103.00,75.51M91.62,90.00L103.00,78.62M94.73,90.00L103.00,81.73M97.84,90.00L103.00,84.84M100.95,90.00L103.00,87.95" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="85.50" y="63.45" width="17.50" height="26.55" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="94.25" y1="74.05" x2="94.25" y2="64.65" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="94.25" cy="76.45" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="106.00" y="64.33" width="17.50" height="25.67" rx="0" fill="#f4f0fb"/>
+<path d="M106.00,65.89L107.56,64.33M106.00,69.00L110.67,64.33M106.00,72.11L113.78,64.33M106.00,75.22L116.89,64.33M106.00,78.34L120.00,64.33M106.00,81.45L123.11,64.33M106.00,84.56L123.50,67.06M106.00,87.67L123.50,70.17M106.78,90.00L123.50,73.28M109.89,90.00L123.50,76.39M113.00,90.00L123.50,79.50M116.11,90.00L123.50,82.61M119.23,90.00L123.50,85.73M122.34,90.00L123.50,88.84" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="106.00" y="64.33" width="17.50" height="25.67" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="114.75" y1="74.93" x2="114.75" y2="65.53" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="114.75" cy="77.33" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="126.50" y="60.98" width="17.50" height="29.02" rx="0" fill="#f4f0fb"/>
+<path d="M126.50,62.54L128.06,60.98M126.50,65.65L131.17,60.98M126.50,68.76L134.28,60.98M126.50,71.87L137.39,60.98M126.50,74.98L140.50,60.98M126.50,78.10L143.61,60.98M126.50,81.21L144.00,63.71M126.50,84.32L144.00,66.82M126.50,87.43L144.00,69.93M127.04,90.00L144.00,73.04M130.15,90.00L144.00,76.15M133.26,90.00L144.00,79.26M136.37,90.00L144.00,82.37M139.49,90.00L144.00,85.49M142.60,90.00L144.00,88.60" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="126.50" y="60.98" width="17.50" height="29.02" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="135.25" y1="71.58" x2="135.25" y2="62.18" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="135.25" cy="73.98" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="147.00" y="32.82" width="17.50" height="57.18" rx="0" fill="#dccff2" stroke="#1d2329" stroke-width="0.9"/>
+<line x1="155.75" y1="46.42" x2="155.75" y2="33.62" stroke="#1d2329" stroke-width="0.7"/>
+<circle cx="155.75" cy="48.82" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<rect x="167.50" y="57.00" width="17.50" height="33.00" rx="0" fill="#f4f0fb"/>
+<path d="M167.50,58.55L169.06,57.00M167.50,61.66L172.17,57.00M167.50,64.77L175.28,57.00M167.50,67.88L178.39,57.00M167.50,71.00L181.50,57.00M167.50,74.11L184.61,57.00M167.50,77.22L185.00,59.72M167.50,80.33L185.00,62.83M167.50,83.44L185.00,65.94M167.50,86.55L185.00,69.05M167.50,89.66L185.00,72.16M170.28,90.00L185.00,75.28M173.39,90.00L185.00,78.39M176.50,90.00L185.00,81.50M179.61,90.00L185.00,84.61M182.72,90.00L185.00,87.72" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="167.50" y="57.00" width="17.50" height="33.00" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<line x1="176.25" y1="67.60" x2="176.25" y2="58.20" stroke="#3b8a5a" stroke-width="0.7" marker-end="url(#ah-green)"/>
+<circle cx="176.25" cy="70.00" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<line x1="21.00" y1="90.00" x2="188.00" y2="90.00" stroke="#1d2329" stroke-width="0.5"/>
+<text x="16.00" y="62.00" font-size="8" text-anchor="middle" fill="#1d2329" transform="rotate(-90 16.00 62.00)">log mass</text>
+<circle cx="11.25" cy="100.10" r="2.2" fill="#ffffff" stroke="#3b8a5a" stroke-width="0.9"/>
+<text x="17.00" y="103.00" font-size="8" text-anchor="start" fill="#1d2329">the card's estimate, every window</text>
+<rect x="8.00" y="106.70" width="6.50" height="6.50" rx="0" fill="#dccff2" stroke="#1d2329" stroke-width="0.9"/>
+<text x="17.00" y="113.00" font-size="8" text-anchor="start" fill="#1d2329">opened: exact, which measures the gap</text>
+<rect x="8.00" y="116.70" width="6.50" height="6.50" rx="0" fill="#f4f0fb"/>
+<path d="M8.00,118.26L9.56,116.70M8.00,121.37L12.67,116.70M9.28,123.20L14.50,117.98M12.39,123.20L14.50,121.09" stroke="#b9a8e0" stroke-width="0.5" fill="none"/>
+<rect x="8.00" y="116.70" width="6.50" height="6.50" rx="0" fill="none" stroke="#6446a4" stroke-width="0.5" stroke-dasharray="1.5 1"/>
+<text x="17.00" y="123.00" font-size="8" text-anchor="start" fill="#1d2329">unread: estimate + the average gap</text>
+<text x="8.00" y="135.00" font-size="8" text-anchor="start" fill="#1d2329">credited mass enters the output and the score</text>
+</g>
+<g transform="translate(0,148)" class="panel" data-w="396" data-h="86">
+<rect x="0.00" y="0.00" width="396.00" height="86.00" rx="4" fill="#ffffff" stroke="#1d2329" stroke-width="0.6"/>
+<text x="6.00" y="11.00" font-size="9" text-anchor="start" fill="#1d2329" font-weight="bold">(c)  The four cache sections share one byte budget</text>
+<rect x="50.00" y="22.00" width="2.20" height="18.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.4"/>
+<rect x="52.20" y="22.00" width="2.20" height="18.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.4"/>
+<rect x="54.40" y="22.00" width="2.20" height="18.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.4"/>
+<rect x="56.60" y="22.00" width="2.20" height="18.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.4"/>
+<rect x="58.80" y="22.00" width="2.20" height="18.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.4"/>
+<rect x="67.00" y="22.00" width="28.00" height="18.00" rx="0" fill="#cfe0f3" stroke="#3c6ea8" stroke-width="0.6"/>
+<line x1="70.50" y1="23.00" x2="70.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="74.00" y1="23.00" x2="74.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="77.50" y1="23.00" x2="77.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="81.00" y1="23.00" x2="81.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="84.50" y1="23.00" x2="84.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="88.00" y1="23.00" x2="88.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="91.50" y1="23.00" x2="91.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<rect x="97.00" y="22.00" width="28.00" height="18.00" rx="0" fill="#cfe0f3" stroke="#3c6ea8" stroke-width="0.6"/>
+<line x1="100.50" y1="23.00" x2="100.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="104.00" y1="23.00" x2="104.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="107.50" y1="23.00" x2="107.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="111.00" y1="23.00" x2="111.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="114.50" y1="23.00" x2="114.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="118.00" y1="23.00" x2="118.00" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<line x1="121.50" y1="23.00" x2="121.50" y2="39.00" stroke="#ffffff" stroke-width="0.35"/>
+<rect x="131.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="135.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="151.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="155.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="171.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="175.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="191.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="195.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="211.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="215.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="231.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="235.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="251.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="255.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="271.00" y="35.50" width="18.00" height="4.50" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.6"/>
+<use href="#card" xlink:href="#card" x="275.95" y="26.40" width="8.1" height="8.1"/>
+<rect x="295.00" y="22.00" width="28.00" height="18.00" rx="0" fill="#eef4fb"/>
+<path d="M295.00,23.56L296.56,22.00M295.00,26.67L299.67,22.00M295.00,29.78L302.78,22.00M295.00,32.89L305.89,22.00M295.00,36.00L309.00,22.00M295.00,39.11L312.11,22.00M297.22,40.00L315.22,22.00M300.33,40.00L318.33,22.00M303.45,40.00L321.45,22.00M306.56,40.00L323.00,23.56M309.67,40.00L323.00,26.67M312.78,40.00L323.00,29.78M315.89,40.00L323.00,32.89M319.00,40.00L323.00,36.00M322.11,40.00L323.00,39.11" stroke="#b8cfe8" stroke-width="0.5" fill="none"/>
+<rect x="295.00" y="22.00" width="28.00" height="18.00" rx="0" fill="none" stroke="#3c6ea8" stroke-width="0.6"/>
+<rect x="325.00" y="22.00" width="28.00" height="18.00" rx="0" fill="#eef4fb"/>
+<path d="M325.00,23.56L326.56,22.00M325.00,26.67L329.67,22.00M325.00,29.78L332.78,22.00M325.00,32.89L335.89,22.00M325.00,36.00L339.00,22.00M325.00,39.11L342.11,22.00M327.22,40.00L345.22,22.00M330.33,40.00L348.33,22.00M333.45,40.00L351.45,22.00M336.56,40.00L353.00,23.56M339.67,40.00L353.00,26.67M342.78,40.00L353.00,29.78M345.89,40.00L353.00,32.89M349.00,40.00L353.00,36.00M352.11,40.00L353.00,39.11" stroke="#b8cfe8" stroke-width="0.5" fill="none"/>
+<rect x="325.00" y="22.00" width="28.00" height="18.00" rx="0" fill="none" stroke="#3c6ea8" stroke-width="0.6"/>
+<rect x="354.20" y="22.00" width="2.40" height="18.00" rx="0" fill="#f6cdc9" stroke="#c0392b" stroke-width="0.5"/>
+<line x1="48.00" y1="40.00" x2="358.60" y2="40.00" stroke="#1d2329" stroke-width="0.5"/>
+<path d="M50,41 L61.0,41 L53.52413793103448,55.5 L50,55.5 Z" fill="#e2e6eb" stroke="none" stroke-width="0.7" opacity="0.6"/>
+<path d="M67.0,41 L125.0,41 L130.91420689655172,55.5 L53.52413793103448,55.5 Z" fill="#cfe0f3" stroke="none" stroke-width="0.7" opacity="0.6"/>
+<path d="M131.0,41 L289.0,41 L311.4910344827586,55.5 L130.91420689655172,55.5 Z" fill="#dccff2" stroke="none" stroke-width="0.7" opacity="0.6"/>
+<path d="M295.0,41 L356.59999999999997,41 L356.59999999999997,55.5 L311.4910344827586,55.5 Z" fill="#eef4fb" stroke="none" stroke-width="0.7" opacity="0.6"/>
+<rect x="50.00" y="56.00" width="3.52" height="11.00" rx="0" fill="#e2e6eb" stroke="#5b6878" stroke-width="0.5"/>
+<rect x="53.52" y="56.00" width="77.39" height="11.00" rx="0" fill="#cfe0f3" stroke="#3c6ea8" stroke-width="0.5"/>
+<rect x="130.91" y="56.00" width="134.93" height="11.00" rx="0" fill="#dccff2" stroke="#6446a4" stroke-width="0.5"/>
+<rect x="265.84" y="56.00" width="45.65" height="11.00" rx="0" fill="#d4ecdc" stroke="#3b8a5a" stroke-width="0.5"/>
+<rect x="311.49" y="56.00" width="45.11" height="11.00" rx="0" fill="#eef4fb"/>
+<path d="M311.49,57.56L313.05,56.00M311.49,60.67L316.16,56.00M311.49,63.78L319.27,56.00M311.49,66.89L322.38,56.00M314.49,67.00L325.49,56.00M317.60,67.00L328.60,56.00M320.71,67.00L331.71,56.00M323.83,67.00L334.83,56.00M326.94,67.00L337.94,56.00M330.05,67.00L341.05,56.00M333.16,67.00L344.16,56.00M336.27,67.00L347.27,56.00M339.38,67.00L350.38,56.00M342.49,67.00L353.49,56.00M345.60,67.00L356.60,56.00M348.72,67.00L356.60,59.12M351.83,67.00L356.60,62.23M354.94,67.00L356.60,65.34" stroke="#b8cfe8" stroke-width="0.5" fill="none"/>
+<rect x="311.49" y="56.00" width="45.11" height="11.00" rx="0" fill="none" stroke="#3c6ea8" stroke-width="0.5"/>
+<text x="92.22" y="64.20" font-size="8" text-anchor="middle" fill="#2c5a8f" font-weight="bold">fp16</text>
+<text x="198.38" y="64.20" font-size="8" text-anchor="middle" fill="#51368a" font-weight="bold">int2 windows</text>
+<text x="288.67" y="64.20" font-size="8" text-anchor="middle" fill="#2a6d45" font-weight="bold">cards</text>
+<text x="334.05" y="64.20" font-size="8" text-anchor="middle" fill="#2c5a8f" font-weight="bold">local</text>
+<text x="47.00" y="64.20" font-size="8" text-anchor="end" fill="#5b6878">sink: fixed</text>
+<text x="359.60" y="64.20" font-size="8" text-anchor="start" fill="#2c5a8f">fixed</text>
+<path d="M53.52413793103448,67 L53.52413793103448,69 L311.4910344827586,69 L311.4910344827586,67" fill="none" stroke="#1d2329" stroke-width="0.6"/>
+<text x="182.51" y="78.00" font-size="8" text-anchor="middle" fill="#1d2329">evictable bytes, split between fp16 and int2 + cards by the quant ratio</text>
+</g>
+</svg>

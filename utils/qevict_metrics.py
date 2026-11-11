@@ -676,3 +676,451 @@ def binary_transition(
         "pooled_counts": pooled_counts,
         "pooled_probabilities": pooled,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tier dynamics — the F / Q / E chain (promotion, demotion, eviction)
+# ---------------------------------------------------------------------------
+#
+# Observation III's ``binary_transition`` over the policy's fp tier asks "was
+# the window in fp?", so its ``0`` pools two different states: held in int2
+# (Q, promotable) and evicted (E, gone for good). A window evicted once
+# contributes a ``0 -> 0`` pair at every later event, so ``P01`` read as "the
+# promotion rate" is diluted by windows that can never be promoted, and ``P10``
+# mixes demotion with outright eviction. In a three-tier cache those are the
+# design's three separate moves, so they are counted separately here.
+
+STATE_F, STATE_Q, STATE_E = 0, 1, 2
+STATE_NAMES: Tuple[str, str, str] = ("F", "Q", "E")
+
+#: Named lag-``delta`` moves, ``(from, to)``.
+MOVES: Dict[str, Tuple[int, int]] = {
+    "stay_fp": (STATE_F, STATE_F),
+    "promote": (STATE_Q, STATE_F),
+    "demote": (STATE_F, STATE_Q),
+    "stay_q": (STATE_Q, STATE_Q),
+    "evict_from_fp": (STATE_F, STATE_E),
+    "evict_from_q": (STATE_Q, STATE_E),
+}
+
+
+def tier_states(acc_fp: Array, acc_q: Array, band: Array) -> Array:
+    """``[M, R, W]`` int8 tier state over the evictable band.
+
+    ``-1`` outside the band at that event (not yet created, still in the
+    protected local tail, or padding); ``0`` F (full precision); ``1`` Q (int2);
+    ``2`` E — in the band but in neither tier, i.e. evicted at this event or an
+    earlier one. ``band`` is ``[R, W]`` or ``[M, R, W]``.
+    """
+    fp = np.asarray(acc_fp, dtype=bool)
+    q = np.asarray(acc_q, dtype=bool)
+    b = np.asarray(band, dtype=bool)
+    if b.ndim == 2:
+        b = np.broadcast_to(b[None], fp.shape)
+    if fp.shape != q.shape or fp.shape != b.shape:
+        raise ValueError(f"shape mismatch: fp {fp.shape}, q {q.shape}, band {b.shape}")
+    if np.any(fp & q & b):
+        raise ValueError("a window is tagged both fp and Q at one event")
+    out = np.full(fp.shape, -1, dtype=np.int8)
+    out[b] = STATE_E
+    out[b & fp] = STATE_F
+    out[b & q] = STATE_Q
+    return out
+
+
+def tier_transitions(states: Array, delta: int = 1) -> Dict[str, object]:
+    """Lag-``delta`` F/Q/E transition counts and rates.
+
+    Only pairs where the window is in the band at *both* ends are counted, so
+    a window leaving the local tail enters through ``entry_counts`` (the state
+    it is first given) rather than as a transition. ``E`` is absorbing in the
+    cache; ``resurrections`` counts ``E -> F|Q`` pairs, which must be zero —
+    anything else means the survivor ids were mapped onto the wrong windows.
+
+    Returns counts ``[M, 3, 3]`` (``from, to``), per-trace row probabilities,
+    pooled counts/probabilities, ``entry_counts`` ``[M, 3]`` and one
+    ``rate_<move>`` ``[M]`` per :data:`MOVES` entry (``P(to | from)``).
+    """
+    x = np.asarray(states, dtype=int)
+    if x.ndim != 3:
+        raise ValueError(f"states must be [M, R, W]; got {x.shape}")
+    M, R, _ = x.shape
+    delta = int(delta)
+    if not 0 < delta < R:
+        raise ValueError(f"delta must satisfy 0 < delta < R = {R}; got {delta}")
+    cur, fut = x[:, :R - delta], x[:, delta:]
+    ok = (cur >= 0) & (fut >= 0)
+    counts = np.zeros((M, 3, 3), dtype=np.int64)
+    for a in range(3):
+        for b in range(3):
+            counts[:, a, b] = np.sum(ok & (cur == a) & (fut == b), axis=(1, 2))
+    entry = np.zeros((M, 3), dtype=np.int64)
+    for b in range(3):
+        entry[:, b] = np.sum((cur < 0) & (fut == b), axis=(1, 2))
+    probs = np.full((M, 3, 3), np.nan)
+    den = counts.sum(axis=2, keepdims=True)
+    np.divide(counts, den, out=probs, where=den > 0)
+    pooled_counts = counts.sum(axis=0)
+    pooled = np.full((3, 3), np.nan)
+    pden = pooled_counts.sum(axis=1, keepdims=True)
+    np.divide(pooled_counts, pden, out=pooled, where=pden > 0)
+    out: Dict[str, object] = {
+        "delta": delta,
+        "counts_by_trace": counts,
+        "probabilities_by_trace": probs,
+        "pooled_counts": pooled_counts,
+        "pooled_probabilities": pooled,
+        "entry_counts": entry,
+        "resurrections": int(counts[:, STATE_E, STATE_F].sum()
+                             + counts[:, STATE_E, STATE_Q].sum()),
+    }
+    for name, (a, b) in MOVES.items():
+        out[f"rate_{name}"] = probs[:, a, b]
+    return out
+
+
+def _future_mass(step_mass: Array, t: int, horizon: int) -> Optional[Array]:
+    """``[M, W]`` mass over steps ``t+1 .. t+H``; ``None`` if not fully observed."""
+    T = step_mass.shape[1]
+    if t + horizon + 1 > T:
+        return None
+    return step_mass[:, t + 1:t + horizon + 1, :].sum(axis=1)
+
+
+def _top_k_mask(scores: Array, cand: Array, k: Array) -> Array:
+    """``[M, W]`` bool — each row's top ``k[m]`` candidates by ``scores``."""
+    s = np.where(cand, scores, -np.inf)
+    order = np.argsort(-s, axis=-1, kind="stable")
+    rank = np.empty_like(order)
+    np.put_along_axis(rank, order, np.arange(s.shape[-1])[None, :], axis=-1)
+    return cand & (rank < np.asarray(k)[:, None])
+
+
+def transition_outcomes(
+    states: Array,
+    step_mass: Array,
+    event_steps: Sequence[int],
+    horizon: int,
+) -> Dict[str, object]:
+    """Did each tier move land on the windows the future actually attends?
+
+    For every routing event ``r >= 1`` (decode step ``t``), the lag-1 move of
+    each window from event ``r-1`` to ``r`` is scored against its ground-truth
+    mass over the next ``H`` steps, ``F_w = Σ_{t'=t+1}^{t+H} mass[t', w]``.
+    The **candidates** are the windows that event actually decided: in the
+    band at ``r`` and not already evicted at ``r-1``.
+
+    Per trace, summed over events (ratio-of-sums, so an event with many moves
+    weighs more than one with few):
+
+    * ``share_<move>`` — fraction of the candidates' future mass sitting on the
+      windows that made that move. ``share_promote`` is the mass promotions
+      brought back to full precision; ``share_evict_from_fp`` +
+      ``share_evict_from_q`` is the eviction regret.
+    * ``lift_<move>`` — a moved window's mean future mass over the candidate
+      mean. ``> 1`` = the move picked windows the future attends more than
+      average. ``lift_promote - lift_demote`` is the swap gain: positive when
+      what came up to fp outweighs what went down.
+    * ``hit_promote`` — fraction of promotions into the hindsight-best fp set
+      (the top ``|F|`` candidates by future mass, ``|F|`` the policy's own fp
+      count, so the comparison is size-matched); ``hit_demote`` — fraction of
+      demotions out of it; ``hit_evict`` — fraction of evictions outside the
+      hindsight-best retained set (top ``|F| + |Q|``); ``fp_precision`` —
+      ``|F ∩ best F| / |F|`` over all candidates.
+
+    Events without a full ``H``-step future are skipped (right-censored), as in
+    :func:`future_missed_mass`.
+    """
+    x = np.asarray(states, dtype=int)
+    mass = np.asarray(step_mass, dtype=float)
+    steps = np.asarray(event_steps, dtype=int)
+    if x.ndim != 3 or mass.ndim != 3:
+        raise ValueError("states and step_mass must both be 3-D")
+    M, R, W = x.shape
+    if mass.shape[0] != M or mass.shape[2] != W:
+        raise ValueError(f"step_mass must be [{M}, T, {W}]; got {mass.shape}")
+    if steps.size != R:
+        raise ValueError("event_steps length must equal states.shape[1]")
+
+    names = list(MOVES)
+    s_mass = {n: np.zeros(M) for n in names}
+    s_cnt = {n: np.zeros(M) for n in names}
+    cand_mass = np.zeros(M)
+    cand_cnt = np.zeros(M)
+    hits = {k: np.zeros(M) for k in ("promote", "demote", "evict", "fp")}
+    tots = {k: np.zeros(M) for k in ("promote", "demote", "evict", "fp")}
+    scored = 0
+    for r in range(1, R):
+        fut = _future_mass(mass, int(steps[r]), int(horizon))
+        if fut is None:
+            continue
+        scored += 1
+        prev, now = x[:, r - 1], x[:, r]
+        cand = (now >= 0) & (prev != STATE_E)
+        cand_mass += np.sum(np.where(cand, fut, 0.0), axis=-1)
+        cand_cnt += cand.sum(axis=-1)
+        for n in names:
+            a, b = MOVES[n]
+            sel = cand & (prev == a) & (now == b)
+            s_mass[n] += np.sum(np.where(sel, fut, 0.0), axis=-1)
+            s_cnt[n] += sel.sum(axis=-1)
+        k_fp = np.sum(cand & (now == STATE_F), axis=-1)
+        k_alive = k_fp + np.sum(cand & (now == STATE_Q), axis=-1)
+        best_fp = _top_k_mask(fut, cand, k_fp)
+        best_alive = _top_k_mask(fut, cand, k_alive)
+        prom = cand & (prev == STATE_Q) & (now == STATE_F)
+        dem = cand & (prev == STATE_F) & (now == STATE_Q)
+        ev = cand & (prev != STATE_E) & (now == STATE_E)
+        fpn = cand & (now == STATE_F)
+        for key, sel, good in (("promote", prom, best_fp),
+                               ("demote", dem, ~best_fp),
+                               ("evict", ev, ~best_alive),
+                               ("fp", fpn, best_fp)):
+            hits[key] += np.sum(sel & good, axis=-1)
+            tots[key] += sel.sum(axis=-1)
+
+    def ratio(a: Array, b: Array) -> Array:
+        return np.divide(a, b, out=np.full(M, np.nan), where=b > 0)
+
+    cand_mean = ratio(cand_mass, cand_cnt)
+    out: Dict[str, object] = {"events_scored": scored, "horizon": int(horizon),
+                              "candidate_count": cand_cnt}
+    for n in names:
+        out[f"count_{n}"] = s_cnt[n]
+        out[f"share_{n}"] = ratio(s_mass[n], cand_mass)
+        out[f"lift_{n}"] = ratio(ratio(s_mass[n], s_cnt[n]), cand_mean)
+    out["swap_gain"] = out["lift_promote"] - out["lift_demote"]
+    out["eviction_regret"] = out["share_evict_from_fp"] + out["share_evict_from_q"]
+    for key in ("promote", "demote", "evict"):
+        out[f"hit_{key}"] = ratio(hits[key], tots[key])
+        out[f"hit_{key}_num"] = hits[key]
+        out[f"hit_{key}_den"] = tots[key]
+    out["fp_precision"] = ratio(hits["fp"], tots["fp"])
+    out["fp_precision_num"] = hits["fp"]
+    out["fp_precision_den"] = tots["fp"]
+    return out
+
+
+def tier_decision_fidelity(states: Array, rank_scores: Array) -> Array:
+    """``[M, R]`` Jaccard of the policy's fp set vs the oracle's, same survivors.
+
+    Among the windows the cache still holds at an event (F or Q), the oracle
+    puts in fp the ``|F|`` with the highest ground-truth cumulative score.
+    This isolates the *ranking* the eviction used — its own running scores,
+    which under the read gate credit a skipped int2 window with its card
+    estimate — from what the cache happened to retain. NaN where the event
+    holds no fp window.
+    """
+    x = np.asarray(states, dtype=int)
+    rank = np.asarray(rank_scores, dtype=float)
+    if x.shape != rank.shape:
+        raise ValueError(f"states {x.shape} and rank_scores {rank.shape} differ")
+    M, R, _ = x.shape
+    out = np.full((M, R), np.nan)
+    for r in range(R):
+        alive = (x[:, r] == STATE_F) | (x[:, r] == STATE_Q)
+        pol = x[:, r] == STATE_F
+        k = pol.sum(axis=-1)
+        best = _top_k_mask(rank[:, r], alive, k)
+        inter = np.sum(pol & best, axis=-1)
+        union = np.sum(pol | best, axis=-1)
+        np.divide(inter, union, out=out[:, r], where=union > 0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Observation IV — the decode read ledger (per query head, gate-aware)
+# ---------------------------------------------------------------------------
+#
+# FMM scores what the cache RETAINS. On the flash path that is not what a decode
+# step READS: the read gate opens a fraction of the int2 tier per KV head, and a
+# skipped int2 window reaches the output only through its value centroid, at
+# the card's calibrated weight. So at every decode step, each query head's
+# ground-truth attention is split into where it actually landed.
+
+#: Window classes on the baseline window axis, per decode step.
+CLS_FP, CLS_Q, CLS_LOCAL, CLS_EVICTED, CLS_FRESH = 0, 1, 2, 3, 4
+
+#: Ledger columns. ``fp`` and ``local`` are read exactly; ``q_read`` at int2;
+#: ``q_skipped`` only through the centroid fill; ``evicted`` not at all.
+#: ``fresh`` is the newest tokens, appended to the fp store since the last score
+#: column was created (read exactly). ``sink`` is the rest of the head's mass.
+LEDGER_PARTS: Tuple[str, ...] = (
+    "fp", "local", "fresh", "q_read", "q_skipped", "evicted", "sink")
+
+
+def survivor_to_base(ids: Array, tier: Array, W: int,
+                     gate_read: Optional[Array] = None
+                     ) -> Tuple[Array, Optional[Array], int]:
+    """Scatter one trace's survivor axis onto the baseline window axis.
+
+    Parameters
+    ----------
+    ids, tier : ``[T, Wo]`` — ``all_window_ids`` / ``all_window_tier`` for one
+        ``(sample, layer)``; ``-1`` pads.
+    W : baseline window count.
+    gate_read : ``[T, H_kv, Wo]`` bool, optional — the gate's pick.
+
+    Returns ``(cls [T, W] int8, read [T, H_kv, W] bool or None, n_out_of_range)``.
+    A window absent from the survivors is ``CLS_EVICTED`` when some newer window
+    survives (ids are chronological and eviction is the only way off the axis),
+    and ``CLS_FRESH`` when it is newer than every survivor: its tokens are
+    already in the fp store and its score column arrives with the next update.
+    """
+    ids = np.asarray(ids)
+    tier = np.asarray(tier)
+    T = ids.shape[0]
+    valid = (ids >= 0) & (tier >= 0)
+    oob = int(np.sum(valid & (ids >= W)))
+    valid &= ids < W
+    max_id = np.where(valid, ids, -1).max(axis=1) if ids.size else np.full(T, -1)
+    cols = np.arange(W)[None, :]
+    cls = np.where(cols <= max_id[:, None], CLS_EVICTED, CLS_FRESH).astype(np.int8)
+    t_idx, o_idx = np.nonzero(valid)
+    w_idx = ids[t_idx, o_idx]
+    tmap = np.array([CLS_FP, CLS_Q, CLS_LOCAL], dtype=np.int8)
+    cls[t_idx, w_idx] = tmap[np.clip(tier[t_idx, o_idx], 0, 2)]
+    read = None
+    if gate_read is not None:
+        g = np.asarray(gate_read, dtype=bool)
+        read = np.zeros((T, g.shape[1], W), dtype=bool)
+        if t_idx.size:
+            read[t_idx, :, w_idx] = g[t_idx, :, o_idx]
+    return cls, read, oob
+
+
+def decode_read_ledger(
+    head_mass: Array,
+    cls: Array,
+    read: Optional[Array],
+    fired: Optional[Array],
+    rep: int,
+    first_step: int = 1,
+) -> Dict[str, Array]:
+    """Split each query head's per-step attention by where the decode read it.
+
+    Parameters
+    ----------
+    head_mass : ``[T, H, W]`` ground-truth per-step, per-query-head window mass
+        (post-sink; one query row per decode step, so each head's total over
+        sink + windows is 1).
+    cls : ``[T, W]`` window class (:func:`survivor_to_base`).
+    read : ``[T, H_kv, W]`` bool — the gate's pick; ``None`` = never gated.
+    fired : ``[T]`` bool — the gate ran at that step. Where it did not, the
+        whole Q tier counts as read (the ungated materialize / eager read).
+    rep : query heads per KV head (GQA); query head ``h`` reads KV head
+        ``h // rep``, the layout ``repeat_kv`` and the gate both use.
+    first_step : steps before it are skipped (step 0 is the prefill forward,
+        which has many query rows and no gate).
+
+    Returns
+    -------
+    ``parts`` ``[T', H, P]`` — fraction of each head's mass per
+    :data:`LEDGER_PARTS` column (rows sum to 1 up to the sink clamp);
+    ``gated`` ``[T']`` bool; ``q_mass`` ``[T', H]``; ``read_frac`` ``[T', H_kv]``
+    (opened / active int2 windows, NaN where ungated or no Q tier);
+    ``oracle_q_read`` ``[T', H]`` — the int2 mass a hindsight pick of the SAME
+    number of windows per KV head would have opened, choosing at each step the
+    windows with the largest summed per-head share over the group (each head's
+    Q mass normalised to 1 first, never raw mass: CLAUDE.md, the GQA union).
+    It is optimal for that per-step objective, which is the gate's own; recall
+    aggregated as a ratio of sums over steps can still land a hair above it.
+    """
+    m = np.asarray(head_mass, dtype=np.float32)[first_step:]
+    c = np.asarray(cls)[first_step:]
+    Tn, H, W = m.shape
+    if c.shape != (Tn, W):
+        raise ValueError(f"cls must be [{Tn}, {W}] after first_step; got {c.shape}")
+    rep = max(1, int(rep))
+    kv_of = np.arange(H) // rep
+    H_kv = int(kv_of.max()) + 1 if H else 0
+    if fired is None:
+        gated = np.zeros(Tn, dtype=bool)
+    else:
+        gated = np.asarray(fired, dtype=bool)[first_step:]
+    if read is None:
+        rd = np.zeros((Tn, H_kv, W), dtype=bool)
+        gated = np.zeros(Tn, dtype=bool)
+    else:
+        rd = np.asarray(read, dtype=bool)[first_step:]
+        if rd.shape[1] != H_kv:
+            raise ValueError(
+                f"gate_read has {rd.shape[1]} KV heads but H={H} query heads at "
+                f"rep={rep} imply {H_kv}")
+
+    is_q = c == CLS_Q                                          # [Tn, W]
+    read_h = rd[:, kv_of, :]                                   # [Tn, H, W]
+    g = gated[:, None, None]
+    q_read = is_q[:, None, :] & (read_h | ~g)
+    q_skip = is_q[:, None, :] & ~read_h & g
+
+    parts = np.zeros((Tn, H, len(LEDGER_PARTS)), dtype=np.float64)
+    for i, (name, klass) in enumerate((("fp", CLS_FP), ("local", CLS_LOCAL),
+                                       ("fresh", CLS_FRESH),
+                                       ("evicted", CLS_EVICTED))):
+        parts[..., LEDGER_PARTS.index(name)] = np.einsum(
+            "thw,tw->th", m, (c == klass).astype(np.float32))
+    parts[..., LEDGER_PARTS.index("q_read")] = np.einsum(
+        "thw,thw->th", m, q_read.astype(np.float32))
+    parts[..., LEDGER_PARTS.index("q_skipped")] = np.einsum(
+        "thw,thw->th", m, q_skip.astype(np.float32))
+    win_total = parts[..., :LEDGER_PARTS.index("sink")].sum(-1)
+    parts[..., LEDGER_PARTS.index("sink")] = np.clip(1.0 - win_total, 0.0, None)
+    q_mass = (parts[..., LEDGER_PARTS.index("q_read")]
+              + parts[..., LEDGER_PARTS.index("q_skipped")])
+
+    n_q = is_q.sum(-1).astype(float)                           # [Tn]
+    opened = np.sum(rd & is_q[:, None, :], axis=-1).astype(float)   # [Tn, H_kv]
+    read_frac = np.full((Tn, H_kv), np.nan)
+    ok = gated & (n_q > 0)
+    np.divide(opened, n_q[:, None], out=read_frac, where=ok[:, None])
+
+    # Hindsight ceiling: same count per KV head, best by summed per-head share.
+    oracle = np.full((Tn, H), np.nan)
+    if np.any(ok):
+        share = m / np.maximum(q_mass, 1e-30)[..., None]       # [Tn, H, W]
+        share = np.where(is_q[:, None, :], share, 0.0)
+        grp = np.zeros((Tn, H_kv, W), dtype=np.float64)
+        np.add.at(grp, (slice(None), kv_of, slice(None)), share)
+        grp = np.where(is_q[:, None, :], grp, -np.inf)
+        order = np.argsort(-grp, axis=-1, kind="stable")
+        rank = np.empty_like(order)
+        np.put_along_axis(rank, order, np.arange(W)[None, None, :], axis=-1)
+        pick = rank < opened[..., None]                        # [Tn, H_kv, W]
+        o_read = np.einsum("thw,thw->th", m,
+                           (pick[:, kv_of, :] & is_q[:, None, :]).astype(np.float32))
+        oracle[ok] = o_read[ok]
+    return {"parts": parts, "gated": gated, "q_mass": q_mass,
+            "read_frac": read_frac, "oracle_q_read": oracle}
+
+
+def ledger_head_recall(parts: Array, gated: Array, oracle: Optional[Array] = None,
+                       min_q_share: float = 0.0) -> Dict[str, Array]:
+    """Per-head gate recall over one trace's gated steps (ratio of sums).
+
+    ``recall[h] = Σ_t q_read / Σ_t (q_read + q_skipped)`` over steps where the
+    gate ran and head ``h`` put at least ``min_q_share`` of its mass on the int2
+    tier. ``oracle_recall`` is the same with the hindsight pick's mass. Per head,
+    never pooled across heads first: a group sum is dominated by its loudest
+    head, which is how the old recall test read 1.000 while one head got 0.05%
+    of its mass read (CLAUDE.md, §12).
+    """
+    p = np.asarray(parts, dtype=float)
+    g = np.asarray(gated, dtype=bool)
+    qr = p[..., LEDGER_PARTS.index("q_read")]
+    qs = p[..., LEDGER_PARTS.index("q_skipped")]
+    qm = qr + qs
+    use = g[:, None] & (qm > max(float(min_q_share), 0.0)) & (qm > 0)
+    num = np.sum(np.where(use, qr, 0.0), axis=0)
+    den = np.sum(np.where(use, qm, 0.0), axis=0)
+    H = p.shape[1]
+    recall = np.divide(num, den, out=np.full(H, np.nan), where=den > 0)
+    out = {"recall": recall, "q_mass_total": den,
+           "step_recall": np.divide(qr, qm, out=np.full(qr.shape, np.nan),
+                                    where=use)}
+    if oracle is not None:
+        o = np.asarray(oracle, dtype=float)
+        onum = np.sum(np.where(use & np.isfinite(o), o, 0.0), axis=0)
+        out["oracle_recall"] = np.divide(onum, den, out=np.full(H, np.nan),
+                                         where=den > 0)
+    return out

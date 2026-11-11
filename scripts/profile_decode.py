@@ -18,21 +18,44 @@ path is batch-invariant -- e.g. one launched on a ``B * H_kv`` grid, which is 8
 blocks on a 108-SM A100 at B=1 -- produces the identical signature. The two
 hypotheses are distinguished by exactly one number, printed first below:
 
-    GPU busy fraction = (CUDA kernel self time) / wall time
+    GPU busy fraction = (CUDA kernel self time) / UNPROFILED wall time
 
   << 1.0   host-bound. The launch/sync path is the budget; the dispatch-count
            argument was right and the remaining launches are the target.
   ~= 1.0   kernel-bound. The GPU is saturated and the kernels themselves are
            slow. No amount of launch collapsing can help; fix the kernel.
 
+The denominator is load-bearing and was wrong until it was measured separately.
+Kernel time comes from the profiler, so the obvious thing is to take the wall
+from the same block -- but the profiler charges tens of microseconds per event,
+and a decode step that issues ~1,650 launches pays that ~1,650 times. The cost
+lands wholly in the denominator (the kernels themselves are unchanged), so it
+pushes `busy` down by close to 2x and turns a mixed step into a host-bound
+verdict. This script therefore times `steps` steps with the profiler OFF, uses
+that as the denominator, and prints the profiled wall beside it as overhead.
+Anything comparing `busy` against TPOT must use the unprofiled figure.
+
 Then the A/B that names the kernel, if it is one:
 
     python scripts/profile_decode.py --config <cfg> --fused 1     # Triton path
     python scripts/profile_decode.py --config <cfg> --fused 0     # materialize
 
-Usage:
+What to read, in order:
+
+1. ``GPU busy %`` -- host-bound or kernel-bound. Everything else is secondary.
+2. ``WHERE THE STEP GOES`` -- the bucketed rollup. ``ours (cache)`` vs ``model``
+   is the split that decides whether more cache work is worth doing at all.
+   ``other`` is always listed by name; if it is large, the fix is a new pattern
+   in ``_BUCKETS``, never a subtraction.
+3. The flat top-N, for the individual kernel once the bucket says which one.
+
+Usage (the shape the perf table's 4096/256 batch-32 row runs at):
+
     python scripts/profile_decode.py --config configs/perf_ours.yaml \
-        --prefill 1048 --batch 1 --steps 20
+        --prefill 4096 --batch 32 --steps 24 --top 40
+
+Add ``--trace out.json`` to get a chrome trace; that is the only thing that can
+split the ``shared/other`` bucket, because it carries the launching stack.
 """
 
 from __future__ import annotations
@@ -43,13 +66,14 @@ import sys
 import time
 from pathlib import Path
 
-
-def _env_gate(args) -> None:
-    """Set the path flags BEFORE anything reads them (hooks latch at install)."""
-    if args.fused is not None:
-        os.environ["STICKYKV_FUSED_DECODE"] = str(args.fused)
-    if args.compile_evict is not None:
-        os.environ["STICKYKV_COMPILE_EVICT"] = str(args.compile_evict)
+# The project root, so `utils` / `modules` import when this file is run as a
+# path -- `python scripts/profile_decode.py`, the usage the docstring above
+# gives. sys.path[0] is then scripts/, not the root, and the `from utils.config
+# import ...` inside main() raises ModuleNotFoundError before anything loads.
+# The insert inside main() adds scripts/ for the audit_e2e sibling import: a
+# different directory, and it runs after that import, so it never covered this.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _self_device_us(ev) -> float:
@@ -59,6 +83,234 @@ def _self_device_us(ev) -> float:
         if v is not None:
             return float(v)
     return 0.0
+
+
+#: Ordered classification of CUDA kernel names into the buckets the decode
+#: question is actually about. FIRST MATCH WINS, so the specific patterns come
+#: before the generic ones -- our Triton kernels are named before "elementwise"
+#: can claim anything, and the model's GEMMs before "reduction" can.
+#:
+#: This exists because the flat top-N list below cannot answer "how much of the
+#: step is the cache?". Reading it, you subtract the rows you recognise from the
+#: total and call the remainder a tail -- which is how a 10.4 ms "unattributed"
+#: block got quoted in this repo that was never a block at all, just every kernel
+#: ranked below the cut. Hence the rule this table is built around: the `other`
+#: bucket is ALWAYS printed by name. A tail you cannot see is a tail you will
+#: eventually explain with a guess.
+#:
+#: Matching is on the kernel name, so it is a heuristic and can mis-file. Two
+#: consequences are called out in the output rather than hidden: `memory:` is
+#: shared between the cache and the model and is attributed to NEITHER, and
+#: anything unmatched is listed individually.
+_BUCKETS = (
+    # -- ours: the three Triton kernels this project owns ------------------
+    ("ours: two-tier decode", ("_two_tier_decode_kernel",)),
+    ("ours: read gate",       ("_gate_kernel",)),
+    ("ours: prefill score",   ("_score_kernel",)),
+    # Inductor names its generated kernels triton_{poi,red,tem,for,unk}_fused_*.
+    # Nothing else here is compiled, so these are the eviction body.
+    ("ours: compiled evict",  ("triton_poi_fused", "triton_red_fused",
+                               "triton_tem_fused", "triton_for_fused",
+                               "triton_unk_fused", "triton_mm_fused")),
+    # -- the model --------------------------------------------------------
+    ("model: attention",      ("flash_fwd", "flash::", "fmha", "mha_fwd",
+                               "attention", "scaled_dot")),
+    ("model: GEMM",           ("gemm", "gemv", "cutlass", "cublas", "xmma",
+                               "sm80_", "sm90_", "ampere_", "turing_",
+                               "volta_", "splitKreduce", "dot_kernel")),
+    ("model: norm/softmax",   ("layer_norm", "layernorm", "rms_norm",
+                               "rmsnorm", "softmax")),
+    ("model: activation",     ("silu", "gelu", "swiglu", "sigmoid")),
+    # -- shared: cannot be attributed to either side by name ---------------
+    ("memory: copy/cat",      ("copy_device_to_device", "direct_copy",
+                               "CatArrayBatched", "Memcpy", "Memset",
+                               "vectorized_copy")),
+    ("memory: index/gather",  ("indexSelect", "index_elementwise",
+                               "index_put", "gather", "scatter", "take_",
+                               "gatherTopK")),
+    ("sort/topk",             ("radix", "bitonic", "sort", "Sort", "topk",
+                               "TopK")),
+    ("elementwise",           ("elementwise_kernel", "unrolled_elementwise",
+                               "CUDAFunctor")),
+    ("reduction",             ("reduce_kernel", "ReduceOp", "cub::")),
+)
+
+#: Buckets whose time belongs to this project, for the headline split.
+_OURS = tuple(name for name, _ in _BUCKETS if name.startswith("ours:"))
+#: Buckets that are the model's own work.
+_MODEL = tuple(name for name, _ in _BUCKETS if name.startswith("model:"))
+
+
+def _bucket_of(key: str) -> str:
+    """Which bucket a CUDA kernel name falls in. ``"other"`` if none match."""
+    low = key.lower()
+    for name, pats in _BUCKETS:
+        for pat in pats:
+            if pat.lower() in low:
+                return name
+    return "other"
+
+
+#: The cache this run built, so the rollup can read its counters. One process,
+#: one profiled cache; a dict rather than a global rebind keeps it importable.
+_PROFILED_CACHE: dict = {"cache": None}
+#: The decode-graph runner this run built, so the rollup can report it.
+_PROFILED_GRAPH: dict = {"runner": None}
+
+
+def _print_buckets(evs, n: int, gpu_us: float) -> None:
+    """The rollup: where the step's GPU time and launches actually go."""
+    agg: dict = {}
+    for e in evs:
+        us = _self_device_us(e)
+        if us <= 0:
+            continue
+        b = _bucket_of(e.key)
+        rec = agg.setdefault(b, {"us": 0.0, "n": 0, "kernels": []})
+        rec["us"] += us
+        rec["n"] += e.count
+        rec["kernels"].append((us, e.count, e.key))
+
+    def share(rec):
+        return rec["us"] / max(gpu_us, 1.0) * 100
+
+    ours = sum(agg[b]["us"] for b in _OURS if b in agg)
+    model = sum(agg[b]["us"] for b in _MODEL if b in agg)
+    shared = gpu_us - ours - model
+
+    print("\n" + "-" * 74)
+    print("  WHERE THE STEP GOES")
+    print("-" * 74)
+    print(f"    {'bucket':<26} {'ms/step':>9} {'% GPU':>7} {'launches/step':>14}")
+    for b, _ in _BUCKETS:
+        if b not in agg:
+            continue
+        r = agg[b]
+        print(f"    {b:<26} {r['us']/n/1000:9.3f} {share(r):6.1f}% "
+              f"{r['n']/n:14.0f}")
+    if "other" in agg:
+        r = agg["other"]
+        print(f"    {'other':<26} {r['us']/n/1000:9.3f} {share(r):6.1f}% "
+              f"{r['n']/n:14.0f}")
+
+    print(f"\n    ours (cache)   {ours/n/1000:8.3f} ms/step  "
+          f"{ours/max(gpu_us,1)*100:5.1f}%")
+    print(f"    model          {model/n/1000:8.3f} ms/step  "
+          f"{model/max(gpu_us,1)*100:5.1f}%")
+    print(f"    shared/other   {shared/n/1000:8.3f} ms/step  "
+          f"{shared/max(gpu_us,1)*100:5.1f}%")
+    print("      ^ copy / index / sort / elementwise / reduction, issued by BOTH")
+    print("        sides. A kernel name alone cannot say which, so it is")
+    print("        attributed to neither. Shrinking it needs the chrome trace")
+    print("        (--trace), which carries the launching stack.")
+
+    # The rule this table exists for: `other` is never anonymous.
+    if "other" in agg:
+        ks = sorted(agg["other"]["kernels"], reverse=True)
+        plural = "kernel" if len(ks) == 1 else "kernels"
+        print(f"\n    'other' in full ({len(ks)} distinct {plural}) -- if this is "
+              "large, add a\n    pattern to _BUCKETS rather than calling it a tail:")
+        for us, cnt, key in ks[:12]:
+            print(f"      {us/n/1000:8.3f} ms/step  n={cnt/n:7.1f}  {key[:52]}")
+        if len(ks) > 12:
+            rest = sum(u for u, _, _ in ks[12:])
+            print(f"      {rest/n/1000:8.3f} ms/step  ... and {len(ks)-12} more")
+
+    _print_evict_fusion_verdict(agg, n)
+
+    total = sum(r["us"] for r in agg.values())
+    if abs(total - gpu_us) > 1.0:   # us; float noise only
+        print(f"\n    !! buckets sum to {total/n/1000:.3f} ms but CUDA self time "
+              f"is {gpu_us/n/1000:.3f} ms/step -- the rollup is dropping work.")
+
+
+def _print_evict_fusion_verdict(agg, n: int) -> None:
+    """Say whether the eviction FUSED, not merely whether it compiled.
+
+    These are different claims and only the first one was ever reported.
+    ``_run_compiled_evict`` is kernel-or-error, so a run that finishes proves the
+    compiled callable ran -- and the banner duly prints ``COMPILED ... ACTIVE
+    [OK]``. It does not prove Inductor generated anything. A body that traces,
+    graph-breaks, and lowers each fragment back to stock ATen kernels satisfies
+    every check this repo had, reports itself as compiled, and delivers none of
+    what compiling is for.
+
+    That is what a 2026-09-16 GPU profile showed: ``ours (cache)`` came to
+    7.917 ms against ``_two_tier_decode_kernel`` 7.104 + ``_gate_kernel`` 0.813
+    -- the two hand-written Triton kernels to the milligram, so ``ours: compiled
+    evict`` contributed exactly 0.000. The eviction was landing as
+    ``at::native::elementwise_kernel`` and friends with fractional launch counts
+    (n < 5/step, i.e. one step in ``window_size``), which is the unfused
+    signature the design notes describes.
+
+    Root cause was eight ``untyped_storage().data_ptr()`` graph breaks in
+    now pins the count at zero. This printer is the other half: the instrument
+    that would have said so at the time.
+    """
+    try:
+        from modules.windowed_cache.cache import evict_path_stats
+    except Exception:  # pragma: no cover - import-path dependent
+        return
+    stats = evict_path_stats()
+    compiled_runs, eager_runs = int(stats.get("compiled", 0)), int(stats.get("eager", 0))
+    if compiled_runs == 0 and eager_runs == 0:
+        print("\n    eviction: NO EVICTION RAN in the profiled window. Raise "
+              "--steps above window_size, or this profile is not measuring the "
+              "eviction at all.")
+        return
+
+    fused_us = agg.get("ours: compiled evict", {}).get("us", 0.0)
+    fused_n = agg.get("ours: compiled evict", {}).get("n", 0.0)
+    print(f"\n    eviction: {compiled_runs} compiled / {eager_runs} eager runs, "
+          f"Inductor kernels {fused_us/n/1000:.3f} ms/step over {fused_n/n:.0f} "
+          "launches/step")
+    if compiled_runs > 0 and fused_us <= 0.0:
+        print("      !! COMPILED BUT NOT FUSED. The compiled callable ran and "
+              "Inductor\n"
+              "         emitted no kernel this rollup can see. The eviction is "
+              "paying\n"
+              "         compile overhead for eager kernels. Check:\n"
+              "         and bound the cost with one --compile-evict 0 run: if "
+              "eager\n"
+              "         and 'compiled' tie, the compile is doing nothing either "
+              "way.")
+    elif eager_runs > 0 and compiled_runs > 0:
+        print("      !! MIXED eviction paths in one window -- the ms/step above "
+              "is an\n         average of two methods. Re-run with "
+              "--compile-evict pinned.")
+
+
+def _is_device_event(ev) -> bool:
+    """True for a CUDA KERNEL event; false for the ATen op that launched it.
+
+    ``key_averages()`` returns BOTH, and both carry self device time. A leaf op's
+    self device time is the time of the kernels it launched, and those kernels
+    then report it again under their own names. Summing the lot double-counts
+    every kernel in the step.
+
+    This was live in every number this script has ever printed. It surfaced when
+    the rollup listed its `other` bucket by name and `aten::mm` came back at
+    11.052 ms / 225.0 launches per step against four `ampere_*gemm*` kernels
+    summing to 10.831 ms / **exactly** 225.0. Same launches, same time, counted
+    twice -- which inflated `CUDA kernels`, `kernel launches`, and therefore the
+    `GPU busy %` this whole script exists to report, by close to 2x.
+
+    ``device_type`` is the real signal. The name check is only a fallback for a
+    build that does not expose it: the operator view is namespaced (``aten::``,
+    ``autograd::``), device events are not. Memcpy/Memset are device events and
+    are deliberately NOT excluded by it.
+    """
+    dt = getattr(ev, "device_type", None)
+    if dt is not None:
+        try:
+            from torch.autograd import DeviceType
+            return dt == DeviceType.CUDA
+        except Exception:  # pragma: no cover - torch-version dependent
+            pass
+    return not str(ev.key).startswith(
+        ("aten::", "autograd::", "torch::", "nn.Module", "Optimizer",
+         "ProfilerStep", "cudaLaunch", "cudaMemcpy", "cudaStream",
+         "cudaDevice", "cudaEvent", "cudaHost"))
 
 
 def _perf_cell_quant(cfg) -> float:
@@ -80,15 +332,16 @@ def main() -> None:
     ap.add_argument("--warmup", type=int, default=12,
                     help="decode steps before profiling; must exceed window_size "
                          "so at least one eviction is compiled/autotuned away")
-    ap.add_argument("--fused", type=int, choices=(0, 1), default=None,
-                    help="STICKYKV_FUSED_DECODE. 0 = materialize path (A/B the "
-                         "Triton decode kernel out of the picture)")
-    ap.add_argument("--compile-evict", type=int, choices=(0, 1), default=None)
+    # Defaults to 1, which is what the library itself picks on CUDA (the device
+    # decides -- see _compile_evict_enabled). This used to be the one place the
+    # two disagreed: the library defaulted to 0 while run_perf_table.sh exported
+    # 1, so an unset profile attributed the EAGER eviction against a table that
+    # ran it compiled -- a different method, and not by a little: compiling moved
+    # TPOT 101.6 -> 85 ms (DECODE_HISTORY.md §1). Pass 0 deliberately to A/B it.
     ap.add_argument("--trace", default=None, help="write a chrome trace here")
     ap.add_argument("--top", type=int, default=15)
     args = ap.parse_args()
 
-    _env_gate(args)
 
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -133,6 +386,14 @@ def main() -> None:
             rope = mod
             break
 
+    # Deliberately counts ONE window of `steps`, not the two that actually run.
+    # `max_tokens` is not a capacity: the buffers are sized to the eviction
+    # budget (cache.py's "Sized to the EVICTION BUDGET" note), and the only thing
+    # this value reaches is `config.resolve`, where the budget is taken against
+    # `prefill_len + max_tokens`. Counting the second (unprofiled) window here
+    # would widen the budget by ~0.6% and quietly profile a different method than
+    # every earlier run of this script. The extra steps cost budget nothing --
+    # they evict against the same target like any other step.
     total_steps = args.warmup + args.steps + 1
     # Shared with audit_e2e: budget and quant settings live in perf.configs[0],
     # not cfg.cache, and first_eviction_step must be carried or this profiles a
@@ -145,29 +406,81 @@ def main() -> None:
         kv_dtype=dtype, rope_module=rope,
         num_layers=model.config.num_hidden_layers, max_tokens=total_steps)
     hooks = install_score_hooks(model, cache, cache_config)
+    # The rollup is printed by a module-level function, so it needs a handle to
+    # the live cache to read its eviction-width counters.
+    _PROFILED_CACHE["cache"] = cache
+
+    # cache_position must be passed EXPLICITLY and advanced monotonically. Left
+    # to itself, transformers derives it from `past_key_values.get_seq_length()`,
+    # which for an evicting cache is the RETAINED key count, not the absolute
+    # token index — so it jumps backwards after the first eviction and the store
+    # ends up with duplicated, non-monotonic positions. `generate()` does this
+    # for us, which is why every quality runner is unaffected and only this
+    # hand-written decode loop trips the cache's position contract.
+    device = input_ids.device
+    pos = 0                      # absolute token index, advanced by _step
+
+    _decode_step = [-1]
+
+    def _step(ids, past, n_new):
+        nonlocal pos
+        cp = torch.arange(pos, pos + n_new, device=device)
+        pos += n_new
+        _decode_step[0] += 1
+        return model(input_ids=ids, past_key_values=past, use_cache=True,
+                     return_dict=True, cache_position=cp)
 
     try:
         with torch.no_grad():
-            out = model(input_ids=input_ids, past_key_values=cache,
-                        use_cache=True, return_dict=True)
+            out = _step(input_ids, cache, input_ids.shape[1])
             pkv = out.past_key_values
             nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
             # Warm up past compile / autotune / the first eviction.
             for _ in range(args.warmup):
-                out = model(input_ids=nxt, past_key_values=pkv,
-                            use_cache=True, return_dict=True)
+                out = _step(nxt, pkv, 1)
                 pkv = out.past_key_values
                 nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
             torch.cuda.synchronize()
 
+            # ---- window 1: the STEADY wall, with the profiler OFF ------------
+            # `GPU busy` is kernel time over wall time, and the only wall that
+            # answers the question is the one the step costs when nothing is
+            # watching. Timing it inside the `profile` block instead charges the
+            # denominator for the profiler's own per-event cost -- which on this
+            # workload is not a rounding error: CPU+CUDA activity tracing pays
+            # roughly tens of microseconds per launch, and a step that issues
+            # ~1,650 of them absorbs tens of milliseconds it does not otherwise
+            # spend. That lands entirely in the denominator and nowhere in the
+            # numerator, so it drives `busy` DOWN and makes a mixed step read as
+            # host-bound -- the one reading this script exists to rule on.
+            t0 = time.perf_counter()
+            for _ in range(args.steps):
+                out = _step(nxt, pkv, 1)
+                pkv = out.past_key_values
+                nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            torch.cuda.synchronize()
+            steady_us = (time.perf_counter() - t0) * 1e6
+
+            # ---- window 2: the attribution, with the profiler ON -------------
+            # Same length as window 1 so the two see the same number of eviction
+            # steps, which are ~2.7x a steady step and would otherwise bias
+            # whichever window held more of them.
+            #
+            # Zero the eviction path counters here, not at startup: the verdict
+            # printed with the rollup has to describe the window the kernels were
+            # measured in, and warmup alone runs several evictions.
+            try:
+                from modules.windowed_cache.cache import reset_evict_path_stats
+                reset_evict_path_stats()
+            except Exception:  # pragma: no cover - import-path dependent
+                pass
             t0 = time.perf_counter()
             with profile(
                 activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
             ) as prof:
                 for _ in range(args.steps):
-                    out = model(input_ids=nxt, past_key_values=pkv,
-                                use_cache=True, return_dict=True)
+                    out = _step(nxt, pkv, 1)
                     pkv = out.past_key_values
                     nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                 torch.cuda.synchronize()
@@ -176,8 +489,13 @@ def main() -> None:
         hooks.remove()
 
     evs = prof.key_averages()
-    gpu_us = sum(_self_device_us(e) for e in evs)
-    n_launch = sum(e.count for e in evs if _self_device_us(e) > 0)
+    kernels = [e for e in evs if _is_device_event(e) and _self_device_us(e) > 0]
+    gpu_us = sum(_self_device_us(e) for e in kernels)
+    n_launch = sum(e.count for e in kernels)
+    # The same work seen from the operator side. Reported, never added -- see
+    # _is_device_event for what adding it did to every number below.
+    op_us = sum(_self_device_us(e) for e in evs
+                if not _is_device_event(e) and _self_device_us(e) > 0)
 
     # Host-side stalls. A sync does not cost a launch's ~5 us -- it drains the
     # queue, so it converts every downstream launch's CPU cost from hidden to
@@ -191,13 +509,24 @@ def main() -> None:
     n = max(args.steps, 1)
     print("\n" + "=" * 74)
     print(f"DECODE PROFILE  batch={args.batch} prefill={args.prefill} "
-          f"steps={n}  fused={os.environ.get('STICKYKV_FUSED_DECODE', '1')} "
-          f"compile_evict={os.environ.get('STICKYKV_COMPILE_EVICT', '0')}")
+          f"steps={n}")
     print("=" * 74)
-    print(f"  wall            {wall_us / n / 1000:8.2f} ms/step")
+    print(f"  wall            {steady_us / n / 1000:8.2f} ms/step   "
+          "(profiler OFF -- the real step)")
+    print(f"  wall, profiled  {wall_us / n / 1000:8.2f} ms/step   "
+          f"({(wall_us - steady_us) / n / 1000:+.2f} ms of profiler overhead, "
+          "NOT the step's cost)")
     print(f"  CUDA kernels    {gpu_us / n / 1000:8.2f} ms/step")
-    busy = gpu_us / max(wall_us, 1.0)
+    if op_us > 0:
+        print(f"  (ATen op view   {op_us / n / 1000:8.2f} ms/step  -- the same "
+              "kernels seen from the\n                            operator side. "
+              "NOT added: key_averages()\n                            returns "
+              "both, and summing them double-counts.)")
+    busy = gpu_us / max(steady_us, 1.0)
     print(f"  GPU busy        {busy * 100:8.1f} %   <-- THE number")
+    print(f"  (against the profiled wall it would read "
+          f"{gpu_us / max(wall_us, 1.0) * 100:.1f}% -- that figure is an "
+          "artifact\n   of the measurement and must not be quoted.)")
     print(f"  kernel launches {n_launch / n:8.0f} /step")
     if busy < 0.5:
         print("  -> HOST-BOUND. The GPU idles most of the step; launches and "
@@ -208,14 +537,142 @@ def main() -> None:
     else:
         print("  -> MIXED. Both terms are real; fix the larger one first.")
 
+    # Which method was actually profiled. The fused kernel running does not mean
+    # the read gate ran: a store with no sketch cards reads the whole tier,
+    # correctly, and looks identical in every number above.
+    try:
+        from modules.windowed_cache import flash_decode
+        st = flash_decode.stats()
+        if st["armed"] or st["fired"]:
+            rf = st["read_fraction"]
+            print(f"\n  path        armed={st['armed']} fired={st['fired']} "
+                  f"gated={st['gated']}"
+                  + (f"  read_fraction={rf:.3f}" if rf is not None else ""))
+            if st["fired"] and not st["gated"]:
+                print("  -> the gate NEVER RAN: this profile is the ungated "
+                      "tier (no sketch cards, or quant_gate_ratio >= 1.0).")
+            elif st["gated"] and st["gated"] != st["fired"]:
+                print(f"  -> the gate ran on only {st['gated']}/{st['fired']} "
+                      "fused steps; the rest read the whole tier.")
+    except Exception:
+        pass
+
+    # The tile rung, asked for rather than caught. The kernel prints its choice
+    # once per geometry, which happens in warmup and scrolls away above whatever
+    # is being read -- so the one line DECODE_NEXT.md §5 step 1 says to read was
+    # the one line a profile did not carry.
+    def _print_search(title, choice_fn, timings_fn, fmt_sig, fmt_rung):
+        """One tuner's verdict AND its margin. Never swallowed silently.
+
+        This block used to sit inside a bare ``except Exception: pass`` while
+        importing a ``fit_choice`` that did not exist -- so the one line the
+        tuning step needs was the one line a profile never carried, and nothing
+        said why. A diagnostic must not fail the run, but it must say when it
+        cannot answer.
+        """
+        try:
+            chosen, timed = choice_fn(), timings_fn()
+            if not chosen:
+                print(f"\n  {title}: nothing tuned (the kernel never ran)")
+                return
+            print(f"\n  {title}:")
+            # Formatting is INSIDE the try too. A signature's arity is part of
+            # the tuner's contract, so a stale or renamed one unpacks wrong here
+            # -- and a diagnostic that kills the run it is diagnosing is worse
+            # than one that says it cannot answer.
+            for sig, rung in sorted(chosen.items(), key=lambda kv: str(kv[0])):
+                ranked = timed.get(sig, [])
+                best_ms = ranked[0][1] if ranked else None
+                # The margin is the point: a rung that won by 30% and one that
+                # won by 0.5% call for different next moves.
+                margin = ""
+                if len(ranked) > 1 and best_ms:
+                    margin = (f"   ({100.0 * (ranked[1][1] - best_ms) / best_ms:.1f}% "
+                              f"clear of {fmt_rung(ranked[1][0])})")
+                ms = f"  {best_ms:.3f} ms" if best_ms else ""
+                print(f"    {fmt_sig(sig)}  ->  {fmt_rung(rung)}{ms}{margin}")
+                for r, t in ranked:
+                    mark = " *" if r == rung else "  "
+                    print(f"        {mark} {fmt_rung(r):<18} {t:.3f} ms")
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            print(f"\n  {title}: unavailable ({type(exc).__name__}: {exc})")
+
+    try:
+        from modules.windowed_cache import decode_kernel as _dk
+        from modules.windowed_cache import gate_kernel as _gk
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        _dk = _gk = None
+        print(f"\n  tile searches: unavailable ({type(exc).__name__}: {exc})")
+
+    if _dk is not None:
+        _print_search(
+            "decode tiling (target_keys x num_stages x num_warps), per geometry",
+            _dk.fit_choice, _dk.fit_timings,
+            lambda s: (f"ws={s[0]} head_dim={s[1]} BLOCK_R={s[2]} "
+                       f"q_tier={bool(s[3])} gated={s[4]} B={s[5]} "
+                       f"Sfp~2^{s[6]} n_sel~2^{s[7]}"),
+            lambda r: f"{r[0]}x{r[1]}x{r[2]}w",
+        )
+        _print_search(
+            "read gate tiling (BLOCK_W x num_warps), per geometry",
+            _gk.gate_choice, _gk.gate_timings,
+            lambda s: (f"NW={s[0]} H_kv={s[1]} head_dim={s[2]} ws={s[3]} "
+                       f"B={s[4]} rep={s[5]}"),
+            lambda r: f"BLOCK_W={r[0]}x{r[1]}w",
+        )
+
+    # What the eviction's worst-case width actually bought (DECODE_NEXT.md D1).
+    # Printed here, after both timed windows, because reading it syncs once.
+    try:
+        from modules.windowed_cache.cache import evict_width_stats
+        w = evict_width_stats(_PROFILED_CACHE["cache"])
+        if w:
+            print(f"\n  eviction widths over {w['evictions']} evictions "
+                  f"(n_q={w['n_q']}, W_retained={w['W_retained']}):")
+            print(f"    fresh (quantize+sketch)  max={w['fresh_max']:4d}  "
+                  f"mean={w['fresh_mean']:6.2f}  of n_q={w['n_q']}"
+                  + (f"   fill={w['fresh_fill']:.1%}"
+                     if w["fresh_fill"] is not None else ""))
+            print(f"    promote (dequant+RoPE)   max={w['promote_max']:4d}  "
+                  f"mean={w['promote_mean']:6.2f}"
+                  + (f"   fill={w['promote_fill']:.1%}"
+                     if w.get("promote_fill") is not None else ""))
+            print(f"    reactivate (free)        max={w['react_max']:4d}")
+            # Both sides are now sized by the measured max rather than by their
+            # cap, so these fills are what the OLD code wasted, not what the
+            # current one does. A low fill means the saving is large.
+            for label, fill, cap, work in (
+                ("demote", w["fresh_fill"], w["n_q"],
+                 "un-rotates, quantizes and sketches"),
+                ("promote", w.get("promote_fill"), w["n_q"],
+                 "dequantizes, RoPEs and splices"),
+            ):
+                if fill is None:
+                    continue
+                if fill < 0.5:
+                    print(f"    -> D1 ({label}) is live: sizing by the cap "
+                          f"would {work}\n       [L*B, {cap}, H_kv, ws, D] "
+                          f"per eviction and mask away {1 - fill:.0%} of it.")
+                else:
+                    print(f"    -> D1 ({label}) buys little here: the cap is "
+                          "already close to the real count.")
+    except Exception:  # pragma: no cover - diagnostics must never fail a run
+        pass
+
+    if _PROFILED_GRAPH["runner"] is not None:
+        print(f"\n  {_PROFILED_GRAPH['runner'].report()}")
+
     if syncs:
         print("\n  host stalls (each drains the queue and exposes downstream "
               "launch cost):")
         for k, c, us in sorted(syncs, key=lambda r: -r[2])[:8]:
             print(f"    {k:<32} {c / n:7.1f} /step   {us / n / 1000:7.2f} ms/step")
 
+    _print_buckets(kernels, n, gpu_us)
+
     print(f"\n  top {args.top} kernels by CUDA self time:")
-    ranked = sorted(((e, _self_device_us(e)) for e in evs), key=lambda r: -r[1])
+    ranked = sorted(((e, _self_device_us(e)) for e in kernels),
+                    key=lambda r: -r[1])
     for e, us in ranked[:args.top]:
         if us <= 0:
             break

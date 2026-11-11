@@ -325,9 +325,10 @@ def _measure_windowed(
                 q_slots = table.n_slots
                 q_active_windows = n_active
 
+            from modules.quant.slots import GRID_FIELDS
             kv_tensors = (
-                table.key_codes, table.key_scale, table.key_zero,
-                table.val_codes, table.val_scale, table.val_zero,
+                table.key_codes, table.val_codes,
+                *(getattr(table, f) for f in GRID_FIELDS),
             )
             meta_tensors = (table.slot_pos, table.slot_wid, table.slot_active)
 

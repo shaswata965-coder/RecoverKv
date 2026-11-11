@@ -1,8 +1,25 @@
 """Print a human-readable summary of batched perf benchmark results.
 
 Reads all perf_prefill*_gen*_bs*.npz files produced by eval_perf_batched.yaml
-and emits, per config × scenario cell: median TPOT (ms/token), TTFT (s),
-end-to-end throughput (token/s), and the peak memory the cell reached.
+and emits, per config × scenario cell: median steady-state TPOT (ms/token),
+TTFT (s), decode and end-to-end throughput (token/s), and the peak memory the
+cell reached.
+
+Three corrections landed here; reports produced before them are not comparable:
+
+* **Median.** ``_median`` returned ``np.mean`` despite its name. At
+  ``num_measurement_runs: 2`` one throttled run moved a figure by half its
+  excess.
+* **Steady-state TPOT.** Every TPOT column and every derived rate now uses
+  ``tpot_steady_ms``. ``tpot_ms`` averages in decode step 0, which is where this
+  design compacts the whole prompt.
+* **Two throughputs, not one.** ``decode tok/s`` = ``batch / tpot_steady``;
+  ``e2e tok/s`` = ``batch * gen_len / e2e_latency``. The npz's legacy
+  ``throughput_tokps`` is neither — its denominator omits
+  ``prefill_to_decode_gap_ms`` (the interval ``e2e_latency_ms`` does include),
+  so it overstates the rate. Both new columns prefer the runner's own
+  ``throughput_decode_tokps`` / ``throughput_e2e_tokps`` and fall back to
+  deriving them for npz files written before those fields existed.
 
 It then prints the **max-B summary** — the point of the batched suite. For each
 (prefill, gen) scenario and config it reports the largest batch size that did not
@@ -68,9 +85,50 @@ def _meta(data: dict) -> dict:
 
 
 def _median(arr: np.ndarray, ci: int) -> float | None:
-    row = arr[ci]
-    valid = row[~np.isnan(row)]
-    return float(np.mean(valid)) if len(valid) else None
+    """True median over the measurement runs.
+
+    This used to return ``np.mean`` despite its name and despite the module
+    docstring promising a median. With ``num_measurement_runs`` as low as 2 and
+    no outlier rejection, one thermally-throttled run moved the reported figure
+    by half its excess. Numbers recorded before this change are means.
+    """
+    row = np.asarray(arr)[ci]
+    valid = row[np.isfinite(row)]
+    return float(np.median(valid)) if len(valid) else None
+
+
+def _decode_tps(data: dict, ci: int, batch_size: int) -> float | None:
+    """Decode-only tokens/s: ``batch / tpot_steady``.
+
+    Prefers the runner's own ``throughput_decode_tokps`` and derives it from
+    ``tpot_steady_ms`` for npz files written before that field existed. It is
+    deliberately NOT ``batch / tpot_ms``: ``tpot_ms`` averages in decode step 0,
+    which is where this design compacts the whole prompt, so a rate built on it
+    charges a one-off O(prefill) cost into every token — a bias that decays as
+    ``1/gen_len``, i.e. the same method reports a different decode throughput
+    depending only on how many tokens the cell asked for.
+    """
+    direct = _median(data["throughput_decode_tokps"], ci) \
+        if "throughput_decode_tokps" in data else None
+    if direct is not None:
+        return direct
+    tpot_ss = _median(data["tpot_steady_ms"], ci) if "tpot_steady_ms" in data else None
+    return batch_size / (tpot_ss / 1000.0) if tpot_ss else None
+
+
+def _e2e_tps(data: dict, ci: int, batch_size: int, gen_len: int) -> float | None:
+    """End-to-end tokens/s, consistent with ``e2e_latency_ms``.
+
+    NOT the stored ``throughput_tokps``, whose denominator omits the interval
+    between end-of-prefill and start-of-decode (``prefill_to_decode_gap_ms``)
+    that ``e2e_latency_ms`` does include — so the two stored fields disagree.
+    """
+    direct = _median(data["throughput_e2e_tokps"], ci) \
+        if "throughput_e2e_tokps" in data else None
+    if direct is not None:
+        return direct
+    e2e = _median(data["e2e_latency_ms"], ci) if "e2e_latency_ms" in data else None
+    return (batch_size * gen_len) / (e2e / 1000.0) if e2e else None
 
 
 def _fmt(v: float | None, decimals: int = 2) -> str:
@@ -115,22 +173,26 @@ def _print_scenario(data: dict, label: str, sink: list[str]) -> None:
         f"\n{'='*110}\n"
         f"SCENARIO: {label}\n"
         f"{'='*110}\n"
-        f"{'Config':<{COL_W}} {'TTFT (s)':>{NUM_W}} {'TPOT (ms/tok)':>{NUM_W}} {'E2E Latency (ms)':>{NUM_W}} {'Throughput (tok/s)':>{NUM_W}} {'Peak mem (MB)':>{NUM_W}}\n"
-        f"{'-'*COL_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W}"
+        f"{'Config':<{COL_W}} {'TTFT (s)':>{NUM_W}} {'TPOT_st (ms)':>{NUM_W}} {'E2E Latency (ms)':>{NUM_W}} {'decode tok/s':>{NUM_W}} {'e2e tok/s':>{NUM_W}} {'Peak mem (MB)':>{NUM_W}}\n"
+        f"{'-'*COL_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W} {'-'*NUM_W}"
     )
     sink.append(header)
 
+    gen_len = int(meta.get("gen_len", 0))
     for ci, name in enumerate(names):
         if skipped[ci]:
             why = _skip_label(data, ci, oom, err)
-            cells = " ".join(f"{why:>{NUM_W}}" for _ in range(5))
+            cells = " ".join(f"{why:>{NUM_W}}" for _ in range(6))
             row = f"{name:<{COL_W}} {cells}"
         else:
             ttft_s   = _median(ttft_ms, ci)
             ttft_val = ttft_s / 1000.0 if ttft_s is not None else None
-            tpot_val = _median(tpot_ms, ci)
+            # Steady-state TPOT, not tpot_ms: step 0 compacts the whole prompt.
+            tpot_val = (_median(data["tpot_steady_ms"], ci)
+                        if "tpot_steady_ms" in data else _median(tpot_ms, ci))
             e2e_val  = _median(e2e_ms_arr, ci) if e2e_ms_arr is not None else None
-            tput_val = _median(tput, ci)
+            dec_val  = _decode_tps(data, ci, batch_size)
+            e2e_tps  = _e2e_tps(data, ci, batch_size, gen_len)
             # Prefer the device-level peak (what an OOM is decided on); fall back
             # to the torch allocated peak on CPU runs and on older npz files.
             mem_val = _median(peak_dev, ci) if peak_dev is not None else None
@@ -141,7 +203,8 @@ def _print_scenario(data: dict, label: str, sink: list[str]) -> None:
                 f" {_fmt(ttft_val, 3):>{NUM_W}}"
                 f" {_fmt(tpot_val, 2):>{NUM_W}}"
                 f" {_fmt(e2e_val, 1):>{NUM_W}}"
-                f" {_fmt(tput_val, 1):>{NUM_W}}"
+                f" {_fmt(dec_val, 1):>{NUM_W}}"
+                f" {_fmt(e2e_tps, 1):>{NUM_W}}"
                 f" {_fmt(mem_val, 0):>{NUM_W}}"
             )
         sink.append(row)
@@ -160,17 +223,20 @@ def _print_scenario(data: dict, label: str, sink: list[str]) -> None:
         None,
     )
     if baseline_idx is not None:
-        base_tpot = _median(tpot_ms, baseline_idx)
-        base_tput = _median(tput, baseline_idx)
-        sink.append(f"\n  Relative to '{names[baseline_idx]}':")
+        def _tpot_st(i):
+            return (_median(data["tpot_steady_ms"], i)
+                    if "tpot_steady_ms" in data else _median(tpot_ms, i))
+        base_tpot = _tpot_st(baseline_idx)
+        base_tput = _decode_tps(data, baseline_idx, batch_size)
+        sink.append(f"\n  Relative to '{names[baseline_idx]}' (steady state):")
         for ci, name in enumerate(names):
             if ci == baseline_idx or skipped[ci]:
                 continue
-            t = _median(tpot_ms, ci)
-            tp = _median(tput, ci)
+            t = _tpot_st(ci)
+            tp = _decode_tps(data, ci, batch_size)
             tpot_ratio = f"{base_tpot/t:.2f}x faster" if t and base_tpot else "n/a"
             tput_ratio = f"{tp/base_tput:.2f}x" if tp and base_tput else "n/a"
-            sink.append(f"    {name:<{COL_W-4}}  TPOT {tpot_ratio:<18}  throughput {tput_ratio}")
+            sink.append(f"    {name:<{COL_W-4}}  TPOT_st {tpot_ratio:<18}  decode tok/s {tput_ratio}")
 
 
 def _collect_cells(npz_files: list[Path]) -> list[dict]:
@@ -194,8 +260,13 @@ def _collect_cells(npz_files: list[Path]) -> list[dict]:
                 "ran": not skipped[ci],
                 "oom": bool(oom[ci]),
                 "error": bool(err[ci]),
-                "tpot_ms": _median(data["tpot_ms"], ci),
-                "tput": _median(data["throughput_tokps"], ci),
+                # Steady state, and a decode rate built on it — the max-B
+                # headline is "tokens/s at the largest batch that fits", and a
+                # rate carrying decode step 0's prompt compaction is not that.
+                "tpot_ms": (_median(data["tpot_steady_ms"], ci)
+                            if "tpot_steady_ms" in data
+                            else _median(data["tpot_ms"], ci)),
+                "tput": _decode_tps(data, ci, int(meta.get("batch_size", 1))),
                 "peak_dev_mb": (
                     _median(data["peak_device_used_mb"], ci)
                     if "peak_device_used_mb" in data else None
@@ -219,10 +290,12 @@ def _collect_cells(npz_files: list[Path]) -> list[dict]:
 def _print_max_b(cells: list[dict], sink: list[str]) -> None:
     """The headline: largest batch that fits, and the throughput there.
 
-    Decode throughput is ``batch_size / (tpot_ms / 1000)`` — NOT the npz's
-    ``throughput_tokps``, which includes prefill (perf_runner says so). At a
-    long-prompt shape the prefill term dominates and would hide the decode win
-    this suite exists to measure.
+    Decode throughput is ``batch_size / (tpot_steady_ms / 1000)`` — NOT the
+    npz's ``throughput_tokps``, which includes prefill, and NOT ``tpot_ms``,
+    which averages in decode step 0 (where this design compacts the whole
+    prompt). The prefill term would hide the decode win at a long-prompt shape;
+    the step-0 term would charge a one-off O(prefill) cost into every token,
+    with a bias decaying as ``1/gen_len``.
     """
     if not cells:
         return

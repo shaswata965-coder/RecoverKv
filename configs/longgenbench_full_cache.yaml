@@ -1,0 +1,39 @@
+# ============================================================================
+# LongGenBench-16K — full-cache baseline
+# ============================================================================
+# The reference every compressed run is read against. For context, the paper
+# reports Llama-3.1-8B-Instruct at 16K as CR 93.5%, STIC-1 23.4%, STIC-2 22.0%,
+# wAvg 20.6% (vLLM, bf16, all 400 documents); longgenbench_eval/reference.py
+# .PAPER_TABLE2 carries those numbers.
+#
+# Produces: outputs/longgenbench/16K/fullkv/{<type>.jsonl, <type>.meta.json}
+_base_: base.yaml
+
+run:
+  mode: longgenbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: null
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic          # DynamicCache: no eviction, no quantization
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longgenbench:
+  data_dir: data/longgenbench
+  setting: 16K
+  types: null
+  output_dir: outputs/longgenbench/16K/fullkv
+  decoding: reference
+  batch_size: 16             # equal-length prompts only; on OOM fall back to 8, then 6
+  batch_fallback: [8, 6]
+  skip_oom: false
+  aggressive_cache_clear: true

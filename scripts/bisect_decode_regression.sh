@@ -23,8 +23,6 @@
 # size, so it is measured rather than argued:
 #
 #   baseline    as shipped
-#   noexp2      STICKYKV_DECODE_EXP2=0        base-e softmax (the old kernel)
-#   nordtype    STICKYKV_ROPE_STORE_DTYPE=0   fp32 RoPE tables (the old dtype)
 #
 # The decision is pre-committed, so the result is not argued about afterwards:
 #
@@ -105,8 +103,6 @@ run_arm() {   # $1 = arm name, $2.. = env assignments
 }
 
 run_arm baseline
-run_arm noexp2   STICKYKV_DECODE_EXP2=0
-run_arm nordtype STICKYKV_ROPE_STORE_DTYPE=0
 
 # ---------------------------------------------------------------------------
 # The profile: GPU busy % and the chosen tile rung, on the shipped build.

@@ -1,0 +1,61 @@
+# ============================================================================
+# LongGenBench-16K — Ours (flash-attn backend), at the shipped operating point
+# ============================================================================
+# LongGenBench (Wu et al., ICLR'25): one ~700-token prompt asks for a long
+# structured document (a year of weekly diary entries, a 100-floor skyscraper,
+# ...) with instructions that must surface in particular entries; the answer
+# runs up to 16,000 tokens. The prompt is tiny, so this scores the DECODE-phase
+# cache: almost everything the model attends to is its own generation.
+#
+#   python -m longgenbench_eval.data --out data/longgenbench --setting 16K
+#   python main.py --config configs/longgenbench_ours_flash.yaml
+#   python -m longgenbench_eval.judge --generations outputs/longgenbench/16K/ours/<type>.jsonl
+#
+# The budget is cache_budget * (prompt + max_new_tokens), the method's own
+# definition. Colab: notebooks/longgenbench_colab.ipynb.
+#
+# Produces: outputs/longgenbench/16K/ours/{<type>.jsonl, <type>.meta.json}
+_base_: base.yaml
+
+run:
+  mode: longgenbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: null
+  dtype: float16
+  attn_implementation: flash_attention_2     # MUST match cache.backend_package
+
+cache:
+  # Pinned to utils.config.OPERATING_POINT -- the one point speed and quality
+  # are both measured at. scripts/check_operating_point.py fails if it drifts.
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_budget_mode: bytes
+  quant_gate_ratio: 0.25
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longgenbench:
+  data_dir: data/longgenbench
+  setting: 16K
+  types: null                # all four: Week, Floor, Menu Week, Block
+  output_dir: outputs/longgenbench/16K/ours
+  decoding: reference        # the runs behind Table 2: T=0.95, top_p=0.95; greedy = the paper's text
+  batch_size: 16             # equal-length prompts only; on OOM fall back to 8, then 6
+  batch_fallback: [8, 6]
+  skip_oom: false
+  aggressive_cache_clear: true

@@ -29,7 +29,6 @@ expensive way possible to learn a number that was computable in advance.
                  error bar on the whole prediction, not as a known quantity.
 
 The actionable consequence is in ``lse_recompute``: it is the only term that is
-pure waste. ``STICKYKV_PREFILL_SCORE_CHUNK`` divides it linearly with no logic
 change and no change in total FLOPs (same work, smaller blocks, more
 iterations), and a working L-reuse removes it outright.
 """

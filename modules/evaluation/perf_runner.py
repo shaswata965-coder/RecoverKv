@@ -52,6 +52,23 @@ all flipped together by ``configs/eval_efficiency.yaml``):
   two are split and ``prefill_plus_compress_ms`` is the directly comparable one.
 
 None of this changes what a ``native``-protocol run measures.
+
+Which throughput field to quote
+-------------------------------
+Three are recorded and they are not interchangeable:
+
+* ``throughput_decode_tokps`` = ``batch / tpot_steady_ms`` — **the decode claim.**
+  Built on the steady state, so the one-off prompt compaction charged to decode
+  step 0 is excluded. A rate built on ``tpot_ms`` instead would fold an
+  O(prefill) cost into every token, with a bias that decays as ``1/gen_len``, so
+  the same method would report a different decode throughput purely as a
+  function of how many tokens the cell asked for.
+* ``throughput_e2e_tokps`` = ``batch * gen_len / (t3 - t0)`` — **the end-to-end
+  claim.** Consistent with ``e2e_latency_ms`` by construction.
+* ``throughput_tokps`` — **legacy, kept bit-for-bit for existing npz readers.**
+  Its denominator is ``gen_time + TTFT``, which omits ``prefill_to_decode_gap_ms``
+  (the L-reuse/recompute and the first argmax between the two timed regions), so
+  it overstates the rate by ``gap / (e2e - gap)``. Do not quote it.
 """
 from __future__ import annotations
 import json, math, os, pathlib, time, gc, traceback
@@ -236,7 +253,6 @@ _DYNAMO_BREAK_SECTIONS = ("graph_break", "unimplemented", "unimplemented_with_re
 def _dynamo_counters() -> Dict[str, int]:
     """Normalized ``torch._dynamo`` counters, or ``{}`` if unavailable.
 
-    Used to verify that ``STICKYKV_COMPILE_EVICT`` actually *fused* the eviction
     rather than merely tracing it. ``torch.compile`` never fails loudly on a
     graph break — it silently splits the region and runs the pieces eagerly — so
     a compiled eviction that broke on every store mutation issues the same ~273
@@ -342,22 +358,6 @@ def _reset_lse_recompute_count() -> None:
             pass
 
 
-def _lse_strict() -> bool:
-    """Whether an L-reuse MISS is a hard error (default) or a loud warning.
-
-    ``STICKYKV_LSE_STRICT`` (default "1"): a run that asked for L from the forward
-    but recomputed it (``compute_lse`` ran) ERRORS the cell — the rigorous
-    contract, so a degraded TTFT / max-B never masquerades as the method's. Set
-    "0" to DOWNGRADE that to a warning and keep the cell: the run completes on the
-    recompute path, TTFT is flagged recompute-path in provenance, and the decode
-    columns (TPOT / throughput / memory) — which L-reuse does not touch, it is a
-    prefill-only optimization — are reported normally. That is the right default
-    for a decode-focused table; the run_perf_table.sh script sets it.
-    """
-    return os.environ.get("STICKYKV_LSE_STRICT", "1").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def _lse_reuse_requested() -> bool:
     """Whether the run asked for L to come from the forward (the default)."""
     return os.environ.get(
@@ -370,7 +370,6 @@ def _lse_transient_gb(batch_size: int, model_config: Any, prefill_len: int) -> f
 
     Sized so the L-reuse failure below can say what it costs at THIS shape rather
     than quoting one example. ``chunk`` is the query-row block
-    (``STICKYKV_PREFILL_SCORE_CHUNK``, default 1024) and ``S`` is the prefill
     length, so the term is quadratic in context and linear in batch.
     """
     try:
@@ -388,6 +387,31 @@ def _evict_path_stats() -> Dict[str, int]:
         return fn() if fn is not None else {}
     except Exception:  # pragma: no cover - environment dependent
         return {}
+
+
+def _gate_stats(expect_gated: bool = True) -> Dict[str, Any]:
+    """``flash_decode.stats()`` — proof the read gate ran, or {} off that path.
+
+    Recorded because a run that did NOT gate is indistinguishable in a latency
+    table from one that did: it reads the whole int2 tier, produces correct
+    output, and finishes. That is not hypothetical — the gate had zero non-test
+    callers for eight commits of this branch while every number looked fine. The
+    counters cost nothing (Python ints off tensor shapes, no device sync), so the
+    only reason they were not in the npz is that nobody put them there.
+    """
+    try:
+        from modules.windowed_cache import flash_decode
+        return dict(flash_decode.gate_report(expect_gated))
+    except Exception:  # pragma: no cover - environment dependent
+        return {}
+
+
+def _reset_gate_stats() -> None:
+    try:
+        from modules.windowed_cache import flash_decode
+        flash_decode.reset_stats()
+    except Exception:  # pragma: no cover - environment dependent
+        pass
 
 
 def _reset_evict_path_stats() -> None:
@@ -498,6 +522,10 @@ def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
         "top_k_fp": int(resolved.top_k_fp),
         "N_q": int(resolved.N_q),
         "quant_ratio": float(resolved.quant_ratio),
+        # The gate card's widths and what they cost -- a narrower card is a
+        # cheaper window, so N_q above already reflects them under "bytes".
+        "quant_card_bits": dict(resolved.quant_card_bits._asdict()),
+        "bytes_per_gate_card": int(resolved.bytes_per_gate_card),
         "fp_tokens": fp_tokens,
         "q_tokens": q_tokens,
         # The number of keys one decode step attends over — the quantity that
@@ -888,6 +916,12 @@ class PerfRunner:
         self._config_diag = {}
         ttft = np.full((n_configs, n_runs), np.nan)
         throughput = np.full((n_configs, n_runs), np.nan)
+        # The two throughput figures a claim can actually be built on, plus the
+        # untimed prefill->decode interval that makes `throughput` disagree with
+        # `e2e_latency`. `throughput` keeps its original meaning for old readers.
+        throughput_e2e = np.full((n_configs, n_runs), np.nan)
+        throughput_decode = np.full((n_configs, n_runs), np.nan)
+        prefill_to_decode_gap = np.full((n_configs, n_runs), np.nan)
         tpot = np.full((n_configs, n_runs), np.nan)
         e2e_latency = np.full((n_configs, n_runs), np.nan)
         # Compression accounting (see _measure_config): step 0 is where this
@@ -940,6 +974,9 @@ class PerfRunner:
                 for ri, m in enumerate(measurements):
                     ttft[ci, ri] = m["ttft_ms"]
                     throughput[ci, ri] = m["throughput_tokps"]
+                    throughput_e2e[ci, ri] = m["throughput_e2e_tokps"]
+                    throughput_decode[ci, ri] = m["throughput_decode_tokps"]
+                    prefill_to_decode_gap[ci, ri] = m["prefill_to_decode_gap_ms"]
                     tpot[ci, ri] = m["tpot_ms"]
                     e2e_latency[ci, ri] = m["e2e_latency_ms"]
                     decode_step0[ci, ri] = m["decode_step0_ms"]
@@ -996,7 +1033,10 @@ class PerfRunner:
                 ", ".join(n for n, e in zip(names, errored) if e),
             )
         return {"names": names, "attn_impls": attn_impls, "ttft": ttft,
-                "throughput": throughput, "tpot": tpot, "e2e_latency": e2e_latency,
+                "throughput": throughput, "throughput_e2e": throughput_e2e,
+                "throughput_decode": throughput_decode,
+                "prefill_to_decode_gap": prefill_to_decode_gap,
+                "tpot": tpot, "e2e_latency": e2e_latency,
                 "decode_step0": decode_step0, "tpot_steady": tpot_steady,
                 "prefill_plus_compress": prefill_plus_compress,
                 "peak_mem": peak_mem, "skipped": skipped,
@@ -1246,6 +1286,7 @@ class PerfRunner:
             from utils.cache_factory import (
                 assert_transformers_version_supported,
                 get_cache_classes,
+                quant_gate_ratio_kwargs,
                 validate_backend_attn_pairing,
             )
             # Fail fast: the windowed cache's RoPE handling assumes monotonic
@@ -1274,17 +1315,22 @@ class PerfRunner:
             # measured the eager eviction. Verify it with the dynamo counters and
             # evict_path_stats() below rather than trusting the flag.
             #
-            # STICKYKV_COMPILE_READ, by contrast, is INERT on the fused decode
-            # path: _read_fn is only reachable through QuantizedStore.
-            # effective_q_tier, and the fused path (default on CUDA since the
-            # decode kernel landed) hands raw int2 straight to Triton and never
-            # materializes the Q tier. It is left enabled because it is still the
-            # fast path whenever the fused kernel is off (STICKYKV_FUSED_DECODE=0,
-            # or an empty Q tier), not because it does anything for the rows below.
-            for _flag in ("STICKYKV_COMPILE_READ", "STICKYKV_COMPILE_EVICT"):
-                if torch.cuda.is_available() and os.environ.get(_flag) is None:
-                    os.environ[_flag] = "1"
-                    log.info("enabled %s=1 for CUDA windowed decode", _flag)
+            # STICKYKV_COMPILE_READ used to be set here too, on the reasoning
+            # that it was "still the fast path whenever the fused kernel is off
+            # (STICKYKV_FUSED_DECODE=0, or an empty Q tier)". Neither case
+            # survives: the fused kernel can no longer be turned off, and on an
+            # empty Q tier effective_q_tier returns None before reaching the read
+            # chain. It was setting a flag that selected nothing and printing a
+            # banner naming a read path the run was not taking, so the flag and
+            # its fork are gone (modules/quant/effective.py).
+            # STICKYKV_COMPILE_EVICT is NOT set here any more. The eviction has
+            # been compiled unconditionally since 0974687 and `cache.py` reads no
+            # environment variable at all, so setting it selected nothing while
+            # leaving a variable in the run's environment that a reader would
+            # reasonably take for a control arm. A knob that records intent but
+            # controls nothing is worse than no knob: it is the shape of a
+            # measurement you can attribute to something, and the attribution is
+            # false. See the banner at the top of modules/windowed_cache/cache.py.
             # Fair measurement: reject a backend/attn mismatch up front, exactly
             # as the quality runners do (longbench/gsm8k/ruler/ours_parity). Without
             # it, cache_package='eager' paired with flash attention (or vice
@@ -1330,7 +1376,18 @@ class PerfRunner:
                       quant_ratio=quant_ratio,
                       quant_budget_mode=quant_budget_mode,
                       quant_memoize_read=memoize,
-                      first_eviction_step=first_eviction_step)
+                      first_eviction_step=first_eviction_step,
+                      # Per-config override falling back to the shared cache
+                      # setting, like every other quant knob above. Routed
+                      # through the factory: the eager package has no gate.
+                      **quant_gate_ratio_kwargs(
+                          WCC, c.get("quant_gate_ratio",
+                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))),
+                      # Gate-card field widths, per-config override like the
+                      # ratio above; None means the shipped card.
+                      quant_card_bits=c.get(
+                          "quant_card_bits",
+                          getattr(cfg.cache, "quant_card_bits", None)))
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():
@@ -1555,6 +1612,7 @@ class PerfRunner:
         # expected and would otherwise swamp the signal we want (recompiles and
         # graph breaks that keep happening once the shapes have settled).
         _reset_evict_path_stats()
+        _reset_gate_stats()
         _reset_dynamo_counters()
         # Measurement runs
         measurements = []
@@ -1672,7 +1730,7 @@ class PerfRunner:
                         f"transient (~{tgb:.1f} GB here). {cause} A prefill-only "
                         f"issue; decode TPOT / memory are unaffected."
                     )
-                    if _lse_strict():
+                    if True:
                         from utils.config import ConfigValidationError
                         raise ConfigValidationError(
                             detail + " Refusing to report a TTFT/max-B that belong "
@@ -1749,12 +1807,13 @@ class PerfRunner:
                         t_step0 = time.perf_counter()
                     if n_decode >= 2:
                         with probe.phase("decode_steady"):
-                            for _ in range(n_decode - 1):
+                            for _i in range(n_decode - 1):
                                 out = model(input_ids=next_tok, past_key_values=pkv,
                                             use_cache=True, return_dict=True,
                                             cache_position=_cache_pos(1), **gen_kwargs)
                                 pkv = out.past_key_values
-                                next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                                next_tok = out.logits[:, -1, :].argmax(
+                                    dim=-1, keepdim=True)
                 if torch.cuda.is_available(): torch.cuda.synchronize()
                 t3 = time.perf_counter()
                 gen_time = t3 - t2
@@ -1772,14 +1831,36 @@ class PerfRunner:
                 prefill_plus_compress_ms = ttft_ms + (
                     decode_step0_ms if n_decode >= 1 else 0.0)
                 e2e_latency_ms = (t3 - t0) * 1000
-                # End-to-end throughput includes prefill (TTFT) + decode time; this
-                # mirrors the legacy field name but is NOT decode-only. Counts all
-                # batch_size rows (B=1 ⇒ identical to the legacy value).
+                # The interval between end-of-prefill and start-of-decode: the
+                # L-reuse / recompute and the first argmax. It is real work, it IS
+                # inside e2e_latency_ms (= t3 - t0), and it is NOT inside
+                # throughput_tokps' denominator — which is exactly why those two
+                # published fields disagree. Recorded so the disagreement is
+                # auditable rather than something a reader has to infer.
+                prefill_to_decode_gap_ms = (t2 - t1) * 1000
+                # LEGACY — kept bit-for-bit so existing npz readers are unaffected.
+                # Its denominator is gen_time + TTFT, which omits the gap above, so
+                # it slightly OVERSTATES the rate. It is neither a clean end-to-end
+                # figure nor a decode figure; prefer the two fields below.
                 throughput_tokps = (batch_size * gen_len) / max(gen_time + (t1-t0), 1e-9)
+                # End-to-end, consistent with e2e_latency_ms by construction.
+                throughput_e2e_tokps = (batch_size * gen_len) / max(t3 - t0, 1e-9)
+                # Decode-only, built on the STEADY state. Deliberately NOT tpot_ms:
+                # that averages in decode step 0, which is where this design
+                # compacts the whole prompt, so a rate built on it charges a one-off
+                # O(prefill) cost into every token and the bias decays as 1/gen_len
+                # — the same method then reports a different decode throughput
+                # purely as a function of how many tokens the cell asked for.
+                throughput_decode_tokps = (
+                    batch_size / (tpot_steady_ms / 1000.0)
+                    if n_decode >= 2 and tpot_steady_ms > 0 else float("nan"))
                 peak = probe.stop().report()
                 phase_peak = {p.name: p for p in peak.phases}
                 measurements.append({
                     "ttft_ms": ttft_ms, "throughput_tokps": throughput_tokps,
+                    "throughput_e2e_tokps": throughput_e2e_tokps,
+                    "throughput_decode_tokps": throughput_decode_tokps,
+                    "prefill_to_decode_gap_ms": prefill_to_decode_gap_ms,
                     "tpot_ms": tpot_ms, "e2e_latency_ms": e2e_latency_ms,
                     "decode_step0_ms": decode_step0_ms,
                     "tpot_steady_ms": tpot_steady_ms,
@@ -1821,6 +1902,29 @@ class PerfRunner:
         # QuantizedStore in place and calls free_slots, so breaks are the
         # expected failure mode, not a remote one.
         if cache_backend == "windowed":
+            # One definition of "should this have gated", shared with the quality
+            # runners (flash_decode.expect_gated), so a perf row and a LongBench
+            # sidecar cannot disagree about what the run was.
+            from modules.windowed_cache import flash_decode as _fd
+            # Re-read the two knobs rather than reusing locals bound inside the
+            # cache-construction branch: this site must not depend on which
+            # branches ran above it.
+            gs = _gate_stats(_fd.expect_gated(
+                c.get("cache_package"),
+                c.get("quant_ratio", getattr(cfg.cache, "quant_ratio", 0.0)),
+                torch.cuda.is_available()))
+            diag["gate"] = gs
+            if gs:
+                rf = gs.get("read_fraction")
+                log.info("read gate [%s]: %s (gated=%s fired=%s read_fraction=%s)",
+                         c.get("name"), gs.get("verdict"), gs.get("gated"),
+                         gs.get("fired"), "n/a" if rf is None else f"{rf:.3f}")
+                if not gs.get("ok", True):
+                    log.warning(
+                        "config %s: %s -- this cell is NOT measuring the gated "
+                        "method. The flash path has no ungated arm, so either the "
+                        "fused kernel never fired or some layers took a different "
+                        "route.", c.get("name"), gs.get("verdict"))
             ev = _evict_path_stats()
             dyn = _dynamo_counters()
             compile_failed = _evict_compile_failed()
@@ -1862,8 +1966,12 @@ class PerfRunner:
                     "precisely so the varying window count does not retrigger "
                     "compilation; this is compile latency inside the timings.",
                     c.get("name"), dyn["frames_ok"])
-        # Cleanup
-        del model
+        # Cleanup. `model = None` and not `del model`: the nested helpers above
+        # close over `model`, and a `del` in this scope makes every one of those
+        # references read as unbound to a static checker -- which is how the
+        # checker that would have caught `_score_exp2_enabled` gets drowned in
+        # false positives. Dropping the reference frees exactly the same bytes.
+        model = None
         gc.collect()
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         return measurements
@@ -1950,7 +2058,14 @@ class PerfRunner:
             config_names=np.array(result["names"], dtype=object),
             attn_implementations=np.array(result["attn_impls"], dtype=object),
             ttft_ms=result["ttft"],
+            # `throughput_tokps` keeps its original formula and meaning so old
+            # readers are unaffected; it omits `prefill_to_decode_gap_ms` from its
+            # denominator and therefore overstates the rate slightly. The two
+            # fields beside it are the ones a throughput claim should quote.
             throughput_tokps=result["throughput"],
+            throughput_e2e_tokps=result["throughput_e2e"],
+            throughput_decode_tokps=result["throughput_decode"],
+            prefill_to_decode_gap_ms=result["prefill_to_decode_gap"],
             tpot_ms=result["tpot"],
             e2e_latency_ms=result["e2e_latency"],
             # Compression accounting. tpot_ms keeps its original meaning (mean

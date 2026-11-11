@@ -87,12 +87,22 @@ perf:
     - { prefill_len: 4096, gen_len: 4096 }
     - { prefill_len: 8192, gen_len: 1024 }
     - { prefill_len: 8192, gen_len: 4096 }
+  # Method-independent and large: the full [B, L, V] prefill logits tensor is
+  # ~1.05 GB per row in fp16 at prefill=4096, which swamps the very differences
+  # a memory column exists to show. See eval_efficiency.yaml's note.
+  prefill_logits: last_only
+
   num_warmup_runs: 2
+  warmup_decode_steps: null            # auto: cross the first eviction
   num_measurement_runs: 10
-  allow_shared_gpu: true
+  # GPU-state hygiene — without these, later cells run on a hotter, slower part
+  # and a co-tenant process is indistinguishable from a slow method.
+  cooldown_s: 3.0
+  enable_clock_locking: true           # needs elevated perms; warns and continues
+  clock_settle_s: 5.0
+  allow_shared_gpu: false
   skip_if_oom: true
   skip_if_flash_attn_unavailable: true
-  enable_clock_locking: false
 
 telemetry:
   output_dir: outputs

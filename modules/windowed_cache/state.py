@@ -41,6 +41,37 @@ import torch
 from torch import Tensor
 
 
+def _tracing() -> bool:
+    """True while Dynamo is tracing this call.
+
+    ``untyped_storage().data_ptr()`` is the only way to ask "do these two
+    tensors share memory", and Dynamo cannot trace it: *"Dynamo does not know
+    how to trace method ``data_ptr`` of class ``UntypedStorage``"*. Every such
+    call inside the eviction body is a **graph break**, and the eviction is
+    compiled precisely so its pointwise chain fuses into a few kernels instead
+    of launching sixteen. Measured on torch 2.14 CPU Inductor, the three
+    aliasing guards below broke ``_evict_two_tier_impl`` into **7 fragments**,
+    and fusion cannot cross a fragment boundary.
+
+    So the guards are skipped while tracing, and that is safe rather than
+    merely convenient: AOTAutograd **functionalizes** the graph it traces, so a
+    source that aliased its destination is already a distinct functional value
+    by the time the epilogue copy runs. The clone :meth:`replace` performs is
+    what functionalization does for free, and the overlap
+    :meth:`replace_body` refuses cannot reach a kernel.
+
+    The checks keep full coverage where they are the only mechanism: the whole
+    CPU suite runs the eager eviction (``_compile_evict_enabled`` lets the
+    device decide, and CPU decides eager), so every test that drives an
+    eviction still executes them. ``torch.compiler.is_compiling`` is a
+    trace-time constant, so under Dynamo this folds away and emits nothing.
+    """
+    try:
+        return bool(torch.compiler.is_compiling())
+    except Exception:  # pragma: no cover - torch-version dependent
+        return False
+
+
 class CacheState:
     """Mutable tensor state for one layer's KV cache.
 
@@ -250,7 +281,7 @@ class CacheState:
         Every subsequent eviction lands on the same target, so this reallocates
         exactly once and never thrashes.
         """
-        if self._key_buf is not None:
+        if self._key_buf is not None and not _tracing():
             if key.untyped_storage().data_ptr() == self._key_buf.untyped_storage().data_ptr():
                 key = key.clone()
             if value.untyped_storage().data_ptr() == self._val_buf.untyped_storage().data_ptr():
@@ -461,17 +492,18 @@ class CacheState:
         """
         if self._key_buf is None:
             raise RuntimeError("replace_body() before the buffers exist")
-        for name, src, buf in (
-            ("key", body_key, self._key_buf),
-            ("value", body_value, self._val_buf),
-            ("positions", body_positions, self._pos_buf),
-        ):
-            if src.untyped_storage().data_ptr() == buf.untyped_storage().data_ptr():
-                raise RuntimeError(
-                    f"replace_body: body_{name} aliases the {name} buffer it "
-                    "would be written into; the compacted body must be a fresh "
-                    "tensor (gather/where allocate, views do not)"
-                )
+        if not _tracing():
+            for name, src, buf in (
+                ("key", body_key, self._key_buf),
+                ("value", body_value, self._val_buf),
+                ("positions", body_positions, self._pos_buf),
+            ):
+                if src.untyped_storage().data_ptr() == buf.untyped_storage().data_ptr():
+                    raise RuntimeError(
+                        f"replace_body: body_{name} aliases the {name} buffer it "
+                        "would be written into; the compacted body must be a fresh "
+                        "tensor (gather/where allocate, views do not)"
+                    )
         n = num_sink + body_key.shape[2]
         if n > self.buffer_capacity:
             # Preserves the live prefix, which is exactly where the sinks are.

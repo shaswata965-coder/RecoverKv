@@ -1,8 +1,23 @@
 """OursParityRunner — windowed cache, either backend (Suite A).
 
-Uses the full windowed cache system from modules.windowed_cache (flash) or
-modules.windowed_eager_cache (eager), selected via config.cache.backend_package.
+Uses the one windowed cache (``modules.windowed_cache``); the backend decides only
+where the eviction scores come from and whether the read gate runs.
 Teacher-forces from the base npz's generated_tokens — never samples.
+
+Schema 1.3 adds what the observation suite needs to score the decode step as it
+actually runs, not as the tier tags alone describe it:
+
+``gate_read``   ``[S, T, L, H_kv, W]`` bool, on the same survivor axis as
+                ``all_window_ids`` — the int2 windows the read gate OPENED for
+                each KV head at each step. An int2 window it skipped is attended
+                only through its value centroid at the card's calibrated weight.
+``gate_fired``  ``[S, T, L]`` bool — whether the gate ran for that layer and step.
+                False everywhere on the eager backend, at ``quant_ratio = 0``, and
+                on CPU (none of them gate; ``flash_decode.expect_gated``).
+
+and in the metadata: the gate verdict (``read_gate``, as every quality runner
+records it), ``quant_gate_ratio``, ``quant_card_bits``, ``quant_budget_mode``,
+the GQA head counts, and the base run's ``article_indices`` replayed exactly.
 """
 from __future__ import annotations
 import json, math, time
@@ -12,7 +27,11 @@ import numpy as np
 import torch
 from torch import Tensor
 from data.corpus_loader import CorpusLoader
-from utils.cache_factory import get_cache_classes, validate_backend_attn_pairing
+from utils.cache_factory import (get_cache_classes, quant_budget_mode_kwargs,
+                                 quant_card_bits_record, quant_gate_ratio_kwargs,
+                                 quant_tier_policy_kwargs,
+                                 quant_tier_policy_record,
+                                 validate_backend_attn_pairing)
 from utils.config import (
     FIRST_EVICTION_STEP_DEFAULT, ConfigValidationError, ExperimentConfig,
     ParityValidationError,
@@ -128,6 +147,93 @@ def _extract_row_retained(ws_row: Tensor, orig_row: Optional[Tensor],
             all_tier_arr[:eW][is_q] = 1                        # int2 Q tier
     return tk_arr, ws_arr, ret_ids_arr, ret_sc_arr, all_ids_full, all_tier_arr
 
+
+def forward_at(model, input_ids: Tensor, cache, pos: int, **kwargs):
+    """One forward at ABSOLUTE token position ``pos``; returns ``(out, pos')``.
+
+    A hand-written decode loop must pass ``cache_position`` itself. Omitted,
+    transformers derives it from ``cache.get_seq_length()`` -- the RETAINED key
+    count, which drops at every eviction -- so positions run backward and the
+    cache refuses (``WindowedCache._check_position_contract``). ``generate()``
+    advances it on its own; this does the same for the runners that loop by
+    hand. ``position_ids`` follow from it inside the model.
+    """
+    n = int(input_ids.shape[1])
+    cp = torch.arange(pos, pos + n, device=input_ids.device)
+    out = model(input_ids=input_ids, past_key_values=cache, use_cache=True,
+                return_dict=True, cache_position=cp, **kwargs)
+    return out, pos + n
+
+
+def _gate_read_row(all_ids_row: np.ndarray, picked_row: Optional[np.ndarray],
+                   n_kv: int) -> np.ndarray:
+    """``[H_kv, W]`` bool: which survivor columns the gate opened, per KV head.
+
+    ``all_ids_row`` is the survivor axis (``[W]`` original window ids, as
+    ``_extract_row_retained`` returns it); ``picked_row`` the gate's pick mapped
+    to window ids, ``[H_kv, n_sel]``, or ``None`` when the gate did not run for
+    this layer and step (all False).
+    """
+    out = np.zeros((n_kv, all_ids_row.size), dtype=bool)
+    if picked_row is None:
+        return out
+    for kv in range(min(n_kv, picked_row.shape[0])):
+        out[kv] = np.isin(all_ids_row, picked_row[kv]) & (all_ids_row >= 0)
+    return out
+
+
+class GateRecorder:
+    """``flash_decode`` gate observer: each layer's pick, as window ids.
+
+    The gate's ``sel`` ``[B, H_kv, n_sel]`` indexes the int2 tier in
+    ``active_order`` — ascending window id, the order ``store.active_ids()``
+    lists — so ``active_ids().gather(sel)`` names the windows. It is mapped HERE,
+    against the store the gate just read, rather than after the forward: under
+    the layer-major path one eviction moves every layer's tier at once, so an
+    id read later could belong to a different epoch than the pick.
+
+    Holds device tensors until :meth:`host`, so recording costs one gather per
+    fused layer and one copy per step, not a sync per layer.
+    """
+
+    def __init__(self) -> None:
+        self.cache = None
+        self.picks: Dict[int, Tensor] = {}
+        # The card estimates the gate ranked on, [B, H_q, n_active] in active
+        # order, and those active ids -- kept for callers that score the card
+        # itself (modules/evaluation/observation_collector.py).
+        self.logmass: Dict[int, Tensor] = {}
+        self.active_ids: Dict[int, Tensor] = {}
+
+    def bind(self, cache) -> None:
+        self.cache = cache
+        self.clear()
+
+    def clear(self) -> None:
+        self.picks = {}
+        self.logmass = {}
+        self.active_ids = {}
+
+    def __call__(self, layer_idx: int, sel: Tensor, logmass: Tensor) -> None:
+        ids = self.cache._stores[layer_idx].active_ids()        # [B, n_active]
+        if ids is None or ids.shape[1] != logmass.shape[-1]:
+            raise RuntimeError(
+                f"layer {layer_idx}: the gate scored {logmass.shape[-1]} "
+                f"windows but the store lists "
+                f"{None if ids is None else ids.shape[1]} active ids -- the pick "
+                "cannot be mapped to window ids, and a mis-mapped pick would "
+                "score the gate against the wrong windows.")
+        B, hk, n = sel.shape
+        self.picks[layer_idx] = torch.gather(
+            ids, 1, sel.long().reshape(B, hk * n)).reshape(B, hk, n)
+        self.logmass[layer_idx] = logmass.detach()
+        self.active_ids[layer_idx] = ids
+
+    def host(self) -> Dict[int, np.ndarray]:
+        """``{layer: [B, H_kv, n_sel] int64 window ids}`` for this step."""
+        return {li: t.detach().cpu().numpy() for li, t in self.picks.items()}
+
+
 class OursParityRunner:
     def __init__(self, config: ExperimentConfig) -> None:
         self.config = config
@@ -203,11 +309,23 @@ class OursParityRunner:
         validate_parity_pair(base_meta, cfg)
 
         # 4. Load corpus + validate per-sample article shas
-        loader = CorpusLoader(p.dataset)
+        text_field = getattr(p, "text_field", None)
+        record_filter = getattr(p, "record_filter", None)
+        loader = CorpusLoader(
+            p.dataset,
+            text_field=text_field if isinstance(text_field, str) else None,
+            record_filter=record_filter if isinstance(record_filter, str) else None)
         articles = loader.load()
+        # Replay the base run's selection exactly (schema >= 1.3 skips articles
+        # shorter than prefill_len and records what it used); older base npzs
+        # used a contiguous range.
+        base_indices = base_meta.get("article_indices")
+        article_indices = ([int(i) for i in base_indices][:num_samples]
+                           if base_indices else
+                           [p.article_index + i for i in range(num_samples)])
         samples_shas: List[str] = []
         for sample_idx in range(num_samples):
-            article_idx = p.article_index + sample_idx
+            article_idx = article_indices[sample_idx]
             if article_idx >= len(articles):
                 raise ParityValidationError(
                     f"article_index+sample {article_idx} out of range "
@@ -278,6 +396,17 @@ class OursParityRunner:
         samples_ret_scores: List[np.ndarray] = []  # [num_steps, n_layers, H_q, M] float16
         samples_win_ids: List[np.ndarray] = []      # [num_steps, n_layers, W] int64, -1 pad
         samples_win_tier: List[np.ndarray] = []     # [num_steps, n_layers, W] int64, -1 pad
+        samples_gate_read: List[np.ndarray] = []    # [num_steps, n_layers, H_kv, W] bool
+        samples_gate_fired: List[np.ndarray] = []   # [num_steps, n_layers] bool
+
+        # The read gate's pick, per layer, for the step in flight (GateRecorder).
+        from modules.windowed_cache import flash_decode
+        record_gate = bool(getattr(p, "record_gate", True) is not False)
+        n_kv = int(getattr(model.config, "num_key_value_heads",
+                           model.config.num_attention_heads))
+        recorder = GateRecorder()
+
+        flash_decode.reset_stats()
 
         resolved_cfg = None   # captured from the cache for tier metadata (below)
         t0 = time.time()
@@ -292,7 +421,7 @@ class OursParityRunner:
             # to prefill_len; batching requires they all reach that length.
             tok_list = []
             for sample_idx in chunk:
-                article_idx = p.article_index + sample_idx
+                article_idx = article_indices[sample_idx]
                 t = tokenizer.encode(articles[article_idx], return_tensors="pt",
                                      add_special_tokens=True)[:, :prefill_len]
                 tok_list.append(t)
@@ -309,7 +438,7 @@ class OursParityRunner:
             log.info(
                 "── Chunk samples %d–%d/%d (articles %d–%d) ──",
                 chunk[0] + 1, chunk[-1] + 1, num_samples,
-                p.article_index + chunk[0], p.article_index + chunk[-1],
+                article_indices[chunk[0]], article_indices[chunk[-1]],
             )
 
             # Fresh cache + hooks per chunk (cache state must reset).
@@ -318,7 +447,15 @@ class OursParityRunner:
                 local_window_size=w.local_window_size, cache_budget=budget,
                 rerotate_on_evict=getattr(cfg.cache, "rerotate_on_evict", False),
                 quant_ratio=getattr(cfg.cache, "quant_ratio", 0.0),
-                first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT))
+                first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
+                **quant_gate_ratio_kwargs(
+                    WCC, getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+                # Threaded through like every quality runner does: the parity
+                # run used to drop it, so a 'tokens' request ran 'bytes'.
+                **quant_budget_mode_kwargs(
+                    WCC, getattr(cfg.cache, "quant_budget_mode", "bytes")),
+                quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+                **quant_tier_policy_kwargs(cfg.cache),)
             cache = WC(config=cache_config, prefill_len=prefill_len,
                        model_config=model.config,
                        kv_dtype=dtypes.get(cfg.model.dtype, torch.float16),
@@ -328,7 +465,12 @@ class OursParityRunner:
             # Resolved tier counts (top_k_fp / N_q / quant_ratio) for the npz
             # metadata; identical across chunks, so capturing the last is fine.
             resolved_cfg = cache.resolved
+            recorder.bind(cache)
             hooks = install_hooks(model, cache, cache_config)
+            if record_gate:
+                # Per chunk, cleared in the chunk's `finally`, so a failed run
+                # cannot leave an observer installed in the process.
+                flash_decode.set_gate_observer(recorder)
 
             # Per-row forced-token streams: [Bc, num_steps].
             chunk_forced = base_gen_tokens[chunk]
@@ -341,11 +483,14 @@ class OursParityRunner:
             all_ret_scores = [[] for _ in range(Bc)]
             all_win_ids    = [[] for _ in range(Bc)]   # [num_steps, n_layers, W] orig ids
             all_win_tier   = [[] for _ in range(Bc)]   # [num_steps, n_layers, W] 0=fp,1=Q,2=local
+            all_gate_read  = [[] for _ in range(Bc)]   # [num_steps, n_layers, H_kv, W]
+            all_gate_fired = [[] for _ in range(Bc)]   # [num_steps, n_layers]
             gen_kwargs: Dict[str, Any] = {}
             if cfg.cache.backend_package == "eager":
                 gen_kwargs["output_attentions"] = True
 
             try:
+                pos = 0          # absolute token index, advanced by forward_at
                 with torch.no_grad():
                     for step in range(gen_len):
                         if step == 0:
@@ -355,8 +500,8 @@ class OursParityRunner:
                                 [[int(chunk_forced[bi, step - 1])] for bi in range(Bc)],
                                 device=model.device,
                             )   # [Bc, 1]
-                        out = model(input_ids=inp, past_key_values=cache, use_cache=True,
-                                    return_dict=True, **gen_kwargs)
+                        recorder.clear()
+                        out, pos = forward_at(model, inp, cache, pos, **gen_kwargs)
                         # cache.update() increments _generation_step AFTER the
                         # eviction check, so the step that was checked is
                         # (_generation_step - 1). Ask the policy's should_evict
@@ -376,7 +521,7 @@ class OursParityRunner:
                             for li in range(n_layers):
                                 a = out.attentions[li]
                                 # Sum over ALL query rows (cumulative across steps via acc_scores).
-                                ts = a.sum(dim=-2)
+                                ts = a.sum(dim=-2, dtype=torch.float32)
                                 if acc_scores[li] is None:
                                     acc_scores[li] = ts.clone()
                                 else:
@@ -420,12 +565,16 @@ class OursParityRunner:
                                 layer_wsv.append(None)
                                 layer_orig.append(None)
 
+                        # The gate's picks for this step, as window ids, on host.
+                        picks = recorder.host()
+
                         # Extract per sample-in-chunk, per layer (runner loops are
                         # fine — only cache/state/policy/scorer are loop-free).
                         for bi in range(Bc):
                             all_evict[bi].append(evicted)
                             step_tk, step_ws, step_ret_ids, step_ret_scores = [], [], [], []
                             step_win_ids, step_win_tier = [], []
+                            step_gate, step_fired = [], []
                             for li in range(n_layers):
                                 ws_v = layer_wsv[li]
                                 if ws_v is None:
@@ -435,6 +584,8 @@ class OursParityRunner:
                                     step_ret_scores.append(np.zeros((1, 0), dtype=np.float16))
                                     step_win_ids.append(np.full(1, -1, dtype=np.int64))
                                     step_win_tier.append(np.full(1, -1, dtype=np.int64))
+                                    step_gate.append(np.zeros((n_kv, 1), dtype=bool))
+                                    step_fired.append(li in picks)
                                     continue
                                 orig_full = layer_orig[li]
                                 orig_row = orig_full[bi] if orig_full is not None else None
@@ -450,6 +601,10 @@ class OursParityRunner:
                                 step_ret_scores.append(a_rsc)
                                 step_win_ids.append(a_wid)
                                 step_win_tier.append(a_wtier)
+                                pk = picks.get(li)
+                                step_gate.append(_gate_read_row(
+                                    a_wid, None if pk is None else pk[bi], n_kv))
+                                step_fired.append(pk is not None)
 
                             # ── stack per-layer results for this step/sample ──
                             all_topk[bi].append(np.stack(step_tk, 0))
@@ -458,6 +613,11 @@ class OursParityRunner:
                             # (uniform across layers), so it stacks directly.
                             all_win_ids[bi].append(np.stack(step_win_ids, 0))   # [n_layers, W]
                             all_win_tier[bi].append(np.stack(step_win_tier, 0)) # [n_layers, W]
+                            gW = max(x.shape[-1] for x in step_gate)
+                            all_gate_read[bi].append(np.stack(
+                                [np.pad(x, [(0, 0), (0, gW - x.shape[-1])])
+                                 for x in step_gate], 0))                     # [n_layers, H_kv, W]
+                            all_gate_fired[bi].append(np.asarray(step_fired, dtype=bool))
                             mM_s = max(len(x) for x in step_ret_ids)
                             mH_s = max(x.shape[0] for x in step_ret_scores)
                             p_rid = [np.pad(x, [(0, mM_s - len(x))], constant_values=-1)
@@ -472,6 +632,8 @@ class OursParityRunner:
                             log.info("  Step %d/%d", step+1, gen_len)
             finally:
                 hooks.remove()
+                flash_decode.clear_gate_observer()
+                recorder.bind(None)
 
             # Finalize each sample in the chunk (pad per-step, append to samples_*
             # in global sample order so the leading sample axis stays in order).
@@ -479,6 +641,7 @@ class OursParityRunner:
                 s_topk, s_ws, s_evict = all_topk[bi], all_ws[bi], all_evict[bi]
                 s_rid, s_rsc = all_ret_ids[bi], all_ret_scores[bi]
                 s_wid, s_wtier = all_win_ids[bi], all_win_tier[bi]
+                s_gate, s_fired = all_gate_read[bi], all_gate_fired[bi]
 
                 mW = max(x.shape[-1] for x in s_ws)
                 mK = max(x.shape[-1] for x in s_topk)
@@ -497,6 +660,10 @@ class OursParityRunner:
                 samples_evict.append(np.array(s_evict, dtype=bool))
                 samples_win_ids.append(np.stack(pwid, 0))    # [num_steps, n_layers, mW]
                 samples_win_tier.append(np.stack(pwtier, 0)) # [num_steps, n_layers, mW]
+                samples_gate_read.append(np.stack(
+                    [np.pad(x, [(0, 0), (0, 0), (0, mW - x.shape[-1])])
+                     if x.shape[-1] < mW else x[..., :mW] for x in s_gate], 0))
+                samples_gate_fired.append(np.stack(s_fired, 0))
 
                 # Pad retained arrays across steps (M and H_q may grow over time)
                 mM2  = max(x.shape[-1]  for x in s_rid)
@@ -554,6 +721,9 @@ class OursParityRunner:
             aligned_ret_scores.append(rscarr)
             aligned_win_ids.append(widarr)
             aligned_win_tier.append(wtierarr)
+        aligned_gate_read = [
+            np.pad(g, [(0, 0), (0, 0), (0, 0), (0, max_W - g.shape[-1])])
+            if g.shape[-1] < max_W else g for g in samples_gate_read]
 
         top_window_indices     = np.stack(aligned_topk, 0)
         window_scores          = np.stack(aligned_ws, 0)
@@ -562,6 +732,16 @@ class OursParityRunner:
         retained_window_scores = np.stack(aligned_ret_scores, 0) # [S, T, L, H, M]
         all_window_ids         = np.stack(aligned_win_ids, 0)    # [S, T, L, W]
         all_window_tier        = np.stack(aligned_win_tier, 0)   # [S, T, L, W]
+        gate_read              = np.stack(aligned_gate_read, 0)  # [S, T, L, H_kv, W]
+        gate_fired             = np.stack(samples_gate_fired, 0) # [S, T, L]
+        expect = flash_decode.expect_gated(
+            cfg.cache.backend_package, getattr(cfg.cache, "quant_ratio", 0.0),
+            torch.cuda.is_available())
+        read_gate = flash_decode.log_gate_report(log, "parity_ours", expect)
+        if record_gate and read_gate.get("gated") and not gate_fired.any():
+            raise RuntimeError(
+                "the read gate ran but no pick was recorded -- the observer did "
+                "not see it, so gate_read would describe an ungated read.")
 
         elapsed = time.time() - t0
         log.info("Done: %d samples, %.1fs", num_samples, elapsed)
@@ -584,12 +764,16 @@ class OursParityRunner:
 
         env = capture_environment()
         meta = {
-            "schema_version": "1.2",                  # bumped: full-survivor tier arrays
+            # 1.3: gate_read / gate_fired, read_gate verdict, gate + card knobs.
+            "schema_version": "1.3",
             "mode": "parity_ours",
             "seed": cfg.run.seed,
             "dataset": p.dataset,
             "article_id": p.article_index,
             "article_index_start": p.article_index,
+            "article_indices": [int(i) for i in article_indices],
+            "text_field": text_field if isinstance(text_field, str) else None,
+            "record_filter": record_filter if isinstance(record_filter, str) else None,
             "num_samples": num_samples,
             "article_shas": samples_shas,
             "article_sha": samples_shas[0],
@@ -605,6 +789,29 @@ class OursParityRunner:
             "quant_ratio": q_ratio,
             "top_k_fp": top_k_fp,
             "N_q": n_q,
+            # How the int2 tier was READ, beside how it was sized. Without these
+            # an observation over a gated run and one over an ungated run look
+            # identical (CLAUDE.md: a missing or non-`gated` verdict means the
+            # number beside it is not a gated number).
+            "quant_gate_ratio": float(getattr(
+                resolved_cfg, "quant_gate_ratio",
+                getattr(cfg.cache, "quant_gate_ratio", 0.25))),
+            "quant_budget_mode": str(getattr(
+                resolved_cfg, "quant_budget_mode",
+                getattr(cfg.cache, "quant_budget_mode", "bytes"))),
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
+            "read_gate": read_gate,
+            "gate_recorded": bool(record_gate),
+            # Per-window prices (all KV heads), so a read-traffic axis can be
+            # drawn from this npz alone: an int2 window costs its card plus its
+            # data, and the gate reads every card plus `ratio` of the data.
+            "bytes_per_fp_window": int(getattr(resolved_cfg, "bytes_per_fp_window", 0) or 0),
+            "bytes_per_q_window": int(getattr(resolved_cfg, "bytes_per_q_window", 0) or 0),
+            "bytes_per_gate_card": int(getattr(resolved_cfg, "bytes_per_gate_card", 0) or 0),
+            "score_accum_dtype": "float32",
+            "num_attention_heads": int(model.config.num_attention_heads),
+            "num_key_value_heads": n_kv,
             # The eviction SCHEDULE, alongside the eviction geometry above.
             # Without it the eviction_step_mask in this npz cannot be attributed
             # to an operating point after the fact, and Suites B and E read this
@@ -643,6 +850,8 @@ class OursParityRunner:
             retained_window_scores=retained_window_scores,  # [S, T, L, H, M] ours' scores
             all_window_ids=all_window_ids,              # [S, T, L, W] id per score col, -1 pad
             all_window_tier=all_window_tier,            # [S, T, L, W] 0=fp,1=Q,2=local,-1=pad
+            gate_read=gate_read,                        # [S, T, L, H_kv, W] opened by the gate
+            gate_fired=gate_fired,                      # [S, T, L] gate ran
             metadata_json=np.array([json.dumps(meta)], dtype=object),
         )
         with open(npz.with_suffix(".meta.json"), "w") as f:

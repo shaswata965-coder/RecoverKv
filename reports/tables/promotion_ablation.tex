@@ -1,0 +1,98 @@
+% Q->F promotion in the paper's Table 18 layout and labels, on the q = 0.70 collector
+% run (and q = 0.20 for context). Needs \usepackage{booktabs}.
+%
+% Source: reports/promotion_ablation/q0.7.json and q0.2.json, written by
+%   python -m modules.evaluation.promotion_ablation --zip <run>.zip --out-dir ...
+% Full write-up, definitions and checks: reports/promotion_mass_q0.7_wikitext.md.
+%
+% Columns -- all on the same prompts and queries:
+%   With gated promotion  the measured run (quant_promotion: bidir; the card gate
+%                         reads 7 of 26 int2 windows per KV head at q = 0.70).
+%   With promotion        the same run with the gate off: every int2 window read, as
+%                         in the paper's pilot. Same tiers and scores (a replay), so
+%                         the rows the gate cannot move carry the measured values;
+%                         R_Q is "--": the 2-bit read of the windows the gate skipped
+%                         is never recorded by a gated run. A --gate-ratio 1.0
+%                         collector run fills it.
+%   No promotion          the one-way policy (quant_promotion: oneway) REPLAYED on the
+%                         run's own ranking signal, gated: the gate re-run by its own
+%                         rule on the recorded cards, with the windows the run had
+%                         promoted always read (favours no promotion). The replay
+%                         reproduces the recorded tiers at 16,384 / 16,384
+%                         layer-evictions (bidir). Not a recorded one-way run.
+%   Delta                 with gated promotion minus no promotion, paired per
+%                         (prompt, layer) trace.
+%
+% R_Q, "FullKV attention mass preserved": per query head and step, each int2
+% window's FullKV attention against the attention the decode step gives it (its
+% 2-bit read, or its card fill if the gate skipped it), rescaled to FullKV by the
+% exactly-read local band; sum of min(credit, FullKV) over the int2 tier's FullKV
+% attention. Scored on the head-steps both arms can credit (99.9% at q = 0.70,
+% 95.4% at q = 0.20).
+% Rows below the rule: a share of each query head's FullKV attention per decode step.
+% "Contested fp slot": the next 32 steps' attention per step on the window a
+% promotion puts in fp vs the fp window demoted for it (which keeps the slot without
+% promotion).
+% Bold: the with-gated-promotion value where its paired 95% bootstrap CI (256
+% traces) excludes zero in its favour and the difference shows at the printed
+% precision; the no-promotion value where the reverse holds (QSA at q = 0.20: in a
+% replay both arms carry the same scores, so QSA moves only by which windows sit in
+% int2). The gate-off column is never bold: its 0.00% card-fill row is by
+% construction.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Metric & No promotion & With promotion & With gated promotion & $\Delta$ \\
+\midrule
+R3 FMM $\downarrow$                                  & 28.9\% & 28.9\% & 28.9\%          & $0.0$\,pp   \\
+Quantized-Score Agreement $\uparrow$                 & 0.983  & 0.983  & 0.983           & $0.000$     \\
+FullKV attention mass preserved, $R_Q$ $\uparrow$    & 88.5\% & --     & 88.5\%          & $+0.02$\,pp \\
+Global LIR $\uparrow$                                & 0.0\%  & 0.7\%  & \textbf{0.7\%}  & $+0.7$\,pp  \\
+Recorded Q$\to$F transitions                         & 0      & 233    & 233             & $+233$      \\
+\midrule
+FullKV mass on the fp tier $\uparrow$                & 1.00\% & 1.07\% & \textbf{1.07\%} & $+0.06$\,pp \\
+FullKV mass reached only via the card $\downarrow$   & 2.90\% & 0.00\% & \textbf{2.87\%} & $-0.03$\,pp \\
+Future mass of the contested fp slot $\uparrow$      & 0.39\% & 0.78\% & \textbf{0.78\%} & $\times 2.0$ \\
+\bottomrule
+\end{tabular}
+\caption{Effect of Q$\to$F promotion at quant ratio 0.70 (2 fp + 26 int2 windows,
+$\Omega = 8$, 20\% byte budget), Llama-3.1-8B-Instruct, 8 wikitext-103 prompts,
+512-token prefill and 512 decode steps. All three columns use the same prompts and
+queries. \emph{With gated promotion} is the measured run, whose read gate opens 7 of
+26 int2 windows per KV head. \emph{With promotion} is that run with every int2
+window read. \emph{No promotion} replays the one-way policy on the run's ranking
+signal. $\Delta$: gated promotion minus no promotion, paired. $R_Q$: share of the
+int2 tier's FullKV attention that the decode step gives those windows (2-bit read
+or card fill). Promotion does not change which windows are kept (identical at every
+eviction, hence equal R3 FMM); it changes which of them sit in full precision.}
+\label{tab:promotion-q070}
+\end{table}
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Metric & No promotion & With promotion & With gated promotion & $\Delta$ \\
+\midrule
+R3 FMM $\downarrow$                                  & 40.5\%         & 40.5\% & 40.5\%          & $0.0$\,pp    \\
+Quantized-Score Agreement $\uparrow$                 & \textbf{0.940} & 0.926  & 0.926           & $-0.014$     \\
+FullKV attention mass preserved, $R_Q$ $\uparrow$    & 88.1\%         & --     & 88.0\%          & $-0.12$\,pp  \\
+Global LIR $\uparrow$                                & 0.0\%          & 1.9\%  & \textbf{1.9\%}  & $+1.9$\,pp   \\
+Recorded Q$\to$F transitions                         & 0              & 726    & 726             & $+726$       \\
+\midrule
+FullKV mass on the fp tier $\uparrow$                & 3.33\%         & 3.71\% & \textbf{3.71\%} & $+0.38$\,pp  \\
+FullKV mass reached only via the card $\downarrow$   & 1.03\%         & 0.00\% & \textbf{0.86\%} & $-0.17$\,pp  \\
+Future mass of the contested fp slot $\uparrow$      & 0.32\%         & 0.77\% & \textbf{0.77\%} & $\times 2.4$ \\
+\bottomrule
+\end{tabular}
+\caption{As Table~\ref{tab:promotion-q070}, at quant ratio 0.20 (7 fp + 7 int2
+windows; the gate opens 2 of 7 per KV head), same prompts. The $R_Q$ difference is
+not significant (95\% CI $[-0.36, +0.09]$\,pp).}
+\label{tab:promotion-q020}
+\end{table}

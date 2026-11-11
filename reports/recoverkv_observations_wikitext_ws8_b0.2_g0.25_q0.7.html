@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RecoverKV Observations</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface-1: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --base: #b9b7ae; --base2: #6f6e69; --seg0: #d6d4cc; --chip: #eef3fb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --base: #5f5e59; --base2: #a3a198; --seg0: #45443f; --chip: #1c2533;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface-1: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --base: #5f5e59; --base2: #a3a198; --seg0: #45443f; --chip: #1c2533;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+header h1 { font-size: 28px; line-height: 1.2; margin: 0 0 6px; }
+header .sub { color: var(--ink2); margin: 0 0 16px; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 13px;
+  color: var(--ink2); background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 16px; margin-bottom: 14px; }
+.facts b { color: var(--ink); font-weight: 600; }
+.key { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 13px; color: var(--ink2); margin: 0 0 14px; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; margin-right: 6px; }
+.sw.ours { background: var(--s1); } .sw.base { background: var(--base); }
+.sw.ref { border: 1.5px solid var(--ink2); }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+nav a { font-size: 13px; color: var(--ink); text-decoration: none; background: var(--chip);
+  padding: 4px 10px; border-radius: 999px; }
+button { font: 600 13px system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink);
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px;
+  cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--s1); color: #fff; border-color: transparent; }
+.spacer { flex: 1; }
+.status { flex-basis: 100%; text-align: right; font-size: 12.5px; color: var(--ink2); min-height: 1em; }
+section { margin-top: 36px; }
+section > h2 { font-size: 21px; margin: 0 0 4px; }
+section > .lede { color: var(--ink2); margin: 0 0 14px; font-size: 14px; }
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px 14px; margin: 0 0 16px; }
+.card h3 { font-size: 17px; line-height: 1.35; margin: 0 0 12px; font-weight: 600; }
+.card h3 .nm { color: var(--s1); }
+canvas.fig { display: block; width: 100%; }
+.tbl { overflow-x: auto; }
+.facts { grid-template-columns: max-content minmax(0, 1fr); overflow-wrap: anywhere; }
+.card table { width: 100%; border-collapse: collapse; margin: 12px 0 8px; font-size: 13px;
+  font-variant-numeric: tabular-nums; }
+.card th, .card td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); }
+.card th { color: var(--ink2); font-weight: 600; }
+.card td:not(:first-child), .card th:not(:first-child) { text-align: right; }
+.meaning { font-size: 13.5px; color: var(--ink2); margin: 6px 0 8px; }
+.meaning b { color: var(--ink); }
+.card ul { margin: 0 0 8px; padding-left: 20px; }
+.card li { margin: 4px 0; font-size: 14px; }
+.actions { display: flex; justify-content: flex-end; }
+#tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface-1); color: var(--ink);
+  border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12.5px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.12); display: none; white-space: pre; }
+@media (max-width: 600px) { .card { padding: 14px 12px; } header h1 { font-size: 23px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>RecoverKV: observations</h1>
+    <p class="sub">Eviction, int2 storage with read cards, and the gated fused decode kernel, measured on one run and compared with fp16 eviction at the same memory.</p>
+    <div class="facts" id="facts"></div>
+    <div class="key">
+      <span><span class="sw ours"></span>RecoverKV (measured on the run)</span>
+      <span><span class="sw base"></span>Baseline, simulated on the same run's attention</span>
+      <span><span class="sw ref"></span>Oracle or reference</span>
+    </div>
+    <div class="bar">
+      <nav id="nav" class="bar"></nav>
+      <span class="spacer"></span>
+      <button id="theme" type="button">Theme: auto</button>
+      <button id="exportAll" class="primary export" type="button">Export all (ZIP of PNGs)</button>
+      <span id="status" class="status" aria-live="polite"></span>
+    </div>
+  </header>
+  <main id="main"></main>
+</div>
+<div id="tip" role="tooltip"></div>
+<script>
+const RUN = {"model": "Llama-3.1-8B-Instruct", "data": "8 wikitext-103 test articles; 512-token prompt + 512 greedy decode steps each", "cache": "budget 20% (204 of 1,024 tokens/row); 5 sinks + 128-token local band; 2 fp16 + 26 int2 windows of 8 tokens; gate reads 7 of 26 per KV head", "gate": "read gate `gated` on 131,072 / 131,072 fused layer-steps", "tag": "RecoverKV \u00b7 wikitext \u00b7 ws 8 \u00b7 budget 0.20 \u00b7 gate 0.25 \u00b7 q 0.70"};
+const SECTIONS = [{"id": "evict", "title": "Eviction", "lede": "What the two-tier eviction keeps, compared with fp16-only eviction holding the same bytes. Baselines are simulated on this run's own attention; the H2O-style one is given exact scores, which favours it.", "obs": [{"id": "skewed-importance", "name": "Skewed Importance", "claim": "Importance is broad, not peaked, so coverage wins: RecoverKV holds 1.8x the windows of fp16 eviction at the same bytes", "chart": {"type": "hbar", "unit": "%", "max": 100, "bars": [{"label": "Windows needed for 80% of importance", "value": 64.9, "kind": "ref"}, {"label": "Held by RecoverKV (fp + int2)", "value": 47.9, "kind": "ours"}, {"label": "Held by H2O-style fp16 eviction, same bytes", "value": 26.1, "kind": "base"}]}, "table": {"cols": ["measure", "value"], "rows": [["top 10% of windows hold", "22.4% of importance"], ["windows for 50% / 80% / 90% of importance", "32.2% / 64.9% / 79.4%"], ["windows held: RecoverKV", "44 (47.9% of existing)"], ["windows held: fp16 eviction, same bytes", "24 (26.1% of existing)"]]}, "meaning": "Importance = cumulative attention per 8-token window (Observation I). The top 10% of windows carry only 22%, so no small set holds it; 80% of it is spread over 65% of the windows. Keeping many windows cheaply beats keeping a few exactly, and int2 is what makes 44 windows affordable where fp16 affords 24."}, {"id": "missed-mass", "name": "Missed Mass", "claim": "At equal memory RecoverKV misses 35% less attention than fp16 eviction", "chart": {"type": "hbar", "unit": "%", "bars": [{"label": "RecoverKV (measured)", "value": 9.9, "kind": "ours"}, {"label": "H2O-style fp16 eviction, same bytes", "value": 15.2, "kind": "base"}, {"label": "StreamingLLM-style fp16, same bytes", "value": 15.6, "kind": "base"}, {"label": "Ceiling: best 28 windows re-picked every step", "value": 5.5, "kind": "ref"}]}, "table": {"cols": ["policy", "mean", "p90", "steps x heads missing >10%"], "rows": [["RecoverKV", "9.9%", "26.0%", "34.0%"], ["H2O-style fp16 eviction, same bytes", "15.2%", "39.6%", "47.1%"], ["StreamingLLM-style fp16, same bytes", "15.6%", "40.5%", "47.0%"], ["Ceiling (per-step best 28)", "5.5%", "13.9%", "17.1%"]]}, "meaning": "Share of each query's attention (full-KV attention of the same query) that falls on tokens no longer in memory; lower is better. RecoverKV also cuts the tail: 1 in 10 steps loses 26% or more, against 40% for fp16 eviction."}, {"id": "future-missed-mass", "name": "Future Missed Mass", "claim": "Holding the tail in int2 cuts the attention the next 32 steps lose by 37% at the same bytes", "chart": {"type": "hbar", "unit": "%", "bars": [{"label": "RecoverKV (fp + int2, measured)", "value": 28.9, "kind": "ours"}, {"label": "H2O-style fp16 eviction, same bytes", "value": 45.9, "kind": "base"}, {"label": "StreamingLLM-style fp16, same bytes", "value": 47.9, "kind": "base"}, {"label": "RecoverKV's fp tier alone (int2 dropped)", "value": 52.3, "kind": "base"}]}, "table": {"cols": ["horizon", "RecoverKV", "H2O-style, same bytes", "StreamingLLM-style, same bytes", "fp tier alone"], "rows": [["next 8 steps", "24.2%", "37.9%", "39.2%", "42.9%"], ["next 32 steps", "28.9%", "45.9%", "47.9%", "52.3%"], ["next 64 steps", "30.7%", "49.7%", "52.4%", "56.9%"]]}, "meaning": "At each eviction: of the attention the next H steps put on windows that already existed, the share on windows that eviction dropped (Observation II; sinks excluded, so it is a share of window attention). Lower means the decision kept what the future needs. Adding the int2 tier to the same fp tier removes 45% of it."}, {"id": "selection-churn", "name": "Selection Churn", "claim": "RecoverKV's retained set is 45% steadier than fp16 eviction, so each window is demoted and carded once", "chart": {"type": "hbar", "unit": "", "digits": 3, "bars": [{"label": "RecoverKV (fp + int2)", "value": 0.044, "kind": "ours"}, {"label": "fp16 eviction, same bytes (H2O- or StreamingLLM-style)", "value": 0.08, "kind": "base"}, {"label": "RecoverKV's fp tier alone", "value": 0.107, "kind": "base"}]}, "table": {"cols": ["measure", "value"], "rows": [["churn (Jaccard distance between consecutive retained sets)", "0.044 vs 0.08"], ["int2 windows still int2 at the next eviction", "99.6%"], ["windows moved per eviction per layer", "about 1"]]}, "meaning": "Jaccard distance between the retained sets of consecutive evictions (0 = unchanged). Low churn means demotion, card writes and promotions are rare, amortised work: the batched eviction moves about one window per layer per event."}, {"id": "prompt-retention", "name": "Prompt Retention", "claim": "The first eviction keeps the prompt windows the whole decode will lean on, at about twice the rate of recency", "chart": {"type": "hbar", "unit": "%", "max": 100, "bars": [{"label": "RecoverKV's kept prompt windows", "value": 76.0, "kind": "ours"}, {"label": "Most recent windows (recency)", "value": 39.1, "kind": "base"}]}, "table": {"cols": ["measure", "value"], "rows": [["kept set that is in the decode's most-attended set", "76.0% vs 39.1% for recency"], ["agreement with exact prompt-attention ranking", "100%"], ["prompt windows before / after the first eviction", "64 -> 28 evictable + 16 local"]]}, "meaning": "At decode step 1 the 512-token prompt is compressed. Overlap = share of the windows RecoverKV keeps that are among the 28 windows the full 512-step decode attends to most. The prompt's own attention predicts what the decode will need."}, {"id": "importance-revival", "name": "Historical Importance Revival", "claim": "Cold windows almost never come back, so evicting the int2 tail permanently is safe", "chart": {"type": "tiles", "tiles": [{"value": "0.2%", "label": "cold windows that revive within 8 evictions"}, {"value": "<0.1%", "label": "cold -> hot at the next eviction"}, {"value": "0.66x", "label": "future attention of windows evicted from int2, vs candidates"}]}, "table": {"cols": ["measure", "value"], "rows": [["episodes: 4 evictions outside the important set", "25,207"], ["revived within 8 evictions", "45 (0.2%)"], ["median time to revival", "3 evictions"]]}, "meaning": "Observation III: of windows outside the ground-truth important set for 4 consecutive evictions, the share that becomes important again within 8. Windows RecoverKV evicts from int2 draw a third less future attention than the average candidate."}, {"id": "tier-dynamics", "name": "Tier Dynamics", "claim": "Every tier move lands where future attention goes: promotions draw 2.34x the average, evictions 0.66x", "chart": {"type": "hbar", "unit": "x", "digits": 2, "refLine": {"value": 1.0, "label": "candidate average"}, "bars": [{"label": "int2 -> fp (promote)", "value": 2.34, "kind": "ours"}, {"label": "stay fp", "value": 1.63, "kind": "ours"}, {"label": "fp -> int2 (demote)", "value": 1.19, "kind": "ours"}, {"label": "stay int2", "value": 0.94, "kind": "ours"}, {"label": "int2 -> evicted", "value": 0.66, "kind": "ours"}]}, "table": {"cols": ["measure", "value"], "rows": [["promotions / demotions / evictions from int2", "221 / 221 / 1,336"], ["decision fidelity (fp set vs true ranking)", "94.5%"], ["eviction regret (future attention on evicted windows)", "0.2%"]]}, "meaning": "Observation V. Lift = a moved window's attention over the next 32 steps divided by the average of all windows that eviction decided on. Above 1 means the move went to a window the future needs: promotions pick the hottest windows and evictions the coldest (swap gain +1.15)."}]}, {"id": "quant", "title": "Quantization and card representation", "lede": "What two-bit storage and the per-window card preserve.", "obs": [{"id": "recovered-mass", "name": "Recovered Mass", "claim": "One fp16 window's bytes buy 3.8 int2 windows with their cards: 28 evictable windows where fp16 holds 8", "chart": {"type": "hbar", "unit": "", "digits": 0, "bars": [{"label": "RecoverKV: 2 fp16 + 26 int2 windows", "value": 28, "kind": "ours"}, {"label": "fp16 eviction at the same bytes", "value": 8, "kind": "base"}]}, "table": {"cols": ["measure", "fp16", "RecoverKV int2 + card"], "rows": [["bytes per 8-token window (K+V, 8 KV heads)", "32,768", "8,608 (card 2,176)"], ["evictable windows at a 20% budget", "8", "28"], ["missed mass, exact ranking (oracle)", "15.2%", "10.0%"], ["attention held in the int2 tier", "-", "7.3%"]]}, "meaning": "Bytes from the resolved cache geometry. Recovered mass: with the same ranking, the int2 tier turns 5.2 points of attention that fp16 eviction would lose into attention the cache still holds."}, {"id": "int2-fidelity", "name": "int2 Fidelity", "claim": "Keys survive two bits: attention over dequantized windows lands within 3.5% of full precision", "chart": {"type": "tiles", "tiles": [{"value": "11.8%", "label": "key reconstruction error (median)"}, {"value": "+3.5%", "label": "attention on read int2 windows vs truth"}, {"value": "+0.017", "label": "output error added by int2 storage"}]}, "table": {"cols": ["measure", "value"], "rows": [["K reconstruction error, median", "11.8%"], ["V reconstruction error, median", "55.0%"], ["output error: kept at fp16 -> kept at int2", "0.182 -> 0.199"]]}, "meaning": "Keys decide where attention goes, and they reconstruct to 12% error, so a dequantized window receives almost exactly the attention it should. Values are lossier (55%), but the int2 tier carries 7.3% of attention, so their measured effect on the output is +0.017."}, {"id": "card-ranking", "name": "Card Ranking", "claim": "A 272-byte card ranks int2 windows almost like exact attention", "chart": {"type": "hbar", "unit": "%", "max": 100, "bars": [{"label": "Card: hottest window in its top 7", "value": 96.4, "kind": "ours"}, {"label": "Random 7: hottest window included", "value": 26.9, "kind": "base"}, {"label": "Card: top 7 overlap with true top 7", "value": 81.0, "kind": "ours"}, {"label": "Random 7: overlap with true top 7", "value": 26.9, "kind": "base"}]}, "table": {"cols": ["measure", "card", "random pick"], "rows": [["Spearman rank correlation with true attention", "0.91", "0.00"], ["top-7 overlap with the true top 7", "81.0%", "26.9%"], ["hottest window in the top 7", "96.4%", "26.9%"], ["bytes per head", "272", "-"]]}, "meaning": "E1: each int2 window's card (key mean, deviation direction, per-token projections and value mean, written once at demotion) estimates the query's attention to it. Compared per query head with the true attention over the 26 int2 windows. The card is 34% of the 804 bytes/head it summarises."}, {"id": "fill-calibration", "name": "Fill Calibration", "claim": "Skipped windows are credited, not dropped: the card's fill is within 2x of truth for 88% of them", "chart": {"type": "tiles", "tiles": [{"value": "87.6%", "label": "skipped windows filled within 2x of truth"}, {"value": "27%", "label": "median fill error per window"}, {"value": "2.9%", "label": "attention reached through the fill, not lost"}]}, "table": {"cols": ["measure", "value"], "rows": [["read windows: cache mass vs truth (median)", "+3.5%"], ["skipped windows within 2x of truth", "87.6%"], ["skipped set in total vs truth", "-8%"]]}, "meaning": "For int2 windows the gate does not open, the kernel credits the card's estimate (the fill) to the score and to the output through the window's value centroid. Compared with the true attention of the same query (windows carrying >0.1% of attention)."}, {"id": "promotion-payload", "name": "Promotion Payload", "claim": "Promoting a dequantized window costs 0.004 output error, so no fp16 shadow is needed", "chart": {"type": "hbar", "unit": "", "digits": 3, "bars": [{"label": "promotion payload (dequantized -> fp16)", "value": 0.004, "kind": "ours"}, {"label": "read gate + fused kernel", "value": 0.054, "kind": "base"}, {"label": "int2 storage", "value": 0.068, "kind": "base"}, {"label": "eviction (the budget itself)", "value": 0.182, "kind": "base"}]}, "table": {"cols": ["measure", "value"], "rows": [["fp windows holding a promoted payload", "15.7%"], ["future attention of promoted windows", "2.34x candidate average"], ["output-error step from the payload", "0.004"]]}, "meaning": "E3: each bar is the mean relative L2 change in a head's attention output caused by one step of the pipeline. Promotion reuses the int2 payload instead of keeping an exact copy, and the cost is 2% of eviction's."}]}, {"id": "kernel", "title": "Devised kernels: gated fused two-tier decode", "lede": "What the fused decode kernel reads, and what the read gate saves it from reading.", "obs": [{"id": "decode-read-ledger", "name": "Decode Read Ledger", "claim": "The fused kernel accounts for every query's attention: 87% read exactly or at int2, 2.9% through the card, 9.9% evicted", "chart": {"type": "stack", "rows": [{"label": "RecoverKV", "segs": [{"label": "sink (exact)", "value": 57.3, "c": 1}, {"label": "local + fp (exact)", "value": 25.6, "c": 2}, {"label": "int2, gate-opened", "value": 4.4, "c": 3}, {"label": "int2, via card fill", "value": 2.9, "c": 4}, {"label": "evicted", "value": 9.9, "c": 0}]}, {"label": "fp16 eviction, same bytes", "segs": [{"label": "sink (exact)", "value": 57.3, "c": 1}, {"label": "local + fp (exact)", "value": 27.5, "c": 2}, {"label": "evicted", "value": 15.2, "c": 0}]}]}, "table": {"cols": ["part of attention", "RecoverKV", "fp16, same bytes"], "rows": [["read exactly (sink, local, fp)", "82.8%", "84.8%"], ["read at int2 (gate opened)", "4.4%", "-"], ["reached through the card fill", "2.9%", "-"], ["evicted", "9.9%", "15.2%"]]}, "meaning": "Observation IV: every query head's true attention at every step, split by how the decode step read it. The fp16 bar is the same-bytes H2O-style cache with exact scores."}, {"id": "gate-recall", "name": "Gate Recall", "claim": "Opening 27% of int2 windows recovers 59% of their attention: 2.2x uniform, 94% of hindsight", "chart": {"type": "hbar", "unit": "%", "max": 100, "bars": [{"label": "RecoverKV read gate (cards)", "value": 59.2, "kind": "ours"}, {"label": "Uniform pick of the same size", "value": 26.9, "kind": "base"}, {"label": "Hindsight pick of the same size", "value": 63.1, "kind": "ref"}]}, "table": {"cols": ["measure", "value"], "rows": [["windows opened per KV head", "7 of 26 (26.9%)"], ["int2 attention in opened windows", "59.2% (hindsight 63.1%)"], ["gate efficiency (recall / hindsight)", "93.9%"], ["head's hottest int2 window opened", "92.0%"]]}, "meaning": "Share of each query head's int2-tier attention that sits in the windows its KV group opened (Observation IV; head-steps with at least 1% of attention in int2). Hindsight opens the same number using the true attention."}, {"id": "gate-coverage", "name": "Gate Coverage", "claim": "The gate ran on every fused layer-step at exactly the configured ratio, with no ungated fallback", "chart": {"type": "tiles", "tiles": [{"value": "131,072", "label": "of 131,072 fused layer-steps gated"}, {"value": "0.269", "label": "realised read fraction (7 / 26)"}, {"value": "26.9%", "label": "of int2 windows dequantized"}]}, "table": {"cols": ["measure", "value"], "rows": [["verdict", "gated"], ["int2 windows opened / active", "917,504 / 3,407,872"], ["configured ratio", "0.25 -> ceil(0.25 x 26) = 7 per KV head"]]}, "meaning": "Counters from the fused decode path (flash_decode.stats). The gate is the only read path wherever an int2 tier exists: a layer without cards raises instead of reading the whole tier."}, {"id": "output-error-ladder", "name": "Output-Error Ladder", "claim": "Two-bit storage, promotion and gated reading together add only 0.031 to the error the budget itself sets", "chart": {"type": "hbar", "unit": "", "digits": 3, "bars": [{"label": "kept tokens at original values (budget only)", "value": 0.182, "kind": "base"}, {"label": "+ int2 storage", "value": 0.199, "kind": "base"}, {"label": "+ promotion payload", "value": 0.199, "kind": "base"}, {"label": "RecoverKV fused-kernel output (+ read gate)", "value": 0.213, "kind": "ours"}]}, "table": {"cols": ["rung", "mean rel. L2 error"], "rows": [["budget only (eviction)", "0.182"], ["+ int2 storage", "0.199"], ["+ promotion payload", "0.199"], ["actual kernel output", "0.213"]]}, "meaning": "Relative L2 error of each head's attention output against full KV, same query, every step; each rung adds one mechanism. 85% of the final error is the budget itself. The last rung includes the fp16 kernel's own rounding."}]}, {"id": "reasoning", "title": "Why it holds up in reasoning", "lede": "Long generations keep returning to the problem statement and spread attention widely. These are the mechanisms behind that, measured on this run.", "obs": [{"id": "long-horizon", "name": "Long-Horizon Stability", "claim": "Across 512 generated tokens RecoverKV misses less than fp16 eviction at every stage, and the gate never degrades", "chart": {"type": "line", "unit": "%", "x": ["1-64", "65-128", "129-192", "193-256", "257-320", "321-384", "385-448", "449-512"], "series": [{"label": "RecoverKV", "values": [5.2, 6.4, 7.4, 8.8, 11.1, 12.2, 13.3, 14.5], "kind": "ours"}, {"label": "H2O-style fp16, same bytes", "values": [12.1, 13.0, 12.8, 13.7, 16.4, 17.0, 17.9, 19.1], "kind": "base"}, {"label": "StreamingLLM-style, same bytes", "values": [13.5, 14.1, 13.4, 13.8, 16.4, 16.8, 17.5, 18.9], "kind": "base2"}]}, "table": {"cols": ["decode steps", "RecoverKV", "H2O-style", "StreamingLLM-style", "gate recall"], "rows": [["1-64", "5.2%", "12.1%", "13.5%", "56.6%"], ["65-128", "6.4%", "13.0%", "14.1%", "55.7%"], ["129-192", "7.4%", "12.8%", "13.4%", "55.6%"], ["193-256", "8.8%", "13.7%", "13.8%", "55.2%"], ["257-320", "11.1%", "16.4%", "16.4%", "56.4%"], ["321-384", "12.2%", "17.0%", "16.8%", "56.7%"], ["385-448", "13.3%", "17.9%", "17.5%", "56.5%"], ["449-512", "14.5%", "19.1%", "18.9%", "57.5%"]]}, "meaning": "Missed mass per 64-step stretch of the decode (all layers, 8 prompts). Gate recall stays at 55-58% from the first token to the last."}, {"id": "reasoning-intuition", "name": "Intuition", "claim": "Why a two-tier cache suits reasoning", "chart": {"type": "none"}, "bullets": ["<b>The problem statement stays.</b> The prompt windows kept at step 1 are the ones the decode attends most (76%, 2x recency), and they stay (churn 0.044).", "<b>Breadth over precision.</b> 80% of importance needs 65% of the windows; RecoverKV holds 28 evictable windows where fp16 holds 8, and misses 35% less attention.", "<b>The hot window is read, not guessed.</b> A head's hottest int2 window is opened 92% of the time; the rest reaches the output through the card instead of vanishing.", "<b>Compression does not compound.</b> Storage, promotion and gated reading add 0.031 to the budget's own 0.182 output error, and promotions correct the ranking with 2.34x lift."], "table": null, "meaning": "Scope: this run measures attention on wikitext continuation, which explains the mechanism, not a reasoning score. Generated text older than the 128-token local band is mostly evicted (91.5% of windows leaving it), the open item for long reasoning chains."}]}];
+const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+
+function tokens() {
+  const cs = getComputedStyle(document.documentElement);
+  const g = n => cs.getPropertyValue(n).trim();
+  return { page: g('--page'), surface: g('--surface-1'), ink: g('--ink'), ink2: g('--ink2'), muted: g('--muted'),
+    grid: g('--grid'), axis: g('--axis'), ours: g('--s1'), base: g('--base'), base2: g('--base2'),
+    seg: [g('--seg0'), g('--s1'), g('--s2'), g('--s3'), g('--s4')] };
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+const stripTags = s => String(s).replace(/<[^>]+>/g, '');
+
+function fmtVal(v, s) {
+  const d = s.digits ?? 1;
+  if (s.unit === '%') return v.toFixed(d) + '%';
+  if (s.unit === 'x') return v.toFixed(d) + 'x';
+  return d === 0 ? String(Math.round(v)) : v.toFixed(d);
+}
+function niceStep(v) {
+  const e = Math.pow(10, Math.floor(Math.log10(v))), m = v / e;
+  return (m <= 1 ? 1 : m <= 2 ? 2 : m <= 2.5 ? 2.5 : m <= 5 ? 5 : 10) * e;
+}
+// -> {max, step, digits}: 4-6 round ticks covering v
+function scale(v, fixedMax) {
+  if (fixedMax) { const step = fixedMax / 4; return { max: fixedMax, step, digits: decimals(step) }; }
+  const step = niceStep(Math.max(v, 1e-9) / 4), max = Math.ceil(v / step - 1e-9) * step;
+  return { max, step, digits: decimals(step) };
+}
+function decimals(step) { let d = 0; while (d < 4 && Math.abs(Math.round(step * 10 ** d) - step * 10 ** d) > 1e-6) d++; return d; }
+function ticks(sc) { const out = []; for (let t = 0; t <= sc.max + 1e-9; t += sc.step) out.push(t); return out; }
+function wrap(ctx, text, maxW) {
+  const out = []; let line = '';
+  for (const word of String(text).split(/\s+/)) {
+    const t = line ? line + ' ' + word : word;
+    if (ctx.measureText(t).width > maxW && line) { out.push(line); line = word; } else line = t;
+  }
+  if (line) out.push(line);
+  return out;
+}
+function hline(ctx, x1, y1, x2, y2) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function barPath(ctx, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r); ctx.arcTo(x + w, y + h, x + w - r, y + h, r); ctx.lineTo(x, y + h); ctx.closePath();
+}
+
+// ---- chart painters: (ctx, spec, x, y, w, T, hits) -> height -------------
+function drawHbar(ctx, s, x0, y0, w, T, hits) {
+  const barH = 20, gap = 16, fs = 13;
+  ctx.font = `${fs}px ${FONT}`;
+  const labelW = Math.min(w * 0.44, Math.max(...s.bars.map(b => ctx.measureText(b.label).width)) + 14);
+  const valW = 70, px = x0 + labelW, pw = Math.max(40, w - labelW - valW);
+  const sc = scale(Math.max(...s.bars.map(b => b.value), s.refLine ? s.refLine.value : 0) * 1.04, s.max), vmax = sc.max;
+  const top = y0 + (s.refLine ? 22 : 6), plotH = s.bars.length * (barH + gap) - gap, vals = [];
+  ctx.strokeStyle = T.grid; ctx.lineWidth = 1;
+  ticks(sc).forEach(t => { const gx = Math.round(px + pw * t / vmax) + 0.5; hline(ctx, gx, top - 6, gx, top + plotH + 6); });
+  s.bars.forEach((b, i) => {
+    const by = top + i * (barH + gap), bw = Math.max(2, pw * Math.min(b.value, vmax) / vmax);
+    ctx.font = `${fs}px ${FONT}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'right'; ctx.fillStyle = T.ink2;
+    const lines = wrap(ctx, b.label, labelW - 14);
+    if (lines.length === 1) ctx.fillText(lines[0], px - 10, by + barH / 2);
+    else { ctx.font = `12px ${FONT}`; const l2 = wrap(ctx, b.label, labelW - 14).slice(0, 2);
+      l2.forEach((l, k) => ctx.fillText(l, px - 10, by + barH / 2 + (k - 0.5) * 14)); }
+    barPath(ctx, px, by, bw, barH, 4);
+    if (b.kind === 'ref') { ctx.strokeStyle = T.ink2; ctx.lineWidth = 1.5; ctx.stroke(); }
+    else { ctx.fillStyle = b.kind === 'ours' ? T.ours : T.base; ctx.fill(); }
+    vals.push([b, px + bw + 7, by + barH / 2]);
+    if (hits) hits.push({ x: x0, y: by - gap / 2, w, h: barH + gap, tip: `${b.label}\n${fmtVal(b.value, s)}` });
+  });
+  ctx.strokeStyle = T.axis; ctx.lineWidth = 1; hline(ctx, Math.round(px) + 0.5, top - 6, Math.round(px) + 0.5, top + plotH + 6);
+  ctx.fillStyle = T.muted; ctx.font = `11px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ticks(sc).forEach(t => ctx.fillText(fmtVal(t, { ...s, digits: sc.digits }), px + pw * t / vmax, top + plotH + 22));
+  if (s.refLine) {
+    const rx = Math.round(px + pw * s.refLine.value / vmax) + 0.5;
+    ctx.strokeStyle = T.ink2; ctx.lineWidth = 1.5; hline(ctx, rx, top - 8, rx, top + plotH + 6);
+    ctx.fillStyle = T.ink2; ctx.font = `12px ${FONT}`; ctx.textAlign = 'center';
+    ctx.fillText(`${s.refLine.label} = ${fmtVal(s.refLine.value, s)}`, rx, top - 12);
+  }
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  vals.forEach(([b, vx, vy]) => {
+    ctx.font = `${b.kind === 'ours' ? '600 ' : ''}${fs}px ${FONT}`; const t = fmtVal(b.value, s), tw = ctx.measureText(t).width;
+    ctx.fillStyle = T.surface; ctx.fillRect(vx - 3, vy - 9, tw + 6, 18);
+    ctx.fillStyle = T.ink; ctx.fillText(t, vx, vy);
+  });
+  return top + plotH + 30 - y0;
+}
+
+function drawStack(ctx, s, x0, y0, w, T, hits) {
+  let y = y0 + 4; const barH = 24, gapPx = 2;
+  s.rows.forEach(r => {
+    ctx.font = `600 13px ${FONT}`; ctx.fillStyle = T.ink; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(r.label, x0, y + 13); y += 20;
+    const tot = r.segs.reduce((a, b) => a + b.value, 0); let x = x0;
+    r.segs.forEach((sg, i) => {
+      const sw = w * sg.value / tot, last = i === r.segs.length - 1, drawW = Math.max(1, sw - (last ? 0 : gapPx));
+      barPath(ctx, x, y, drawW, barH, last ? 4 : 0); ctx.fillStyle = T.seg[sg.c]; ctx.fill();
+      if (hits) hits.push({ x, y, w: Math.max(sw, 6), h: barH, tip: `${r.label}: ${sg.label}\n${sg.value.toFixed(1)}%` });
+      x += sw;
+    });
+    y += barH + 10;
+    ctx.font = `12.5px ${FONT}`; let lx = x0;
+    r.segs.forEach(sg => {
+      const txt = `${sg.label} ${sg.value.toFixed(1)}%`, tw = ctx.measureText(txt).width + 34;
+      if (lx + tw > x0 + w) { lx = x0; y += 20; }
+      ctx.fillStyle = T.seg[sg.c]; barPath(ctx, lx, y, 11, 11, 2); ctx.fill();
+      ctx.fillStyle = T.ink2; ctx.textBaseline = 'middle'; ctx.fillText(txt, lx + 17, y + 6); lx += tw;
+    });
+    y += 30;
+  });
+  return y - y0;
+}
+
+function drawLine(ctx, s, x0, y0, w, T, hits) {
+  const H = 250, legendH = 22, left = 40, right = 150, top = y0 + legendH + 12, plotH = H - legendH - 48;
+  const pw = w - left - right, px = x0 + left;
+  const colors = { ours: T.ours, base: T.base, base2: T.base2 };
+  const all = s.series.flatMap(se => se.values), sc = scale(Math.max(...all) * 1.04), vmax = sc.max;
+  let lx = x0; ctx.font = `12.5px ${FONT}`; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  s.series.forEach(se => {
+    ctx.strokeStyle = colors[se.kind]; ctx.lineWidth = se.kind === 'ours' ? 3 : 2; hline(ctx, lx, y0 + 9, lx + 18, y0 + 9);
+    ctx.fillStyle = T.ink2; ctx.fillText(se.label, lx + 24, y0 + 9); lx += ctx.measureText(se.label).width + 46;
+  });
+  ctx.strokeStyle = T.grid; ctx.lineWidth = 1; ctx.fillStyle = T.muted; ctx.font = `11px ${FONT}`; ctx.textAlign = 'right';
+  ticks(sc).forEach(t => { const gy = Math.round(top + plotH - plotH * t / vmax) + 0.5; hline(ctx, px, gy, px + pw, gy);
+    ctx.fillText(fmtVal(t, { ...s, digits: sc.digits }), px - 6, gy); });
+  ctx.strokeStyle = T.axis; hline(ctx, px, top + plotH + 0.5, px + pw, top + plotH + 0.5);
+  const n = s.x.length, xAt = i => px + pw * (i + 0.5) / n, yAt = v => top + plotH - plotH * v / vmax;
+  ctx.textAlign = 'center'; ctx.fillStyle = T.muted; ctx.textBaseline = 'alphabetic';
+  s.x.forEach((lab, i) => ctx.fillText(lab, xAt(i), top + plotH + 16));
+  ctx.fillText('decode steps', px + pw / 2, top + plotH + 34);
+  const order = [...s.series].sort((a, b) => (a.kind === 'ours') - (b.kind === 'ours'));
+  order.forEach(se => {
+    ctx.strokeStyle = colors[se.kind]; ctx.lineWidth = se.kind === 'ours' ? 3 : 2; ctx.lineJoin = 'round';
+    ctx.beginPath(); se.values.forEach((v, i) => i ? ctx.lineTo(xAt(i), yAt(v)) : ctx.moveTo(xAt(i), yAt(v))); ctx.stroke();
+    se.values.forEach((v, i) => { ctx.beginPath(); ctx.arc(xAt(i), yAt(v), 4, 0, 2 * Math.PI);
+      ctx.fillStyle = colors[se.kind]; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = T.surface; ctx.stroke(); });
+  });
+  const ends = s.series.map(se => ({ se, y: yAt(se.values[n - 1]) })).sort((a, b) => a.y - b.y);
+  for (let i = 1; i < ends.length; i++) if (ends[i].y - ends[i - 1].y < 16) ends[i].y = ends[i - 1].y + 16;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ends.forEach(e => { ctx.font = `${e.se.kind === 'ours' ? '600 ' : ''}12px ${FONT}`; ctx.fillStyle = T.ink;
+    ctx.fillText(`${fmtVal(e.se.values[n - 1], s)} ${e.se.label.split(',')[0]}`, px + pw + 8, e.y); });
+  if (hits) s.x.forEach((lab, i) => hits.push({ x: px + pw * i / n, y: top, w: pw / n, h: plotH,
+    tip: `steps ${lab}\n` + s.series.map(se => `${se.label}: ${fmtVal(se.values[i], s)}`).join('\n') }));
+  return H;
+}
+
+function drawTiles(ctx, s, x0, y0, w, T) {
+  const n = s.tiles.length, gap = 14, tw = (w - gap * (n - 1)) / n; let maxH = 0;
+  s.tiles.forEach((t, i) => {
+    const tx = x0 + i * (tw + gap);
+    ctx.fillStyle = T.ink; ctx.font = `600 30px ${FONT}`; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(t.value, tx, y0 + 34);
+    ctx.fillStyle = T.ink2; ctx.font = `12.5px ${FONT}`;
+    const lines = wrap(ctx, t.label, tw - 4); lines.forEach((l, k) => ctx.fillText(l, tx, y0 + 56 + k * 17));
+    ctx.fillStyle = T.ours; ctx.fillRect(tx, y0 + 2, 26, 3);
+    maxH = Math.max(maxH, 56 + lines.length * 17);
+  });
+  return maxH + 6;
+}
+
+const PAINT = { hbar: drawHbar, stack: drawStack, line: drawLine, tiles: drawTiles };
+function paint(ctx, spec, x, y, w, T, hits) { const f = PAINT[spec.type]; return f ? f(ctx, spec, x, y, w, T, hits) : 0; }
+const measureCtx = document.createElement('canvas').getContext('2d');
+
+// ---- on-screen rendering ---------------------------------------------------
+const CARDS = [];
+function renderFigure(entry) {
+  const { card, canvas } = entry; if (!canvas) return;
+  const T = tokens(), cssW = canvas.clientWidth || canvas.parentElement.clientWidth;
+  const h = Math.ceil(paint(measureCtx, card.chart, 0, 0, cssW, T, null));
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.height = h + 'px'; canvas.width = Math.round(cssW * dpr); canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, cssW, h);
+  entry.hits = []; paint(ctx, card.chart, 0, 0, cssW, T, entry.hits);
+}
+function renderAll() { CARDS.forEach(renderFigure); }
+
+function build() {
+  const facts = document.getElementById('facts');
+  [['Model', RUN.model], ['Data', RUN.data], ['Cache', RUN.cache], ['Read gate', RUN.gate]]
+    .forEach(([k, v]) => facts.insertAdjacentHTML('beforeend', `<b>${k}</b><span>${esc(v)}</span>`));
+  const nav = document.getElementById('nav'), main = document.getElementById('main');
+  SECTIONS.forEach(sec => {
+    nav.insertAdjacentHTML('beforeend', `<a href="#${sec.id}">${esc(sec.title)}</a>`);
+    const s = document.createElement('section'); s.id = sec.id;
+    s.innerHTML = `<h2>${esc(sec.title)}</h2><p class="lede">${esc(sec.lede)}</p>`;
+    sec.obs.forEach(card => {
+      const a = document.createElement('article'); a.className = 'card'; a.id = 'obs-' + card.id;
+      let html = `<h3><span class="nm">${esc(card.name)}:</span> ${esc(card.claim)}</h3>`;
+      if (card.chart.type !== 'none') html += `<canvas class="fig" role="img" aria-label="${esc(card.name)} chart"></canvas>`;
+      if (card.bullets) html += '<ul>' + card.bullets.map(b => `<li>${b}</li>`).join('') + '</ul>';
+      if (card.table) html += '<div class="tbl"><table><thead><tr>' + card.table.cols.map(c => `<th>${esc(c)}</th>`).join('') + '</tr></thead><tbody>'
+        + card.table.rows.map(r => '<tr>' + r.map(c => `<td>${esc(c)}</td>`).join('') + '</tr>').join('') + '</tbody></table></div>';
+      html += `<p class="meaning"><b>What the data means.</b> ${esc(card.meaning)}</p>`;
+      html += `<div class="actions"><button type="button" class="export">Export PNG</button></div>`;
+      a.innerHTML = html; s.appendChild(a);
+      const entry = { card, section: sec.title, canvas: a.querySelector('canvas'), hits: [] };
+      a.querySelector('.actions button').addEventListener('click', () => exportCard(entry));
+      if (entry.canvas) attachTip(entry);
+      CARDS.push(entry);
+    });
+    main.appendChild(s);
+  });
+}
+
+// ---- tooltip ---------------------------------------------------------------
+const tip = document.getElementById('tip');
+function attachTip(entry) {
+  const c = entry.canvas;
+  c.addEventListener('mousemove', ev => {
+    const r = c.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+    const h = entry.hits.find(h => x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h);
+    if (!h) { tip.style.display = 'none'; return; }
+    tip.textContent = h.tip; tip.style.display = 'block';
+    const tw = tip.offsetWidth, left = Math.min(ev.clientX + 14, window.innerWidth - tw - 8);
+    tip.style.left = left + 'px'; tip.style.top = (ev.clientY + 14) + 'px';
+  });
+  c.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+}
+
+// ---- PNG export: headline + figure + table + meaning in one image ------------
+function composeCard(entry, W = 1100, scale = 2) {
+  const T = tokens(), card = entry.card, pad = 40, inner = W - 2 * pad;
+  const layout = (ctx, draw) => {
+    let y = pad;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.font = `600 12px ${FONT}`; if (draw) { ctx.fillStyle = T.muted; ctx.fillText(entry.section.toUpperCase(), pad, y + 10); } y += 26;
+    ctx.font = `600 22px ${FONT}`;
+    const head = wrap(ctx, `${card.name}: ${card.claim}`, inner);
+    head.forEach((l, i) => { if (draw) { ctx.fillStyle = T.ink; ctx.fillText(l, pad, y + 20); } y += 30; });
+    if (draw) { ctx.fillStyle = T.ours; ctx.fillRect(pad, y + 2, 44, 3); } y += 22;
+    if (card.chart.type !== 'none') { y += paint(ctx, card.chart, pad, y, inner, T, null) + 14; }
+    if (card.bullets) {
+      ctx.font = `15px ${FONT}`;
+      card.bullets.forEach(b => { const ls = wrap(ctx, stripTags(b), inner - 22);
+        ls.forEach((l, i) => { if (draw) { ctx.fillStyle = T.ink; if (!i) ctx.fillText('•', pad, y + 16); ctx.fillText(l, pad + 20, y + 16); } y += 22; }); y += 6; });
+    }
+    if (card.table) {
+      const cols = card.table.cols, all = [cols, ...card.table.rows];
+      const need = cols.map((_, i) => Math.max(...all.map((r, k) => { ctx.font = `${k ? '' : '600 '}13px ${FONT}`; return ctx.measureText(String(r[i])).width; })) + 24);
+      const restW = need.slice(1).reduce((a, b) => a + b, 0), first = Math.max(inner * 0.3, inner - restW);
+      const wid = i => i === 0 ? first : need[i] * Math.min(1, (inner - first) / Math.max(restW, 1));
+      const colX = i => { let x = pad; for (let k = 0; k <= i; k++) x += wid(k); return i === 0 ? pad : x; };
+      const cell = (txt, i, yy, bold) => {
+        ctx.font = `${bold ? '600 ' : ''}13px ${FONT}`; let t = String(txt); const maxW = wid(i) - 12;
+        while (ctx.measureText(t).width > maxW && t.length > 4) t = t.slice(0, -2);
+        if (t !== String(txt)) t = t.slice(0, -1) + '…';
+        ctx.textAlign = i === 0 ? 'left' : 'right'; ctx.fillText(t, i === 0 ? colX(0) + 6 : colX(i), yy);
+      };
+      if (draw) { ctx.fillStyle = T.ink2; cols.forEach((c, i) => cell(c, i, y + 18, true)); ctx.strokeStyle = T.axis; hline(ctx, pad, y + 28.5, pad + inner, y + 28.5); }
+      y += 30;
+      card.table.rows.forEach(r => { if (draw) { ctx.fillStyle = T.ink; r.forEach((c, i) => cell(c, i, y + 18, false));
+        ctx.strokeStyle = T.grid; hline(ctx, pad, y + 27.5, pad + inner, y + 27.5); } y += 28; });
+      y += 14;
+    }
+    ctx.font = `14px ${FONT}`; ctx.textAlign = 'left';
+    const ms = wrap(ctx, 'What the data means. ' + card.meaning, inner);
+    ms.forEach((l, i) => { if (draw) { ctx.fillStyle = T.ink2; ctx.fillText(l, pad, y + 16); } y += 21; });
+    y += 14; ctx.font = `11.5px ${FONT}`; if (draw) { ctx.fillStyle = T.muted; ctx.fillText(RUN.tag, pad, y + 10); } y += 18;
+    return y + pad - 10;
+  };
+  const H = Math.ceil(layout(measureCtx, false));
+  const cv = document.createElement('canvas'); cv.width = W * scale; cv.height = H * scale;
+  const ctx = cv.getContext('2d'); ctx.scale(scale, scale);
+  ctx.fillStyle = T.surface; ctx.fillRect(0, 0, W, H);
+  layout(ctx, true);
+  return cv;
+}
+// ---- saving: the viewer's save prompt when hosted, a plain download when opened as a file
+const statusEl = document.getElementById('status');
+const say = msg => { statusEl.textContent = msg; };
+const hosted = !!(window.claude && typeof window.claude.use === 'function');
+let DL;   // undefined until asked; null when this view cannot save files
+if (hosted) window.claude.use('downloads').then(d => { DL = d; if (!d) document.querySelectorAll('.export').forEach(b => { b.hidden = true; }); },
+  () => { DL = null; });
+async function saveFile(filename, blob) {
+  if (hosted) {
+    const d = DL === undefined ? await window.claude.use('downloads') : DL;
+    if (!d) { say('Saving files is not available in this view.'); return false; }
+    try { await d.save({ filename, data: blob }); say('Saved ' + filename); return true; }
+    catch (e) {
+      const c = e && e.code;
+      say(c === 'declined' ? 'Save cancelled.' : c === 'rate_limited' ? 'A save prompt is already open; try again in a moment.'
+        : 'Could not save the file (' + (c || 'error') + ').');
+      return false;
+    }
+  }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  say('Saved ' + filename); return true;
+}
+const toBlob = cv => new Promise(r => cv.toBlob(r, 'image/png'));
+async function exportCard(entry) { return saveFile(`recoverkv-${entry.card.id}.png`, await toBlob(composeCard(entry))); }
+
+// a stored (uncompressed) ZIP: PNGs are already compressed
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8) { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function zipStore(files) {
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  for (const f of files) {
+    const name = enc.encode(f.name), crc = crc32(f.data), n = f.data.length;
+    const h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(12, 0x21, true);
+    h.setUint32(14, crc, true); h.setUint32(18, n, true); h.setUint32(22, n, true); h.setUint16(26, name.length, true);
+    parts.push(h, name, f.data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(14, 0x21, true);
+    c.setUint32(16, crc, true); c.setUint32(20, n, true); c.setUint32(24, n, true); c.setUint16(28, name.length, true);
+    c.setUint32(42, off, true);
+    central.push(c, name);
+    off += 30 + name.length + n;
+  }
+  const cd = central.reduce((a, p) => a + p.byteLength, 0), e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+  e.setUint32(12, cd, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, e], { type: 'application/zip' });
+}
+async function exportAllZip() {
+  say(`Rendering ${CARDS.length} images...`);
+  const files = [];
+  for (const e of CARDS) files.push({ name: `recoverkv-${e.card.id}.png`,
+    data: new Uint8Array(await (await toBlob(composeCard(e))).arrayBuffer()) });
+  return zipStore(files);
+}
+document.getElementById('exportAll').addEventListener('click', async () => {
+  saveFile('recoverkv-observations-png.zip', await exportAllZip());
+});
+
+// ---- theme -------------------------------------------------------------------
+const modes = ['auto', 'light', 'dark']; let mode = 0;
+try { const m = localStorage.getItem('rkv-theme'); if (m && modes.includes(m)) mode = modes.indexOf(m); } catch (e) {}
+function applyTheme() {
+  const m = modes[mode]; if (m === 'auto') delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = m;
+  document.getElementById('theme').textContent = 'Theme: ' + m; renderAll();
+}
+document.getElementById('theme').addEventListener('click', () => { mode = (mode + 1) % 3;
+  try { localStorage.setItem('rkv-theme', modes[mode]); } catch (e) {} applyTheme(); });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderAll);
+let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderAll, 120); });
+
+build(); applyTheme();
+window.__RKV = { CARDS, composeCard, exportAllZip };
+</script>
+</body>
+</html>

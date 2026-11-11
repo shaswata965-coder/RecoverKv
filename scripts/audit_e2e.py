@@ -42,7 +42,6 @@ the fixed prefill cost lands in that one gap, undivided, and the decode cost may
 too. The ladder would narrow decode to one of three buckets and prefill to a
 single bucket that is the whole overhead -- useful, not sufficient.
 
-An env A/B on L-reuse cannot fill that hole either: ``STICKYKV_SCORE_LSE_FROM_
 FORWARD=1`` currently MISSES, so both arms would recompute and the delta would
 be zero. There is no switch that isolates ``compute_lse``.
 
@@ -77,7 +76,6 @@ from typing import Any, Dict, List, Optional
 
 # --------------------------------------------------------------------------
 # Rung definitions. Env is applied BEFORE hooks install, which is when
-# STICKYKV_FUSED_DECODE and STICKYKV_SCORE_LSE_FROM_FORWARD are latched.
 # --------------------------------------------------------------------------
 RUNGS = [
     {"id": "0_baseline", "windowed": False, "q": 0.0, "env": {},
@@ -85,10 +83,8 @@ RUNGS = [
     {"id": "1_windowed_q0", "windowed": True, "q": 0.0, "env": {},
      "what": "+ cache bookkeeping, scoring, eviction (no quant, no fused kernel)"},
     {"id": "2_q70_materialize", "windowed": True, "q": 0.70,
-     "env": {"STICKYKV_FUSED_DECODE": "0"},
      "what": "+ int2 Q tier via the materialize path"},
     {"id": "3_q70_fused", "windowed": True, "q": 0.70,
-     "env": {"STICKYKV_FUSED_DECODE": "1"},
      "what": "+ the fused Triton decode kernel (as shipped)"},
 ]
 
@@ -210,6 +206,18 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         "quant_memoize_read": c.get(
             "quant_memoize_read",
             getattr(cfg.cache, "quant_memoize_read", None)),
+        # The read gate's selectivity. Carried for the same reason as everything
+        # else here: without it the profile silently measures the 0.25 default,
+        # so profiling the --gate-ratio 1.0 control arm would report the GATED
+        # path under the ungated arm's name.
+        "quant_gate_ratio": c.get(
+            "quant_gate_ratio",
+            getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+        # Same reason: the card's widths are compile-time constants of both
+        # kernels, so profiling must run the card the config asked for.
+        "quant_card_bits": c.get(
+            "quant_card_bits",
+            getattr(cfg.cache, "quant_card_bits", None)),
         "first_eviction_step": c.get(
             "first_eviction_step",
             getattr(cfg.cache, "first_eviction_step",
@@ -228,6 +236,15 @@ def resolve_cache_kwargs(cfg, q: float, pkg: Optional[str] = None) -> Dict[str, 
         # dropping the DEFAULT is correct. Dropping a value the config actually
         # asked for would silently run a different method.
         if name == "quant_budget_mode" and kw[name] in ("tokens", None):
+            continue
+        # The eager package has no gate at all -- it dequantizes every active
+        # window every step -- so this is dropped at every ratio, matching
+        # utils.cache_factory.quant_gate_ratio_kwargs. Raising instead would
+        # break every existing eager config over a knob that could never have
+        # applied to it, and unlike quant_budget_mode the drop changes how much
+        # is READ, not what is KEPT. That it happened is visible at runtime:
+        # flash_decode.stats() reports gated == 0.
+        if name == "quant_gate_ratio":
             continue
         raise ValueError(
             f"cache package {pkg!r} has no {name!r} field, but the config sets "
@@ -533,7 +550,6 @@ def _report(results: List[Dict[str, Any]], batch: int) -> None:
 def _report_equivalence(results: List[Dict[str, Any]]) -> None:
     """Do the materialize and fused routes emit the same tokens?
 
-    Rungs 2 and 3 differ only by STICKYKV_FUSED_DECODE, so they are the same
     method computed two ways and MUST agree. The fused kernel is the default on
     CUDA and has never been checked against its reference on a GPU, so this is
     the first evidence either way.

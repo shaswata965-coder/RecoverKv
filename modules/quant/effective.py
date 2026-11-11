@@ -26,13 +26,12 @@ head count.
 
 from __future__ import annotations
 
-import os
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
-from .quantizer import dequantize_key_windows
+from .quantizer import QGrid, dequantize_key_windows
 
 
 def _apply_rotary():
@@ -42,6 +41,116 @@ def _apply_rotary():
     except ImportError:  # pragma: no cover - depends on installed model families
         from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
     return apply_rotary_pos_emb
+
+
+def _rotate_half():
+    """HF's own ``rotate_half``, from the same module as ``apply_rotary_pos_emb``.
+
+    Imported rather than restated so the RoPE convention stays HF's. The only
+    thing :func:`_apply_rotary_one` changes is *how many tensors get rotated*,
+    never which halves go where or with what sign.
+
+    **Not used on the compiled eviction path** -- see :func:`_rotate_half_no_cat`,
+    which is bit-identical and is what that path calls. This stays as the
+    reference the equality test compares against.
+    """
+    try:
+        from transformers.models.llama.modeling_llama import rotate_half
+    except ImportError:  # pragma: no cover - depends on installed model families
+        from transformers.models.qwen2.modeling_qwen2 import rotate_half
+    return rotate_half
+
+
+def _rotate_half_no_cat(x: Tensor) -> Tensor:
+    """``rotate_half`` without ``torch.cat``. Bit-identical; see why it must be.
+
+    HF writes the rotation as ``torch.cat((-x2, x1), dim=-1)``. That one line is
+    what made every GPU perf cell ERROR with
+
+        ValueError: The argument '((I)//8)' is not comparable.
+
+    and the message is not about shapes at all, which is why two rounds of
+    forcing ``int()`` on ``.shape`` reads changed nothing. Decoded:
+
+    * ``I`` is **not** the imaginary unit and not a shape symbol. It is
+      ``torch.utils._sympy.functions.Identity`` -- Inductor's "do not expand
+      this" wrapper -- printed as ``I`` because sympy's ``StrPrinter`` has a
+      ``_print_Identity`` written for the identity *matrix* and dispatches on the
+      class *name*. So ``((I)//8)`` is ``FloorDiv(Identity(<expr>), ws)``.
+    * Inductor creates that wrapper in exactly one place:
+      ``_inductor/lowering.py::pointwise_cat``, as
+      ``Identity(idx[dim] - inputs_ranges[i][0])`` -- the shifted index of a
+      ``torch.cat`` lowered as a fused pointwise read. **A cat is the only way to
+      get one.**
+    * It blows up in ``_simplify_loops`` -> ``stride_vars``, which removes the
+      offset by substituting every index var with 0. ``Identity(i - h)`` then
+      becomes ``Identity(-h)`` -- no free symbols -- and sympy rebuilds the
+      enclosing ``Min``/``Max``, whose ``_new_args_filter`` rejects any arg that
+      ``is_number`` but not ``is_comparable``. ``Identity`` is a ``Function``
+      sympy cannot evaluate, so it is exactly that.
+
+    Two consequences worth keeping in mind, because both were got wrong before:
+
+    * ``is_number`` is True on the failing argument, so the value was **already
+      concrete**. A symbolic shape is not what this is, and no amount of
+      ``int()`` can fix it. It is also why the ``dynamic=False`` retry failed
+      with the identical message instead of a different one.
+    * It cannot reproduce on CPU no matter what is compiled, because
+      ``lowering.py::cat`` returns a ``ConcatKernel`` unconditionally for CPU
+      devices ("negative performance impact of pointwise_cat on CPU") and so
+      never builds an ``Identity`` at all. The CPU/GPU split is that branch, not
+      anything about the C++ backend tolerating symbolic ints.
+
+    The rotation itself is pure index motion, so it does not need a cat:
+    view the last axis as ``[2, h]`` (half 0 = ``x1``, half 1 = ``x2``), ``flip``
+    that axis to get ``[x2, x1]``, and scale by ``[-1, +1]``. ``flip`` lowers to
+    an index transform, not a concatenation, so no ``Identity`` is created.
+
+    Bit-identity, not approximate equality: ``x * -1`` flips the sign bit and
+    ``x * 1`` is the identity, for every finite, infinite and subnormal value in
+    every float dtype, so each output element is the same bit pattern HF's
+    ``cat((-x2, x1))`` produces. ``test_rotate_half_no_cat_is_bit_identical``
+    pins it against HF directly.
+    """
+    # int(): a concrete half-width, for the same reason the rest of the compiled
+    # region forces its shape reads. HF writes `x.shape[-1] // 2` raw.
+    h = int(x.shape[-1]) // 2
+    # [..., 2, h] -- reshape, not unflatten, so a non-contiguous caller is handled.
+    u = x.reshape(*x.shape[:-1], 2, h)
+    sign = torch.tensor([[-1.0], [1.0]], dtype=x.dtype, device=x.device)
+    return (u.flip(-2) * sign).reshape(x.shape)
+
+
+def _apply_rotary_one(k: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """RoPE **one** tensor, in place where it is safe to.
+
+    ``apply_rotary_pos_emb(q, k, cos, sin)`` rotates two tensors and returns
+    both. Every caller here wants only the key, and passed the key as *both*
+    arguments -- so the function computed the identical result twice, threw one
+    copy away, and peaked at roughly five key-sized buffers to produce one.
+    At 2048/batch-32 the demote path asked for 3.62 GiB in exactly that spot and
+    the allocator refused (``cache.py`` demote, first eviction, full width).
+
+    This computes HF's expression once:
+
+        (k * cos) + (rotate_half(k) * sin)
+
+    with ``rotate_half`` imported from HF, and with the two adds done in place
+    on tensors this function allocated, so the peak is the input plus two
+    buffers instead of five. Every operation and its order is unchanged, so the
+    result is bit-for-bit what ``apply_rotary_pos_emb(k, k, cos, sin)[1]``
+    returns -- which is asserted directly in
+    ``test_apply_rotary_one_matches_huggingface``.
+    """
+    cos = cos.unsqueeze(1)    # HF's unsqueeze_dim default: the head axis
+    sin = sin.unsqueeze(1)
+    out = k * cos                         # allocation 1 (ours; safe in place)
+    # `_rotate_half_no_cat`, NOT HF's `rotate_half`: bit-identical, and free of
+    # the `torch.cat` whose Inductor lowering emitted the `Identity` node that
+    # made every compiled eviction fail to lower. The whole derivation is in
+    # that function's docstring; this call site is the only reason it exists.
+    tmp = _rotate_half_no_cat(k) * sin    # allocation 2 (ours)
+    return out.add_(tmp)
 
 
 # ---------------------------------------------------------------------------
@@ -57,23 +166,24 @@ def _apply_rotary():
 # reshape/permute), so fusing it is numerically safe: torch.compile lowers it to
 # a single kernel that keeps the fp32 temporaries in registers.
 #
-# Opt-in via ``STICKYKV_COMPILE_READ`` (default off). The dev box has no GPU, so
-# compiling in the CPU test suite only buys first-call Inductor latency and
-# flakiness for no launch-count win; the perf runner sets it for GPU decode. The
-# eager path below is the op-for-op sequence the store used before this change,
-# so with the flag off the read path stays byte-identical.
-
-
-def _compile_read_enabled() -> bool:
-    return os.environ.get("STICKYKV_COMPILE_READ", "0").lower() in (
-        "1", "true", "yes", "on",
-    )
+# This chain no longer runs in production, and the torch.compile fork that used
+# fused two-tier decode kernel hands raw int2 straight to Triton and dequantizes
+# inside the kernel, so ``dequant_rotate_q_keys`` is unreachable there by two
+# independent routes: ``update()`` only falls through to ``_materialize_joint``
+# when the Q tier is EMPTY, and ``effective_q_tier`` returns ``None`` on an empty
+# tier before reaching this. The flag was set to 1 on every CUDA perf run and
+# printed a banner naming a "decode read path" that the run was not taking.
+#
+# What is left is the CPU reference: ``_materialize_joint`` on a box with no
+# fused kernel builds the effective K through here, op for op, and every
+# accuracy test validates against it. That is worth keeping and is not worth
+# compiling -- on CPU a compile buys first-call Inductor latency and nothing else.
 
 
 def _dequant_rotate_flat(
     k_codes: Tensor,
-    k_scale: Tensor,
-    k_zero: Tensor,
+    k_scale: QGrid,
+    k_zero: QGrid,
     window: int,
     cos: Tensor,
     sin: Tensor,
@@ -105,64 +215,10 @@ def _dequant_rotate_flat(
     return k_rot.to(out_dtype)
 
 
-_COMPILED_READ_FN = None
-_READ_ANNOUNCED = {"done": False}
-
-
-def _announce_read_path_once(compiled: bool) -> None:
-    """Print, once per process, which decode read path is live."""
-    if _READ_ANNOUNCED["done"]:
-        return
-    _READ_ANNOUNCED["done"] = True
-    if compiled:
-        print(
-            "[StickyKV] decode read path: COMPILED fused dequant->RoPE kernel "
-            "ACTIVE [OK] (STICKYKV_COMPILE_READ=1)",
-            flush=True,
-        )
-    else:
-        print(
-            "[StickyKV] decode read path: eager dequant->RoPE chain "
-            "(STICKYKV_COMPILE_READ off)",
-            flush=True,
-        )
-
-
-def _read_fn():
-    """Return the fused dequant→RoPE callable, honouring kernel-or-error.
-
-    With ``STICKYKV_COMPILE_READ`` off (default) the eager op-for-op chain runs —
-    the CPU/reference path, byte-identical, always available. With it ON the fused
-    (compiled) kernel is REQUIRED: if ``torch.compile`` fails there is **no** silent
-    fallback to the ~20-launch eager chain, because that is the decode analog of
-    the prefill PyTorch fallback we removed — slower, and invisible in the numbers.
-    Compiles once, lazily, ``dynamic=True`` so the varying active-window count ``n``
-    does not recompile every eviction.
-    """
-    global _COMPILED_READ_FN
-    if not _compile_read_enabled():
-        _announce_read_path_once(compiled=False)
-        return _dequant_rotate_flat
-    if _COMPILED_READ_FN is None:
-        try:
-            _COMPILED_READ_FN = torch.compile(_dequant_rotate_flat, dynamic=True)
-        except Exception as e:
-            raise RuntimeError(
-                "STICKYKV_COMPILE_READ is set but torch.compile of the fused "
-                f"decode read path failed ({type(e).__name__}: {e}). The fused "
-                "read kernel is required when enabled — there is no silent "
-                "fallback to the eager dequant->RoPE chain (kernel-or-error, as "
-                "on the prefill score path). Unset STICKYKV_COMPILE_READ to run "
-                "the eager reference."
-            ) from e
-    _announce_read_path_once(compiled=True)
-    return _COMPILED_READ_FN
-
-
 def dequant_rotate_q_keys(
     k_codes: Tensor,
-    k_scale: Tensor,
-    k_zero: Tensor,
+    k_scale: QGrid,
+    k_zero: QGrid,
     window: int,
     pos_flat: Tensor,
     rope_module: torch.nn.Module,
@@ -175,8 +231,7 @@ def dequant_rotate_q_keys(
     """Read-path Q-tier keys: dequantize + RoPE, fused.
 
     Equivalent to ``rotate_key_window(dequant(...).reshape/permute, pos_flat)`` in
-    the store, but routed through :func:`_dequant_rotate_flat` so the whole chain
-    can be a single compiled kernel. ``cos``/``sin`` depend only on the positions
+    the store. ``cos``/``sin`` depend only on the positions
     and the ``out_dtype``/device (not the key values), so we build them from a
     tiny reference tensor — bit-identical to computing them from the dequantized
     keys as the eager path did.
@@ -184,13 +239,7 @@ def dequant_rotate_q_keys(
     ref = torch.empty(1, 1, 1, dtype=out_dtype, device=pos_flat.device)
     cos, sin = _rope_cos_sin(rope_module, ref, pos_flat)
     apply_rotary = _apply_rotary()
-    fn = _read_fn()
-    # No silent fallback: with COMPILE_READ off, fn IS the eager chain; with it on,
-    # fn is the compiled kernel and any failure propagates (kernel-or-error, see
-    # _read_fn). The eager and compiled paths are the same op sequence, so a
-    # runtime failure in the compiled one is a real failure — not a reason to
-    # quietly run the slow path under the fast path's name.
-    return fn(
+    return _dequant_rotate_flat(
         k_codes, k_scale, k_zero, window, cos, sin,
         out_dtype, B, n, H, D, apply_rotary,
     )
@@ -223,11 +272,10 @@ def unrotate_key_window(
     position_range : ``[window]`` or ``[B, window]`` int64
         The window's original positions.
     """
-    apply_rotary_pos_emb = _apply_rotary()
     batched = key_post_rope.dim() == 4
     k = key_post_rope if batched else key_post_rope.unsqueeze(0)
     cos, sin = _rope_cos_sin(rope_module, k, position_range)
-    _, k_un = apply_rotary_pos_emb(k, k, cos, -sin)
+    k_un = _apply_rotary_one(k, cos, -sin)
     return k_un if batched else k_un.squeeze(0)
 
 
@@ -241,11 +289,10 @@ def rotate_key_window(
     Accepts ``[H_kv, window, D]`` with ``[window]`` positions, or
     ``[B, H_kv, window, D]`` with ``[B, window]``.
     """
-    apply_rotary_pos_emb = _apply_rotary()
     batched = key_pre_rope.dim() == 4
     k = key_pre_rope if batched else key_pre_rope.unsqueeze(0)
     cos, sin = _rope_cos_sin(rope_module, k, position_range)
-    _, k_rot = apply_rotary_pos_emb(k, k, cos, sin)
+    k_rot = _apply_rotary_one(k, cos, sin)
     return k_rot if batched else k_rot.squeeze(0)
 
 

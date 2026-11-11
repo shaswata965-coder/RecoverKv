@@ -83,26 +83,56 @@ def test_dispatcher_is_triton_or_error_on_cpu():
         fused_two_tier_decode(q, k, v, None, 8 ** -0.5)   # qtier=None (empty Q)
 
 
-def test_fused_decode_enabled_default_and_off(monkeypatch):
-    """Fused decode is ON by default and honours STICKYKV_FUSED_DECODE=0."""
+def test_there_is_no_switch_that_selects_a_different_decode(monkeypatch):
+    """One decode on the flash backend; the device picks it, not an env var.
+
+    STICKYKV_FUSED_DECODE used to route a production run to the materialize
+    path — a second, slower implementation of the same method, chosen by a
+    variable nobody reads back when quoting a number. The materialize path
+    survives as the CPU oracle; it is not reachable as an alternative.
+    """
+    import inspect
+
+    from modules.windowed_cache import decode_kernel as dk
+
     monkeypatch.delenv("STICKYKV_FUSED_DECODE", raising=False)
     assert fused_decode_enabled() is True
     monkeypatch.setenv("STICKYKV_FUSED_DECODE", "0")
-    assert fused_decode_enabled() is False
+    assert fused_decode_enabled() is True, (
+        "the off-switch must be gone, not merely defaulted on")
+    assert "os.environ" not in inspect.getsource(dk.fused_decode_enabled)
 
 
-def test_gate_raises_without_triton():
-    """The flash-backend gate refuses to run without a launchable decode kernel."""
+def test_gate_raises_without_triton(monkeypatch):
+    """The flash-backend gate refuses to run without a launchable decode kernel.
+
+    Triton is forced absent rather than assumed absent: torch ships it as a
+    dependency on Linux, so a box that has torch usually has triton and this
+    test asserted a fact about the machine instead of one about the code.
+    """
+    from modules.windowed_cache import decode_kernel as dk
+
+    monkeypatch.setattr(dk, "_HAS_TRITON", False)
     with pytest.raises(RuntimeError, match="fused two-tier decode Triton kernel"):
-        assert_decode_kernel_available(True)   # CPU box: triton absent
+        assert_decode_kernel_available(True)
     assert "WILL ERROR" in describe_decode_backend(True)
 
 
-def test_gate_is_noop_when_fused_disabled(monkeypatch):
-    """With fused decode disabled, the gate does not raise (materialize fallback)."""
+def test_the_backend_gate_cannot_be_talked_out_of_requiring_the_kernel(monkeypatch):
+    """No env value makes the flash backend accept a missing decode kernel.
+
+    It used to: STICKYKV_FUSED_DECODE=0 turned the Triton-or-error contract
+    into a silent materialize run.
+    """
+    from modules.windowed_cache import decode_kernel as dk
+
+    # Force the kernel unavailable regardless of what this box has installed —
+    # the point is that the env var can no longer wave the requirement away.
+    monkeypatch.setattr(dk, "_HAS_TRITON", False)
     monkeypatch.setenv("STICKYKV_FUSED_DECODE", "0")
-    assert_decode_kernel_available(True)        # must not raise
-    assert "disabled" in describe_decode_backend(True)
+    with pytest.raises(RuntimeError, match="fused two-tier decode Triton kernel"):
+        assert_decode_kernel_available(True)
+    assert "disabled" not in describe_decode_backend(True)
 
 
 # NOTE: the Triton kernel (_two_tier_decode_kernel) has no CPU test by construction
@@ -154,21 +184,24 @@ def test_unrelated_errors_are_not_swallowed_by_the_ladder():
     assert not _is_out_of_resources(RuntimeError("CUDA error: out of memory"))
 
 
-def test_fit_ladder_is_ordered_fastest_first_and_terminates():
+def test_every_fit_ladder_rung_is_launchable():
+    """Each rung must name a legal launch. Ordering is NOT asserted any more.
+
+    The ladder used to be first-fit, so its order *was* the policy and
+    "widest-first" was the claim being made. It is now timed (`_search_rungs`),
+    so every rung that fits is measured and the fastest wins — the order only
+    decides the sequence of the announcement. What still has to hold is that no
+    rung can turn a fit problem into a crash.
+    """
     from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
 
     assert len(_FIT_LADDER) >= 2
-    keys = [k for k, _ in _FIT_LADDER]
-    assert keys == sorted(keys, reverse=True), "biggest tile must be tried first"
-    # every rung yields a legal, shrinking tile at the shipped window size
-    seen = []
-    for target_keys, num_stages in _FIT_LADDER:
+    for target_keys, num_stages, num_warps in _FIT_LADDER:
         nw, t = window_tiling(8, target_keys)
         assert nw >= 1 and t & (t - 1) == 0
         assert num_stages >= 1
-        seen.append(nw)
-    assert seen[0] >= seen[-1], "tiles must not grow as the ladder steps down"
-    assert seen[-1] >= 1, "the last rung must still be launchable"
+        assert num_warps >= 1 and num_warps & (num_warps - 1) == 0, (
+            f"num_warps={num_warps} is not a power of two")
 
 
 @pytest.mark.parametrize("ws", [1, 4, 8, 12, 32, 128])
@@ -177,8 +210,89 @@ def test_every_ladder_rung_is_a_legal_tiling(ws):
     the next one, turning a fit problem into a crash."""
     from modules.windowed_cache.decode_kernel import _FIT_LADDER, window_tiling
 
-    for target_keys, _ in _FIT_LADDER:
+    for target_keys, _, _ in _FIT_LADDER:
         nw, t = window_tiling(ws, target_keys)
         assert nw >= 1, f"ws={ws} target={target_keys} produced {nw} windows/tile"
         assert nw * ws <= t
         assert t & (t - 1) == 0
+
+
+# ---------------------------------------------------------------------------
+# The tile ladder (D3): the missing (64, 1) rung, and pinning one to measure it
+# ---------------------------------------------------------------------------
+
+
+def test_the_ladder_can_drop_a_stage_before_it_drops_the_tile():
+    """``num_stages`` is shared memory too, so it is the cheaper thing to give up.
+
+    Triton's software pipeliner allocates ``num_stages`` copies of the loop's
+    shared-memory operands, so 2 -> 1 roughly halves the staging at the SAME
+    tile. Without a ``(64, 1)`` rung a kernel that just missed ``(64, 2)`` fell
+    straight to ``target_keys=32`` and doubled its serial Q-tier iterations --
+    23 -> 45 at ``ws=8`` -- to buy memory one fewer stage would also have bought.
+
+    The GATED variant is the one at risk: ``GATED`` is a ``constexpr`` so it is a
+    separate compile, and it stages strictly more than the ungated kernel (the
+    ``SEL`` loads, ``LOGM``, the prologue, the §5 fill).
+    """
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER
+
+    widest = max(k for k, _, _ in _FIT_LADDER)
+    at_top = {s for k, s, _ in _FIT_LADDER if k == widest}
+    assert len(at_top) > 1, (
+        f"the ladder offers only num_stages={sorted(at_top)} at "
+        f"target_keys={widest}, so a kernel that cannot fit the widest tile has "
+        "to halve the tile instead of dropping a pipeline stage first"
+    )
+
+
+def test_every_rung_is_distinct():
+    from modules.windowed_cache.decode_kernel import _FIT_LADDER
+    assert len(set(_FIT_LADDER)) == len(_FIT_LADDER)
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("64x2", (64, 2)), ("32x1", (32, 1)), ("16X2", (16, 2)), ("64", (64, 1)),
+])
+def test_the_tile_override_parses(raw, want, monkeypatch):
+    """``STICKYKV_DECODE_TILE`` is the arm that prices the ladder's ordering.
+
+    The ladder falls on ``OutOfResources`` and never benchmarks, so "the first
+    rung that fits is the fastest" is a claim, not a measurement. Pinning two
+    rungs and running the table twice is how it gets checked -- and every rung is
+    bit-identical, so the comparison is pure speed.
+    """
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", raw)
+    assert _tile_override() == want
+
+
+def test_no_override_means_the_ladder(monkeypatch):
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.delenv("STICKYKV_DECODE_TILE", raising=False)
+    assert _tile_override() is None
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", "  ")
+    assert _tile_override() is None
+
+
+@pytest.mark.parametrize("raw", ["sixty-four", "64x", "0x2", "64x0", "64xx2"])
+def test_a_malformed_override_raises_rather_than_being_ignored(raw, monkeypatch):
+    """A pin that silently did nothing would report the ladder's rung under the
+    pinned rung's label -- the exact failure mode this repo keeps finding."""
+    from modules.windowed_cache.decode_kernel import _tile_override
+    monkeypatch.setenv("STICKYKV_DECODE_TILE", raw)
+    with pytest.raises(ValueError):
+        _tile_override()
+
+
+def test_fit_choice_is_readable_and_a_copy():
+    """The chosen rung has to be ASKABLE, not caught in warmup scrollback."""
+    from modules.windowed_cache import decode_kernel as dk
+    dk._FIT_CHOICE[("probe",)] = (64, 2, 4)
+    try:
+        got = dk.fit_choice()
+        assert got[("probe",)] == (64, 2, 4)
+        got.clear()
+        assert ("probe",) in dk._FIT_CHOICE, "fit_choice must return a copy"
+    finally:
+        dk._FIT_CHOICE.pop(("probe",), None)

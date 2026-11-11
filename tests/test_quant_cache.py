@@ -265,14 +265,18 @@ def test_fused_ctx_dequant_matches_effective_q_tier():
 
 
 class TestReadMemoization:
-    """The Q-tier read memo is configurable and OFF by default above B=1.
+    """The Q-tier read memo, now that the gate has superseded it.
 
-    It caches the dequantized + RoPE'd Q tier between evictions — correct and
-    free at B=1, where decode is weight-bound (BATCHING_PLAN.md §5) and the memo
-    saves 7 of every 8 steps' dequant at window_size=8. Above B=1 it is charged
-    per row: measured at the qasper steady state it holds ~149 MB/row against
-    ~131 MB/row of actual two-tier KV, so it more than doubles per-row memory and
-    halves the batch that fits — and batch capacity is the entire thesis.
+    The memo cached the whole dequantized + RoPE'd Q tier between evictions,
+    keyed on ``store.version``. That key only moves at eviction, while the gate's
+    selected set moves every step -- so a memo beside a live gate would serve a
+    set the gate did not choose. And the gate is not optional: it is the read
+    path wherever a Q tier exists.
+
+    So the memo is now unreachable in any configuration that has a store, and
+    these tests say so rather than pretending the old batch heuristic still
+    decides anything. The mechanism is kept because ``effective_q_tier`` remains
+    the gated path's test oracle; it is no longer a production read path.
     """
 
     def _cache(self, memo, q=0.5):
@@ -286,21 +290,23 @@ class TestReadMemoization:
             num_layers=1, max_tokens=8,
         )
 
-    def test_auto_default_is_on_at_b1_off_above(self):
-        c = self._cache(None)
-        c._resolve_memoization(1)
-        assert c._stores[0].memoize_read is True
-        c = self._cache(None)
-        c._resolve_memoization(4)
-        assert c._stores[0].memoize_read is False, (
-            "the memo must default OFF at B>1 — it costs ~149 MB/row and halves "
-            "max batch, which is what the method exists to raise"
-        )
+    def test_memo_is_off_wherever_a_q_tier_exists(self):
+        """No batch size turns it back on: the gate wins unconditionally."""
+        for batch in (1, 4, 32):
+            c = self._cache(None)
+            c._resolve_memoization(batch)
+            assert c._stores[0].memoize_read is False, (
+                f"B={batch}: the gate is the read path, so the whole-tier memo "
+                "must be off -- it is keyed on store.version, which does not "
+                "move between evictions, while the selected set moves every step"
+            )
 
-    def test_explicit_setting_overrides_the_batch_heuristic(self):
-        c = self._cache(True)
-        c._resolve_memoization(8)
-        assert c._stores[0].memoize_read is True
+    def test_asking_for_the_memo_beside_a_q_tier_is_a_config_error(self):
+        """Kernel-or-error, applied to config: no silently ignored request."""
+        with pytest.raises(ValueError, match="quant_memoize_read"):
+            self._cache(True)
+
+    def test_explicit_false_is_accepted_and_redundant(self):
         c = self._cache(False)
         c._resolve_memoization(1)
         assert c._stores[0].memoize_read is False
@@ -311,11 +317,20 @@ class TestReadMemoization:
         Codes and grids are written once at first demotion and position_range is
         never rebased (§10), so the dequant + RoPE cannot move between evictions.
         If these ever diverged, the memo would be serving stale reads.
+
+        The flag is set on the store directly rather than through config, because
+        config now refuses to pair the memo with a Q tier. The mechanism is still
+        worth pinning: ``effective_q_tier`` is the gated path's test oracle, and
+        an oracle that can serve a stale read is not one.
         """
         ws, H, D, prefill = 4, 2, 4, 16
         outs = []
         for memo in (True, False):
-            c = self._cache(memo)
+            c = self._cache(None)
+            for st_ in c._stores:
+                if st_ is not None:
+                    st_.memoize_read = memo
+            c._memoization_resolved = True
             c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 2, 2, 1
             torch.manual_seed(5)
             kp = torch.randn(1, H, prefill, D)
@@ -796,118 +811,8 @@ def test_b_gt_1_end_to_end_invariants(B):
 
 
 # ---------------------------------------------------------------------------
-# Flash / eager backend parity (shared cache.py ⇒ identical two-tier results)
+# The memoized fused hand-off
 # ---------------------------------------------------------------------------
-
-from modules.windowed_eager_cache.cache import WindowedCache as EagerWindowedCache
-from modules.windowed_eager_cache.config import WindowedCacheConfig as EagerCfg
-
-
-@pytest.mark.parametrize("B", [1, 4])
-def test_flash_eager_two_tier_parity(B):
-    """The twins share cache.py, so their two-tier results must be identical —
-    at B>1 as well as B=1, since batching is a cache.py-level change."""
-    ws, num_sink, H, D, prefill = 4, 0, 2, 4, 16
-
-    def build(EWC, ECfg):
-        cfg = ECfg(window_size=ws, num_sink_tokens=num_sink, local_window_size=ws,
-                   cache_budget=0.5, quant_ratio=0.5)
-        c = EWC(config=cfg, prefill_len=prefill, model_config=_FakeModelConfig(),
-                kv_dtype=torch.float32, rope_module=_RealRoPE(4), num_layers=1, max_tokens=8)
-        c._policies[0].top_k_fp, c._policies[0].N_q, c._policies[0].local_windows = 2, 2, 1
-        return c
-
-    flash = build(WindowedCache, WindowedCacheConfig)
-    eager = build(EagerWindowedCache, EagerCfg)
-
-    torch.manual_seed(3)
-    kp = torch.randn(B, H, prefill, D); vp = torch.randn(B, H, prefill, D)
-    sc0 = _rows_diverge_scores(B, H, 12)[0][:, :, :_merged_W(flash, ws, num_sink, prefill)]
-    fk, _ = flash.update(kp.clone(), vp.clone(), 0,
-                         cache_kwargs={"cache_position": torch.arange(prefill), "window_scores": sc0.clone()})
-    ek, _ = eager.update(kp.clone(), vp.clone(), 0,
-                         cache_kwargs={"cache_position": torch.arange(prefill), "window_scores": sc0.clone()})
-    assert torch.equal(fk, ek)
-
-    pool = _rows_diverge_scores(B, H, 12)
-    for i, t in enumerate(range(prefill, prefill + 12)):
-        k1 = torch.randn(B, H, 1, D); v1 = torch.randn(B, H, 1, D)
-        Wf = _merged_W(flash, ws, num_sink, flash._states[0].seq_length)
-        sc = pool[i + 1][:, :, :Wf]
-        fk, fv = flash.update(k1.clone(), v1.clone(), 0,
-                              cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
-        ek, ev = eager.update(k1.clone(), v1.clone(), 0,
-                              cache_kwargs={"cache_position": torch.arange(t, t + 1), "window_scores": sc.clone()})
-        assert torch.equal(fk, ek) and torch.equal(fv, ev)
-        fa, ea = flash._stores[0].active_ids(), eager._stores[0].active_ids()
-        assert (fa is None and ea is None) or torch.equal(fa, ea)
-        assert flash.get_seq_length(0) == eager.get_seq_length(0)
-
-
-# ---------------------------------------------------------------------------
-# Fused hand-off memoization — the per-layer/per-step launch-overhead fix.
-# The claim under test is EQUIVALENCE, not speed: what the memo hands back must
-# be what a recompute would have produced, tensor for tensor.
-# ---------------------------------------------------------------------------
-
-
-def _fresh_fused_ctx(cache, layer_idx=0):
-    """Rebuild the fused hand-off from scratch — the pre-memo code path, verbatim."""
-    from modules.windowed_cache.decode_kernel import rope_cos_sin_halves
-    from modules.quant.effective import compute_score_meta
-
-    state = cache._states[layer_idx]
-    store = cache._stores[layer_idx]
-    n = store.num_active_windows
-    B = state.key_states.shape[0]
-    ws = cache.resolved.window_size
-    idx = store.table.active_order(n)
-    kc, ks, kz, vc, vs, vz, qpos = store.table.gather(idx)
-    qtier = {
-        "k_codes": kc.reshape(B, n, *kc.shape[1:]),
-        "k_scale": ks.reshape(B, n, *ks.shape[1:]),
-        "k_zero": kz.reshape(B, n, *kz.shape[1:]),
-        "v_codes": vc.reshape(B, n, *vc.shape[1:]),
-        "v_scale": vs.reshape(B, n, *vs.shape[1:]),
-        "v_zero": vz.reshape(B, n, *vz.shape[1:]),
-    }
-    qpos_flat = qpos.reshape(B, n * ws)
-    qtier["cos"], qtier["sin"] = rope_cos_sin_halves(cache.rope_module, qpos_flat)
-    meta = compute_score_meta(
-        state.position_ids, qpos_flat, cache.resolved.num_sink_tokens, ws
-    )
-    return qtier, meta
-
-
-def _seeded_fused_cache(ws=4):
-    """A layer-0 cache past its first two-tier eviction, armed for fused decode."""
-    cache = _make_cache(quant_ratio=0.5, ws=ws, num_sink=0)
-    _seed_prefill_state(cache, n_win=4, ws=ws)
-    st = cache._states[0]
-    st.window_scores = torch.zeros(1, 2, 4)
-    st.window_scores[0, :, 0] = 100.0
-    st.window_scores[0, :, 1] = 50.0
-    st.window_scores[0, :, 2] = 10.0
-    st.original_window_ids = torch.tensor([[0, 1, 2, 3]])
-    pol = cache._policies[0]
-    pol.top_k_fp, pol.N_q, pol.local_windows = 1, 1, 1
-    cache._evict_two_tier(0, step=2)
-    cache._prefill_done[0] = True
-    cache._fused_decode_active = True
-    return cache
-
-
-def _drive_decode_step(cache, pos):
-    """One decode update(); returns the ctx the fused path armed (and disarms it)."""
-    from modules.windowed_cache import flash_decode
-
-    k = torch.randn(1, 2, 1, 4)
-    cache.update(k, k.clone(), 0,
-                 cache_kwargs={"cache_position": torch.tensor([pos])})
-    ctx = flash_decode._PENDING["ctx"]
-    # Stand in for the wrapper consuming it (the Triton launch is GPU-only).
-    flash_decode._PENDING["ctx"] = None
-    return ctx
 
 
 def test_memoized_fused_ctx_equals_a_fresh_rebuild_every_step():
@@ -1025,7 +930,12 @@ class TestFusedDecodeProofOfExecution:
             flash_decode._PENDING["ctx"] = None        # wrapper consumes
             flash_decode._STATS["fired"] += 1
         flash_decode.clear()
-        assert flash_decode.stats() == {"armed": 3, "fired": 3}
+        s = flash_decode.stats()
+        assert (s["armed"], s["fired"]) == (3, 3)
+        # Driving the hand-off by hand never reaches the gate, and the gate
+        # counters must not move on the strength of the kernel having run —
+        # telling those two apart is the whole point of counting them.
+        assert s["gated"] == 0 and s["read_fraction"] is None
 
     def test_wrapper_passes_through_and_counts_only_fused_calls(self):
         from modules.windowed_cache import flash_decode
@@ -1052,6 +962,14 @@ def _run_decode_across_eviction(compile_backend=None, seed=1234):
     from modules.windowed_cache import cache as cache_mod
     from modules.windowed_cache import flash_decode
 
+    # NOTE: both variables below are INERT since 0974687 ("one production path,
+    # no fallbacks") -- `modules/windowed_cache/cache.py` reads no environment
+    # variable at all and compiles the eviction unconditionally. They are still
+    # set/restored so this fixture leaves the process environment as it found it,
+    # but `compile_backend=None` does NOT give an eager eviction any more: both
+    # arms run the same compiled body, so a test here comparing "eager" against
+    # "compiled" is comparing a path to itself. What still does the real work is
+    # the process-global reset below.
     prev = os.environ.get("STICKYKV_COMPILE_EVICT")
     prev_b = os.environ.get("STICKYKV_COMPILE_EVICT_BACKEND")
     if compile_backend is not None:
@@ -1275,3 +1193,188 @@ def test_compile_failure_leaves_cache_state_untouched():
         else: os.environ["STICKYKV_COMPILE_EVICT"] = prev
         if prev_b is None: os.environ.pop("STICKYKV_COMPILE_EVICT_BACKEND", None)
         else: os.environ["STICKYKV_COMPILE_EVICT_BACKEND"] = prev_b
+
+
+def test_evict_oom_is_not_recorded_as_a_build_failure():
+    """An OOM in the eviction must not poison every later cell of a sweep.
+
+    `_EVICT_COMPILE_FAILED` is sticky on purpose: it means *this build cannot
+    lower the eviction body*, which is true of every later cell too, so re-trying
+    the compile per cell is waste. An out-of-memory condition is the opposite
+    kind of fact -- it is about THIS cell's shape and the allocator's
+    fragmentation at that moment, and the next cell may be half the size and
+    fine.
+
+    Conflating them turned one bad cell into a dead table: a 2048/batch-32 cell
+    ran out of memory, its OOM was filed as a build failure, and all six rows of
+    `table_v5_graph` then reported "already failed on this build" -- a claim that
+    was false for five of them and that also hid which cell actually ran out of
+    memory.
+
+    So: the OOM propagates as itself, and the sticky record stays clean.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _oom_boom(gm, example_inputs):
+        raise torch.cuda.OutOfMemoryError(
+            "CUDA out of memory. Tried to allocate 7.25 GiB")
+
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            _run_decode_across_eviction(compile_backend="_oom_boom")
+        assert evict_compile_failed() is None, (
+            "an OOM was recorded as a build-wide lowering failure; every later "
+            "cell in the sweep would now fail fast with someone else's reason"
+        )
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_wrapped_oom_is_re_raised_as_an_oom():
+    """torch.compile may deliver the OOM wrapped; the runner catches by TYPE.
+
+    `perf_runner` marks a cell `oom` (skipped, and legitimate max-B evidence) by
+    `except torch.cuda.OutOfMemoryError`, and everything else `errored` -- which
+    its own log line calls "NOT max-B evidence". Re-raising a Dynamo wrapper
+    around a genuine OOM would file it under the wrong one of those two, so the
+    cause chain is unwrapped and the OOM itself is what propagates.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _wrapped_oom_boom(gm, example_inputs):
+        try:
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 3.62 GiB")
+        except torch.cuda.OutOfMemoryError as inner:
+            raise RuntimeError("backend compiler failed") from inner
+
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            _run_decode_across_eviction(compile_backend="_wrapped_oom_boom")
+        assert evict_compile_failed() is None
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_a_real_lowering_failure_is_still_sticky():
+    """The other half of the contract: a build failure MUST stay sticky.
+
+    Loosening the OOM case must not loosen this one -- a body torch.compile
+    cannot lower will fail identically on every remaining cell, and re-attempting
+    the compile each time costs minutes of a sweep for a known answer.
+    """
+    pytest.importorskip("torch")
+    from torch._dynamo import register_backend
+    from modules.windowed_cache import cache as cache_mod
+    from modules.windowed_cache.cache import evict_compile_failed
+
+    @register_backend
+    def _plain_lowering_boom(gm, example_inputs):
+        raise RuntimeError("LoweringException: aten.amin.default did not lower")
+
+    try:
+        with pytest.raises(RuntimeError, match="KERNEL-OR-ERROR"):
+            _run_decode_across_eviction(compile_backend="_plain_lowering_boom")
+        reason = evict_compile_failed()
+        assert reason and "amin" in reason, reason
+    finally:
+        cache_mod._COMPILED_EVICT_FN = None
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRACEBACK = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+
+
+def test_oom_keeps_the_compiled_fn_and_the_static_retry():
+    """An OOM must leave the dispatch state exactly as it found it.
+
+    Three globals decide what the NEXT cell does: `_EVICT_COMPILE_FAILED` (fail
+    fast with a recorded reason), `_COMPILED_EVICT_FN` (reuse the built graph),
+    and `_EVICT_COMPILE_TRIED_STATIC` (the one-shot `dynamic=False` retry). A
+    lowering failure legitimately consumes all three. An OOM must consume none
+    of them -- it says nothing about whether the body lowers, and spending the
+    static retry on it would mean a later, genuine lowering failure never gets
+    the retry that is there to rescue it.
+
+    Driven through `_run_compiled_evict` directly so the assertions can be made
+    before any fixture teardown resets the globals.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from modules.windowed_cache import cache as cache_mod
+
+    def _oom_fn(cache, state, store, policy):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 7.25 GiB")
+
+    prev = (cache_mod._COMPILED_EVICT_FN, cache_mod._EVICT_COMPILE_FAILED,
+            cache_mod._EVICT_COMPILE_TRIED_STATIC)
+    try:
+        cache_mod._EVICT_COMPILE_FAILED = None
+        cache_mod._EVICT_COMPILE_TRIED_STATIC = False
+        cache_mod._COMPILED_EVICT_FN = _oom_fn
+        cache_mod._EVICT_ANNOUNCED["done"] = True
+
+        with pytest.raises(torch.cuda.OutOfMemoryError):
+            cache_mod._run_compiled_evict(
+                object(), object(), object(), object(), 8)
+
+        assert cache_mod._EVICT_COMPILE_FAILED is None, (
+            "an OOM was filed as a build-wide lowering failure")
+        assert cache_mod._COMPILED_EVICT_FN is _oom_fn, (
+            "the compiled fn was discarded on an OOM; the next cell would pay a "
+            "fresh compile for a failure that was never about lowering")
+        assert cache_mod._EVICT_COMPILE_TRIED_STATIC is False, (
+            "an OOM burned the one-shot dynamic=False retry, which exists for "
+            "lowering failures")
+    finally:
+        (cache_mod._COMPILED_EVICT_FN, cache_mod._EVICT_COMPILE_FAILED,
+         cache_mod._EVICT_COMPILE_TRIED_STATIC) = prev
+
+
+def test_cuda_oom_cause_prefers_the_typed_exception_over_the_message():
+    """Unwrap by type across the whole chain, not by text depth-first.
+
+    Dynamo's `BackendCompilerFailed` repeats the inner error's message verbatim,
+    so a depth-first text match returns the WRAPPER -- the one type
+    `perf_runner` does not catch as an OOM. The chain is searched for a typed
+    OOM first, everywhere, before the message is consulted at all.
+    """
+    pytest.importorskip("torch")
+    import torch
+    from modules.windowed_cache.cache import _cuda_oom_cause
+
+    assert _cuda_oom_cause(RuntimeError("LoweringException: amin")) is None
+
+    bare = torch.cuda.OutOfMemoryError("CUDA out of memory. Tried 1 GiB")
+    assert _cuda_oom_cause(bare) is bare
+
+    try:
+        try:
+            raise bare
+        except torch.cuda.OutOfMemoryError as inner:
+            raise RuntimeError(f"backend='x' raised:\n{inner}") from inner
+    except RuntimeError as wrapped:
+        found = _cuda_oom_cause(wrapped)
+    assert found is bare, (
+        "returned the wrapper, whose text merely repeats the OOM message")
+
+    # A wrapper with no typed OOM anywhere still classifies as one, normalised
+    # to the type the runner catches, with the original kept as the cause.
+    textonly = RuntimeError("CUDA out of memory. Tried to allocate 3.62 GiB")
+    norm = _cuda_oom_cause(textonly)
+    assert isinstance(norm, torch.cuda.OutOfMemoryError)
+    assert norm.__cause__ is textonly

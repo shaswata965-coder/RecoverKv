@@ -21,6 +21,18 @@ directories are walked in sorted path order):
     <file>.txt               exactly one article
     <dir>/                   every .txt / .jsonl / .ndjson / .json inside,
                              recursively, sorted by path
+    <save_to_disk dir>/      a HuggingFace ``datasets.save_to_disk`` directory
+                             (has ``dataset_info.json``) -- e.g. the RULER
+                             splits -- read with ``load_from_disk``, on-disk order
+
+Two knobs make benchmark files usable as parity corpora:
+
+* ``text_field`` -- LongBench records carry both ``input`` (the question) and
+  ``context`` (the long document), and auto-detection reaches ``input`` first,
+  so a LongBench jsonl needs ``text_field="context"``;
+* ``record_filter`` -- ``"key=value"``; keep only records whose ``key`` field
+  equals ``value`` (``"task=niah_single_3"`` picks one RULER task out of the
+  13 interleaved in one split).
 
 For object records the text field is auto-detected from ``_TEXT_FIELDS`` in
 priority order; if none matches and the record has exactly one string-valued
@@ -62,10 +74,18 @@ class CorpusLoader:
                     "input", "prompt", "context")
 
     def __init__(self, dataset: str, cache_dir: Optional[str] = None,
-                 text_field: Optional[str] = None) -> None:
+                 text_field: Optional[str] = None,
+                 record_filter: Optional[str] = None) -> None:
         self.dataset = dataset
         self.cache_dir = cache_dir
-        self.text_field = text_field
+        self.text_field = text_field or None
+        self.record_filter: Optional[tuple] = None
+        if record_filter:
+            key, sep, value = str(record_filter).partition("=")
+            if not sep or not key.strip():
+                raise ValueError(
+                    f"record_filter must be 'key=value', got {record_filter!r}")
+            self.record_filter = (key.strip(), value.strip())
         self._articles: Optional[List[str]] = None
 
         spec = dataset[len(_LOCAL_PREFIX):] if dataset.startswith(_LOCAL_PREFIX) \
@@ -91,6 +111,10 @@ class CorpusLoader:
         runners' default npz names stay valid paths.
         """
         raw = self.local_path.stem if self.local_path is not None else self.dataset
+        if self.record_filter is not None:
+            # One RULER split holds 13 tasks; without the value in the name two
+            # tasks' parity npzs would share a default filename.
+            raw = f"{raw}-{self.record_filter[1]}"
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-")
         return slug or "corpus"
 
@@ -128,8 +152,19 @@ class CorpusLoader:
     # Local corpora
     # ------------------------------------------------------------------
 
+    def _keep(self, record) -> bool:
+        """``record_filter`` test. Bare-string records carry no fields: dropped."""
+        if self.record_filter is None:
+            return True
+        if not isinstance(record, dict):
+            return False
+        key, value = self.record_filter
+        return str(record.get(key)) == value
+
     def _extract_text(self, record, origin: str) -> Optional[str]:
         """Pull the article text out of one JSON record."""
+        if not self._keep(record):
+            return None
         if isinstance(record, str):
             return record
         if not isinstance(record, dict):
@@ -188,9 +223,34 @@ class CorpusLoader:
             return [t for t in texts if t]
         raise ValueError(f"{path}: unsupported corpus file type {suffix!r}")
 
+    def _load_saved_dataset(self, path: Path) -> List[str]:
+        """A ``datasets.save_to_disk`` directory, records in on-disk order."""
+        from datasets import load_from_disk  # type: ignore[import-untyped]
+
+        ds = load_from_disk(str(path))
+        out = []
+        for i, record in enumerate(ds):
+            text = self._extract_text(dict(record), f"{path}[{i}]")
+            if text:
+                out.append(text)
+        return out
+
     def _load_local(self) -> List[str]:
         path = self.local_path
         assert path is not None
+        if path.is_dir() and (path / "dataset_info.json").exists():
+            articles = [a.strip() for a in self._load_saved_dataset(path)
+                        if a and a.strip()]
+            if not articles:
+                raise ValueError(
+                    f"save_to_disk dataset {path} produced no non-empty articles"
+                    + (f" matching {self.record_filter}" if self.record_filter
+                       else ""))
+            log.info("Loaded saved dataset %s: %d article(s)%s", path,
+                     len(articles),
+                     f" matching {self.record_filter}" if self.record_filter
+                     else "")
+            return articles
         if path.is_dir():
             files = sorted(
                 p for p in path.rglob("*")

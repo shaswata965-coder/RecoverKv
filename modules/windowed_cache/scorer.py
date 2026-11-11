@@ -164,3 +164,78 @@ def accumulate(state_scores: Tensor, new_scores: Tensor) -> Tensor:
     """
     state_scores += new_scores
     return state_scores
+
+
+def fill_skipped_window_scores(
+    exact: Tensor,
+    keep: Tensor,
+    logmass: Tensor,
+) -> Tensor:
+    """Complete the Q-tier window scores when only some windows were read.
+
+    The gated read path dequantizes a fraction of the int2 tier, so only those
+    windows receive real attention and only they produce a real score. Leaving
+    the rest at zero is not an option: ``window_scores`` is what eviction ranks
+    on, so a skipped window would score zero, rank last, and be dropped — the
+    gate would silently destroy the tier it exists to read less often, and at
+    ``quant_ratio = 0.7`` that is 70% of the evictable cache.
+
+    So every skipped window is credited with the estimate its own card produced,
+    corrected by the card's **typical** error on the selected windows:
+
+        log c = mean over selected of (log exact - logmass)
+
+    ``c`` needs nothing the step did not already compute — the selected windows
+    have *both* a real and an estimated score, so the correction is free and
+    self-calibrating. Without it the two populations sit on different scales and
+    the ranking between them is arbitrary.
+
+    **Why a mean of logs and not a ratio of sums.** ``c`` used to be
+    ``sum(exact) / sum(estimated)`` over the selected windows. That is right only
+    when the card is off by one common factor, and it fails on exactly the step a
+    retrieval benchmark is made of: a head copying a token out of a selected
+    int2 window puts nearly all of its mass on that one token, which a rank-1
+    card does not model, so ``sum(exact)`` is that token's mass and the ratio
+    becomes that token's estimation error. Every skipped window was then
+    credited with a share of the needle's mass — about three times the needle at
+    ratio 0.25 — and, since the same weight is what the skipped windows attend
+    with, the needle's value was diluted by that factor and replaced by a blend
+    of centroids. The more peaked the head, the more mass it handed to the
+    windows it did NOT read, which is backwards. A mean over logs moves by
+    ``1/n_selected`` of one outlier, not by all of it, and still recovers a
+    common factor exactly (``tests/test_gate_fill_calibration.py``).
+
+    A selected window with ``exact == 0`` has no finite log and is left out of the
+    mean; if none is left, the skipped windows are credited with nothing.
+
+    Parameters
+    ----------
+    exact : ``[B, H_q, W]`` real per-window scores. Only entries where ``keep``
+        are read; the rest may hold anything.
+    keep : ``[B, H_q, W]`` bool — which windows were actually dequantized. Pass
+        the KV-head mask expanded over its query-head group; a window read for a
+        KV head was read for every query head sharing it.
+    logmass : ``[B, H_q, W]`` the card's log-domain mass estimate for **every**
+        window, from :func:`modules.quant.sketch.gate_and_score`.
+
+    Returns
+    -------
+    ``[B, H_q, W]`` — ``exact`` where selected, ``c * exp(logmass)`` where not.
+    """
+    logmass = logmass.to(torch.float32)
+    ok = keep & (exact > 0)
+    log_exact = torch.log(torch.where(ok, exact.to(torch.float32),
+                                      torch.ones_like(logmass)))
+    cnt = ok.sum(dim=-1, keepdim=True)
+    dsum = torch.where(ok, log_exact - logmass,
+                       torch.zeros_like(logmass)).sum(dim=-1, keepdim=True)
+    log_c = torch.where(cnt > 0, dsum / cnt.clamp_min(1),
+                        torch.full_like(dsum, float("-inf")))
+    return torch.where(keep, exact.to(torch.float32), (logmass + log_c).exp())
+
+
+def expand_keep_to_query_heads(keep: Tensor, num_query_heads: int) -> Tensor:
+    """``[B, H_kv, W]`` -> ``[B, H_q, W]``. A window read for a KV head was read
+    for every query head sharing it, so the mask repeats along the group."""
+    B, hkv, W = keep.shape
+    return keep.repeat_interleave(num_query_heads // hkv, dim=1)

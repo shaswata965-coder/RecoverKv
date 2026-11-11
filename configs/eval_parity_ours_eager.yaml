@@ -17,7 +17,7 @@ model:
 
 cache:
   backend: windowed
-  backend_package: eager            # imports modules.windowed_eager_cache
+  backend_package: eager            # the one cache, UNGATED: eager scores, whole int2 tier read (read_gate: not-expected)
   cache_budget: 0.25
   window_size: 32
   num_sink_tokens: 4

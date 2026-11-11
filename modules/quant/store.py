@@ -33,12 +33,16 @@ eviction to learn the true max.
 
 from __future__ import annotations
 
+import math
+
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
+from .compact import stable_partition
 from .quantizer import (
+    QGrid,
     dequantize_key_windows,
     dequantize_value_windows,
     quantize_key_windows,
@@ -67,12 +71,37 @@ class QuantizedStore:
         num_kv_heads: int,
         n_slots: int,
         memoize_read: bool = True,
+        sketch_enabled: bool = False,
+        card_bits=None,
+        shadow_dtype: Optional[torch.dtype] = None,
     ) -> None:
         self.window_size = window_size
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
         self.memoize_read = memoize_read
+
+        # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
+        # off nothing is allocated and every path below is the pre-gate one.
+        self.sketch_enabled = sketch_enabled
+        # Each card field's width (the `quant_card_bits` knob, sketch.CardBits).
+        # Parsed once here so every later call hands the encoder, the gate and
+        # the slot table the same validated object.
+        from .sketch import parse_card_bits
+        self.card_bits = parse_card_bits(card_bits)
+        # Evaluation-only fp shadow of every demoted window's ORIGINAL K and V
+        # (`quant_promote_source="original"`, slots.SHADOW_FIELDS). `None` in
+        # every shipped configuration: nothing is allocated and promotion
+        # dequantizes, as it always has.
+        self.shadow_dtype = shadow_dtype
+        # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
+        # be frozen, not running: a card is written once and never revisited
+        # (§10), so a later anchor change would silently reinterpret every card
+        # already on disk. Freezing makes the encoding as immutable as the codes.
+        self._anchor: Optional[Tensor] = None
+        # [B, H_kv, D] value-side common mode, frozen on the same batch and for
+        # the same reason as `_anchor`.
+        self._v_anchor: Optional[Tensor] = None
 
         # Allocated on first use: the row count and device are not known until
         # the first forward pass reaches the cache.
@@ -105,6 +134,9 @@ class QuantizedStore:
                 head_dim=self.head_dim,
                 num_kv_heads=self.num_kv_heads,
                 device=device,
+                sketch=self.sketch_enabled,
+                card_bits=self.card_bits,
+                shadow_dtype=self.shadow_dtype,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -138,8 +170,10 @@ class QuantizedStore:
                     f"join_layers: layer {i} has {s._n_active} active Q windows, "
                     f"layer 0 has {ref._n_active} — layers must stay in lockstep"
                 )
-            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots) != (
-                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots):
+            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots,
+                    s.card_bits, s.shadow_dtype) != (
+                        ref.window_size, ref.head_dim, ref.num_kv_heads,
+                        ref.n_slots, ref.card_bits, ref.shadow_dtype):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s store geometry differs from layer 0's"
                 )
@@ -157,7 +191,15 @@ class QuantizedStore:
             num_kv_heads=ref.num_kv_heads,
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
+            sketch_enabled=ref.sketch_enabled,
+            card_bits=ref.card_bits,
+            shadow_dtype=ref.shadow_dtype,
         )
+        # Anchors are per-row already, so joining is the same row-axis concat the
+        # tables use: layer i owns rows [i*B, (i+1)*B).
+        if ref.sketch_enabled and all(s._anchor is not None for s in stores):
+            joint._anchor = torch.cat([s._anchor for s in stores], dim=0)
+            joint._v_anchor = torch.cat([s._v_anchor for s in stores], dim=0)
         if ref.table is not None:
             joint.table = QuantSlotTable.join_layers([s.table for s in stores])
         joint._n_active = ref._n_active
@@ -205,10 +247,10 @@ class QuantizedStore:
         """Resolve ``[B, W]`` window ids to slots. See :meth:`QuantSlotTable.lookup`."""
         return self.table.lookup(wids)
 
-    def retain_only(self, match: Tensor) -> None:
+    def retain_only(self, keep: Tensor) -> None:
         """Free slots for windows dropped outright (§6). ``match`` from :meth:`lookup`."""
         self._invalidate()
-        self.table.retain_only(match)
+        self.table.retain_only(keep)
 
     def reactivate_many(self, slot_idx: Tensor, valid: Tensor) -> None:
         """Re-demote dormant entries: dormant → active, no recompute (§10)."""
@@ -225,6 +267,7 @@ class QuantizedStore:
         keys_pre_rope: Tensor,
         values: Tensor,
         position_ranges: Tensor,
+        keys_post_rope: Optional[Tensor] = None,
     ) -> None:
         """First-time demotion of up to ``n`` windows per row, in one quantize.
 
@@ -240,9 +283,22 @@ class QuantizedStore:
         wid : ``[B, n]`` int64 window ids (``-1`` on invalid lanes).
         keys_pre_rope, values : ``[B, n, H_kv, window, D]``.
         position_ranges : ``[B, n, window]`` int64 original absolute positions.
+        keys_post_rope : ``[B, n, H_kv, window, D]``, required when
+            :attr:`sketch_enabled`. The gate card is built from the keys **as
+            they are here**, i.e. still rotated, which is why it costs no extra
+            RoPE: the caller already holds them (it is about to un-rotate them to
+            get ``keys_pre_rope``). The card is then frozen for life, because
+            eviction never rebases positions.
         """
         self._invalidate()
-        B, n = slot_idx.shape
+        # ``n`` CONCRETE: this runs inside the compiled eviction and ``n`` is a
+        # reshape extent below (``B * n`` and ``[B, n, H, S, D]``), so a SymInt
+        # here becomes a symbolic ``i // n``-shaped index expression in the
+        # generated kernel. It is a ``_EVICT_WIDTH_LADDER`` rung, already
+        # specialized by the ``.item()`` in ``_evict_widths``, so forcing it
+        # costs no recompile. ``B`` stays symbolic.
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
         # Flatten (row, lane) into the quantizers' leading window axis. They
@@ -253,12 +309,51 @@ class QuantizedStore:
         k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
         v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
 
+        sketch = None
+        if self.sketch_enabled:
+            if keys_post_rope is None:
+                raise ValueError(
+                    "sketch_enabled but demote_many got no keys_post_rope; the "
+                    "card must be built from the rotated keys (see §5, §10)."
+                )
+            from .sketch import build_sketch
+            kp = keys_post_rope.reshape(B * n, H, S, D).to(torch.float32)
+            vp = values.reshape(B * n, H, S, D).to(torch.float32)
+            if self._anchor is None:
+                # Frozen here, from the first batch of demoted windows: the mean
+                # over (window, token) of this layer's keys, per row and head.
+                # Frozen and not running, because a card is written once and never
+                # revisited (§10) -- a later anchor change would silently
+                # reinterpret every card already stored.
+                self._anchor = kp.reshape(B, n, H, S, D).mean(dim=(1, 3))
+                self._v_anchor = vp.reshape(B, n, H, S, D).mean(dim=(1, 3))
+            anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
+            vanc = self._v_anchor.repeat_interleave(n, dim=0)
+            sketch = tuple(build_sketch(kp, anc, vp, vanc, self.card_bits))
+
+        shadow = None
+        if self.shadow_dtype is not None:
+            if keys_post_rope is None:
+                raise ValueError(
+                    "the fp shadow (quant_promote_source='original') needs "
+                    "keys_post_rope: the oracle returns the keys exactly as the "
+                    "fp store held them.")
+            shadow = (keys_post_rope.to(self.shadow_dtype),
+                      values.to(self.shadow_dtype))
+
         self.table.write(
             slot_idx, valid, wid,
             k_codes, k_scale, k_zero,
             v_codes, v_scale, v_zero,
             position_ranges.to(torch.long),
+            sketch=sketch,
+            shadow=shadow,
         )
+
+    @property
+    def shadow_enabled(self) -> bool:
+        """Whether promotion returns the original fp window (the oracle arm)."""
+        return self.shadow_dtype is not None
 
     # -- promotion -----------------------------------------------------------
 
@@ -279,7 +374,14 @@ class QuantizedStore:
         position_ranges : ``[B, n, window]`` int64
         """
         self._invalidate()
-        B, n = slot_idx.shape
+        # ``n`` CONCRETE: this runs inside the compiled eviction and ``n`` is a
+        # reshape extent below (``B * n`` and ``[B, n, H, S, D]``), so a SymInt
+        # here becomes a symbolic ``i // n``-shaped index expression in the
+        # generated kernel. It is a ``_EVICT_WIDTH_LADDER`` rung, already
+        # specialized by the ``.item()`` in ``_evict_widths``, so forcing it
+        # costs no recompile. ``B`` stays symbolic.
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
         H, S, D = self.num_kv_heads, self.window_size, self.head_dim
 
         k_codes, k_scale, k_zero, v_codes, v_scale, v_zero, pos = self.table.gather(slot_idx)
@@ -296,7 +398,204 @@ class QuantizedStore:
             pos.reshape(B, n, S),
         )
 
+    def promote_many_original(
+        self, slot_idx: Tensor, valid: Tensor, out_dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """:meth:`promote_many`, returning the window's ORIGINAL fp K and V.
+
+        The evaluation-only oracle of the promotion-payload experiment
+        (``quant_promote_source="original"``): same bookkeeping -- the entry goes
+        dormant, not free -- but the payload is the shadow written at first
+        demotion, so a promoted window is bit-identical to what was demoted.
+
+        Returns ``(keys_post_rope, values, position_ranges)``: the keys are
+        ALREADY rotated (the shadow holds them as the fp store did), so the
+        caller must not apply RoPE again.
+        """
+        self._invalidate()
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
+        keys, values = self.table.gather_shadow(slot_idx)
+        sp = self.table.slot_pos
+        pos = sp.view(sp.shape[0] * sp.shape[1], S)[self.table._flat(slot_idx)]
+        self.table.set_active(slot_idx, valid, False)
+        return (
+            keys.to(out_dtype).reshape(B, n, H, S, D),
+            values.to(out_dtype).reshape(B, n, H, S, D),
+            pos.reshape(B, n, S),
+        )
+
     # -- read-path gather ----------------------------------------------------
+
+    def gate_and_select(
+        self,
+        query: Tensor,
+        scaling: float,
+        ratio: float,
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Which active Q windows this step dequantizes, and what the rest score.
+
+        Parameters
+        ----------
+        query : ``[B, H_q, D]`` post-RoPE decode query.
+        scaling : attention ``1 / sqrt(head_dim)``.
+        ratio : fraction of this step's ACTIVE windows to dequantize. Resolved
+            against the live ``n_active`` rather than a fixed count, because
+            ``N_q`` moves with the shape and a pinned integer would not be the
+            same fraction anywhere. At least one window always survives.
+
+        Returns
+        -------
+        ``(keep, logmass, slots)`` or ``None`` for an empty tier.
+        keep : ``[B, H_kv, n_active]`` bool -- the union over each GQA group, which
+            is what the kernel needs because one program owns a whole group.
+        logmass : ``[B, H_q, n_active]`` -- the estimated log mass of EVERY window,
+            selected or not. The skipped ones are what the caller credits back,
+            both to ``window_scores`` and to the attention output; without that a
+            skipped window scores zero, ranks last, and gets evicted -- which
+            would silently destroy the tier this gate exists to read less often.
+        slots : ``[B, n_active]`` the slot index behind each column.
+        """
+        if self.table is None or self._n_active == 0:
+            return None
+        if not self.sketch_enabled or self._anchor is None:
+            raise RuntimeError(
+                "gate_and_select needs sketch cards; construct the store with "
+                "sketch_enabled=True and demote at least once."
+            )
+        from .sketch import Sketch, gate_and_score, group_share, select_windows
+
+        slots = self.table.active_order(self._n_active)
+        card = Sketch(*self.table.gather_sketch(slots))
+        logmass, _ = gate_and_score(query, card, self._anchor, scaling,
+                                    self.card_bits)
+        # Union the GQA group FIRST, then select. The KV head is the unit of
+        # work -- one program loads a window once for every query head sharing
+        # it -- so the cap has to bind there. Capping per query head and unioning
+        # afterwards would let ratio r read up to r*rep windows (see group_max).
+        # The union is over each head's SHARE of its own mass, not over raw
+        # logits: a raw max lets the head with the largest baseline pick for the
+        # whole group (see group_share).
+        keep = select_windows(
+            group_share(logmass, self.num_kv_heads), self.cap_for_ratio(ratio))
+        return keep, logmass, slots
+
+    def cap_for_ratio(self, ratio: float) -> int:
+        """Windows read per head per step at ``ratio``, against the live count."""
+        return max(1, min(self._n_active, math.ceil(ratio * self._n_active)))
+
+    def window_centroids(self, slots: Tensor) -> Tensor:
+        """``[B, n_active, H_kv, D]`` — each active window's representative value.
+
+        What a skipped window contributes to the attention output. Gathered from
+        the same card the scan already pulled, so it rides the cache line the
+        scan warmed rather than costing a second pass over the tier.
+        """
+        from .sketch import Sketch, value_centroid
+
+        card = Sketch(*self.table.gather_sketch(slots))
+        return value_centroid(card, self._v_anchor, self.card_bits)
+
+    def gated_q_tier(
+        self,
+        keep: Tensor,
+        slots: Tensor,
+        rope_module: torch.nn.Module,
+        out_dtype: torch.dtype,
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Read-ready Q tier for the SELECTED windows only — the gated read path.
+
+        The counterpart of :meth:`effective_q_tier`, which dequantizes the whole
+        tier. This one dequantizes ``n_sel`` windows per ``(row, KV head)``, which
+        is the point of the gate.
+
+        Selection is per **KV head**, not per row, and that is load-bearing.
+        Measured on a shape-C tier (271 windows, 8 KV heads, 32 query heads) at a
+        0.25 ratio:
+
+            per (row, KV head)      68/271 windows read   100.00% mass recall
+            per row, union of heads 240/271               100.00%
+            per row, top-k row-max   68/271                97.54%
+
+        The union reads 89% of the tier — the gate buys nothing — and a row-level
+        top-k pays 2.5% of the worst head's mass for the same traffic. So each KV
+        head picks its own windows, and the cost is that positions become
+        per-head: ``[B, H_kv, n_sel*ws]`` rather than the shared ``[B, n*ws]``.
+
+        Those recall figures are of the GQA group's summed raw mass, which the
+        loudest query head dominates. They say which unit the cap should bind on;
+        they do not say every query head is served. Measured per query head, the
+        raw-max union that produced them left one head 0.05% of its mass, which is
+        why the union now runs over per-head shares (``sketch.group_share``).
+
+        Counts are equal across rows and heads (the cap is a fixed
+        ``ceil(ratio * n_active)``), so the result is still dense and needs no
+        padding or keep-mask — the same rectangularity argument the tier split
+        already relies on (BATCHING_PLAN.md §3).
+
+        Parameters
+        ----------
+        keep : ``[B, H_kv, n_active]`` bool, equal row sums, from
+            :meth:`gate_and_select`.
+        slots : ``[B, n_active]`` the slot behind each column, same call.
+
+        Returns
+        -------
+        ``(keys, values, positions)`` with keys/values ``[B, H_kv, n_sel*ws, D]``
+        and positions ``[B, H_kv, n_sel*ws]``, or ``None`` for an empty tier.
+        """
+        if self.table is None or self._n_active == 0:
+            return None
+        from .effective import dequant_rotate_q_keys
+        from .quantizer import dequantize_value_windows
+
+        B, H, S, D = keep.shape[0], self.num_kv_heads, self.window_size, self.head_dim
+        n_sel = int(keep[0, 0].sum())
+        # Rank within each head: the selected columns come first, so a
+        # fixed-width slice takes exactly them. The partition is stable, so
+        # column order stays ascending-by-id within the selection — which is
+        # what compute_score_meta_gated relies on.
+        pick = stable_partition(keep)[..., :n_sel]                      # [B,H,n_sel]
+        sel = torch.gather(slots.unsqueeze(1).expand(B, H, slots.shape[1]), 2, pick)
+
+        t = self.table
+        rows = torch.arange(B, device=sel.device)[:, None, None]
+        heads = torch.arange(H, device=sel.device)[None, :, None]
+
+        def take(store_t, head_axis=True):
+            return (store_t[rows, sel, heads] if head_axis
+                    else store_t[rows, sel])
+
+        def take_grid(q_name, s_name):
+            return QGrid(take(getattr(t, q_name)), take(getattr(t, s_name)))
+
+        k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//4]
+        k_scale = take_grid("key_scale_q", "key_scale_s")
+        k_zero = take_grid("key_zero_q", "key_zero_s")
+        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
+        v_scale = take_grid("val_scale_q", "val_scale_s")
+        v_zero = take_grid("val_zero_q", "val_zero_s")
+        pos = take(t.slot_pos, head_axis=False)        # [B,H,n_sel,S]
+
+        # Fold the head axis into the batch axis: the read kernel treats its
+        # leading axis as opaque, so a per-head selection costs no new code path,
+        # only a reshape. cos/sin then come from this row's own positions.
+        BH = B * H
+        pos_flat = pos.reshape(BH, n_sel * S)
+        keys = dequant_rotate_q_keys(
+            k_codes.reshape(BH * n_sel, 1, D, S // 4),
+            k_scale.reshape(BH * n_sel, 1, D), k_zero.reshape(BH * n_sel, 1, D),
+            S, pos_flat, rope_module, out_dtype, BH, n_sel, 1, D,
+        ).reshape(B, H, n_sel * S, D)
+
+        values = dequantize_value_windows(
+            v_codes.reshape(BH * n_sel, 1, S, D // 4),
+            v_scale.reshape(BH * n_sel, 1, S), v_zero.reshape(BH * n_sel, 1, S),
+            D, out_dtype=out_dtype,
+        ).reshape(B, H, n_sel * S, D).to(out_dtype)
+
+        return keys, values, pos.reshape(B, H, n_sel * S)
 
     def effective_q_tier(
         self, rope_module: torch.nn.Module, out_dtype: torch.dtype

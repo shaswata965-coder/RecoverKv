@@ -1,7 +1,8 @@
 """modules.quant — shared two-tier quantization package (design.md §2–§8).
 
-A single copy imported by BOTH cache backends (``windowed_cache`` and
-``windowed_eager_cache``); the backends differ only in ``hooks.py``. Everything
+The Q tier, under the one cache there is. ``flash_attn`` and ``eager`` share it
+and differ only in where eviction scores come from (``hooks.py``); the second
+cache package this docstring used to name was deleted in ``0974687``. Everything
 here is pure-tensor and CPU-testable — the only ``transformers`` dependency is
 the rope module passed in at read time (for the Q-tier RoPE apply and the
 one-time demotion un-rotate).
@@ -12,8 +13,8 @@ Design realities baked in (design.md):
   ``position_range`` (its original absolute positions) is frozen at first
   demotion; the read path applies RoPE at those fixed positions every step. No
   rerotation, no position override (§5).
-- **Pinned grid by identity.** A window's int2 codes + fp16 scale/zero are
-  written exactly once (first demotion) and never recomputed. A re-demotion
+- **Pinned grid by identity.** A window's int2 codes + its one-byte scale/zero
+  grid are written exactly once (first demotion) and never recomputed. A re-demotion
   reactivates the dormant slot; it never re-quantizes (§3, §10).
 - **The Q tier carries a batch axis.** Rows evict divergently — row 0 may hold
   windows ``{1, 5}`` in int2 while row 1 holds ``{4, 11}`` — so the per-window
