@@ -2188,3 +2188,19 @@ On the real data and tokenizer, that skips 11, 4 and 56 shorter examples, and ke
 * up to 512 steps per batch.
 
 The notebook re-projects it from the measured speed after the first arm.
+
+**Update (same day): a full-KV reference, and pooled batches.** Middle truncation
+changes the task, so the published full-context scores are no reference.
+* A `fullkv` arm runs the uncompressed model on the same truncated prompts, batched
+  the same way. Every arm is reported against it on the gold answers, and by
+  fidelity: its predictions scored against full KV's.
+* `gov_report` and `qmsum` (both 6,144 tokens) now share batches
+  (`longbench.pool_datasets`): 3 batches of ~34 rows instead of 4 of 25, so 4 full
+  decodes per arm.
+* `batch_tokens` is 212k on 80 GB. That is an arithmetic estimate of ~66 GiB
+  allocated, near 75 GB reserved: weights plus ~0.25 MiB per prompt token at
+  prefill, for the KV and the eviction's working copies.
+* Each batch's measured peak is in the sidecar, and the notebook prints the
+  budget that would put the peak at 75 GB.
+* An out-of-memory batch now steps down by a quarter, not half. Pinned to
+  `dbbfd12`; not run on a GPU.
