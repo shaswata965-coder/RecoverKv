@@ -2137,3 +2137,54 @@ settings and flags a difference from `OPERATING_POINT` before it runs.
 **Not verified.** Any GPU execution, including the vLLM judge (0.8.5.post1 in its
 own virtualenv, because vLLM needs transformers ≥ 4.51 and the cache refuses
 anything past 4.47.1). No LongGenBench score exists for this method yet.
+
+## 16. The completion ablation, batched on LongBench's long-generation tasks — 2026-11-11
+
+The Reviewer-2 completion ablation now runs in one Colab session. Each of 26 arms
+runs on 50 examples of each of `gov_report`, `qmsum` and `multi_news`, LongBench's
+English tasks with 512-token generations. The budget is 0.10, and it is batched
+(`notebooks/completion_ablation_colab.ipynb`, pinned to `021fde5`).
+
+**A protocol change, so these rows compare with nothing earlier.**
+* The windowed cache batches only equal-length rows, so each task's prompts are
+  middle-truncated to one fixed length: 6,144 tokens for `gov_report` and `qmsum`,
+  and 2,048 for `multi_news`.
+* The truncation is THUDM's rule, applied to the final templated ids
+  (`longbench.prompt_tokens`).
+* The first 50 examples at least that long are used.
+
+On the real data and tokenizer, that skips 11, 4 and 56 shorter examples, and keeps
+46%, 43% and 45% of the used prompts' tokens. Every arm sees the same prompts.
+
+**What was added.**
+* `LongBenchRunner._run_dataset_batched` decodes the rows `batch_size` at a time,
+  capped by `batch_tokens`. Each row is cut at its own EOS, and an out-of-memory
+  batch is halved. The sidecar records the plan, the realised batches and the
+  truncation. `batch_size: 1` with neither knob set is the original path.
+* `modules/evaluation/completion_recorder.py` records every completion rung inside
+  a real batched `generate`. It takes every stride-th step, every layer and every
+  live row, and reduces on the GPU to per-head statistics. It runs in two
+  dedicated arms (`rec_g0.25`, `rec_g0.10`), so Experiment 1 is also measured on
+  the real templated prompts and their long generations. Those arms' predictions
+  must equal their unrecorded twins'.
+
+**CPU-only evidence (no GPU run yet).**
+* `tests/test_completion_recorder.py` feeds a B = 2 cache and two B = 1 caches the
+  same per-row data through the real gate, with the kernel stubbed. The batched
+  records equal the per-row ones, and B = 1 equals the collector's
+  `record_completion_rungs` path.
+* It also checks the hooks inside a real `generate` at B = 2 against the
+  collector's taps.
+* `tests/test_longbench_batched.py`, on a tiny float64 Llama, shows the batched
+  path reproduces the B = 1 path, and that fixed-length batches of 3 equal batches
+  of 1.
+* The notebook ran end to end on CPU against real data and the real tokenizer,
+  with only the GPU run and the collector stood in. A second pass ran nothing.
+
+**Arithmetic, not measured.** The time estimate is ~2.5–3.5 h for the 26 arms plus
+~20 min for the collector:
+* 25-row batches at 6,144 tokens and one 50-row batch at 2,048;
+* `batch_tokens` 160k on 80 GB, so about 50 GB peak at prefill;
+* up to 512 steps per batch.
+
+The notebook re-projects it from the measured speed after the first arm.
