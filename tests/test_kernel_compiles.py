@@ -20,6 +20,8 @@ and speed.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 triton = pytest.importorskip("triton", reason="Triton front end not installed")
@@ -33,18 +35,59 @@ from modules.windowed_cache import gate_kernel as gk      # noqa: E402
 from modules.windowed_cache import decode_kernel as dk    # noqa: E402
 from modules.windowed_cache.decode_kernel import window_tiling  # noqa: E402
 from modules.quant.quantizer import grid_group                # noqa: E402
+from modules.quant.sketch import CARD_BITS_DEFAULT, CardBits    # noqa: E402
 
 #: An A100. Any real target exercises the same front end; the arch only matters
 #: for codegen, which is not what is being checked.
 TARGET = GPUTarget("cuda", 80, 32)
 
 
+#: Triton 3.3 renamed ASTSource's ``constants`` to ``constexprs``. The pinned GPU stack (torch 2.6) ships
+#: Triton 3.2, so the harness takes whichever this Triton has; with only the 3.3 name, every compile below
+#: died on a TypeError before reaching the kernel.
+_CONSTS_KW = "constexprs" if "constexprs" in inspect.signature(ASTSource.__init__).parameters else "constants"
+
+
 def _compile(fn, ptrs, consts):
+    # Every constexpr must be given. One left out becomes an i32 runtime argument and the compile fails
+    # for a reason no launch can hit -- which is how a kernel's new card-width constexpr went unnoticed.
+    need = [p.name for p in fn.params if p.is_constexpr]
+    missing = [n for n in need if n not in consts]
+    assert not missing, f"{fn.__name__}: constexpr(s) {missing} not supplied by the test"
     sig = {n: "i32" for n in fn.arg_names}
     sig.update(ptrs)
     for k in consts:
         sig[k] = "constexpr"
-    tcompile(ASTSource(fn=fn, signature=sig, constexprs=consts), target=TARGET)
+    tcompile(ASTSource(fn=fn, signature=sig, **{_CONSTS_KW: consts}), target=TARGET)
+
+
+def _codes(bits):
+    """A card field's pointer type: int8 unpacked at 8 bits, uint8 packed below (sketch.card_field_layout)."""
+    return "*i8" if bits == 8 else "*u8"
+
+
+def _decode_ptrs(bits=CARD_BITS_DEFAULT):
+    return {**_DECODE_PTRS, "VM": _codes(bits.vm)}
+
+
+def _gate_ptrs(bits=CARD_BITS_DEFAULT):
+    return {**_GATE_PTRS, "MU": _codes(bits.mu), "V": _codes(bits.v), "T": _codes(bits.t)}
+
+
+def _decode_consts(ws, gated, bits=CARD_BITS_DEFAULT):
+    block_nw, block_t = window_tiling(ws)
+    # BLOCK_R as the dispatcher launches it: `_pow2_at_least(rep)` floors at 16, which is also the
+    # smallest M `tl.dot` accepts.
+    return dict(HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=dk._pow2_at_least(4),
+                BLOCK_NW=block_nw, BLOCK_T=block_t, BLOCK_W=16,
+                PACK_K=max(ws // 4, 1), PACK_V=32,
+                GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
+                GATED=gated, LOG2E=dk._LOG2E, VM_BITS=bits.vm)
+
+
+def _gate_consts(ws, bits=CARD_BITS_DEFAULT):
+    return dict(HEAD_DIM=128, WS=ws, BLOCK_WS=triton.next_power_of_2(ws), BLOCK_D=128, BLOCK_W=64,
+                MU_BITS=bits.mu, V_BITS=bits.v, T_BITS=bits.t)
 
 
 #: The int2 grid is one byte per entry (u8 scale, i8 zero) against an fp16
@@ -101,16 +144,14 @@ def test_the_fused_decode_kernel_compiles(gated, ws):
     ungated one folds both away. Compiling only one would leave the other's
     front end unchecked.
     """
-    block_nw, block_t = window_tiling(ws)
-    # BLOCK_R as the dispatcher launches it: `_pow2_at_least(rep)` floors at 16,
-    # which is also the smallest M `tl.dot` accepts. A literal 4 here made every
-    # case below fail to compile on Triton 3.3 for a reason no launch can hit.
-    _compile(dk._two_tier_decode_kernel, _DECODE_PTRS, dict(
-        HEAD_DIM=128, HALF=64, WS=ws, BLOCK_R=dk._pow2_at_least(4),
-        BLOCK_NW=block_nw, BLOCK_T=block_t, BLOCK_W=16,
-        PACK_K=max(ws // 4, 1), PACK_V=32,
-        GROUP_K=grid_group(128), GROUP_V=grid_group(ws),
-        GATED=gated, LOG2E=dk._LOG2E))
+    _compile(dk._two_tier_decode_kernel, _decode_ptrs(), _decode_consts(ws, gated))
+
+
+@pytest.mark.parametrize("bits", [CardBits(8, 8, 8, 8), CardBits(2, 2, 2, 2)], ids=["int8", "int2"])
+def test_the_card_width_variants_compile(bits):
+    """``quant_card_bits`` reaches both kernels as constexprs: the non-default widths are other kernels."""
+    _compile(dk._two_tier_decode_kernel, _decode_ptrs(bits), _decode_consts(8, True, bits))
+    _compile(gk._gate_kernel, _gate_ptrs(bits), _gate_consts(8, bits))
 
 
 @pytest.mark.parametrize("ws", WINDOW_SIZES)
@@ -122,9 +163,7 @@ def test_the_gate_kernel_compiles(ws):
     ``tests/test_window_scores.py`` exercises) could not compile at all. Now the
     axis is padded to ``BLOCK_WS`` and masked.
     """
-    _compile(gk._gate_kernel, _GATE_PTRS, dict(
-        HEAD_DIM=128, WS=ws, BLOCK_WS=triton.next_power_of_2(ws),
-        BLOCK_D=128, BLOCK_W=64))
+    _compile(gk._gate_kernel, _gate_ptrs(), _gate_consts(ws))
 
 
 @pytest.mark.parametrize("rep", [1, 2, 3, 4, 8])
